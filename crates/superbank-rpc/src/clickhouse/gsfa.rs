@@ -18,7 +18,7 @@ use crate::processing::{ProcessingError, ProcessingResult};
 
 use super::QueryFreshnessClass;
 use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
-use super::queries::build_pagination_clauses;
+use super::queries::{build_hot_position_pagination_clauses, build_pagination_clauses};
 use super::sharding::{ShardTarget, ShardTopology};
 use super::types::{QueryTimings, SignatureRecord, SlotBoundary};
 use super::util::{
@@ -143,6 +143,10 @@ fn merge_hot_signature_records(
 impl ClickHouseClient {
     pub(crate) fn is_gsfa_hot_address(&self, pubkey: &Pubkey) -> bool {
         self.gsfa_hot_pubkeys.contains(pubkey)
+    }
+
+    pub(crate) fn should_use_gsfa_hot_fanout(&self, pubkey: &Pubkey) -> bool {
+        self.is_gsfa_hot_address(pubkey) && self.shard_topology.is_some()
     }
 
     pub(crate) fn should_use_gsfa_shard_routing(&self, pubkey: &Pubkey) -> bool {
@@ -304,7 +308,8 @@ impl ClickHouseClient {
         let hot_table = self.gsfa_hot_local_table.clone();
         let addr_bucket = cityhash64(pubkey.as_ref()) % self.bucket_moduli.gsfa_hot;
         let address_literal = pubkey_literal(pubkey);
-        let (with_clause, where_clause) = build_pagination_clauses(before_pos, until_pos);
+        let (with_clause, where_clause) =
+            build_hot_position_pagination_clauses(before_pos, until_pos);
         let spec = HotGsfaQuerySpec {
             local_table: hot_table,
             addr_bucket,
@@ -605,7 +610,7 @@ impl ClickHouseClient {
             let pubkey = Pubkey::from_str(address)
                 .map_err(|e| ProcessingError::deserialization("Invalid address", e))?;
 
-            if self.is_gsfa_hot_address(&pubkey) {
+            if self.should_use_gsfa_hot_fanout(&pubkey) {
                 return self
                     .get_hot_signatures_for_address_with_positions(
                         address, &pubkey, limit, before_pos, until_pos,
@@ -1232,6 +1237,20 @@ mod tests {
             client.gsfa_table_for_address(&hot_pubkey),
             "default.gsfa_hot"
         );
+        assert!(!client.should_use_gsfa_shard_routing(&hot_pubkey));
+    }
+
+    #[test]
+    fn hot_addresses_without_topology_use_distributed_hot_table_not_fanout() {
+        let mut client = test_client();
+        let hot_pubkey = Pubkey::new_from_array([7; 32]);
+        client.gsfa_hot_pubkeys.insert(hot_pubkey);
+
+        assert_eq!(
+            client.gsfa_table_for_address(&hot_pubkey),
+            "default.gsfa_hot"
+        );
+        assert!(!client.should_use_gsfa_hot_fanout(&hot_pubkey));
         assert!(!client.should_use_gsfa_shard_routing(&hot_pubkey));
     }
 
