@@ -54,6 +54,8 @@ pub(crate) struct TxIndexEntries {
     /// `if(meta_status_ok = 1, NULL, meta_err)` of the MVs.
     pub(crate) err: Option<String>,
     pub(crate) memo: Option<String>,
+    /// Every transaction signature, mirroring `signatures.sql`'s ARRAY JOIN.
+    pub(crate) signatures: Vec<[u8; 64]>,
     /// Distinct addresses touched by the transaction, minus the ignored set.
     pub(crate) addresses: Vec<[u8; 32]>,
     pub(crate) token_entries: Vec<TokenOwnerEntry>,
@@ -88,6 +90,7 @@ pub(crate) fn derive_index_entries(record: &StoredTransactionRecord) -> TxIndexE
     TxIndexEntries {
         err,
         memo,
+        signatures: record.tx_signatures.clone(),
         addresses,
         token_entries,
     }
@@ -875,8 +878,10 @@ mod tests {
         [seed; 32]
     }
 
+    // MV parity tests for ddl/local/gsfa.sql, ddl/local/signatures.sql, and
+    // ddl/local/token_owner_activity.sql. Update these when those views change.
     #[test]
-    fn addresses_are_deduped_and_ignored_set_is_filtered() {
+    fn mv_parity_gsfa_addresses_are_distinct_loaded_and_filtered() {
         use std::str::FromStr;
         let vote_program = Pubkey::from_str("Vote111111111111111111111111111111111111111")
             .unwrap()
@@ -907,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn err_follows_meta_status() {
+    fn mv_parity_err_follows_meta_status() {
         let mut record = base_record();
         record.meta_status_ok = true;
         record.meta_err = Some("ignored".to_string());
@@ -921,7 +926,20 @@ mod tests {
     }
 
     #[test]
-    fn memo_extraction_uses_combined_account_keys() {
+    fn mv_parity_signatures_indexes_every_transaction_signature() {
+        let mut record = base_record();
+        let second_sig = [8u8; 64];
+        let third_sig = [7u8; 64];
+        record.tx_signatures = vec![record.signature, second_sig, third_sig];
+
+        assert_eq!(
+            derive_index_entries(&record).signatures,
+            record.tx_signatures
+        );
+    }
+
+    #[test]
+    fn mv_parity_memo_extraction_uses_combined_account_keys() {
         use std::str::FromStr;
         let memo_program = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
             .unwrap()
@@ -939,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn token_entries_follow_mv_semantics() {
+    fn mv_parity_token_entries_follow_owner_and_balance_semantics() {
         let mut record = base_record();
         record.tx_account_keys = vec![
             pubkey_bytes(1), // idx 0
@@ -995,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn token_entry_with_no_owner_is_dropped() {
+    fn mv_parity_token_entry_with_no_owner_is_dropped() {
         let mut record = base_record();
         record.tx_account_keys = vec![pubkey_bytes(1), pubkey_bytes(2)];
         record.meta_pre_token_account_index = vec![1];

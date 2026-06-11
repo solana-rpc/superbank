@@ -42,8 +42,8 @@ pub(crate) struct FillerConfig {
     pub(crate) repair_interval: Duration,
     /// Never fetch slots ClickHouse ingestion may not have landed yet.
     pub(crate) repair_min_lag_slots: u64,
-    /// After this many failed fetches a slot stays a hole (falls through to
-    /// ClickHouse on reads) and is only logged once.
+    /// After this many incomplete or empty fill results a slot stays a hole
+    /// (falls through to ClickHouse on reads) and is only logged once.
     pub(crate) max_attempts: u32,
 }
 
@@ -148,19 +148,14 @@ pub(crate) async fn run(
             }
 
             match fill_range(&cache, &clickhouse, &bulk, &mut shutdown, &range, &cfg).await {
-                Ok(()) => {
+                Ok(outcome) => {
                     backoff = Duration::from_millis(250);
-                    for slot in range.start..=range.end {
-                        let entry = attempts.entry(slot).or_insert(0);
-                        *entry += 1;
-                        if *entry >= cfg.max_attempts && given_up.insert(slot) {
-                            warn!(
-                                slot,
-                                attempts = *entry,
-                                "disk cache: giving up on slot; it stays a ClickHouse read"
-                            );
-                        }
-                    }
+                    warn_for_given_up(record_fill_attempt_result(
+                        &mut attempts,
+                        &mut given_up,
+                        FillAttemptResult::IncompleteSlots(&outcome.incomplete_slots),
+                        cfg.max_attempts,
+                    ));
                 }
                 Err(FillError::Shutdown) => return,
                 Err(FillError::ClickHouse(err)) => {
@@ -170,6 +165,12 @@ pub(crate) async fn run(
                         end = range.end,
                         "disk cache: backfill fetch failed ({err}); backing off"
                     );
+                    warn_for_given_up(record_fill_attempt_result(
+                        &mut attempts,
+                        &mut given_up,
+                        FillAttemptResult::TransientClickHouse,
+                        cfg.max_attempts,
+                    ));
                     if sleep_or_shutdown(&mut shutdown, backoff).await {
                         return;
                     }
@@ -353,6 +354,10 @@ enum FillError {
     Shutdown,
 }
 
+struct FillOutcome {
+    incomplete_slots: Vec<u64>,
+}
+
 async fn fill_range(
     cache: &DiskCache,
     clickhouse: &ClickHouseClient,
@@ -360,7 +365,7 @@ async fn fill_range(
     shutdown: &mut tokio::sync::broadcast::Receiver<()>,
     range: &SlotRange,
     cfg: &FillerConfig,
-) -> Result<(), FillError> {
+) -> Result<FillOutcome, FillError> {
     let (metas, _) = clickhouse
         .get_block_metadata_by_slot_range(range.start, range.end, cfg.query_timeout)
         .await
@@ -368,7 +373,9 @@ async fn fill_range(
     if metas.is_empty() {
         // Either an all-skipped run (proven by a later block's parent link) or
         // ClickHouse is missing the range; attempts accounting decides.
-        return Ok(());
+        return Ok(FillOutcome {
+            incomplete_slots: uncached_slots(cache, range),
+        });
     }
     let (txs, _) = clickhouse
         .get_block_full_transactions_by_slot_range(range.start, range.end, cfg.query_timeout)
@@ -383,7 +390,9 @@ async fn fill_range(
         );
     }
     if blocks.is_empty() {
-        return Ok(());
+        return Ok(FillOutcome {
+            incomplete_slots: uncached_slots(cache, range),
+        });
     }
 
     let last_slot = blocks.last().map(|(meta, _)| meta.slot);
@@ -414,12 +423,58 @@ async fn fill_range(
             }
         }
     }
-    Ok(())
+    Ok(FillOutcome {
+        incomplete_slots: uncached_slots(cache, range),
+    })
 }
 
 fn prune_tracking(attempts: &mut HashMap<u64, u32>, given_up: &mut HashSet<u64>, floor: u64) {
     attempts.retain(|&slot, _| slot >= floor);
     given_up.retain(|&slot| slot >= floor);
+}
+
+fn uncached_slots(cache: &DiskCache, range: &SlotRange) -> Vec<u64> {
+    (range.start..=range.end)
+        .filter(|&slot| !cache.covers_slot(slot))
+        .collect()
+}
+
+enum FillAttemptResult<'a> {
+    IncompleteSlots(&'a [u64]),
+    TransientClickHouse,
+}
+
+fn record_fill_attempt_result(
+    attempts: &mut HashMap<u64, u32>,
+    given_up: &mut HashSet<u64>,
+    result: FillAttemptResult<'_>,
+    max_attempts: u32,
+) -> Vec<(u64, u32)> {
+    let FillAttemptResult::IncompleteSlots(slots) = result else {
+        return Vec::new();
+    };
+
+    let mut newly_given_up = Vec::new();
+    for &slot in slots {
+        if given_up.contains(&slot) {
+            continue;
+        }
+        let entry = attempts.entry(slot).or_insert(0);
+        *entry += 1;
+        if *entry >= max_attempts && given_up.insert(slot) {
+            newly_given_up.push((slot, *entry));
+        }
+    }
+    newly_given_up
+}
+
+fn warn_for_given_up(slots: Vec<(u64, u32)>) {
+    for (slot, attempts) in slots {
+        warn!(
+            slot,
+            attempts, "disk cache: giving up on slot; it stays a ClickHouse read"
+        );
+    }
 }
 
 /// Returns true when shutdown was requested.
@@ -524,5 +579,66 @@ mod tests {
         assert_eq!(blocks[0].1.len(), 2);
         assert_eq!(blocks[1].0.slot, 102);
         assert!(blocks[1].1.is_empty());
+    }
+
+    #[test]
+    fn incomplete_fill_attempts_give_up_once_at_limit() {
+        let mut attempts = HashMap::new();
+        let mut given_up = HashSet::new();
+        let slots = vec![10, 11];
+
+        assert!(
+            record_fill_attempt_result(
+                &mut attempts,
+                &mut given_up,
+                FillAttemptResult::IncompleteSlots(&slots),
+                2
+            )
+            .is_empty()
+        );
+
+        let newly_given_up = record_fill_attempt_result(
+            &mut attempts,
+            &mut given_up,
+            FillAttemptResult::IncompleteSlots(&slots),
+            2,
+        );
+        assert_eq!(newly_given_up, vec![(10, 2), (11, 2)]);
+        assert!(given_up.contains(&10));
+        assert!(given_up.contains(&11));
+
+        assert!(
+            record_fill_attempt_result(
+                &mut attempts,
+                &mut given_up,
+                FillAttemptResult::IncompleteSlots(&slots),
+                2
+            )
+            .is_empty()
+        );
+        assert_eq!(attempts.get(&10), Some(&2));
+        assert_eq!(attempts.get(&11), Some(&2));
+    }
+
+    #[test]
+    fn clickhouse_errors_do_not_count_toward_given_up_slots() {
+        let mut attempts = HashMap::new();
+        let mut given_up = HashSet::new();
+        let range = SlotRange { start: 10, end: 11 };
+
+        let newly_given_up = record_fill_attempt_result(
+            &mut attempts,
+            &mut given_up,
+            FillAttemptResult::TransientClickHouse,
+            1,
+        );
+        assert!(newly_given_up.is_empty());
+        assert!(attempts.is_empty());
+        assert!(given_up.is_empty());
+
+        assert_eq!(
+            plan_ranges(&[], &[(10, 11)], &given_up, 10, 11, 8, 64),
+            vec![range]
+        );
     }
 }

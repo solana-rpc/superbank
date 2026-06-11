@@ -215,6 +215,19 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-disk-cache-parity.js \
   -e ADDRESS_FILE=tests/k6/data/pools/addresses.txt
 ```
 
+Performance comparison against the same build without disk cache:
+
+```bash
+k6 run tests/k6/scenarios/performance/superbank-rpc-disk-cache-compare.js \
+  -e RPC_URL=http://disk-enabled:8899 -e REFERENCE_RPC_URL=http://disk-disabled:8899 \
+  -e ADDRESS_FILE=tests/k6/data/pools/addresses.txt \
+  -e VUS=10 -e DURATION=60s
+```
+
+The performance scenario pre-probes the target and only keeps workload items whose
+`X-Superbank-Sources` header reports a disk-cache hit, then reports per-method latency deltas and
+speedup ratios versus the reference.
+
 License note: the `disk-cache` feature implies `grpc-head-cache` and therefore also pulls in
 `yellowstone-block-machine` (AGPL-3.0).
 

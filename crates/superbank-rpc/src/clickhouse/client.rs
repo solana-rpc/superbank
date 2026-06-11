@@ -797,6 +797,15 @@ impl ClickHouseClient {
         operation: &'static str,
         freshness: QueryFreshnessClass,
     ) -> String {
+        self.select_settings_clause_with_timeout(operation, freshness, self.query_timeout)
+    }
+
+    pub(crate) fn select_settings_clause_with_timeout(
+        &self,
+        operation: &'static str,
+        freshness: QueryFreshnessClass,
+        timeout: Duration,
+    ) -> String {
         // Bound the server-side query lifetime so a query ClickHouse keeps running after
         // `with_timeout` drops the HTTP future does not linger and hold a connection.
         append_max_execution_time_setting(
@@ -807,7 +816,7 @@ impl ClickHouseClient {
                 false,
                 operation,
             ),
-            self.query_timeout,
+            timeout,
         )
     }
 
@@ -1950,7 +1959,7 @@ fn split_table_reference<'a>(default_database: &'a str, table: &'a str) -> (&'a 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         ClickHouseClient, ClickHouseClientOptions, kill_query_sql, shard_tcp_query_timeout_for,
@@ -2081,6 +2090,22 @@ mod tests {
         assert!(clause.contains("query_cache_ttl=10"));
         assert!(!clause.contains("query_cache_min_query_runs"));
         assert!(clause.contains("max_execution_time=8"));
+    }
+
+    #[test]
+    fn settings_clause_can_use_explicit_timeout() {
+        let client = test_client_with_query_cache();
+
+        let clause = client.select_settings_clause_with_timeout(
+            "get_block_full_transactions_by_slot_range",
+            QueryFreshnessClass::Historical,
+            Duration::from_millis(30_000),
+        );
+
+        assert!(clause.contains("query_cache_ttl=10"));
+        assert!(!clause.contains("query_cache_min_query_runs"));
+        assert!(clause.contains("max_execution_time=30"));
+        assert!(!clause.contains("max_execution_time=8"));
     }
 
     #[tokio::test]

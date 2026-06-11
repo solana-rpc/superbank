@@ -9,6 +9,7 @@ use ch_cityhash102::cityhash64;
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
+use super::constants::SLOT_SHARD_DIVISOR;
 use super::types::{
     NumericFilter, PaginationToken, ResolvedSignatureFilter, SignatureFilter, SignatureSlot,
     SlotBoundary, SortOrder, TokenAccountsFilter, TransactionStatusFilter,
@@ -842,16 +843,24 @@ pub(crate) fn build_transactions_by_slot_range_query(
     end_slot: u64,
     settings_clause: &str,
 ) -> String {
+    let start_bucket = start_slot / SLOT_SHARD_DIVISOR;
+    let end_bucket = end_slot / SLOT_SHARD_DIVISOR;
+
     format!(
         "SELECT
             {columns}
          FROM {transaction_table}
-         PREWHERE slot BETWEEN {start_slot} AND {end_slot}
+         PREWHERE
+            intDiv(slot, {slot_shard_divisor}) BETWEEN {start_bucket} AND {end_bucket}
+            AND slot BETWEEN {start_slot} AND {end_slot}
          ORDER BY slot ASC, slot_idx ASC, signature ASC
          LIMIT 1 BY signature
          {settings_clause}",
         columns = TRANSACTION_SELECT_COLUMNS,
         transaction_table = transaction_table,
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+        start_bucket = start_bucket,
+        end_bucket = end_bucket,
         start_slot = start_slot,
         end_slot = end_slot,
         settings_clause = settings_clause
@@ -862,10 +871,14 @@ pub(crate) fn build_transactions_by_slot_range_query(
 mod tests {
     use ch_cityhash102::cityhash64;
 
+    #[cfg(feature = "disk-cache")]
+    use super::build_transactions_by_slot_range_query;
     use super::{
         TransactionsForAddressTables, build_transactions_for_address_hot_query,
         build_transactions_for_address_query,
     };
+    #[cfg(feature = "disk-cache")]
+    use crate::clickhouse::constants::SLOT_SHARD_DIVISOR;
     use crate::clickhouse::types::{
         NumericFilter, ResolvedSignatureFilter, SignatureFilter, SignatureSlot, SortOrder,
         TokenAccountsFilter, TransactionStatusFilter, TransactionsForAddressQuery,
@@ -923,6 +936,21 @@ mod tests {
         assert!(sql.contains(
             "slot + toUInt64(0) > sig_gte_slot OR (slot + toUInt64(0) = sig_gte_slot AND slot_idx + toUInt32(0) >= sig_gte_idx)"
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "disk-cache")]
+    fn transactions_by_slot_range_query_includes_bucket_predicate_for_shard_pruning() {
+        let query = build_transactions_by_slot_range_query(
+            "default.transactions",
+            SLOT_SHARD_DIVISOR + 1,
+            SLOT_SHARD_DIVISOR + 10,
+            "",
+        );
+        let sql = normalize_sql(&query);
+
+        assert!(sql.contains("intDiv(slot, 432000) BETWEEN 1 AND 1"));
+        assert!(sql.contains("AND slot BETWEEN 432001 AND 432010"));
     }
 
     #[test]

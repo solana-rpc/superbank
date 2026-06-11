@@ -258,6 +258,19 @@ Local RPC helper:
 scripts/dev/run-local-rpc.sh
 ```
 
+Disk-cache RPC helper:
+
+```bash
+DRAGONSMOUTH_ENDPOINT=https://YOUR_DRAGONSMOUTH_ENDPOINT ./test-disk-cache-rpc.sh
+```
+
+This builds `target/release/superbank-rpc` with `--features disk-cache`, runs the disk-cache test
+suite with the larger test stack this repo currently needs, then starts the server with
+`HEAD_CACHE_ENABLED=true` and `DISK_CACHE_ENABLED=true`. It defaults to local ClickHouse
+(`http://localhost:8123`, database `default`) and `target/disk-cache/superbank-rpc`; override the
+environment variables shown by `./test-disk-cache-rpc.sh --help` as needed. Use `RUN_SERVER=0` for
+build/test only or `RUN_TESTS=0` to skip tests.
+
 ### Nix (flakes)
 
 This repo includes a Nix flake with a dev shell that provides `tilt`, `docker`, `kubectl`, `kind`,

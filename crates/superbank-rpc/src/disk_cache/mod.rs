@@ -51,6 +51,30 @@ const MAX_SKIPPED_RUN: u64 = 100_000;
 /// When the byte budget trips, evict down to this fraction of it (hysteresis).
 const BYTE_BUDGET_LOW_WATER: f64 = 0.93;
 
+/// Column families range-deleted immediately by eviction. Index CFs are cleaned
+/// by compaction filters and can lag without changing the slot floor estimate.
+const BYTE_BUDGET_EVICTION_CFS: [&str; 3] = [
+    schema::CF_SLOT_COVERAGE,
+    schema::CF_BLOCK_META,
+    schema::CF_TX,
+];
+
+fn byte_budget_floor(
+    head: u64,
+    max_bytes: u64,
+    data_live_bytes: u64,
+    covered_slots: u64,
+) -> Option<u64> {
+    if max_bytes == 0 || data_live_bytes < max_bytes {
+        return None;
+    }
+
+    let bytes_per_slot = (data_live_bytes / covered_slots.max(1)).max(1);
+    let target_bytes = (max_bytes as f64 * BYTE_BUDGET_LOW_WATER) as u64;
+    let keep_slots = (target_bytes / bytes_per_slot).max(1);
+    Some(head.saturating_sub(keep_slots - 1))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DiskCacheError {
     #[error("rocksdb: {0}")]
@@ -593,7 +617,7 @@ impl DiskCacheInner {
             let entries = index::derive_index_entries(record);
             // signatures.sql ARRAY JOINs tx_signatures: any signature resolves.
             let sig_value = codec::encode_sig_value(slot, record.slot_idx, entries.err.as_deref());
-            for tx_signature in &record.tx_signatures {
+            for tx_signature in &entries.signatures {
                 batch.put_cf(&sig_cf, tx_signature, &sig_value);
             }
 
@@ -686,19 +710,16 @@ impl DiskCacheInner {
 
         let mut byte_budget_bound = false;
         let bytes_floor = if self.cfg.max_bytes > 0 {
-            let live = self.live_sst_bytes();
-            if live >= self.cfg.max_bytes {
-                let covered = self
+            let data_live = self.live_sst_bytes_for(&BYTE_BUDGET_EVICTION_CFS);
+            if data_live >= self.cfg.max_bytes {
+                let covered_slots = self
                     .coverage
                     .read()
                     .expect("coverage lock")
-                    .covered_slot_count()
-                    .max(1);
-                let bytes_per_slot = (live / covered).max(1);
-                let target_bytes = (self.cfg.max_bytes as f64 * BYTE_BUDGET_LOW_WATER) as u64;
-                let keep_slots = (target_bytes / bytes_per_slot).max(1);
+                    .covered_slot_count();
                 byte_budget_bound = true;
-                head.saturating_sub(keep_slots - 1)
+                byte_budget_floor(head, self.cfg.max_bytes, data_live, covered_slots)
+                    .unwrap_or_default()
             } else {
                 0
             }
@@ -753,7 +774,11 @@ impl DiskCacheInner {
     }
 
     fn live_sst_bytes(&self) -> u64 {
-        schema::ALL_CFS
+        self.live_sst_bytes_for(&schema::ALL_CFS)
+    }
+
+    fn live_sst_bytes_for(&self, cf_names: &[&str]) -> u64 {
+        cf_names
             .iter()
             .filter_map(|name| {
                 self.db
@@ -1149,6 +1174,22 @@ pub(crate) mod tests {
             .expect("write slot");
     }
 
+    fn flush_all_cfs(cache: &DiskCache) {
+        cache
+            .inner_for_tests()
+            .db
+            .flush_cfs_opt(
+                &schema::ALL_CFS
+                    .iter()
+                    .map(|name| cache.inner_for_tests().cf(name))
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                &rocksdb::FlushOptions::default(),
+            )
+            .expect("flush");
+    }
+
     fn unwrap_found(result: DiskBlockResult) -> StoredBlockPayload {
         match result {
             DiskBlockResult::Found(payload) => *payload,
@@ -1384,19 +1425,7 @@ pub(crate) mod tests {
             write_slot(&cache, slot, slot - 1, 2);
         }
         // SST sizes only materialize after a flush.
-        cache
-            .inner_for_tests()
-            .db
-            .flush_cfs_opt(
-                &schema::ALL_CFS
-                    .iter()
-                    .map(|name| cache.inner_for_tests().cf(name))
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .collect::<Vec<_>>(),
-                &rocksdb::FlushOptions::default(),
-            )
-            .expect("flush");
+        flush_all_cfs(&cache);
 
         let stats = cache
             .maybe_evict()
@@ -1404,6 +1433,57 @@ pub(crate) mod tests {
             .expect("budget should bind");
         assert!(stats.byte_budget_bound);
         assert!(stats.new_floor > 100);
+    }
+
+    #[test]
+    fn byte_budget_floor_uses_data_cf_pressure() {
+        let head = 120;
+        let max_bytes = 1_000;
+        let covered_slots = 21;
+
+        // The estimator receives evictable data-CF bytes, not total RocksDB
+        // bytes, so lagging index CFs alone cannot move the floor.
+        assert_eq!(
+            byte_budget_floor(head, max_bytes, max_bytes - 1, covered_slots),
+            None
+        );
+        assert!(byte_budget_floor(head, max_bytes, max_bytes, covered_slots).is_some());
+    }
+
+    #[tokio::test]
+    async fn byte_budget_eviction_ignores_lagging_index_cf_pressure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config(&dir);
+        cfg.retain_slots = 1_000_000;
+        let cache = DiskCache::open(cfg.clone()).expect("open");
+
+        for slot in 100..=104u64 {
+            let mut record = transaction(slot, 0);
+            record.tx_account_keys = (0..192)
+                .map(|idx| {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&slot.to_be_bytes());
+                    key[8..16].copy_from_slice(&(idx as u64).to_be_bytes());
+                    key
+                })
+                .collect();
+            write_block(&cache, slot, slot - 1, vec![record]);
+        }
+        flush_all_cfs(&cache);
+
+        let data_live = cache
+            .inner_for_tests()
+            .live_sst_bytes_for(&BYTE_BUDGET_EVICTION_CFS);
+        let total_live = cache.inner_for_tests().live_sst_bytes();
+        assert!(data_live > 0);
+        assert!(total_live > data_live + 1);
+
+        drop(cache);
+        cfg.max_bytes = data_live + 1;
+        let cache = DiskCache::open(cfg).expect("reopen");
+
+        assert!(cache.maybe_evict().expect("evict").is_none());
+        assert_eq!(cache.min_retained_slot(), 0);
     }
 
     fn transaction_with(
