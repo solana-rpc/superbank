@@ -4,7 +4,6 @@
  */
 
 use thiserror::Error;
-use yellowstone_grpc_proto::convert_from;
 use yellowstone_grpc_proto::prelude::{
     CompiledInstruction, MessageAddressTableLookup, RewardType, SubscribeUpdateTransactionInfo,
     TokenBalance, TransactionError, TransactionStatusMeta,
@@ -141,13 +140,12 @@ fn decode_transaction_error(err: Option<&TransactionError>) -> (bool, Option<Str
         return (true, None);
     };
 
-    match convert_from::create_tx_error(Some(err)) {
-        Ok(Some(decoded)) => {
+    match bincode::deserialize::<solana_sdk::transaction::TransactionError>(&err.err) {
+        Ok(decoded) => {
             let serialized =
                 serde_json::to_string(&decoded).unwrap_or_else(|_| format!("{decoded:?}"));
             (false, Some(serialized))
         }
-        Ok(None) => (true, None),
         Err(_) => {
             let fallback = hex::encode(&err.err);
             tracing::warn!("head cache: failed to decode transaction error; storing hex fallback");

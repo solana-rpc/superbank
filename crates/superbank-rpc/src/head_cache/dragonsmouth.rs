@@ -12,8 +12,9 @@ use solana_commitment_config::CommitmentLevel;
 use solana_sdk::{hash::Hash, pubkey::Pubkey};
 use tokio::time::sleep;
 use tracing::{info, warn};
-use yellowstone_block_machine::dragonsmouth::client_ext::{
-    BlockMachineOutput, BlockMachineResult, GeyserGrpcExt,
+use yellowstone_block_machine::dragonsmouth::{
+    client_ext::{GeyserBlockStream, GeyserGrpcExt},
+    stream::BlockMachineOutput,
 };
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
@@ -53,7 +54,7 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
 
     loop {
         match connect_and_subscribe(&cfg).await {
-            Ok(mut rx) => {
+            Ok(mut stream) => {
                 info!(
                     endpoint = cfg.endpoint.as_str(),
                     min_commitment = ?cfg.min_commitment,
@@ -61,7 +62,7 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
                 );
                 backoff = Duration::from_millis(250);
 
-                while let Some(result) = rx.recv().await {
+                while let Some(result) = stream.next().await {
                     match result {
                         Ok(output) => handle_output(&cache, output, &cfg),
                         Err(err) => {
@@ -450,7 +451,7 @@ fn parse_block_rewards(
 
 async fn connect_and_subscribe(
     cfg: &DragonsmouthHeadCacheConfig,
-) -> Result<tokio::sync::mpsc::Receiver<BlockMachineResult>, String> {
+) -> Result<GeyserBlockStream, String> {
     let mut client = GeyserGrpcClient::build_from_shared(cfg.endpoint.clone().into_bytes())
         .map_err(|e| format!("invalid endpoint: {e}"))?
         .x_token(cfg.x_token.clone())
@@ -548,6 +549,7 @@ mod tests {
                         post_balance: 99,
                         reward_type: yellowstone_grpc_proto::prelude::RewardType::Fee as i32,
                         commission: "7".to_string(),
+                        commission_bps: String::new(),
                     }],
                     num_partitions: Some(yellowstone_grpc_proto::prelude::NumPartitions {
                         num_partitions: 4,
