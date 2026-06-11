@@ -36,7 +36,9 @@ use crate::clickhouse::{
 pub(crate) mod codec;
 pub(crate) mod coverage;
 pub(crate) mod index;
+pub(crate) mod ingest;
 pub(crate) mod schema;
+pub(crate) mod writer;
 
 use codec::CoverageValue;
 use coverage::CoverageMap;
@@ -244,7 +246,7 @@ impl DiskCache {
     pub(crate) fn write_finalized_slot(
         &self,
         meta: &BlockMetadataRecord,
-        txs: &[StoredTransactionRecord],
+        txs: &[Arc<StoredTransactionRecord>],
         source: u8,
     ) -> Result<(), DiskCacheError> {
         self.inner.write_finalized_slot(meta, txs, source)
@@ -262,8 +264,11 @@ impl DiskCache {
 
     /// Fsync the WAL; called on graceful shutdown.
     pub(crate) fn flush_wal(&self) -> Result<(), DiskCacheError> {
-        self.inner.db.flush_wal(true)?;
-        Ok(())
+        self.inner.flush_wal()
+    }
+
+    pub(crate) fn inner_arc(&self) -> Arc<DiskCacheInner> {
+        self.inner.clone()
     }
 
     pub(crate) async fn slot_status(&self, slot: u64) -> SlotStatus {
@@ -411,6 +416,15 @@ impl DiskCacheInner {
         self.min_retained.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn covers_slot(&self, slot: u64) -> bool {
+        self.coverage.read().expect("coverage lock").contains(slot)
+    }
+
+    pub(crate) fn flush_wal(&self) -> Result<(), DiskCacheError> {
+        self.db.flush_wal(true)?;
+        Ok(())
+    }
+
     fn load_persisted_state(&self) -> Result<(), DiskCacheError> {
         let meta_cf = self.cf(schema::CF_META);
         let floor = self
@@ -450,7 +464,7 @@ impl DiskCacheInner {
     fn write_finalized_slot(
         &self,
         meta: &BlockMetadataRecord,
-        txs: &[StoredTransactionRecord],
+        txs: &[Arc<StoredTransactionRecord>],
         source: u8,
     ) -> Result<(), DiskCacheError> {
         let slot = meta.slot;
@@ -483,7 +497,7 @@ impl DiskCacheInner {
             batch.put_cf(
                 &tx_cf,
                 schema::tx_key(slot, record.slot_idx),
-                codec::encode_record(record)?,
+                codec::encode_record(record.as_ref())?,
             );
 
             let entries = index::derive_index_entries(record);
@@ -917,7 +931,7 @@ mod tests {
     use super::*;
     use solana_sdk::hash::Hash;
 
-    fn test_config(dir: &tempfile::TempDir) -> DiskCacheConfig {
+    pub(crate) fn test_config(dir: &tempfile::TempDir) -> DiskCacheConfig {
         DiskCacheConfig {
             path: dir.path().join("db"),
             retain_slots: 1_000,
@@ -927,11 +941,15 @@ mod tests {
         }
     }
 
-    fn open_cache(dir: &tempfile::TempDir) -> DiskCache {
+    pub(crate) fn open_cache(dir: &tempfile::TempDir) -> DiskCache {
         DiskCache::open(test_config(dir)).expect("open disk cache")
     }
 
-    fn block_metadata(slot: u64, parent_slot: u64, tx_count: u64) -> BlockMetadataRecord {
+    pub(crate) fn block_metadata(
+        slot: u64,
+        parent_slot: u64,
+        tx_count: u64,
+    ) -> BlockMetadataRecord {
         BlockMetadataRecord {
             slot,
             parent_slot,
@@ -951,7 +969,7 @@ mod tests {
         }
     }
 
-    fn transaction(slot: u64, idx: u32) -> StoredTransactionRecord {
+    pub(crate) fn transaction(slot: u64, idx: u32) -> StoredTransactionRecord {
         let mut signature = [0u8; 64];
         signature[..8].copy_from_slice(&slot.to_be_bytes());
         signature[8..12].copy_from_slice(&idx.to_be_bytes());
@@ -1021,9 +1039,11 @@ mod tests {
         }
     }
 
-    fn write_slot(cache: &DiskCache, slot: u64, parent_slot: u64, tx_count: u32) {
+    pub(crate) fn write_slot(cache: &DiskCache, slot: u64, parent_slot: u64, tx_count: u32) {
         let meta = block_metadata(slot, parent_slot, u64::from(tx_count));
-        let txs: Vec<_> = (0..tx_count).map(|idx| transaction(slot, idx)).collect();
+        let txs: Vec<_> = (0..tx_count)
+            .map(|idx| Arc::new(transaction(slot, idx)))
+            .collect();
         cache
             .write_finalized_slot(&meta, &txs, schema::COVERAGE_SOURCE_LIVE)
             .expect("write slot");
@@ -1128,7 +1148,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = open_cache(&dir);
         let meta = block_metadata(10, 9, 2);
-        let txs = vec![transaction(10, 0)];
+        let txs = vec![Arc::new(transaction(10, 0))];
         let err = cache
             .write_finalized_slot(&meta, &txs, schema::COVERAGE_SOURCE_LIVE)
             .expect_err("must reject");
@@ -1301,8 +1321,14 @@ mod tests {
         record
     }
 
-    fn write_block(cache: &DiskCache, slot: u64, parent: u64, txs: Vec<StoredTransactionRecord>) {
+    pub(crate) fn write_block(
+        cache: &DiskCache,
+        slot: u64,
+        parent: u64,
+        txs: Vec<StoredTransactionRecord>,
+    ) {
         let meta = block_metadata(slot, parent, txs.len() as u64);
+        let txs: Vec<_> = txs.into_iter().map(Arc::new).collect();
         cache
             .write_finalized_slot(&meta, &txs, schema::COVERAGE_SOURCE_LIVE)
             .expect("write block");

@@ -193,6 +193,9 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
                 x_token: args.dragonsmouth_x_token.clone(),
                 max_decoding_bytes: args.grpc_max_decoding_bytes,
                 min_commitment,
+                // Wired up when the disk cache is constructed (disk-cache config phase).
+                #[cfg(feature = "disk-cache")]
+                disk_sink: None,
             };
 
             let task = tokio::spawn(dragonsmouth::run(cache.clone(), cfg));
