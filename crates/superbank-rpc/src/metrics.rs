@@ -350,6 +350,7 @@ struct RouteLabels {
     scope: String,
     source: String,
     head_cache_read: String,
+    disk_cache_read: String,
     outcome: String,
     x_endpoint: Option<String>,
     x_rpc_node: Option<String>,
@@ -368,6 +369,11 @@ impl EncodeLabelSetTrait for RouteLabels {
             "head_cache_read",
             self.head_cache_read.as_str(),
         )?;
+        encode_required_label(
+            &mut encoder,
+            "disk_cache_read",
+            self.disk_cache_read.as_str(),
+        )?;
         encode_required_label(&mut encoder, "outcome", self.outcome.as_str())?;
         encode_request_header_labels(
             &mut encoder,
@@ -385,6 +391,7 @@ pub(crate) struct RouteMetricLabels<'a> {
     pub(crate) scope: &'a str,
     pub(crate) source: &'a str,
     pub(crate) head_cache_read: bool,
+    pub(crate) disk_cache_read: bool,
     pub(crate) outcome: &'a str,
     pub(crate) x_endpoint: Option<&'a str>,
     pub(crate) x_rpc_node: Option<&'a str>,
@@ -1285,6 +1292,11 @@ impl Metrics {
                 scope: labels.scope.to_string(),
                 source: labels.source.to_string(),
                 head_cache_read: if labels.head_cache_read {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                },
+                disk_cache_read: if labels.disk_cache_read {
                     "true".to_string()
                 } else {
                     "false".to_string()

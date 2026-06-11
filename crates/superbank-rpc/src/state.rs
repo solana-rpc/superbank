@@ -44,8 +44,6 @@ pub(crate) struct AppState {
     /// Finalized recent-slot cache on local disk; consulted between the head
     /// cache and ClickHouse. Intentionally not part of latest-slot resolution:
     /// its tip never leads the head cache, so it adds nothing there.
-    // Consumed once the handler read tiers land; remove the allow then.
-    #[allow(dead_code)]
     #[cfg(feature = "disk-cache")]
     pub(crate) disk_cache: Option<Arc<DiskCache>>,
 }

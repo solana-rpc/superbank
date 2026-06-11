@@ -22,8 +22,8 @@ use tracing::error;
 
 use crate::clickhouse::{
     NumericFilter, PaginationToken, QueryTimings, ResolvedSignatureFilter, SignatureFilter,
-    SignatureSlot, SortOrder, TokenAccountsFilter, TransactionStatusFilter,
-    TransactionsForAddressQuery,
+    SignatureSlot, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
+    TransactionStatusFilter, TransactionsForAddressQuery,
 };
 use crate::handlers::{
     RouteMetric,
@@ -157,6 +157,83 @@ fn unsupported_transaction_version_message(version: u8) -> String {
     )
 }
 
+/// Hydrate a stored record and build the JSON-RPC response; shared by the
+/// head-cache, disk-cache, and ClickHouse branches of getTransaction.
+#[allow(clippy::too_many_arguments)]
+async fn respond_with_hydrated_transaction(
+    state: &AppState,
+    id: Value,
+    route: &mut RouteMetric,
+    signature_str: &str,
+    record: Arc<StoredTransactionRecord>,
+    encoding: UiTransactionEncoding,
+    max_version: Option<u8>,
+    timings: Option<QueryTimings>,
+) -> Result<Response, StatusCode> {
+    let attach_timings = |resp: &mut Response| {
+        if let Some(timings) = timings.as_ref() {
+            add_downstream_header(resp, timings);
+        }
+    };
+
+    let permit = match state.hydration_sem.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            error!(signature = signature_str, "Hydration semaphore closed");
+            let mut resp = json_rpc_internal_error_response(id);
+            attach_timings(&mut resp);
+            return Ok(resp);
+        }
+    };
+
+    let record_slot = record.slot;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hydrate_transaction_record(record.as_ref(), encoding, max_version)
+    })
+    .await
+    {
+        Ok(Ok(encoded_tx)) => {
+            route.success();
+            let mut resp = json_rpc_success_response(id, encoded_tx);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Ok(Err(TransactionHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
+            version,
+        )))) => {
+            route.rpc_error();
+            let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
+            let mut resp = json_rpc_error_response(
+                id,
+                code,
+                unsupported_transaction_version_message(version),
+                None,
+            );
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Ok(Err(e)) => {
+            error!(
+                "Failed to hydrate transaction {} in slot {}: {}",
+                signature_str, record_slot, e
+            );
+            let mut resp = json_rpc_internal_error_response(id);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Err(join_err) => {
+            error!(
+                "Failed to join hydration task for transaction {} in slot {}: {}",
+                signature_str, record_slot, join_err
+            );
+            let mut resp = json_rpc_internal_error_response(id);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+    }
+}
+
 pub(crate) async fn handle_get_transaction(
     state: Arc<AppState>,
     id: Value,
@@ -278,57 +355,61 @@ pub(crate) async fn handle_get_transaction(
         }
 
         route.source_head_cache();
-        let max_version = config.max_supported_transaction_version;
-        let permit = match state.hydration_sem.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                error!(signature = signature_str, "Hydration semaphore closed");
-                return Ok(json_rpc_internal_error_response(id));
-            }
-        };
-        let record = record.clone();
-
-        match tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            hydrate_transaction_record(record.as_ref(), encoding, max_version)
-        })
-        .await
-        {
-            Ok(Ok(encoded_tx)) => {
-                route.success();
-                return Ok(json_rpc_success_response(id, encoded_tx));
-            }
-            Ok(Err(TransactionHydrationError::Encode(
-                EncodeError::UnsupportedTransactionVersion(version),
-            ))) => {
-                route.rpc_error();
-                let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-                return Ok(json_rpc_error_response(
-                    id,
-                    code,
-                    unsupported_transaction_version_message(version),
-                    None,
-                ));
-            }
-            Ok(Err(e)) => {
-                error!(
-                    "Failed to hydrate head-cache transaction {}: {}",
-                    signature_str, e
-                );
-                return Ok(json_rpc_internal_error_response(id));
-            }
-            Err(join_err) => {
-                error!(
-                    "Failed to join hydration task for head-cache transaction {}: {}",
-                    signature_str, join_err
-                );
-                return Ok(json_rpc_internal_error_response(id));
-            }
-        }
+        return respond_with_hydrated_transaction(
+            state.as_ref(),
+            id,
+            &mut route,
+            signature_str,
+            record,
+            encoding,
+            config.max_supported_transaction_version,
+            None,
+        )
+        .await;
     }
     #[cfg(feature = "grpc-head-cache")]
     if state.head_cache.is_some() {
         route.head_cache_read();
+    }
+
+    // Disk tier: everything stored is finalized, which satisfies any commitment
+    // accepted above. A hit answers without ClickHouse. A miss proves nothing by
+    // itself (the signature may be older than the window or in a coverage hole) —
+    // EXCEPT when the request pinned a slot that the disk fully covers: then the
+    // transaction conclusively does not exist there.
+    #[cfg(feature = "disk-cache")]
+    if let Some(disk) = state.disk_cache.as_ref() {
+        route.disk_cache_read();
+        if let Some(record) = disk.get_tx(signature).await {
+            if requested_slot.is_some_and(|slot| record.slot != slot) {
+                route.source_disk_cache();
+                route.not_found();
+                return Ok(json_rpc_null_response(id));
+            }
+            route.source_disk_cache();
+            return respond_with_hydrated_transaction(
+                state.as_ref(),
+                id,
+                &mut route,
+                signature_str,
+                Arc::new(record),
+                encoding,
+                config.max_supported_transaction_version,
+                None,
+            )
+            .await;
+        }
+        if let Some(slot) = requested_slot
+            && matches!(
+                disk.slot_status(slot).await,
+                crate::disk_cache::SlotStatus::Covered { .. }
+                    | crate::disk_cache::SlotStatus::Skipped
+            )
+        {
+            route.source_disk_cache();
+            route.not_found();
+            return Ok(json_rpc_null_response(id));
+        }
     }
 
     route.source_clickhouse();
@@ -367,63 +448,17 @@ pub(crate) async fn handle_get_transaction(
         return Ok(resp);
     };
 
-    let max_version = config.max_supported_transaction_version;
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            error!(signature = signature_str, "Hydration semaphore closed");
-            let mut resp = json_rpc_internal_error_response(id);
-            add_downstream_header(&mut resp, &timings);
-            return Ok(resp);
-        }
-    };
-
-    let record_slot = record.slot;
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        hydrate_transaction_record(&record, encoding, max_version)
-    })
+    respond_with_hydrated_transaction(
+        state.as_ref(),
+        id,
+        &mut route,
+        signature_str,
+        Arc::new(record),
+        encoding,
+        config.max_supported_transaction_version,
+        Some(timings),
+    )
     .await
-    {
-        Ok(Ok(encoded_tx)) => {
-            route.success();
-            let mut resp = json_rpc_success_response(id, encoded_tx);
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-        Ok(Err(TransactionHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
-            version,
-        )))) => {
-            route.rpc_error();
-            let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-            let mut resp = json_rpc_error_response(
-                id,
-                code,
-                unsupported_transaction_version_message(version),
-                None,
-            );
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-        Ok(Err(e)) => {
-            error!(
-                "Failed to hydrate transaction {} in slot {}: {}",
-                signature_str, record_slot, e
-            );
-            let mut resp = json_rpc_internal_error_response(id);
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-        Err(join_err) => {
-            error!(
-                "Failed to join hydration task for transaction {} in slot {}: {}",
-                signature_str, record_slot, join_err
-            );
-            let mut resp = json_rpc_internal_error_response(id);
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-    }
 }
 
 pub(crate) async fn handle_get_transactions_for_address(

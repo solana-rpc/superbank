@@ -1000,7 +1000,7 @@ fn check_schema_version(db: Db) -> Result<SchemaCheck, DiskCacheError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use solana_sdk::hash::Hash;
 

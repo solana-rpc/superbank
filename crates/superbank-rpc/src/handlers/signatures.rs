@@ -190,6 +190,49 @@ pub(crate) async fn handle_get_signature_statuses(
         }
     };
 
+    // Disk tier: finalized statuses for signatures the head cache does not hold.
+    // A disk miss proves nothing (the signature may predate the window), so the
+    // remainder still goes to ClickHouse.
+    #[cfg(feature = "disk-cache")]
+    let disk_statuses: HashMap<String, (u64, Option<Value>)> =
+        if let Some(disk) = state.disk_cache.as_ref() {
+            let pending: Vec<(String, Signature)> = unique_valid
+                .iter()
+                .filter(|sig_str| !head_statuses.contains_key(*sig_str))
+                .filter_map(|sig_str| {
+                    Signature::from_str(sig_str)
+                        .ok()
+                        .map(|sig| (sig_str.clone(), sig))
+                })
+                .collect();
+            if pending.is_empty() {
+                HashMap::new()
+            } else {
+                route.disk_cache_read();
+                let signatures: Vec<Signature> = pending.iter().map(|(_, sig)| *sig).collect();
+                let statuses = disk.get_sig_statuses(signatures).await;
+                pending
+                    .into_iter()
+                    .zip(statuses)
+                    .filter_map(|((sig_str, _), status)| {
+                        status.map(|status| {
+                            let err = status
+                                .err
+                                .and_then(|raw| crate::clickhouse::parse_err_json(&sig_str, raw));
+                            (sig_str, (status.slot, err))
+                        })
+                    })
+                    .collect()
+            }
+        } else {
+            HashMap::new()
+        };
+
+    #[cfg(feature = "disk-cache")]
+    let in_disk = |sig: &String| disk_statuses.contains_key(sig);
+    #[cfg(not(feature = "disk-cache"))]
+    let in_disk = |_sig: &String| false;
+
     let mut timings: Option<crate::clickhouse::QueryTimings> = None;
     let status_map: HashMap<String, SignatureStatusRecord> = if unique_valid.is_empty() {
         HashMap::new()
@@ -197,11 +240,15 @@ pub(crate) async fn handle_get_signature_statuses(
         #[cfg(feature = "grpc-head-cache")]
         let to_query = unique_valid
             .iter()
-            .filter(|sig| !head_statuses.contains_key(*sig))
+            .filter(|sig| !head_statuses.contains_key(*sig) && !in_disk(sig))
             .cloned()
             .collect::<Vec<_>>();
         #[cfg(not(feature = "grpc-head-cache"))]
-        let to_query = unique_valid.clone();
+        let to_query: Vec<String> = unique_valid
+            .iter()
+            .filter(|sig| !in_disk(sig))
+            .cloned()
+            .collect();
 
         if to_query.is_empty() {
             HashMap::new()
@@ -226,6 +273,8 @@ pub(crate) async fn handle_get_signature_statuses(
 
     let mut value = Vec::with_capacity(inputs.len());
     let mut has_clickhouse_match = false;
+    #[cfg(feature = "disk-cache")]
+    let mut has_disk_match = false;
     #[cfg(feature = "grpc-head-cache")]
     let mut has_head_match = false;
     for maybe_sig in inputs {
@@ -246,6 +295,24 @@ pub(crate) async fn handle_get_signature_statuses(
                 slot: record.slot,
                 confirmations: None,
                 err: err_value,
+                status: status_value,
+                confirmation_status: "finalized".to_string(),
+            }));
+            continue;
+        }
+
+        #[cfg(feature = "disk-cache")]
+        if let Some((slot, err)) = disk_statuses.get(&sig) {
+            has_disk_match = true;
+            let status_value = match err {
+                Some(err) => json!({ "Err": err }),
+                None => json!({ "Ok": Value::Null }),
+            };
+
+            value.push(Some(SignatureStatusInfo {
+                slot: *slot,
+                confirmations: None,
+                err: err.clone(),
                 status: status_value,
                 confirmation_status: "finalized".to_string(),
             }));
@@ -276,8 +343,16 @@ pub(crate) async fn handle_get_signature_statuses(
     if has_clickhouse_match {
         route.source_clickhouse();
     }
+    #[cfg(all(feature = "grpc-head-cache", feature = "disk-cache"))]
+    let disk_matched = has_disk_match;
+    #[cfg(all(feature = "grpc-head-cache", not(feature = "disk-cache")))]
+    let disk_matched = false;
+    #[cfg(feature = "disk-cache")]
+    if !has_clickhouse_match && has_disk_match {
+        route.source_disk_cache();
+    }
     #[cfg(feature = "grpc-head-cache")]
-    if !has_clickhouse_match && has_head_match {
+    if !has_clickhouse_match && !disk_matched && has_head_match {
         route.source_head_cache();
     }
 
