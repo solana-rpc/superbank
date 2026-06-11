@@ -237,6 +237,7 @@ pub struct TransactionsForAddressRecord {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "disk-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockMetadataRecord {
     pub slot: u64,
     pub parent_slot: u64,
@@ -399,12 +400,15 @@ pub struct SignatureStatusRecord {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "disk-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct StoredTransactionRecord {
+    #[cfg_attr(feature = "disk-cache", serde(with = "serde_big_array::BigArray"))]
     pub signature: [u8; 64],
     pub slot: u64,
     pub slot_idx: u32,
     pub block_time: Option<i64>,
     pub tx_version: Option<u8>,
+    #[cfg_attr(feature = "disk-cache", serde(with = "serde_sig_vec"))]
     pub tx_signatures: Vec<[u8; 64]>,
     pub tx_num_required_signatures: u8,
     pub tx_num_readonly_signed_accounts: u8,
@@ -462,4 +466,28 @@ pub struct StoredTransactionRecord {
     pub meta_return_data_data: Option<Vec<u8>>,
     pub meta_compute_units_consumed: Option<u64>,
     pub meta_cost_units: Option<u64>,
+}
+
+/// Serde support for `Vec<[u8; 64]>` (serde's built-in array impls stop at 32 elements).
+#[cfg(feature = "disk-cache")]
+pub(crate) mod serde_sig_vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_big_array::BigArray;
+
+    #[derive(Serialize, Deserialize)]
+    struct Sig(#[serde(with = "BigArray")] [u8; 64]);
+
+    pub(crate) fn serialize<S: Serializer>(
+        value: &[[u8; 64]],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(value.iter().map(|bytes| Sig(*bytes)))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<[u8; 64]>, D::Error> {
+        let sigs = Vec::<Sig>::deserialize(deserializer)?;
+        Ok(sigs.into_iter().map(|sig| sig.0).collect())
+    }
 }
