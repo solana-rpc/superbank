@@ -5978,6 +5978,388 @@ mod disk_cache_tier {
         }
     }
 
+    fn state_with_head_and_disk(head: Arc<HeadCache>, disk: Arc<DiskCache>) -> Arc<AppState> {
+        let mut state = match Arc::try_unwrap(test_state_with_head_cache_and_clickhouse_url(
+            head,
+            UNREACHABLE_CLICKHOUSE,
+        )) {
+            Ok(state) => state,
+            Err(_) => panic!("test state should have a single Arc owner"),
+        };
+        state.disk_cache = Some(disk);
+        Arc::new(state)
+    }
+
+    /// Block at `slot` whose single transaction touches `address`; returns the
+    /// signature string.
+    fn write_block_for_address(
+        disk: &DiskCache,
+        slot: u64,
+        parent: u64,
+        address: [u8; 32],
+        failed: bool,
+    ) -> String {
+        let meta = block_metadata(slot, parent, 1);
+        let mut tx = transaction(slot, 0);
+        tx.tx_account_keys = vec![address];
+        if failed {
+            tx.meta_status_ok = false;
+            tx.meta_err = Some("\"AccountNotFound\"".to_string());
+        }
+        let signature = bs58::encode(tx.signature).into_string();
+        disk.write_finalized_slot(
+            &meta,
+            &[Arc::new(tx)],
+            crate::disk_cache::schema::COVERAGE_SOURCE_LIVE,
+        )
+        .expect("write block");
+        signature
+    }
+
+    fn empty_head_cache() -> Arc<HeadCache> {
+        Arc::new(HeadCache::new(64, TEST_MAX_LIMIT as usize))
+    }
+
+    #[tokio::test]
+    async fn gsfa_disk_serves_within_coverage_without_clickhouse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let address = [50u8; 32];
+        let mut signatures = Vec::new();
+        for slot in 100..=105u64 {
+            signatures.push(write_block_for_address(
+                &disk,
+                slot,
+                slot - 1,
+                address,
+                false,
+            ));
+        }
+        let state = state_with_head_and_disk(empty_head_cache(), disk);
+        let address_str = bs58::encode(address).into_string();
+
+        // Limit satisfied from disk: no ClickHouse.
+        let response = handle_get_signatures_for_address(
+            state.clone(),
+            json!(1),
+            Some(vec![json!(address_str), json!({ "limit": 3 })]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let rows = parsed.result.expect("rows");
+        let rows = rows.as_array().expect("array");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get("slot").and_then(Value::as_u64), Some(105));
+        assert_eq!(rows[2].get("slot").and_then(Value::as_u64), Some(103));
+        assert_eq!(
+            rows[0].get("confirmationStatus").and_then(Value::as_str),
+            Some("finalized")
+        );
+
+        // until inside coverage: fully answered even though fewer than limit.
+        let response = handle_get_signatures_for_address(
+            state.clone(),
+            json!(1),
+            Some(vec![
+                json!(address_str),
+                json!({ "limit": 100, "untilSlot": 102 }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let rows = parsed.result.expect("rows");
+        assert_eq!(rows.as_array().map(Vec::len), Some(3)); // 105, 104, 103
+
+        // before resolved by the disk signature index, until keeps the scan
+        // inside coverage: still no ClickHouse.
+        let response = handle_get_signatures_for_address(
+            state.clone(),
+            json!(1),
+            Some(vec![
+                json!(address_str),
+                json!({ "limit": 100, "before": signatures[4], "untilSlot": 101 }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let rows = parsed.result.expect("rows");
+        let rows = rows.as_array().expect("array");
+        assert_eq!(rows.len(), 2); // 103, 102
+        assert_eq!(rows[0].get("slot").and_then(Value::as_u64), Some(103));
+
+        // Limit straddles the coverage floor: ClickHouse must be consulted and
+        // is unreachable here.
+        let response = handle_get_signatures_for_address(
+            state,
+            json!(1),
+            Some(vec![json!(address_str), json!({ "limit": 100 })]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_some(), "floor escape must hit ClickHouse");
+    }
+
+    #[tokio::test]
+    async fn gsfa_deduplicates_head_and_disk_rows() {
+        use solana_commitment_config::CommitmentLevel;
+        use solana_sdk::signature::Signature as SdkSignature;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let address = [51u8; 32];
+        let signature = write_block_for_address(&disk, 100, 99, address, false);
+
+        // The same transaction is still resident in the head cache.
+        let head = empty_head_cache();
+        let mut tx = transaction(100, 0);
+        tx.tx_account_keys = vec![address];
+        head.insert_for_tests(
+            SdkSignature::from(tx.signature),
+            tx,
+            0,
+            &[solana_sdk::pubkey::Pubkey::from(address)],
+            CommitmentLevel::Finalized,
+        );
+
+        let state = state_with_head_and_disk(head, disk);
+        let response = handle_get_signatures_for_address(
+            state,
+            json!(1),
+            Some(vec![
+                json!(bs58::encode(address).into_string()),
+                json!({ "limit": 10, "untilSlot": 99 }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let rows = parsed.result.expect("rows");
+        let rows = rows.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "head+disk duplicate must collapse");
+        assert_eq!(
+            rows[0].get("signature").and_then(Value::as_str),
+            Some(signature.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn gtfa_desc_served_from_disk_with_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let address = [52u8; 32];
+        for slot in 100..=105u64 {
+            // Odd slots fail.
+            write_block_for_address(&disk, slot, slot - 1, address, slot % 2 == 1);
+        }
+        let state = state_with_disk_cache(disk);
+        let address_str = bs58::encode(address).into_string();
+
+        // slot.gte above the floor: fully covered, status filter on disk.
+        let response = handle_get_transactions_for_address(
+            state.clone(),
+            json!(1),
+            Some(vec![
+                json!(address_str),
+                json!({
+                    "limit": 10,
+                    "filters": { "slot": { "gte": 101 }, "status": "failed" }
+                }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let result = parsed.result.expect("result");
+        let data = result.get("data").and_then(Value::as_array).expect("data");
+        let slots: Vec<u64> = data
+            .iter()
+            .filter_map(|row| row.get("slot").and_then(Value::as_u64))
+            .collect();
+        assert_eq!(slots, vec![105, 103, 101]);
+        // Disk-sourced pagination tokens are position-shaped.
+        assert_eq!(
+            result.get("paginationToken").and_then(Value::as_str),
+            Some("101:0")
+        );
+
+        // Small limit fills from disk: no ClickHouse even without slot bounds.
+        let response = handle_get_transactions_for_address(
+            state.clone(),
+            json!(1),
+            Some(vec![json!(address_str), json!({ "limit": 2 })]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+
+        // Unbounded request larger than coverage: ClickHouse owes the
+        // remainder and is unreachable.
+        let response = handle_get_transactions_for_address(
+            state,
+            json!(1),
+            Some(vec![json!(address_str), json!({ "limit": 100 })]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_some(), "floor escape must hit ClickHouse");
+    }
+
+    #[tokio::test]
+    async fn gtfa_asc_pages_only_within_coverage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let address = [53u8; 32];
+        for slot in 100..=104u64 {
+            write_block_for_address(&disk, slot, slot - 1, address, false);
+        }
+        let state = state_with_disk_cache(disk);
+        let address_str = bs58::encode(address).into_string();
+
+        // Ascending with a lower bound inside coverage: disk only.
+        let response = handle_get_transactions_for_address(
+            state.clone(),
+            json!(1),
+            Some(vec![
+                json!(address_str),
+                json!({
+                    "limit": 10,
+                    "sortOrder": "asc",
+                    "filters": { "slot": { "gte": 101 } }
+                }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let result = parsed.result.expect("result");
+        let slots: Vec<u64> = result
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("data")
+            .iter()
+            .filter_map(|row| row.get("slot").and_then(Value::as_u64))
+            .collect();
+        assert_eq!(slots, vec![101, 102, 103, 104]);
+
+        // Ascending from below the floor: the oldest rows lead the page, so
+        // ClickHouse must serve it (unreachable here).
+        let response = handle_get_transactions_for_address(
+            state,
+            json!(1),
+            Some(vec![
+                json!(address_str),
+                json!({ "limit": 10, "sortOrder": "asc" }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(
+            parsed.error.is_some(),
+            "asc below floor must hit ClickHouse"
+        );
+    }
+
+    #[tokio::test]
+    async fn gtfa_token_accounts_filter_unions_owner_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let owner = [54u8; 32];
+
+        // Slot 100: owner only via token-owner index, balance changed.
+        let meta = block_metadata(100, 99, 1);
+        let mut tx = transaction(100, 0);
+        tx.tx_account_keys = vec![[1u8; 32], [2u8; 32]];
+        tx.meta_post_token_account_index = vec![1];
+        tx.meta_post_token_owner = vec![Some(owner)];
+        tx.meta_post_token_amount = vec!["5".to_string()];
+        disk.write_finalized_slot(
+            &meta,
+            &[Arc::new(tx)],
+            crate::disk_cache::schema::COVERAGE_SOURCE_LIVE,
+        )
+        .expect("write");
+
+        // Slot 101: owner only via token-owner index, balance unchanged.
+        let meta = block_metadata(101, 100, 1);
+        let mut tx = transaction(101, 0);
+        tx.tx_account_keys = vec![[1u8; 32], [2u8; 32]];
+        tx.meta_pre_token_account_index = vec![1];
+        tx.meta_pre_token_owner = vec![Some(owner)];
+        tx.meta_pre_token_amount = vec!["7".to_string()];
+        tx.meta_post_token_account_index = vec![1];
+        tx.meta_post_token_owner = vec![Some(owner)];
+        tx.meta_post_token_amount = vec!["7".to_string()];
+        disk.write_finalized_slot(
+            &meta,
+            &[Arc::new(tx)],
+            crate::disk_cache::schema::COVERAGE_SOURCE_LIVE,
+        )
+        .expect("write");
+
+        // Slot 102: owner directly in the account keys (gsfa side of the union).
+        write_block_for_address(&disk, 102, 101, owner, false);
+
+        let state = state_with_disk_cache(disk);
+        let address_str = bs58::encode(owner).into_string();
+
+        async fn fetch_slots(
+            state: Arc<AppState>,
+            address_str: &str,
+            token_accounts: &str,
+        ) -> Vec<u64> {
+            let response = handle_get_transactions_for_address(
+                state,
+                json!(1),
+                Some(vec![
+                    json!(address_str),
+                    json!({
+                        "limit": 10,
+                        "filters": { "slot": { "gte": 100 }, "tokenAccounts": token_accounts }
+                    }),
+                ]),
+            )
+            .await
+            .expect("response");
+            let parsed = parse_json_rpc_response(response).await;
+            assert!(parsed.error.is_none(), "{:?}", parsed.error);
+            parsed
+                .result
+                .expect("result")
+                .get("data")
+                .and_then(Value::as_array)
+                .expect("data")
+                .iter()
+                .filter_map(|row| row.get("slot").and_then(Value::as_u64))
+                .collect::<Vec<u64>>()
+        }
+
+        // All: both token rows plus the gsfa row.
+        let slots = fetch_slots(state.clone(), &address_str, "all").await;
+        assert_eq!(slots, vec![102, 101, 100]);
+
+        // BalanceChanged: the unchanged-balance token row drops out; the gsfa
+        // row stays (the union filters only the token side).
+        let slots = fetch_slots(state.clone(), &address_str, "balanceChanged").await;
+        assert_eq!(slots, vec![102, 100]);
+
+        // None: only the gsfa row.
+        let slots = fetch_slots(state, &address_str, "none").await;
+        assert_eq!(slots, vec![102]);
+    }
+
     #[tokio::test]
     async fn get_signature_statuses_unknown_signature_consults_clickhouse() {
         let dir = tempfile::tempdir().expect("tempdir");

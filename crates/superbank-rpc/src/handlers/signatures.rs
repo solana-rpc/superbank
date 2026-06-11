@@ -369,6 +369,21 @@ pub(crate) async fn handle_get_signature_statuses(
     Ok(resp)
 }
 
+/// Tighter of the caller's `before` bound and the disk coverage floor: the
+/// ClickHouse remainder must stay strictly below the floor (the disk page has
+/// already evaluated everything at or above it).
+#[cfg(feature = "disk-cache")]
+fn clamp_before_to_floor(before: Option<SlotBoundary>, floor: u64) -> SlotBoundary {
+    match before {
+        None => SlotBoundary::Slot(floor),
+        Some(SlotBoundary::Slot(slot)) => SlotBoundary::Slot(slot.min(floor)),
+        Some(SlotBoundary::Position(position)) if position.slot < floor => {
+            SlotBoundary::Position(position)
+        }
+        Some(SlotBoundary::Position(_)) => SlotBoundary::Slot(floor),
+    }
+}
+
 pub(crate) async fn handle_get_signatures_for_address(
     state: Arc<AppState>,
     id: Value,
@@ -618,6 +633,15 @@ pub(crate) async fn handle_get_signatures_for_address(
                 });
             }
 
+            #[cfg(feature = "disk-cache")]
+            if pos.is_none()
+                && let Some(disk) = state.disk_cache.as_ref()
+                && let Ok(sig) = Signature::from_str(sig_str)
+            {
+                route.disk_cache_read();
+                pos = disk.signature_position(sig).await;
+            }
+
             if pos.is_none() {
                 route.source_clickhouse();
                 match state.clickhouse.get_signature_slot(sig_str).await {
@@ -653,6 +677,15 @@ pub(crate) async fn handle_get_signatures_for_address(
                         slot: head_pos.slot,
                         slot_idx: head_pos.idx,
                     });
+                }
+
+                #[cfg(feature = "disk-cache")]
+                if pos.is_none()
+                    && let Some(disk) = state.disk_cache.as_ref()
+                    && let Ok(sig) = Signature::from_str(sig_str)
+                {
+                    route.disk_cache_read();
+                    pos = disk.signature_position(sig).await;
                 }
 
                 if pos.is_none() {
@@ -717,33 +750,68 @@ pub(crate) async fn handle_get_signatures_for_address(
             confirmation_status: String,
         }
 
-        route.source_clickhouse();
-        let (signatures, mut timings) = match state
-            .clickhouse
-            .get_signatures_for_address_with_positions(
-                address,
-                limit,
-                before_boundary,
-                until_boundary,
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                metrics::backend_error("get_signatures_for_address_with_positions");
-                error!("Failed to query ClickHouse: {}", e);
-                route.rpc_error();
-                return Ok(json_rpc_long_term_storage_unreachable_response(id));
+        // Disk tier: newest-first page over the contiguous covered span. The
+        // page tells us whether ClickHouse still owes the remainder below the
+        // coverage floor — and when it does, the ClickHouse bound is clamped
+        // strictly below the floor so the tiers can never overlap.
+        #[cfg(feature = "disk-cache")]
+        let disk_page = match state.disk_cache.as_ref() {
+            Some(disk) => {
+                route.disk_cache_read();
+                disk.signatures_for_address(
+                    address_pubkey,
+                    before_boundary,
+                    until_boundary,
+                    limit as usize,
+                )
+                .await
+            }
+            None => None,
+        };
+
+        #[cfg(feature = "disk-cache")]
+        let (skip_clickhouse, clickhouse_before, clickhouse_limit) = match disk_page.as_ref() {
+            Some(page) if !page.reached_floor => (true, before_boundary, 0),
+            Some(page) => (
+                false,
+                Some(clamp_before_to_floor(before_boundary, page.floor)),
+                limit - page.records.len() as u64,
+            ),
+            None => (false, before_boundary, limit),
+        };
+        #[cfg(not(feature = "disk-cache"))]
+        let (skip_clickhouse, clickhouse_before, clickhouse_limit) =
+            (false, before_boundary, limit);
+
+        let (signatures, mut timings) = if skip_clickhouse {
+            (Vec::new(), crate::clickhouse::QueryTimings::zero())
+        } else {
+            route.source_clickhouse();
+            match state
+                .clickhouse
+                .get_signatures_for_address_with_positions(
+                    address,
+                    clickhouse_limit,
+                    clickhouse_before,
+                    until_boundary,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    metrics::backend_error("get_signatures_for_address_with_positions");
+                    error!("Failed to query ClickHouse: {}", e);
+                    route.rpc_error();
+                    return Ok(json_rpc_long_term_storage_unreachable_response(id));
+                }
             }
         };
 
         timings.add(precheck_timings);
-        if signatures.is_empty() && !head_metas.is_empty() {
-            route.source_head_cache();
-        }
 
         let mut seen = HashSet::new();
         let mut merged = Vec::with_capacity(signatures.len() + head_metas.len());
+        let clickhouse_contributed = !signatures.is_empty();
         for sig in signatures {
             seen.insert(sig.signature.clone());
             merged.push(MergedSignature {
@@ -755,6 +823,39 @@ pub(crate) async fn handle_get_signatures_for_address(
                 block_time: sig.block_time,
                 confirmation_status: "finalized".to_string(),
             });
+        }
+
+        #[cfg(feature = "disk-cache")]
+        let disk_contributed = {
+            let mut contributed = false;
+            if let Some(page) = disk_page {
+                for record in page.records {
+                    if seen.insert(record.signature.clone()) {
+                        contributed = true;
+                        merged.push(MergedSignature {
+                            signature: record.signature,
+                            slot: record.slot,
+                            slot_idx: record.slot_idx,
+                            err: record.err,
+                            memo: record.memo,
+                            block_time: record.block_time,
+                            confirmation_status: "finalized".to_string(),
+                        });
+                    }
+                }
+            }
+            contributed
+        };
+        #[cfg(not(feature = "disk-cache"))]
+        let disk_contributed = false;
+
+        if !clickhouse_contributed {
+            if disk_contributed {
+                #[cfg(feature = "disk-cache")]
+                route.source_disk_cache();
+            } else if !head_metas.is_empty() {
+                route.source_head_cache();
+            }
         }
 
         for meta in head_metas {

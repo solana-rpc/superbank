@@ -18,7 +18,8 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 
 use crate::clickhouse::{
-    SignatureRecord, SignatureSlot, SlotBoundary, StoredTransactionRecord, extract_memo,
+    NumericFilter, ResolvedSignatureFilter, SignatureRecord, SignatureSlot, SlotBoundary,
+    SortOrder, StoredTransactionRecord, TokenAccountsFilter, TransactionStatusFilter, extract_memo,
     parse_err_json,
 };
 
@@ -293,6 +294,436 @@ impl DiskCacheInner {
             floor,
         }))
     }
+}
+
+/// Disk-side getTransactionsForAddress query. All signature bounds and the
+/// pagination token must already be resolved to positions — the handler skips
+/// the disk tier otherwise.
+#[derive(Debug, Clone)]
+pub(crate) struct DiskTfaQuery {
+    pub(crate) limit: usize,
+    pub(crate) sort_order: SortOrder,
+    /// Exclusive position bound: Desc pages continue strictly below it, Asc
+    /// pages strictly above it.
+    pub(crate) pagination: Option<SignatureSlot>,
+    pub(crate) slot_filter: Option<NumericFilter<u64>>,
+    pub(crate) block_time_filter: Option<NumericFilter<i64>>,
+    pub(crate) signature_filter: Option<ResolvedSignatureFilter>,
+    pub(crate) status: TransactionStatusFilter,
+    pub(crate) token_accounts: TokenAccountsFilter,
+}
+
+impl DiskCacheInner {
+    /// getTransactionsForAddress over the disk indexes: the gsfa index, unioned
+    /// with the token-owner index when the token filter is active, deduplicated
+    /// by position (one transaction occupies one `(slot, idx)`), with all
+    /// resolved bounds folded into the key-space scan window.
+    ///
+    /// Asc queries must be fully answerable from coverage (the handler gates on
+    /// the lower bound being at or above the floor), so `reached_floor` can only
+    /// be set for Desc scans.
+    pub(crate) fn transactions_for_address_sync(
+        &self,
+        address: &Pubkey,
+        query: &DiskTfaQuery,
+    ) -> Result<Option<DiskGsfaPage>, DiskCacheError> {
+        let Some((tip_floor, _)) = self
+            .coverage
+            .read()
+            .expect("coverage lock")
+            .contiguous_tip_span()
+        else {
+            return Ok(None);
+        };
+        let floor = tip_floor.max(self.min_retained());
+        let address_bytes = address.to_bytes();
+
+        let (key_low, key_high, floor_is_effective) = tfa_key_window(&address_bytes, query, floor);
+        if key_low >= key_high {
+            // Bounds are contradictory; nothing in the window. For Desc this can
+            // mean the whole window sits below the floor.
+            return Ok(Some(DiskGsfaPage {
+                records: Vec::new(),
+                reached_floor: query.sort_order == SortOrder::Desc && floor_is_effective,
+                floor,
+            }));
+        }
+
+        let gsfa_iter = self.window_iterator(
+            schema::CF_ADDR_SIG,
+            key_low.clone(),
+            key_high.clone(),
+            query.sort_order,
+        );
+        let token_iter = (query.token_accounts != TokenAccountsFilter::None).then(|| {
+            self.window_iterator(
+                schema::CF_TOKEN_OWNER,
+                key_low.clone(),
+                key_high.clone(),
+                query.sort_order,
+            )
+        });
+
+        let balance_changed_only = query.token_accounts == TokenAccountsFilter::BalanceChanged;
+        let mut gsfa = IndexCursor::new(gsfa_iter, &key_high, query.sort_order, false)?;
+        let mut token = match token_iter {
+            Some(iter) => Some(IndexCursor::new(
+                iter,
+                &key_high,
+                query.sort_order,
+                balance_changed_only,
+            )?),
+            None => None,
+        };
+
+        let mut records: Vec<SignatureRecord> = Vec::new();
+        let mut last_position: Option<(u64, u32)> = None;
+        while records.len() < query.limit {
+            // Pick the next entry across both cursors in scan order.
+            let take_gsfa = match (
+                &gsfa.current,
+                token.as_ref().and_then(|t| t.current.as_ref()),
+            ) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some((g_pos, _)), Some((t_pos, _))) => match query.sort_order {
+                    SortOrder::Desc => g_pos >= t_pos,
+                    SortOrder::Asc => g_pos <= t_pos,
+                },
+            };
+            let (position, value) = if take_gsfa {
+                gsfa.take()?.expect("cursor checked")
+            } else {
+                token
+                    .as_mut()
+                    .expect("token cursor present")
+                    .take()?
+                    .expect("cursor checked")
+            };
+
+            // LIMIT 1 BY signature: one transaction occupies one position, and
+            // the scan visits positions monotonically.
+            if last_position == Some(position) {
+                continue;
+            }
+            last_position = Some(position);
+
+            if !tfa_entry_matches(&value, position.0, query) {
+                continue;
+            }
+
+            let signature = bs58::encode(value.signature).into_string();
+            let err = value
+                .err
+                .and_then(|raw_err| parse_err_json(&signature, raw_err));
+            records.push(SignatureRecord {
+                signature,
+                slot: position.0,
+                slot_idx: position.1,
+                err,
+                memo: value.memo,
+                block_time: value.block_time,
+            });
+        }
+
+        let reached_floor = query.sort_order == SortOrder::Desc
+            && records.len() < query.limit
+            && floor_is_effective;
+        Ok(Some(DiskGsfaPage {
+            records,
+            reached_floor,
+            floor,
+        }))
+    }
+
+    fn window_iterator(
+        &self,
+        cf_name: &str,
+        key_low: Vec<u8>,
+        key_high: Vec<u8>,
+        sort_order: SortOrder,
+    ) -> rocksdb::DBIteratorWithThreadMode<'_, rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>>
+    {
+        let cf = self.cf(cf_name);
+        let mut read_opts = ReadOptions::default();
+        match sort_order {
+            SortOrder::Desc => {
+                read_opts.set_iterate_upper_bound(key_high.clone());
+                self.db.iterator_cf_opt(
+                    &cf,
+                    read_opts,
+                    IteratorMode::From(&key_low, Direction::Forward),
+                )
+            }
+            SortOrder::Asc => {
+                read_opts.set_iterate_lower_bound(key_low.clone());
+                // The reverse start is inclusive; IndexCursor drops any entry at
+                // or beyond the exclusive high bound.
+                self.db.iterator_cf_opt(
+                    &cf,
+                    read_opts,
+                    IteratorMode::From(&key_high, Direction::Reverse),
+                )
+            }
+        }
+    }
+
+    /// Batch full-record fetch by position; `None` per entry on miss (e.g. the
+    /// eviction floor passed the slot between the index scan and this fetch).
+    pub(crate) fn get_txs_by_position_sync(
+        &self,
+        positions: &[(u64, u32)],
+    ) -> Vec<Option<StoredTransactionRecord>> {
+        let tx_cf = self.cf(schema::CF_TX);
+        positions
+            .iter()
+            .map(|&(slot, idx)| {
+                self.db
+                    .get_pinned_cf(&tx_cf, schema::tx_key(slot, idx))
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| codec::decode_record::<StoredTransactionRecord>(&raw))
+            })
+            .collect()
+    }
+}
+
+/// One decoded index entry: position plus value.
+type IndexEntry = ((u64, u32), codec::AddrSigValue);
+
+/// Streaming decode over one index CF; `current` always holds the next
+/// in-window entry (already past the exclusive high bound and flag filters).
+struct IndexCursor<'a> {
+    iter: rocksdb::DBIteratorWithThreadMode<'a, rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>>,
+    key_high: &'a [u8],
+    sort_order: SortOrder,
+    balance_changed_only: bool,
+    current: Option<IndexEntry>,
+}
+
+impl<'a> IndexCursor<'a> {
+    fn new(
+        iter: rocksdb::DBIteratorWithThreadMode<
+            'a,
+            rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>,
+        >,
+        key_high: &'a [u8],
+        sort_order: SortOrder,
+        balance_changed_only: bool,
+    ) -> Result<Self, DiskCacheError> {
+        let mut cursor = Self {
+            iter,
+            key_high,
+            sort_order,
+            balance_changed_only,
+            current: None,
+        };
+        cursor.advance()?;
+        Ok(cursor)
+    }
+
+    fn take(&mut self) -> Result<Option<IndexEntry>, DiskCacheError> {
+        let current = self.current.take();
+        self.advance()?;
+        Ok(current)
+    }
+
+    fn advance(&mut self) -> Result<(), DiskCacheError> {
+        self.current = None;
+        for entry in self.iter.by_ref() {
+            let (key, raw) = entry?;
+            // Reverse iteration starts at the exclusive high bound itself.
+            if self.sort_order == SortOrder::Asc && key.as_ref() >= self.key_high {
+                continue;
+            }
+            let Some(slot) = schema::addr_key_slot(&key) else {
+                return Err(DiskCacheError::CorruptIndexEntry { slot: None });
+            };
+            let Some(idx) = addr_key_idx(&key) else {
+                return Err(DiskCacheError::CorruptIndexEntry { slot: Some(slot) });
+            };
+            let Some(value) = codec::decode_addr_sig_value(&raw) else {
+                return Err(DiskCacheError::CorruptIndexEntry { slot: Some(slot) });
+            };
+            if self.balance_changed_only && !value.balance_changed {
+                continue;
+            }
+            self.current = Some(((slot, idx), value));
+            break;
+        }
+        Ok(())
+    }
+}
+
+/// Translate the resolved bounds into one key-space window
+/// `[key_low, key_high)` shared by both indexes (their first 44 key bytes have
+/// identical layout). Returns whether the floor is the binding old-side bound,
+/// which is what decides `reached_floor` for Desc scans.
+fn tfa_key_window(
+    address: &[u8; 32],
+    query: &DiskTfaQuery,
+    floor: u64,
+) -> (Vec<u8>, Vec<u8>, bool) {
+    // Key space is order-reversed: newer positions have smaller keys. The "new"
+    // side of the window is key_low, the "old" side is key_high.
+    let mut key_low = {
+        let mut key = Vec::with_capacity(44);
+        key.extend_from_slice(address);
+        key.extend_from_slice(&[0u8; 12]);
+        key
+    };
+    let mut key_high = floor_upper_bound(address, floor);
+    let mut floor_is_effective = true;
+
+    let tighten_new_side = |candidate: Vec<u8>, key_low: &mut Vec<u8>| {
+        if candidate > *key_low {
+            *key_low = candidate;
+        }
+    };
+    let tighten_old_side = |candidate: Vec<u8>, key_high: &mut Vec<u8>, floor_eff: &mut bool| {
+        // Equality counts: a filter bound that coincides with the floor means
+        // the query never extends below coverage, so the floor is not the
+        // binding constraint and no ClickHouse remainder exists.
+        if candidate <= *key_high {
+            *key_high = candidate;
+            *floor_eff = false;
+        }
+    };
+
+    let filter = query.signature_filter.clone().unwrap_or_default();
+    let slot_filter = query.slot_filter.clone().unwrap_or_default();
+
+    // New-side (upper position) bounds: pagination for Desc, slot lt/lte,
+    // signature lt/lte.
+    if query.sort_order == SortOrder::Desc
+        && let Some(position) = query.pagination
+    {
+        let mut key = schema::addr_sig_key(address, position.slot, position.slot_idx).to_vec();
+        key.push(0); // strictly older than the position
+        tighten_new_side(key, &mut key_low);
+    }
+    if let Some(slot) = slot_filter.lt
+        && slot > 0
+    {
+        tighten_new_side(
+            seek_key(address, Some(SlotBoundary::Slot(slot))),
+            &mut key_low,
+        );
+    }
+    if let Some(slot) = slot_filter.lte
+        && slot < u64::MAX
+    {
+        tighten_new_side(
+            seek_key(address, Some(SlotBoundary::Slot(slot + 1))),
+            &mut key_low,
+        );
+    }
+    if let Some(position) = filter.lte {
+        tighten_new_side(
+            schema::addr_sig_key(address, position.slot, position.slot_idx).to_vec(),
+            &mut key_low,
+        );
+    }
+    if let Some(position) = filter.lt {
+        let mut key = schema::addr_sig_key(address, position.slot, position.slot_idx).to_vec();
+        key.push(0);
+        tighten_new_side(key, &mut key_low);
+    }
+
+    // Old-side (lower position) bounds: pagination for Asc, slot gt/gte,
+    // signature gt/gte. The floor seeds key_high above.
+    if query.sort_order == SortOrder::Asc
+        && let Some(position) = query.pagination
+    {
+        tighten_old_side(
+            schema::addr_sig_key(address, position.slot, position.slot_idx).to_vec(),
+            &mut key_high,
+            &mut floor_is_effective,
+        );
+    }
+    if let Some(slot) = slot_filter.gt {
+        tighten_old_side(
+            until_upper_bound(address, SlotBoundary::Slot(slot)),
+            &mut key_high,
+            &mut floor_is_effective,
+        );
+    }
+    if let Some(slot) = slot_filter.gte
+        && slot > 0
+    {
+        tighten_old_side(
+            until_upper_bound(address, SlotBoundary::Slot(slot - 1)),
+            &mut key_high,
+            &mut floor_is_effective,
+        );
+    }
+    if let Some(position) = filter.gte {
+        let mut key = schema::addr_sig_key(address, position.slot, position.slot_idx).to_vec();
+        key.push(0); // include the position itself
+        tighten_old_side(key, &mut key_high, &mut floor_is_effective);
+    }
+    if let Some(position) = filter.gt {
+        tighten_old_side(
+            schema::addr_sig_key(address, position.slot, position.slot_idx).to_vec(),
+            &mut key_high,
+            &mut floor_is_effective,
+        );
+    }
+
+    (key_low, key_high, floor_is_effective)
+}
+
+/// Predicates that cannot be folded into the key window.
+fn tfa_entry_matches(value: &codec::AddrSigValue, _slot: u64, query: &DiskTfaQuery) -> bool {
+    match query.status {
+        TransactionStatusFilter::Any => {}
+        TransactionStatusFilter::Succeeded => {
+            if value.err.is_some() {
+                return false;
+            }
+        }
+        TransactionStatusFilter::Failed => {
+            if value.err.is_none() {
+                return false;
+            }
+        }
+    }
+
+    if let Some(filter) = query.block_time_filter.as_ref() {
+        // Mirrors ClickHouse comparison semantics: a NULL block_time fails
+        // every bound.
+        let Some(block_time) = value.block_time else {
+            return false;
+        };
+        if let Some(bound) = filter.eq
+            && block_time != bound
+        {
+            return false;
+        }
+        if let Some(bound) = filter.gte
+            && block_time < bound
+        {
+            return false;
+        }
+        if let Some(bound) = filter.gt
+            && block_time <= bound
+        {
+            return false;
+        }
+        if let Some(bound) = filter.lte
+            && block_time > bound
+        {
+            return false;
+        }
+        if let Some(bound) = filter.lt
+            && block_time >= bound
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Slot index embedded in an `addr_sig` key.

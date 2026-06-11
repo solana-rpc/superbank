@@ -13,9 +13,6 @@
 //! The ClickHouse-to-disk fill is called "backfill" everywhere — "hydration" in
 //! this crate means converting stored records to RPC JSON.
 
-// Wired into handlers/server in follow-up phases; remove once the read tiers land.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -246,6 +243,9 @@ impl DiskCache {
 
     /// Write one finalized slot (block metadata + every transaction) atomically,
     /// together with its coverage marker and Skipped markers for the parent gap.
+    /// Production writes flow through the writer thread; this is the direct
+    /// surface used by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn write_finalized_slot(
         &self,
         meta: &BlockMetadataRecord,
@@ -256,18 +256,10 @@ impl DiskCache {
     }
 
     /// Apply window and byte-budget eviction; returns stats when the floor moved.
+    /// Production eviction runs on the writer thread's tick; tests call this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn maybe_evict(&self) -> Result<Option<EvictionStats>, DiskCacheError> {
         self.inner.maybe_evict()
-    }
-
-    /// Total live SST bytes across all column families.
-    pub(crate) fn live_sst_bytes(&self) -> u64 {
-        self.inner.live_sst_bytes()
-    }
-
-    /// Fsync the WAL; called on graceful shutdown.
-    pub(crate) fn flush_wal(&self) -> Result<(), DiskCacheError> {
-        self.inner.flush_wal()
     }
 
     pub(crate) fn inner_arc(&self) -> Arc<DiskCacheInner> {
@@ -343,6 +335,7 @@ impl DiskCache {
         result
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn get_sig_status(
         &self,
         signature: solana_sdk::signature::Signature,
@@ -399,6 +392,40 @@ impl DiskCache {
             if result.is_some() { "hit" } else { "miss" },
         );
         result
+    }
+
+    /// getTransactionsForAddress page from the contiguous tip span; same
+    /// `None` semantics as [`Self::signatures_for_address`].
+    pub(crate) async fn transactions_for_address(
+        &self,
+        address: solana_sdk::pubkey::Pubkey,
+        query: index::DiskTfaQuery,
+    ) -> Option<DiskGsfaPage> {
+        let result = self
+            .run_read("transactions_for_address", move |inner| {
+                inner.transactions_for_address_sync(&address, &query)
+            })
+            .await
+            .flatten();
+        crate::metrics::disk_cache_read(
+            "transactions_for_address",
+            if result.is_some() { "hit" } else { "miss" },
+        );
+        result
+    }
+
+    /// Batch full-record fetch by `(slot, idx)` position; per-entry `None` on a
+    /// miss (e.g. the eviction floor passed the slot after the index scan).
+    pub(crate) async fn get_txs_by_position(
+        &self,
+        positions: Vec<(u64, u32)>,
+    ) -> Vec<Option<StoredTransactionRecord>> {
+        let count = positions.len();
+        self.run_read("get_txs_by_position", move |inner| {
+            Ok(inner.get_txs_by_position_sync(&positions))
+        })
+        .await
+        .unwrap_or_else(|| vec![None; count])
     }
 
     /// Newest-first gSFA page from the contiguous tip span. `None` means the
