@@ -53,7 +53,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 
 # Tests with optional features
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope --locked
+cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
 
 # k6 load test (basic)
 k6 run tests/k6/scenarios/basic/superbank-rpc-get-signatures.js -e RPC_URL=http://localhost:8899

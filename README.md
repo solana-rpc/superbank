@@ -19,8 +19,9 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 > [!NOTE]
 > Superbank is licensed under **AGPL-3.0-only** (see `LICENSE`).
 > `superbank-rpc` supports an optional in-memory gRPC "head cache" (`--features grpc-head-cache`) to reduce
-> perceived ingestion lag and (optionally) expose `processed` commitment for a subset of methods.
-> See `crates/superbank-rpc/README.md` for details.
+> perceived ingestion lag and (optionally) expose `processed` commitment for a subset of methods,
+> and an optional RocksDB "disk cache" (`--features disk-cache`) that serves recent finalized slots
+> in place of ClickHouse. See `crates/superbank-rpc/README.md` for details.
 
 ## Features
 
@@ -248,7 +249,7 @@ cargo build -p superbank -p superbank-rpc
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope --locked
+cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
 ```
 
 Local RPC helper:

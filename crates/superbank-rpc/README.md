@@ -144,6 +144,80 @@ Configuration:
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
 The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (also AGPL-3.0).
 
+## Optional RocksDB disk cache (`disk-cache`)
+
+When compiled with `--features disk-cache` (which implies `grpc-head-cache`) and enabled at
+runtime, superbank-rpc keeps a RocksDB-backed cache of recent **finalized** slots on local disk
+and serves it *in place of* ClickHouse. The read tiering becomes:
+
+```
+head cache (memory, unfinalized tip) -> disk cache (finalized, recent slots) -> ClickHouse (full history)
+```
+
+The cache is hydrated FROM ClickHouse ("backfill") on startup, kept current by copying slots out
+of the head cache as the DragonsMouth stream finalizes them, and self-repairs gaps from
+ClickHouse. It never writes to ClickHouse. Coverage is tracked per slot and claimed atomically
+with the data, so the cache never serves a slot it holds partially; any miss, hole, or decode
+failure silently degrades to a ClickHouse read.
+
+Served from disk when covered: `getBlock` (all `transactionDetails` levels), `getBlocks`,
+`getBlocksWithLimit`, `getBlockTime`, `getTransaction`, `getSignatureStatuses`,
+`getSignaturesForAddress`, and `getTransactionsForAddress` (including `tokenAccounts` filters via
+an on-disk port of the `gsfa` and `token_owner_activity` materialized views). Address queries are
+answered from the contiguous covered span; ClickHouse is consulted only for the remainder strictly
+below the coverage floor.
+
+> [!WARNING]
+> **Sizing:** at mainnet volume the default 10-epoch window (4,320,000 slots) needs on the order
+> of **15–20 TB** of NVMe even with compression (~1.5–2 TB per epoch across the record and index
+> column families). Set `DISK_CACHE_MAX_BYTES` to bound disk usage — the retention window shrinks
+> to fit, with the tighter of the slot window and the byte budget winning.
+
+Requires `HEAD_CACHE_ENABLED=true` with a usable `DRAGONSMOUTH_ENDPOINT` (the stream is the live
+ingestion source). `HEAD_CACHE_RETAIN_SLOTS` is clamped to at least `64` when the disk cache is
+enabled: the default `32` roughly equals the mainnet finalization lag, so finalized slots would
+already be evicted from the head cache when the disk snapshot hook fires; `150` is a comfortable
+setting (~1.5–3 GB of head-cache memory at mainnet rates).
+
+Run example:
+
+```bash
+RPC_HOST=0.0.0.0 RPC_PORT=8899 CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default HEAD_CACHE_ENABLED=true HEAD_CACHE_RETAIN_SLOTS=150 DRAGONSMOUTH_ENDPOINT=https://YOUR_DRAGONSMOUTH_ENDPOINT DISK_CACHE_ENABLED=true DISK_CACHE_PATH=/var/lib/superbank/disk-cache DISK_CACHE_MAX_BYTES=2199023255552 cargo run -p superbank-rpc --features disk-cache --
+```
+
+Configuration:
+
+| Option | Environment | Default | Notes |
+| --- | --- | --- | --- |
+| `--disk-cache-enabled` | `DISK_CACHE_ENABLED` | `false` | Enables the feature at runtime. |
+| `--disk-cache-path` | `DISK_CACHE_PATH` | — | RocksDB directory; required when enabled. |
+| `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | `4320000` | Finalized slots to retain (~10 epochs). |
+| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Disk byte budget; `0` = unlimited. Tighter of window/budget wins. |
+| `--disk-cache-block-cache-bytes` | `DISK_CACHE_BLOCK_CACHE_BYTES` | `4294967296` | RocksDB block cache shared across column families. |
+| `--disk-cache-write-queue-slots` | `DISK_CACHE_WRITE_QUEUE_SLOTS` | `64` | Live write queue depth; overflow defers slots to repair. |
+| `--disk-cache-read-concurrency` | `DISK_CACHE_READ_CONCURRENCY` | `64` | Max concurrent blocking disk reads. |
+| `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | ClickHouse->disk backfill/repair task. |
+| `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots per ClickHouse range query. |
+| `--disk-cache-backfill-max-slots-per-sec` | `DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC` | `50` | Backfill rate limit (the default fills 10 epochs in ~24h). |
+| `--disk-cache-backfill-query-timeout-ms` | `DISK_CACHE_BACKFILL_QUERY_TIMEOUT_MS` | `30000` | Range scans need more than the interactive query timeout. |
+| `--disk-cache-repair-interval-ms` | `DISK_CACHE_REPAIR_INTERVAL_MS` | `5000` | Idle wait between repair/backfill planning rounds. |
+| `--disk-cache-repair-min-lag-slots` | `DISK_CACHE_REPAIR_MIN_LAG_SLOTS` | `75` | Never backfill slots ClickHouse ingest may not have landed. |
+
+Observability: `superbank_disk_cache_*` metrics cover coverage span, hit/miss per operation,
+write/backfill/repair/eviction activity, and the route metrics gain a `disk_cache_read` label.
+The `X-Superbank-Sources` response header reports `disk-cache` combinations.
+
+Parity validation against a reference target (e.g. the same build with the disk cache disabled):
+
+```bash
+k6 run tests/k6/scenarios/validation/superbank-rpc-disk-cache-parity.js \
+  -e RPC_URL=http://disk-enabled:8899 -e REFERENCE_RPC_URL=http://reference:8899 \
+  -e ADDRESS_FILE=tests/k6/data/pools/addresses.txt
+```
+
+License note: the `disk-cache` feature implies `grpc-head-cache` and therefore also pulls in
+`yellowstone-block-machine` (AGPL-3.0).
+
 ## Optional Pyroscope profiling (`pyroscope`)
 
 When compiled with `--features pyroscope` and enabled at runtime, superbank-rpc captures CPU

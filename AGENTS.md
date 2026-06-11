@@ -23,7 +23,7 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
   `cargo fmt --all -- --check`
   `cargo clippy --workspace --all-targets --locked -- -D warnings`
   `cargo test --workspace --locked`
-  `cargo test -p superbank-rpc --features grpc-head-cache,pyroscope --locked`
+  `cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked`
 - Load tests:
   `scripts/test/run-k6.sh` (or run a single scenario under `tests/k6/scenarios/`)
 

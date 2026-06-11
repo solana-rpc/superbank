@@ -1,7 +1,7 @@
 # superbank-rpc k6 Load Tests
 
 Comprehensive load testing suite for superbank-rpc methods, including stress tests for many supported RPCs.
-Includes basic tests plus validation tests for `getSignaturesForAddress`, `getTransaction`, `getBlock`, `getTransactionCount`, `getInflationReward`, and a dedicated endpoint-comparison scenario for `getTransactionsForAddress`.
+Includes basic tests plus validation tests for `getSignaturesForAddress`, `getTransaction`, `getBlock`, `getTransactionCount`, `getInflationReward`, a dedicated endpoint-comparison scenario for `getTransactionsForAddress`, and a disk-cache parity scenario (`superbank-rpc-disk-cache-parity.js`) that diffs a disk-cache-enabled target against a reference across every method the disk tier serves.
 
 ## Quick Start
 
