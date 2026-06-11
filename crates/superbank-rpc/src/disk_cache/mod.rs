@@ -35,10 +35,12 @@ use crate::clickhouse::{
 
 pub(crate) mod codec;
 pub(crate) mod coverage;
+pub(crate) mod index;
 pub(crate) mod schema;
 
 use codec::CoverageValue;
 use coverage::CoverageMap;
+pub(crate) use index::DiskSigStatus;
 
 type Db = DBWithThreadMode<MultiThreaded>;
 
@@ -63,6 +65,8 @@ pub(crate) enum DiskCacheError {
     },
     #[error("slot {slot} is below the retention floor {floor}")]
     BelowFloor { slot: u64, floor: u64 },
+    #[error("corrupt address-index entry (slot {slot:?})")]
+    CorruptIndexEntry { slot: Option<u64> },
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +98,17 @@ pub(crate) enum DiskBlockTime {
     Found(Option<i64>),
     Skipped,
     NotCovered,
+}
+
+/// One page of a newest-first address-index scan over the contiguous tip span.
+#[derive(Debug)]
+pub(crate) struct DiskGsfaPage {
+    pub(crate) records: Vec<crate::clickhouse::SignatureRecord>,
+    /// The scan hit the coverage floor before filling the limit: ClickHouse must
+    /// be consulted for slots strictly below `floor`.
+    pub(crate) reached_floor: bool,
+    /// Coverage floor the scan was evaluated against.
+    pub(crate) floor: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -283,6 +298,71 @@ impl DiskCache {
         .await
     }
 
+    /// Full transaction lookup by any of its signatures.
+    pub(crate) async fn get_tx(
+        &self,
+        signature: solana_sdk::signature::Signature,
+    ) -> Option<StoredTransactionRecord> {
+        self.run_read("get_tx", move |inner| Ok(inner.get_tx_sync(&signature)))
+            .await
+            .flatten()
+    }
+
+    pub(crate) async fn get_sig_status(
+        &self,
+        signature: solana_sdk::signature::Signature,
+    ) -> Option<DiskSigStatus> {
+        self.run_read("get_sig_status", move |inner| {
+            Ok(inner.get_sig_status_sync(&signature))
+        })
+        .await
+        .flatten()
+    }
+
+    /// Batch signature-status lookup; one blocking hop for the whole batch.
+    pub(crate) async fn get_sig_statuses(
+        &self,
+        signatures: Vec<solana_sdk::signature::Signature>,
+    ) -> Vec<Option<DiskSigStatus>> {
+        let count = signatures.len();
+        self.run_read("get_sig_statuses", move |inner| {
+            Ok(signatures
+                .iter()
+                .map(|signature| inner.get_sig_status_sync(signature))
+                .collect())
+        })
+        .await
+        .unwrap_or_else(|| vec![None; count])
+    }
+
+    pub(crate) async fn signature_position(
+        &self,
+        signature: solana_sdk::signature::Signature,
+    ) -> Option<crate::clickhouse::SignatureSlot> {
+        self.run_read("signature_position", move |inner| {
+            Ok(inner.signature_position_sync(&signature))
+        })
+        .await
+        .flatten()
+    }
+
+    /// Newest-first gSFA page from the contiguous tip span. `None` means the
+    /// disk tier contributed nothing (no coverage, or a read error) and the
+    /// caller must use ClickHouse with its original bounds.
+    pub(crate) async fn signatures_for_address(
+        &self,
+        address: solana_sdk::pubkey::Pubkey,
+        before: Option<crate::clickhouse::SlotBoundary>,
+        until: Option<crate::clickhouse::SlotBoundary>,
+        limit: usize,
+    ) -> Option<DiskGsfaPage> {
+        self.run_read("signatures_for_address", move |inner| {
+            inner.signatures_for_address_sync(&address, before, until, limit)
+        })
+        .await
+        .flatten()
+    }
+
     /// Run a blocking read against RocksDB off the async runtime, bounded by the
     /// read semaphore. Any error is logged and becomes a miss (`None`).
     async fn run_read<T, F>(&self, op: &'static str, f: F) -> Option<T>
@@ -325,6 +405,10 @@ impl DiskCacheInner {
         self.db
             .cf_handle(name)
             .unwrap_or_else(|| panic!("column family {name} exists"))
+    }
+
+    pub(crate) fn min_retained(&self) -> u64 {
+        self.min_retained.load(Ordering::Relaxed)
     }
 
     fn load_persisted_state(&self) -> Result<(), DiskCacheError> {
@@ -386,6 +470,9 @@ impl DiskCacheInner {
         let block_meta_cf = self.cf(schema::CF_BLOCK_META);
         let tx_cf = self.cf(schema::CF_TX);
         let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE);
+        let sig_cf = self.cf(schema::CF_SIG);
+        let addr_cf = self.cf(schema::CF_ADDR_SIG);
+        let token_cf = self.cf(schema::CF_TOKEN_OWNER);
 
         batch.put_cf(
             &block_meta_cf,
@@ -398,6 +485,48 @@ impl DiskCacheInner {
                 schema::tx_key(slot, record.slot_idx),
                 codec::encode_record(record)?,
             );
+
+            let entries = index::derive_index_entries(record);
+            // signatures.sql ARRAY JOINs tx_signatures: any signature resolves.
+            let sig_value = codec::encode_sig_value(slot, record.slot_idx, entries.err.as_deref());
+            for tx_signature in &record.tx_signatures {
+                batch.put_cf(&sig_cf, tx_signature, &sig_value);
+            }
+
+            let addr_value = codec::encode_addr_sig_value(&codec::AddrSigValue {
+                signature: record.signature,
+                err: entries.err.clone(),
+                memo: entries.memo.clone(),
+                block_time: record.block_time,
+                balance_changed: false,
+            });
+            for address in &entries.addresses {
+                batch.put_cf(
+                    &addr_cf,
+                    schema::addr_sig_key(address, slot, record.slot_idx),
+                    &addr_value,
+                );
+            }
+
+            for token_entry in &entries.token_entries {
+                let token_value = codec::encode_addr_sig_value(&codec::AddrSigValue {
+                    signature: record.signature,
+                    err: entries.err.clone(),
+                    memo: entries.memo.clone(),
+                    block_time: record.block_time,
+                    balance_changed: token_entry.balance_changed,
+                });
+                batch.put_cf(
+                    &token_cf,
+                    schema::token_owner_key(
+                        &token_entry.owner,
+                        slot,
+                        record.slot_idx,
+                        &token_entry.token_account,
+                    ),
+                    &token_value,
+                );
+            }
         }
         batch.put_cf(
             &coverage_cf,
@@ -1155,6 +1284,227 @@ mod tests {
             .expect("budget should bind");
         assert!(stats.byte_budget_bound);
         assert!(stats.new_floor > 100);
+    }
+
+    fn transaction_with(
+        slot: u64,
+        idx: u32,
+        addresses: &[[u8; 32]],
+        status_err: Option<&str>,
+    ) -> StoredTransactionRecord {
+        let mut record = transaction(slot, idx);
+        record.tx_account_keys = addresses.to_vec();
+        if let Some(err) = status_err {
+            record.meta_status_ok = false;
+            record.meta_err = Some(err.to_string());
+        }
+        record
+    }
+
+    fn write_block(cache: &DiskCache, slot: u64, parent: u64, txs: Vec<StoredTransactionRecord>) {
+        let meta = block_metadata(slot, parent, txs.len() as u64);
+        cache
+            .write_finalized_slot(&meta, &txs, schema::COVERAGE_SOURCE_LIVE)
+            .expect("write block");
+    }
+
+    #[tokio::test]
+    async fn get_tx_resolves_any_listed_signature() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = open_cache(&dir);
+
+        let mut record = transaction(100, 0);
+        let mut second_sig = [7u8; 64];
+        second_sig[0] = 42;
+        record.tx_signatures = vec![record.signature, second_sig];
+        write_block(&cache, 100, 99, vec![record.clone()]);
+
+        let primary = solana_sdk::signature::Signature::from(record.signature);
+        let secondary = solana_sdk::signature::Signature::from(second_sig);
+        let unknown = solana_sdk::signature::Signature::from([255u8; 64]);
+
+        assert_eq!(
+            cache.get_tx(primary).await.map(|r| r.signature),
+            Some(record.signature)
+        );
+        assert_eq!(
+            cache.get_tx(secondary).await.map(|r| r.signature),
+            Some(record.signature)
+        );
+        assert!(cache.get_tx(unknown).await.is_none());
+
+        let position = cache.signature_position(primary).await.expect("position");
+        assert_eq!((position.slot, position.slot_idx), (100, 0));
+    }
+
+    #[tokio::test]
+    async fn sig_status_propagates_error_and_respects_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config(&dir);
+        cfg.retain_slots = 3;
+        let cache = DiskCache::open(cfg).expect("open");
+
+        let failed = transaction_with(
+            100,
+            0,
+            &[[1u8; 32]],
+            Some("{\"InstructionError\":[0,{\"Custom\":42}]}"),
+        );
+        let ok = transaction_with(100, 1, &[[1u8; 32]], None);
+        let failed_sig = solana_sdk::signature::Signature::from(failed.signature);
+        let ok_sig = solana_sdk::signature::Signature::from(ok.signature);
+        write_block(&cache, 100, 99, vec![failed, ok]);
+
+        let status = cache.get_sig_status(failed_sig).await.expect("status");
+        assert_eq!(status.slot, 100);
+        assert_eq!(status.slot_idx, 0);
+        assert!(status.err.is_some());
+        assert!(
+            cache
+                .get_sig_status(ok_sig)
+                .await
+                .expect("status")
+                .err
+                .is_none()
+        );
+
+        // Push the floor past slot 100: lingering index entries become invisible.
+        for slot in 101..=110 {
+            write_block(&cache, slot, slot - 1, vec![transaction(slot, 0)]);
+        }
+        cache.maybe_evict().expect("evict").expect("floor moved");
+        assert!(cache.min_retained_slot() > 100);
+        assert!(cache.get_sig_status(failed_sig).await.is_none());
+        assert!(cache.get_tx(failed_sig).await.is_none());
+
+        let batch = cache.get_sig_statuses(vec![failed_sig, ok_sig]).await;
+        assert_eq!(batch, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn gsfa_scan_orders_filters_and_bounds() {
+        use crate::clickhouse::{SignatureSlot, SlotBoundary};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = open_cache(&dir);
+
+        let addr_a = [10u8; 32];
+        let addr_b = [11u8; 32];
+        let address = solana_sdk::pubkey::Pubkey::from(addr_a);
+
+        // Slots 100..=104; address A in every slot, B only in 102.
+        for slot in 100..=104u64 {
+            let mut txs = vec![transaction_with(slot, 0, &[addr_a], None)];
+            if slot == 102 {
+                txs.push(transaction_with(slot, 1, &[addr_b], None));
+            }
+            write_block(&cache, slot, slot - 1, txs);
+        }
+
+        // Unbounded scan: newest-first, only address A, hits the floor unfilled.
+        let page = cache
+            .signatures_for_address(address, None, None, 10)
+            .await
+            .expect("page");
+        let slots: Vec<u64> = page.records.iter().map(|r| r.slot).collect();
+        assert_eq!(slots, vec![104, 103, 102, 101, 100]);
+        assert!(page.reached_floor);
+        assert_eq!(page.floor, 100);
+
+        // Limit satisfied: no floor escape.
+        let page = cache
+            .signatures_for_address(address, None, None, 2)
+            .await
+            .expect("page");
+        let slots: Vec<u64> = page.records.iter().map(|r| r.slot).collect();
+        assert_eq!(slots, vec![104, 103]);
+        assert!(!page.reached_floor);
+
+        // before excludes the position itself.
+        let before = SlotBoundary::Position(SignatureSlot {
+            slot: 104,
+            slot_idx: 0,
+        });
+        let page = cache
+            .signatures_for_address(address, Some(before), None, 10)
+            .await
+            .expect("page");
+        let slots: Vec<u64> = page.records.iter().map(|r| r.slot).collect();
+        assert_eq!(slots, vec![103, 102, 101, 100]);
+
+        // before as a slot bound: strictly below it.
+        let page = cache
+            .signatures_for_address(address, Some(SlotBoundary::Slot(103)), None, 10)
+            .await
+            .expect("page");
+        let slots: Vec<u64> = page.records.iter().map(|r| r.slot).collect();
+        assert_eq!(slots, vec![102, 101, 100]);
+
+        // until inside the span: fully answered, no floor escape.
+        let page = cache
+            .signatures_for_address(address, None, Some(SlotBoundary::Slot(101)), 10)
+            .await
+            .expect("page");
+        let slots: Vec<u64> = page.records.iter().map(|r| r.slot).collect();
+        assert_eq!(slots, vec![104, 103, 102]);
+        assert!(!page.reached_floor);
+
+        // until below the floor: the floor still bounds the scan.
+        let page = cache
+            .signatures_for_address(address, None, Some(SlotBoundary::Slot(50)), 10)
+            .await
+            .expect("page");
+        assert_eq!(page.records.len(), 5);
+        assert!(page.reached_floor);
+    }
+
+    #[tokio::test]
+    async fn gsfa_scan_orders_within_slot_and_carries_metadata() {
+        use std::str::FromStr;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = open_cache(&dir);
+
+        let addr = [20u8; 32];
+        let address = solana_sdk::pubkey::Pubkey::from(addr);
+        let memo_program =
+            solana_sdk::pubkey::Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+                .unwrap()
+                .to_bytes();
+
+        let mut with_memo = transaction_with(100, 1, &[addr], None);
+        with_memo.tx_account_keys.push(memo_program);
+        with_memo.tx_instructions_program_id_index = vec![1];
+        with_memo.tx_instructions_data = vec![b"hi".to_vec()];
+
+        let failed = transaction_with(100, 0, &[addr], Some("\"AccountNotFound\""));
+        write_block(&cache, 100, 99, vec![failed, with_memo]);
+
+        let page = cache
+            .signatures_for_address(address, None, None, 10)
+            .await
+            .expect("page");
+        assert_eq!(page.records.len(), 2);
+        // Desc by slot_idx within the slot.
+        assert_eq!(page.records[0].slot_idx, 1);
+        assert_eq!(page.records[0].memo.as_deref(), Some("[2] hi"));
+        assert!(page.records[0].err.is_none());
+        assert_eq!(page.records[1].slot_idx, 0);
+        assert!(page.records[1].err.is_some());
+        assert_eq!(page.records[0].block_time, Some(1_700_000_100));
+    }
+
+    #[tokio::test]
+    async fn gsfa_scan_without_coverage_returns_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = open_cache(&dir);
+        let address = solana_sdk::pubkey::Pubkey::from([1u8; 32]);
+        assert!(
+            cache
+                .signatures_for_address(address, None, None, 10)
+                .await
+                .is_none()
+        );
     }
 
     #[test]

@@ -13,6 +13,8 @@ use clickhouse::Client as HttpClient;
 use clickhouse_rs::errors::{DriverError as TcpDriverError, Error as TcpError};
 use solana_sdk::pubkey::Pubkey;
 
+#[cfg(feature = "grpc-head-cache")]
+use crate::clickhouse::StoredTransactionRecord;
 use crate::hydration::parse_transaction_error_display;
 use crate::processing::ProcessingError;
 
@@ -318,6 +320,74 @@ pub(crate) fn parse_err_json(signature: &str, err_str: String) -> Option<serde_j
         "Failed to parse err JSON stored in gSFA table; returning raw string"
     );
     Some(serde_json::Value::String(trimmed.to_string()))
+}
+
+/// Extract gSFA-style memos from a stored transaction: every memo-program
+/// instruction's UTF-8 data, formatted `"[len] text"` and joined by `"; "`.
+///
+/// This matches what [`format_gsfa_memo`] produces from the raw memos stored by
+/// the gsfa/token_owner_activity materialized views, so values built here and
+/// values read from ClickHouse render identically.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn extract_memo(record: &StoredTransactionRecord) -> Option<String> {
+    static MEMO_PROGRAM_IDS: once_cell::sync::Lazy<[Pubkey; 2]> =
+        once_cell::sync::Lazy::new(|| {
+            use std::str::FromStr;
+            [
+                Pubkey::from_str("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo")
+                    .expect("memo program id"),
+                Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+                    .expect("memo program id"),
+            ]
+        });
+
+    let mut memos = Vec::new();
+    for (program_id_index, data) in record
+        .tx_instructions_program_id_index
+        .iter()
+        .zip(record.tx_instructions_data.iter())
+    {
+        let idx = usize::from(*program_id_index);
+        let Some(program_id) = account_key_at(record, idx) else {
+            continue;
+        };
+        if !MEMO_PROGRAM_IDS.contains(&program_id) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(data) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        memos.push(format!("[{}] {}", text.len(), text));
+    }
+
+    if memos.is_empty() {
+        None
+    } else {
+        Some(memos.join("; "))
+    }
+}
+
+/// Resolve an instruction account index against the transaction's combined key
+/// list: static keys, then loaded writable, then loaded readonly addresses.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn account_key_at(record: &StoredTransactionRecord, idx: usize) -> Option<Pubkey> {
+    let static_len = record.tx_account_keys.len();
+    if idx < static_len {
+        return Some(Pubkey::from(record.tx_account_keys[idx]));
+    }
+    let idx = idx - static_len;
+    let w_len = record.meta_loaded_addresses_writable.len();
+    if idx < w_len {
+        return Some(Pubkey::from(record.meta_loaded_addresses_writable[idx]));
+    }
+    let idx = idx - w_len;
+    if idx < record.meta_loaded_addresses_readonly.len() {
+        return Some(Pubkey::from(record.meta_loaded_addresses_readonly[idx]));
+    }
+    None
 }
 
 pub(crate) fn format_gsfa_memo(memo: Option<String>) -> Option<String> {

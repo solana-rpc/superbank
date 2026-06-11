@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::clickhouse::{
     BlockMetadataRecord, SlotBoundary, StoredAccountsTransactionRecord, StoredBlockPayload,
-    StoredBlockRecord, StoredTransactionRecord,
+    StoredBlockRecord, StoredTransactionRecord, extract_memo,
 };
 
 mod convert;
@@ -805,64 +805,6 @@ fn commitment_to_str(c: CommitmentLevel) -> &'static str {
         CommitmentLevel::Confirmed => "confirmed",
         CommitmentLevel::Finalized => "finalized",
     }
-}
-
-fn extract_memo(record: &StoredTransactionRecord) -> Option<String> {
-    static MEMO_PROGRAM_IDS: once_cell::sync::Lazy<[Pubkey; 2]> =
-        once_cell::sync::Lazy::new(|| {
-            use std::str::FromStr;
-            [
-                Pubkey::from_str("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo")
-                    .expect("memo program id"),
-                Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
-                    .expect("memo program id"),
-            ]
-        });
-
-    let mut memos = Vec::new();
-    for (program_id_index, data) in record
-        .tx_instructions_program_id_index
-        .iter()
-        .zip(record.tx_instructions_data.iter())
-    {
-        let idx = usize::from(*program_id_index);
-        let Some(program_id) = account_key_at(record, idx) else {
-            continue;
-        };
-        if !MEMO_PROGRAM_IDS.contains(&program_id) {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(data) else {
-            continue;
-        };
-        if text.is_empty() {
-            continue;
-        }
-        memos.push(format!("[{}] {}", text.len(), text));
-    }
-
-    if memos.is_empty() {
-        None
-    } else {
-        Some(memos.join("; "))
-    }
-}
-
-fn account_key_at(record: &StoredTransactionRecord, idx: usize) -> Option<Pubkey> {
-    let static_len = record.tx_account_keys.len();
-    if idx < static_len {
-        return Some(Pubkey::from(record.tx_account_keys[idx]));
-    }
-    let idx = idx - static_len;
-    let w_len = record.meta_loaded_addresses_writable.len();
-    if idx < w_len {
-        return Some(Pubkey::from(record.meta_loaded_addresses_writable[idx]));
-    }
-    let idx = idx - w_len;
-    if idx < record.meta_loaded_addresses_readonly.len() {
-        return Some(Pubkey::from(record.meta_loaded_addresses_readonly[idx]));
-    }
-    None
 }
 
 #[cfg(test)]
