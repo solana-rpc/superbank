@@ -851,6 +851,19 @@ impl ClickHouseClient {
         operation: &'static str,
         fut: impl std::future::Future<Output = ProcessingResult<T>>,
     ) -> ProcessingResult<T> {
+        self.with_timeout_duration(operation, self.query_timeout, fut)
+            .await
+    }
+
+    /// [`Self::with_timeout`] with an explicit deadline, for operations whose
+    /// budget differs from the interactive query timeout (e.g. disk-cache
+    /// backfill range scans).
+    pub(crate) async fn with_timeout_duration<T>(
+        &self,
+        operation: &'static str,
+        timeout: std::time::Duration,
+        fut: impl std::future::Future<Output = ProcessingResult<T>>,
+    ) -> ProcessingResult<T> {
         // Gate every direct (non-fanout) ClickHouse HTTP query on a global permit so concurrent
         // HTTP connections do not track raw request/batch concurrency. Fanout paths use
         // `fanout_sem` and are not gated here; the surrounding request timeout bounds the wait for
@@ -863,13 +876,12 @@ impl ClickHouseClient {
         // the call tree and overflow the (2 MiB) worker/test thread stack; boxing keeps each
         // `with_timeout` future pointer-sized in its caller.
         let fut = Box::pin(fut);
-        match tokio::time::timeout(self.query_timeout, fut).await {
+        match tokio::time::timeout(timeout, fut).await {
             Ok(result) => result,
             Err(_) => {
                 crate::metrics::clickhouse_timeout(operation);
                 Err(ProcessingError::timeout_msg(format!(
-                    "ClickHouse operation '{operation}' timed out after {:?}",
-                    self.query_timeout
+                    "ClickHouse operation '{operation}' timed out after {timeout:?}"
                 )))
             }
         }

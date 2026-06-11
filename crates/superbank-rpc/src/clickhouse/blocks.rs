@@ -15,6 +15,8 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::client::ClickHouseClient;
 use super::constants::SLOT_SHARD_DIVISOR;
+#[cfg(feature = "disk-cache")]
+use super::queries::build_transactions_by_slot_range_query;
 use super::queries::{
     BLOCK_ACCOUNTS_BASE_COLUMNS, BLOCK_FULL_BASE_COLUMNS, BLOCK_METADATA_BASE_COLUMNS,
     BLOCK_METADATA_REWARD_COLUMNS, BLOCK_SIGNATURE_COLUMNS, BLOCK_TRANSACTION_REWARD_COLUMNS,
@@ -26,6 +28,8 @@ use super::rows::{
     map_block_full_transaction_row, map_block_metadata_base_row, map_block_metadata_row,
     map_block_signature_row,
 };
+#[cfg(feature = "disk-cache")]
+use super::rows::{TransactionRow, map_transaction_row};
 use super::types::{
     BlockMetadataRecord, InflationRewardRecord, QueryTimings, StoredAccountsTransactionRecord,
     StoredTransactionRecord,
@@ -172,6 +176,35 @@ fn build_block_transactions_query(
         columns = format_select_columns(&columns),
         transaction_table = table,
         slot = slot,
+        settings_clause = settings_clause
+    )
+}
+
+/// Range variant for disk-cache backfill: every block in `[start, end]`,
+/// rewards included, ascending. Always routed via the distributed table because
+/// slot ranges can straddle shard buckets.
+#[cfg(feature = "disk-cache")]
+fn build_block_metadata_range_query(
+    table: &str,
+    start_slot: u64,
+    end_slot: u64,
+    settings_clause: &str,
+) -> String {
+    let mut columns = BLOCK_METADATA_BASE_COLUMNS.to_vec();
+    columns.extend_from_slice(BLOCK_METADATA_REWARD_COLUMNS);
+
+    format!(
+        "SELECT
+                {columns}
+             FROM {blocks_metadata_table}
+             PREWHERE slot BETWEEN {start_slot} AND {end_slot}
+             ORDER BY slot ASC
+             LIMIT 1 BY slot
+             {settings_clause}",
+        columns = format_select_columns(&columns),
+        blocks_metadata_table = table,
+        start_slot = start_slot,
+        end_slot = end_slot,
         settings_clause = settings_clause
     )
 }
@@ -1345,6 +1378,110 @@ impl ClickHouseClient {
 
             Ok((records, timings))
         })
+        .await
+    }
+
+    /// All block metadata in `[start_slot, end_slot]`, ascending, rewards
+    /// included. Disk-cache backfill only: always uses the distributed table
+    /// (slot ranges can straddle shard buckets, mirroring
+    /// `get_block_slots_by_range`) and a caller-provided timeout sized for
+    /// range scans rather than interactive reads.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn get_block_metadata_by_slot_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        timeout: std::time::Duration,
+    ) -> ProcessingResult<(Vec<BlockMetadataRecord>, QueryTimings)> {
+        self.with_timeout_duration("get_block_metadata_by_slot_range", timeout, async {
+            let settings_clause = self.select_settings_clause(
+                "get_block_metadata_by_slot_range",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_block_metadata_range_query(
+                &self.blocks_metadata_table,
+                start_slot,
+                end_slot,
+                &settings_clause,
+            );
+
+            let start = Instant::now();
+            let mut cursor = self
+                .client
+                .query(&query)
+                .fetch::<BlockMetadataRow>()
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let mut records = Vec::new();
+            while let Some(row) = cursor
+                .next()
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?
+            {
+                records.push(map_block_metadata_row(row));
+            }
+            let timings = QueryTimings {
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                received_bytes: cursor.received_bytes(),
+                decoded_bytes: cursor.decoded_bytes(),
+                rows_read: Some(0),
+                rows_read_unknown: true,
+                rows_returned: records.len() as u64,
+            };
+            Ok((records, timings))
+        })
+        .await
+    }
+
+    /// All transactions in `[start_slot, end_slot]`, ordered by
+    /// `(slot, slot_idx)` ascending. Disk-cache backfill only; see
+    /// [`Self::get_block_metadata_by_slot_range`] for the routing rationale.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn get_block_full_transactions_by_slot_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        timeout: std::time::Duration,
+    ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
+        self.with_timeout_duration(
+            "get_block_full_transactions_by_slot_range",
+            timeout,
+            async {
+                let settings_clause = self.select_settings_clause(
+                    "get_block_full_transactions_by_slot_range",
+                    QueryFreshnessClass::Historical,
+                );
+                let query = build_transactions_by_slot_range_query(
+                    &self.transaction_table,
+                    start_slot,
+                    end_slot,
+                    &settings_clause,
+                );
+
+                let start = Instant::now();
+                let mut cursor = self
+                    .client
+                    .query(&query)
+                    .fetch::<TransactionRow>()
+                    .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+                let mut records = Vec::new();
+                while let Some(row) = cursor
+                    .next()
+                    .await
+                    .map_err(|e| ProcessingError::database(e.to_string(), e))?
+                {
+                    records.push(map_transaction_row(row));
+                }
+                let timings = QueryTimings {
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    received_bytes: cursor.received_bytes(),
+                    decoded_bytes: cursor.decoded_bytes(),
+                    rows_read: Some(0),
+                    rows_read_unknown: true,
+                    rows_returned: records.len() as u64,
+                };
+                Ok((records, timings))
+            },
+        )
         .await
     }
 }

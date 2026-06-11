@@ -35,6 +35,7 @@ use crate::clickhouse::{
 
 pub(crate) mod codec;
 pub(crate) mod coverage;
+pub(crate) mod filler;
 pub(crate) mod index;
 pub(crate) mod ingest;
 pub(crate) mod schema;

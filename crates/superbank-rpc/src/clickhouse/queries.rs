@@ -832,6 +832,32 @@ pub(crate) fn build_transactions_by_slot_signatures_query(
     )
 }
 
+/// Range scan for disk-cache backfill: every transaction in
+/// `[start_slot, end_slot]` in `(slot, slot_idx)` order. `LIMIT 1 BY signature`
+/// mirrors the per-slot block query's ReplacingMergeTree dedup.
+#[cfg(feature = "disk-cache")]
+pub(crate) fn build_transactions_by_slot_range_query(
+    transaction_table: &str,
+    start_slot: u64,
+    end_slot: u64,
+    settings_clause: &str,
+) -> String {
+    format!(
+        "SELECT
+            {columns}
+         FROM {transaction_table}
+         PREWHERE slot BETWEEN {start_slot} AND {end_slot}
+         ORDER BY slot ASC, slot_idx ASC, signature ASC
+         LIMIT 1 BY signature
+         {settings_clause}",
+        columns = TRANSACTION_SELECT_COLUMNS,
+        transaction_table = transaction_table,
+        start_slot = start_slot,
+        end_slot = end_slot,
+        settings_clause = settings_clause
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use ch_cityhash102::cityhash64;
