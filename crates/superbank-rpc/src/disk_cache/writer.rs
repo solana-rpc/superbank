@@ -65,6 +65,7 @@ impl DiskWriteSender {
                     slot,
                     "disk cache: live write queue full; deferring slot to repair"
                 );
+                crate::metrics::disk_cache_dropped_to_repair("queue_full");
                 self.repair.push(slot);
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -205,12 +206,24 @@ fn write_one(
     if inner.covers_slot(slot) {
         return;
     }
-    if let Err(err) = inner.write_finalized_slot(&meta, &txs, source) {
-        warn!(
-            slot,
-            "disk cache: slot write failed ({err}); deferring to repair"
-        );
-        repair.push(slot);
+    let start = Instant::now();
+    match inner.write_finalized_slot(&meta, &txs, source) {
+        Ok(()) => {
+            crate::metrics::disk_cache_write(
+                schema::coverage_source_label(source),
+                txs.len() as u64,
+                start.elapsed().as_secs_f64(),
+            );
+        }
+        Err(err) => {
+            warn!(
+                slot,
+                "disk cache: slot write failed ({err}); deferring to repair"
+            );
+            crate::metrics::disk_cache_write_error();
+            crate::metrics::disk_cache_dropped_to_repair("write_error");
+            repair.push(slot);
+        }
     }
 }
 

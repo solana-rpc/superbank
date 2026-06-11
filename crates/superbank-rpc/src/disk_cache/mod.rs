@@ -156,6 +156,7 @@ impl DiskCache {
                     path = %cfg.path.display(),
                     "disk cache: open failed ({err}); destroying and rebuilding"
                 );
+                crate::metrics::disk_cache_wipe();
                 destroy_db(&cfg.path)?;
                 open_db(&cfg.path, &opts, min_retained.clone())?
             }
@@ -171,6 +172,7 @@ impl DiskCache {
                     "disk cache: schema version mismatch; wiping"
                 );
                 drop(db);
+                crate::metrics::disk_cache_wipe();
                 destroy_db(&cfg.path)?;
                 let db = open_db(&cfg.path, &opts, min_retained.clone())?;
                 match check_schema_version(db)? {
@@ -273,9 +275,17 @@ impl DiskCache {
     }
 
     pub(crate) async fn slot_status(&self, slot: u64) -> SlotStatus {
-        self.run_read("slot_status", move |inner| Ok(inner.slot_status_sync(slot)))
+        let status = self
+            .run_read("slot_status", move |inner| Ok(inner.slot_status_sync(slot)))
             .await
-            .unwrap_or(SlotStatus::NotCovered)
+            .unwrap_or(SlotStatus::NotCovered);
+        let outcome = match status {
+            SlotStatus::Covered { .. } => "hit",
+            SlotStatus::Skipped => "skipped",
+            SlotStatus::NotCovered => "not_covered",
+        };
+        crate::metrics::disk_cache_read("slot_status", outcome);
+        status
     }
 
     pub(crate) async fn get_block(
@@ -283,17 +293,33 @@ impl DiskCache {
         slot: u64,
         transaction_details: TransactionDetails,
     ) -> DiskBlockResult {
-        self.run_read("get_block", move |inner| {
-            Ok(inner.get_block_sync(slot, transaction_details))
-        })
-        .await
-        .unwrap_or(DiskBlockResult::NotCovered)
+        let result = self
+            .run_read("get_block", move |inner| {
+                Ok(inner.get_block_sync(slot, transaction_details))
+            })
+            .await
+            .unwrap_or(DiskBlockResult::NotCovered);
+        let outcome = match &result {
+            DiskBlockResult::Found(_) => "hit",
+            DiskBlockResult::Skipped => "skipped",
+            DiskBlockResult::NotCovered => "not_covered",
+        };
+        crate::metrics::disk_cache_read("get_block", outcome);
+        result
     }
 
     pub(crate) async fn block_time_for_slot(&self, slot: u64) -> DiskBlockTime {
-        self.run_read("block_time", move |inner| Ok(inner.block_time_sync(slot)))
+        let result = self
+            .run_read("block_time", move |inner| Ok(inner.block_time_sync(slot)))
             .await
-            .unwrap_or(DiskBlockTime::NotCovered)
+            .unwrap_or(DiskBlockTime::NotCovered);
+        let outcome = match result {
+            DiskBlockTime::Found(_) => "hit",
+            DiskBlockTime::Skipped => "skipped",
+            DiskBlockTime::NotCovered => "not_covered",
+        };
+        crate::metrics::disk_cache_read("block_time", outcome);
+        result
     }
 
     /// Covered (non-skipped) slots within `[start, end]`, ascending.
@@ -309,20 +335,29 @@ impl DiskCache {
         &self,
         signature: solana_sdk::signature::Signature,
     ) -> Option<StoredTransactionRecord> {
-        self.run_read("get_tx", move |inner| Ok(inner.get_tx_sync(&signature)))
+        let result = self
+            .run_read("get_tx", move |inner| Ok(inner.get_tx_sync(&signature)))
             .await
-            .flatten()
+            .flatten();
+        crate::metrics::disk_cache_read("get_tx", if result.is_some() { "hit" } else { "miss" });
+        result
     }
 
     pub(crate) async fn get_sig_status(
         &self,
         signature: solana_sdk::signature::Signature,
     ) -> Option<DiskSigStatus> {
-        self.run_read("get_sig_status", move |inner| {
-            Ok(inner.get_sig_status_sync(&signature))
-        })
-        .await
-        .flatten()
+        let result = self
+            .run_read("get_sig_status", move |inner| {
+                Ok(inner.get_sig_status_sync(&signature))
+            })
+            .await
+            .flatten();
+        crate::metrics::disk_cache_read(
+            "get_sig_status",
+            if result.is_some() { "hit" } else { "miss" },
+        );
+        result
     }
 
     /// Batch signature-status lookup; one blocking hop for the whole batch.
@@ -331,25 +366,39 @@ impl DiskCache {
         signatures: Vec<solana_sdk::signature::Signature>,
     ) -> Vec<Option<DiskSigStatus>> {
         let count = signatures.len();
-        self.run_read("get_sig_statuses", move |inner| {
-            Ok(signatures
-                .iter()
-                .map(|signature| inner.get_sig_status_sync(signature))
-                .collect())
-        })
-        .await
-        .unwrap_or_else(|| vec![None; count])
+        let results: Vec<Option<DiskSigStatus>> = self
+            .run_read("get_sig_statuses", move |inner| {
+                Ok(signatures
+                    .iter()
+                    .map(|signature| inner.get_sig_status_sync(signature))
+                    .collect())
+            })
+            .await
+            .unwrap_or_else(|| vec![None; count]);
+        for result in &results {
+            crate::metrics::disk_cache_read(
+                "get_sig_statuses",
+                if result.is_some() { "hit" } else { "miss" },
+            );
+        }
+        results
     }
 
     pub(crate) async fn signature_position(
         &self,
         signature: solana_sdk::signature::Signature,
     ) -> Option<crate::clickhouse::SignatureSlot> {
-        self.run_read("signature_position", move |inner| {
-            Ok(inner.signature_position_sync(&signature))
-        })
-        .await
-        .flatten()
+        let result = self
+            .run_read("signature_position", move |inner| {
+                Ok(inner.signature_position_sync(&signature))
+            })
+            .await
+            .flatten();
+        crate::metrics::disk_cache_read(
+            "signature_position",
+            if result.is_some() { "hit" } else { "miss" },
+        );
+        result
     }
 
     /// Newest-first gSFA page from the contiguous tip span. `None` means the
@@ -362,11 +411,17 @@ impl DiskCache {
         until: Option<crate::clickhouse::SlotBoundary>,
         limit: usize,
     ) -> Option<DiskGsfaPage> {
-        self.run_read("signatures_for_address", move |inner| {
-            inner.signatures_for_address_sync(&address, before, until, limit)
-        })
-        .await
-        .flatten()
+        let result = self
+            .run_read("signatures_for_address", move |inner| {
+                inner.signatures_for_address_sync(&address, before, until, limit)
+            })
+            .await
+            .flatten();
+        crate::metrics::disk_cache_read(
+            "signatures_for_address",
+            if result.is_some() { "hit" } else { "miss" },
+        );
+        result
     }
 
     /// Run a blocking read against RocksDB off the async runtime, bounded by the
@@ -424,6 +479,13 @@ impl DiskCacheInner {
     pub(crate) fn flush_wal(&self) -> Result<(), DiskCacheError> {
         self.db.flush_wal(true)?;
         Ok(())
+    }
+
+    fn publish_coverage_metrics(&self) {
+        let map = self.coverage.read().expect("coverage lock");
+        let (min_covered, max_covered) = map.covered_span().unwrap_or((0, 0));
+        let contiguous_floor = map.contiguous_tip_span().map_or(0, |(floor, _)| floor);
+        crate::metrics::disk_cache_coverage(min_covered, max_covered, contiguous_floor);
     }
 
     fn load_persisted_state(&self) -> Result<(), DiskCacheError> {
@@ -583,6 +645,7 @@ impl DiskCacheInner {
             let mut map = self.coverage.write().expect("coverage lock");
             map.insert_range(claim_start, slot);
         }
+        self.publish_coverage_metrics();
         Ok(())
     }
 
@@ -648,6 +711,13 @@ impl DiskCacheInner {
             .expect("coverage lock")
             .remove_below(new_floor);
 
+        crate::metrics::disk_cache_evicted(
+            if byte_budget_bound { "bytes" } else { "window" },
+            new_floor - old_floor,
+        );
+        crate::metrics::disk_cache_size_bytes(self.live_sst_bytes());
+        self.publish_coverage_metrics();
+
         Ok(Some(EvictionStats {
             old_floor,
             new_floor,
@@ -671,6 +741,7 @@ impl DiskCacheInner {
     /// degrades to ClickHouse until repair re-ingests it.
     fn poison_slot(&self, slot: u64) {
         warn!(slot, "disk cache: poisoning slot after inconsistency");
+        crate::metrics::disk_cache_poisoned_slot();
         if let Err(err) = self
             .db
             .delete_cf(&self.cf(schema::CF_SLOT_COVERAGE), schema::slot_key(slot))
@@ -678,6 +749,7 @@ impl DiskCacheInner {
             warn!(slot, "disk cache: failed to delete coverage marker: {err}");
         }
         self.coverage.write().expect("coverage lock").remove(slot);
+        self.publish_coverage_metrics();
     }
 
     pub(crate) fn slot_status_sync(&self, slot: u64) -> SlotStatus {

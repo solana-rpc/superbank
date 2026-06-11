@@ -103,6 +103,8 @@ pub(crate) async fn run(
 
         let repair_slots = repair.drain(MAX_SLOTS_PER_ROUND as usize);
         let holes = cache.holes_in(window.floor, window.tip);
+        let hole_slots: u64 = holes.iter().map(|&(start, end)| end - start + 1).sum();
+        crate::metrics::disk_cache_backfill_remaining(hole_slots + repair.len() as u64);
         let ranges = plan_ranges(
             &repair_slots,
             &holes,
@@ -162,6 +164,7 @@ pub(crate) async fn run(
                 }
                 Err(FillError::Shutdown) => return,
                 Err(FillError::ClickHouse(err)) => {
+                    crate::metrics::disk_cache_fill_error();
                     warn!(
                         start = range.start,
                         end = range.end,

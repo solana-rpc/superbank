@@ -120,6 +120,7 @@ impl DiskIngestSink {
                     slot,
                     "disk cache: head cache view of finalized slot is incomplete; deferring to repair"
                 );
+                crate::metrics::disk_cache_dropped_to_repair("incomplete_head");
                 self.repair.push(slot);
             }
         }

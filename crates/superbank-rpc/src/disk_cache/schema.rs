@@ -54,6 +54,15 @@ pub(crate) const COVERAGE_SOURCE_LIVE: u8 = 0;
 pub(crate) const COVERAGE_SOURCE_BACKFILL: u8 = 1;
 pub(crate) const COVERAGE_SOURCE_REPAIR: u8 = 2;
 
+pub(crate) fn coverage_source_label(source: u8) -> &'static str {
+    match source {
+        COVERAGE_SOURCE_LIVE => "live",
+        COVERAGE_SOURCE_BACKFILL => "backfill",
+        COVERAGE_SOURCE_REPAIR => "repair",
+        _ => "unknown",
+    }
+}
+
 #[inline]
 pub(crate) fn rev_slot(slot: u64) -> u64 {
     !slot
