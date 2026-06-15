@@ -777,7 +777,7 @@ async fn dispatch_json_rpc_request(
     let id_for_dispatch = id.clone();
     let params = req.params;
     let method_str = method.as_str();
-    let dispatch = async {
+    let dispatch = Box::pin(async {
         match method_str {
             "getSignaturesForAddress" => {
                 signatures::handle_get_signatures_for_address(state, id_for_dispatch, params).await
@@ -825,7 +825,7 @@ async fn dispatch_json_rpc_request(
                 None,
             )),
         }
-    };
+    });
     let result = if let Some(timeout) = timeout {
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(result) => result,
@@ -988,7 +988,11 @@ async fn handle_single_request(
     let dispatch_request = request.into_dispatch_request();
     let response = metrics::with_request_metric_labels(
         request_metric_labels,
-        dispatch_json_rpc_request(state, dispatch_request, Some(timeout)),
+        Box::pin(dispatch_json_rpc_request(
+            state,
+            dispatch_request,
+            Some(timeout),
+        )),
     )
     .await?;
     Ok(response)
@@ -1028,7 +1032,7 @@ async fn execute_batch_requests(
                         response_header_metrics_context,
                         metrics::with_request_metric_labels(
                             request_metric_labels,
-                            dispatch_json_rpc_request(state, dispatch_request, None),
+                            Box::pin(dispatch_json_rpc_request(state, dispatch_request, None)),
                         ),
                     )
                     .await
