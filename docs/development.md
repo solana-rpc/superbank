@@ -263,7 +263,7 @@ git push origin v0.4.0
 ```
 
 The release workflow runs the Tilt E2E profile first, then GoReleaser builds both binaries for
-Linux amd64, Linux arm64, and Darwin arm64, publishes GitHub release notes, uploads `.tar.gz`
+Linux amd64 and Linux arm64, publishes GitHub release notes, uploads `.tar.gz`
 archives, and generates `SHA256SUMS.txt`.
 
 ### Key environment variables

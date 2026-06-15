@@ -10,7 +10,6 @@ builds:
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
-      - aarch64-apple-darwin
     flags:
       - --release
       - --locked
@@ -26,7 +25,6 @@ builds:
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
-      - aarch64-apple-darwin
     flags:
       - --release
       - --locked

@@ -210,7 +210,7 @@ Releases are tag-driven and published by GoReleaser:
 3. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL,
    runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite before assets are
    published.
-4. After E2E passes, GoReleaser builds both binaries for Linux amd64, Linux arm64, and Darwin arm64,
+4. After E2E passes, GoReleaser builds both binaries for Linux amd64 and Linux arm64,
    then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`.
 
 Example:
