@@ -191,7 +191,7 @@ Keep changes focused and avoid drive-by refactors unless they are part of the sa
 Superbank uses **Conventional Commits** (semantic commits) to:
 
 - enforce consistent commit messages on `main`
-- drive automated SemVer bumps (major/minor/patch) for releases
+- keep release history and GitHub release notes readable
 
 Requirements:
 
@@ -203,22 +203,27 @@ CI enforces PR titles via the `Lint PR title` GitHub Actions check.
 
 ### Releases
 
-Releases are automated from `main` using `release-please`:
+Releases are tag-driven and published by GoReleaser:
 
-1. Pushes to `main` update (or open) a **Release PR**.
-2. Squash-merging the Release PR to `main` creates and pushes a `vX.Y.Z` tag.
-3. Tag pushes trigger the binary release workflow.
-4. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL,
+1. Update the workspace and member versions in the `Cargo.toml` files.
+2. Create and push an annotated `vX.Y.Z` tag.
+3. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL,
    runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite before assets are
    published.
-5. After the E2E and binary-build jobs pass, the workflow publishes a GitHub Release with versioned tarballs.
+4. After E2E passes, GoReleaser builds both binaries for Linux amd64, Linux arm64, and Darwin arm64,
+   then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`.
+
+Example:
+
+```bash
+git tag -a v0.4.0 -m "Release v0.4.0"
+git push origin v0.4.0
+```
 
 Repository settings required (GitHub UI):
 
 - Enable squash merging and set squash commit messages to use the PR title by default.
 - Protect the `main` branch to require PRs and required status checks (at minimum: `CI` and `Lint PR title`).
-- Create an Actions secret `RELEASE_TOKEN` (PAT) with permissions to open PRs and push tags.
-- Enable `Settings -> Actions -> General -> Allow GitHub Actions to create and approve pull requests`.
 
 Formatting and linting:
 

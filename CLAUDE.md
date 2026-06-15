@@ -66,7 +66,7 @@ scripts/test/run-k6.sh
 
 - **Rust stable toolchain** with `rustfmt` and `clippy` components (see `rust-toolchain.toml`)
 - **Conventional Commits** required for PR titles (e.g. `fix: ...`, `feat: ...`, `chore: ...`). CI enforces this via `Lint PR title` check.
-- PRs are squash-merged to `main`; releases automated via `release-please`.
+- PRs are squash-merged to `main`; releases are published by GoReleaser from `vX.Y.Z` tags.
 - Keep diffs scoped — avoid drive-by refactors.
 - When changing CLI flags, env vars, config fields, or scripts, update docs (`README.md`, `superbank.example.yaml`, `crates/*/README.md`) in the same PR.
 - Config precedence: CLI flags > env vars > config file > defaults.

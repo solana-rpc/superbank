@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Rust workspace (root `Cargo.toml`): `superbank-workspace` (helper crate used for release/version automation), `crates/superbank/` (ingestor), and `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`).
+- Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), and `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`).
 - ClickHouse DDL: `ddl/`
 - Load tests: `tests/k6/`
 - Helper scripts: `scripts/`

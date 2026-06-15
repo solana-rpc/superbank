@@ -14,54 +14,31 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  SUPERBANK_GIT_SHA: ${{ github.sha }}
 
 jobs:
   e2e:
     name: E2E - Tilt + k6
     uses: ./.github/workflows/e2e.yml
 
-  build:
-    name: Build - ${{ matrix.platform.os_name }} - ${{ matrix.platform.arch }} - ${{ matrix.binary.name }}
-    runs-on: ${{ matrix.platform.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - os: ubuntu-latest
-            os_name: linux
-            arch: x86_64
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            os_name: linux
-            arch: aarch64
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            os_name: darwin
-            arch: aarch64
-            target: aarch64-apple-darwin
-        binary:
-          - name: superbank
-            manifest: crates/superbank/Cargo.toml
-            bin: superbank
-            artifact_prefix: superbank
-          - name: superbank-rpc
-            manifest: crates/superbank-rpc/Cargo.toml
-            bin: superbank-rpc
-            artifact_prefix: superbank-rpc
+  goreleaser:
+    name: GoReleaser
+    needs: [e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
           toolchain: stable
-          targets: ${{ matrix.platform.target }}
 
-      - name: Install libclang (Linux)
-        if: matrix.platform.os_name == 'linux'
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev llvm-dev pkg-config libudev-dev libusb-1.0-0-dev
@@ -72,71 +49,24 @@ jobs:
           version: "25.3"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
-          shared-key: release-${{ matrix.platform.target }}-${{ matrix.binary.artifact_prefix }}
+          shared-key: release-goreleaser
 
-      - name: Build
-        run: |
-          cargo build --release --locked \
-            --manifest-path "${{ matrix.binary.manifest }}" \
-            --bin "${{ matrix.binary.bin }}" \
-            --target "${{ matrix.platform.target }}"
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
 
-      - name: Package
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
+      - name: Export Rust version
+        run: echo "RUST_VERSION=$(rustc --version)" >> "${GITHUB_ENV}"
 
-          BINARY_NAME="${{ matrix.binary.bin }}"
-          ARTIFACT_PREFIX="${{ matrix.binary.artifact_prefix }}"
-          TAG="${{ github.ref_name }}"
-          ARTIFACT_NAME="${ARTIFACT_PREFIX}-${TAG}-${{ matrix.platform.os_name }}-${{ matrix.platform.arch }}"
-
-          cd "target/${{ matrix.platform.target }}/release"
-          tar czf "../../../dist/${ARTIFACT_NAME}.tar.gz" "${BINARY_NAME}"
-          cd -
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
         with:
-          name: ${{ matrix.binary.artifact_prefix }}-${{ matrix.platform.os_name }}-${{ matrix.platform.arch }}
-          if-no-files-found: error
-          path: |
-            dist/${{ matrix.binary.artifact_prefix }}-*.tar.gz
-
-  release:
-    name: Publish GitHub Release
-    needs: [build, e2e]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: artifacts
-
-      - name: Generate checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
-            | sort -z \
-            | xargs -0 sha256sum \
-            > SHA256SUMS.txt
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
-        with:
-          name: Release ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            artifacts/**/*.tar.gz
-            SHA256SUMS.txt
+          version: "~> v2"
+          args: release --clean --config .goreleaser.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

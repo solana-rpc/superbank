@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+
+version: 2
+
+builds:
+  - id: superbank
+    builder: rust
+    command: zigbuild
+    binary: superbank
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - aarch64-apple-darwin
+    flags:
+      - --release
+      - --locked
+      - --package=superbank
+      - --bin=superbank
+    env:
+      - SUPERBANK_GIT_SHA={{ .Commit }}
+
+  - id: superbank-rpc
+    builder: rust
+    command: zigbuild
+    binary: superbank-rpc
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - aarch64-apple-darwin
+    flags:
+      - --release
+      - --locked
+      - --all-features
+      - --package=superbank-rpc
+      - --bin=superbank-rpc
+    env:
+      - SUPERBANK_GIT_SHA={{ .Commit }}
+      - RUSTFLAGS=-C force-frame-pointers=yes
+
+archives:
+  - id: superbank
+    ids: [superbank]
+    name_template: superbank-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
+    formats: [tar.gz]
+    files: []
+
+  - id: superbank-rpc
+    ids: [superbank-rpc]
+    name_template: superbank-rpc-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
+    formats: [tar.gz]
+    files: []
+
+checksum:
+  name_template: SHA256SUMS.txt
+
+release:
+  name_template: "Release {{ .Tag }}"
+  header: |
+    rust {{ .Env.RUST_VERSION }}
+
+changelog:
+  sort: asc
+  use: github

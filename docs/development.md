@@ -225,8 +225,8 @@ nix develop -c tilt up --stream
 ### Tilt E2E CI profile
 
 The E2E workflow uses `../scripts/ci/release-e2e.sh` to run the same Tilt stack in GitHub CI.
-It can be run manually from GitHub Actions against any branch, and the release workflow calls it
-before publishing release assets for version tags. The script:
+It can be run manually from GitHub Actions against any branch, and the tag release workflow calls
+it before GoReleaser publishes release assets. The script:
 
 - creates a Kind cluster and configures the local registry via `../scripts/dev/setup-tilt.sh`
 - runs `tilt ci` so ClickHouse, the DDL Job, `superbank-rpc`, and the RPC ingest Job are all exercised
@@ -251,6 +251,20 @@ Manual branch run:
 ```bash
 gh workflow run e2e.yml --ref <branch-name>
 ```
+
+### Release flow
+
+Releases are tag-driven. Before cutting a release, update the workspace and member versions in
+`Cargo.toml` files, then create and push an annotated `vX.Y.Z` tag:
+
+```bash
+git tag -a v0.4.0 -m "Release v0.4.0"
+git push origin v0.4.0
+```
+
+The release workflow runs the Tilt E2E profile first, then GoReleaser builds both binaries for
+Linux amd64, Linux arm64, and Darwin arm64, publishes GitHub release notes, uploads `.tar.gz`
+archives, and generates `SHA256SUMS.txt`.
 
 ### Key environment variables
 

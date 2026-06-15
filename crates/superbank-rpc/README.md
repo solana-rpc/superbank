@@ -380,7 +380,7 @@ Response metric headers:
 - `X-Downstream-Timings` is removed and is no longer emitted.
   - This is a breaking change for clients that relied on that header.
   - Migrate to `X-Superbank-Metrics` and/or Prometheus metrics for downstream timing and volume data.
-  - Check release notes/changelog for rollout timing in your deployment version.
+  - Check GitHub release notes for rollout timing in your deployment version.
 
 Head cache activation metric:
 
