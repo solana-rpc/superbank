@@ -8,8 +8,9 @@ use clickhouse::{Client as ClickHouseClient, Row};
 use serde::{Deserialize, Serialize};
 use serde_big_array::Array;
 use serde_bytes::ByteBuf;
-use std::time::Instant;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 use crate::cli::Args;
 use crate::metrics;
@@ -212,6 +213,42 @@ pub(crate) async fn flush_buffers(
     }
 
     Ok(())
+}
+
+pub(crate) struct RetryConfig {
+    pub(crate) max_retries: u32,
+    pub(crate) base_ms: u64,
+    pub(crate) max_ms: u64,
+}
+
+pub(crate) async fn flush_buffers_with_retry(
+    client: &ClickHouseClient,
+    tables: &InsertTables,
+    transaction_rows: &mut Vec<TransactionRow>,
+    block_rows: &mut Vec<BlockMetadataRow>,
+    entry_rows: &mut Vec<EntryRow>,
+    progress: Option<ProgressSnapshot>,
+    retry: &RetryConfig,
+) -> Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match flush_buffers(client, tables, transaction_rows, block_rows, entry_rows, progress).await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < retry.max_retries => {
+                attempt += 1;
+                let delay_ms = retry.base_ms.saturating_mul(1u64 << (attempt - 1).min(62)).min(retry.max_ms);
+                warn!(
+                    attempt,
+                    max_retries = retry.max_retries,
+                    delay_ms,
+                    error = %err,
+                    "ClickHouse insert failed, retrying"
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn split_qualified_table(name: &str) -> Option<(&str, &str)> {

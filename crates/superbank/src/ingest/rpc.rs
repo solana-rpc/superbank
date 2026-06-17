@@ -40,8 +40,8 @@ use tracing::{info, warn};
 
 use crate::cli::{Args, FromSlotSpec};
 use crate::clickhouse::{
-    BlockMetadataRow, InsertTables, ProgressSnapshot, TransactionRow, build_clickhouse_client,
-    fetch_latest_slot_from_blocks, flush_buffers,
+    BlockMetadataRow, InsertTables, ProgressSnapshot, RetryConfig, TransactionRow,
+    build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers_with_retry,
 };
 use crate::commitment::parse_commitment_config;
 use crate::metrics;
@@ -341,6 +341,7 @@ async fn enqueue_flush(
     clickhouse: Arc<clickhouse::Client>,
     insert_tables: Arc<InsertTables>,
     batch: FlushBatch,
+    retry: Arc<RetryConfig>,
 ) -> Result<()> {
     let max_inflight = insert_concurrency.max(1);
     while insert_tasks.len() >= max_inflight {
@@ -353,13 +354,14 @@ async fn enqueue_flush(
         let mut transaction_rows = batch.transaction_rows;
         let mut block_rows = batch.block_rows;
         let mut entry_rows = Vec::new();
-        flush_buffers(
+        flush_buffers_with_retry(
             clickhouse.as_ref(),
             insert_tables.as_ref(),
             &mut transaction_rows,
             &mut block_rows,
             &mut entry_rows,
             batch.progress,
+            &retry,
         )
         .await
     });
@@ -480,6 +482,11 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
         range,
         start_time,
     } = args;
+    let retry_config = Arc::new(RetryConfig {
+        max_retries: cli_args.insert_max_retries,
+        base_ms: cli_args.insert_retry_base_ms,
+        max_ms: cli_args.insert_retry_max_ms,
+    });
     let mut transaction_rows: Vec<TransactionRow> =
         Vec::with_capacity(cli_args.transactions_flush_rows);
     let mut block_rows: Vec<BlockMetadataRow> = Vec::with_capacity(cli_args.blocks_flush_rows);
@@ -526,6 +533,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                         clickhouse.clone(),
                         insert_tables.clone(),
                         batch,
+                        retry_config.clone(),
                     )
                     .await?;
                     last_progress = None;
@@ -580,6 +588,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                                 clickhouse.clone(),
                                 insert_tables.clone(),
                                 batch,
+                                retry_config.clone(),
                             )
                             .await?;
                         }
@@ -595,6 +604,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                             clickhouse.clone(),
                             insert_tables.clone(),
                             batch,
+                            retry_config.clone(),
                         )
                         .await?;
                     }

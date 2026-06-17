@@ -26,8 +26,8 @@ use yellowstone_grpc_proto::prelude::{
 
 use crate::cli::{Args, FromSlotSpec};
 use crate::clickhouse::{
-    BlockMetadataRow, EntryRow, InsertTables, TransactionRow, build_clickhouse_client,
-    fetch_latest_slot_from_blocks, flush_buffers,
+    BlockMetadataRow, EntryRow, InsertTables, RetryConfig, TransactionRow, build_clickhouse_client,
+    fetch_latest_slot_from_blocks, flush_buffers, flush_buffers_with_retry,
 };
 use crate::commitment::parse_commitment_level;
 use crate::metrics;
@@ -120,6 +120,32 @@ impl BufferedRows {
         }
         Ok(())
     }
+
+    pub(crate) async fn flush_with_retry(
+        &mut self,
+        clickhouse: &ClickHouseClient,
+        insert_tables: &InsertTables,
+        retry: &RetryConfig,
+    ) -> Result<()> {
+        let flushed_block_slot = max_block_slot(&self.block_rows);
+        flush_buffers_with_retry(
+            clickhouse,
+            insert_tables,
+            &mut self.transaction_rows,
+            &mut self.block_rows,
+            &mut self.entry_rows,
+            None,
+            retry,
+        )
+        .await?;
+        if let Some(slot) = flushed_block_slot {
+            self.last_durable_block_slot = Some(
+                self.last_durable_block_slot
+                    .map_or(slot, |prev| prev.max(slot)),
+            );
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
@@ -147,6 +173,11 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
 
     let mut buffered_rows = BufferedRows::new(args);
     let insert_tables = InsertTables::from_args(args);
+    let retry_config = RetryConfig {
+        max_retries: args.insert_max_retries,
+        base_ms: args.insert_retry_base_ms,
+        max_ms: args.insert_retry_max_ms,
+    };
     let include_entries = args.entries_table.is_some();
 
     let mut flush_timer = interval(Duration::from_secs(args.flush_interval_secs));
@@ -219,7 +250,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                 break;
             }
             _ = flush_timer.tick() => {
-                buffered_rows.flush(&clickhouse, &insert_tables).await?;
+                buffered_rows.flush_with_retry(&clickhouse, &insert_tables, &retry_config).await?;
             }
             health_failure = health_failure_rx.recv() => {
                 let reason = health_failure
@@ -337,7 +368,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     }
     let shutdown_count = *shutdown_rx.borrow();
     tokio::select! {
-        result = buffered_rows.flush(&clickhouse, &insert_tables) => {
+        result = buffered_rows.flush_with_retry(&clickhouse, &insert_tables, &retry_config) => {
             result?;
         }
         _ = shutdown_rx.changed() => {
