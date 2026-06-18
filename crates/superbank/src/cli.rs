@@ -1241,9 +1241,6 @@ fn load_config(path: Option<&Path>) -> Result<Option<FileConfig>> {
         .with_context(|| format!("read config file {}", path.display()))?;
     let config = serde_yaml::from_str::<FileConfig>(&contents)
         .with_context(|| format!("parse config file {}", path.display()))?;
-    println!("Loaded config from {}", path.display());
-    println!("Config: {:#?}", config);
-    println!("CLI args override config file values if specified");
     Ok(Some(config))
 }
 
