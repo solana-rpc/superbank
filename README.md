@@ -169,6 +169,8 @@ curl -sS http://localhost:8899 \
 - `superbank` supports YAML config, CLI flags, and environment variables.
   Precedence is: flags > env > config file > defaults.
   See `crates/superbank/README.md` and `superbank.example.yaml`.
+  Fumarole ingest includes a default memory soft-limit backpressure guard; set
+  `fumarole-memory-soft-limit-bytes: 0` only if you want to disable it.
 - `superbank-rpc` is configured via CLI flags and environment variables.
   See `crates/superbank-rpc/README.md`.
 

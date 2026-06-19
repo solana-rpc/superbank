@@ -6317,6 +6317,7 @@ dependencies = [
  "once_cell",
  "prometheus-client",
  "prometheus-client-derive-encode",
+ "prost 0.14.3",
  "prost-types 0.14.3",
  "reqwest 0.12.28",
  "serde",

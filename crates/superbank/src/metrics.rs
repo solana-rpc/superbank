@@ -66,6 +66,11 @@ pub(crate) struct Metrics {
     inserted_slots_total: Counter,
     inserted_transactions_total: Counter,
     fumarole_data_channel_capacity: Gauge,
+    fumarole_memory_soft_limit_bytes: Gauge,
+    fumarole_buffered_bytes: Gauge,
+    fumarole_pending_slots: Gauge,
+    fumarole_rss_bytes: Gauge,
+    fumarole_pressure_flushes_total: Counter,
     last_successful_flush_timestamp_seconds: Gauge,
     flush_duration_seconds: Family<TableLabels, Histogram>,
     flush_rows_total: Family<TableLabels, Counter>,
@@ -84,6 +89,11 @@ impl Metrics {
         let inserted_slots_total = Counter::default();
         let inserted_transactions_total = Counter::default();
         let fumarole_data_channel_capacity = Gauge::default();
+        let fumarole_memory_soft_limit_bytes = Gauge::default();
+        let fumarole_buffered_bytes = Gauge::default();
+        let fumarole_pending_slots = Gauge::default();
+        let fumarole_rss_bytes = Gauge::default();
+        let fumarole_pressure_flushes_total = Counter::default();
         let last_successful_flush_timestamp_seconds = Gauge::default();
         let flush_duration_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
@@ -141,6 +151,31 @@ impl Metrics {
             fumarole_data_channel_capacity.clone(),
         );
         registry_for_metrics.register(
+            "ingest_fumarole_memory_soft_limit_bytes",
+            "Configured Fumarole memory pressure soft limit in bytes; zero disables the guard",
+            fumarole_memory_soft_limit_bytes.clone(),
+        );
+        registry_for_metrics.register(
+            "ingest_fumarole_buffered_bytes",
+            "Estimated bytes buffered by the Superbank Fumarole block assembler",
+            fumarole_buffered_bytes.clone(),
+        );
+        registry_for_metrics.register(
+            "ingest_fumarole_pending_slots",
+            "Slots currently pending in the Superbank Fumarole block assembler",
+            fumarole_pending_slots.clone(),
+        );
+        registry_for_metrics.register(
+            "ingest_fumarole_rss_bytes",
+            "Latest sampled process resident set size in bytes used by the Fumarole pressure guard",
+            fumarole_rss_bytes.clone(),
+        );
+        registry_for_metrics.register(
+            "ingest_fumarole_pressure_flushes_total",
+            "Total ClickHouse flushes triggered by the Fumarole memory pressure guard",
+            fumarole_pressure_flushes_total.clone(),
+        );
+        registry_for_metrics.register(
             "ingest_last_successful_flush_timestamp_seconds",
             "Unix timestamp of the last successful ClickHouse flush",
             last_successful_flush_timestamp_seconds.clone(),
@@ -181,6 +216,11 @@ impl Metrics {
             inserted_slots_total,
             inserted_transactions_total,
             fumarole_data_channel_capacity,
+            fumarole_memory_soft_limit_bytes,
+            fumarole_buffered_bytes,
+            fumarole_pending_slots,
+            fumarole_rss_bytes,
+            fumarole_pressure_flushes_total,
             last_successful_flush_timestamp_seconds,
             flush_duration_seconds,
             flush_rows_total,
@@ -224,6 +264,26 @@ impl Metrics {
     fn set_fumarole_data_channel_capacity(&self, capacity: usize) {
         self.fumarole_data_channel_capacity
             .set(clamp_usize(capacity));
+    }
+
+    fn set_fumarole_memory_soft_limit_bytes(&self, bytes: u64) {
+        self.fumarole_memory_soft_limit_bytes.set(clamp_i64(bytes));
+    }
+
+    fn set_fumarole_buffered_bytes(&self, bytes: u64) {
+        self.fumarole_buffered_bytes.set(clamp_i64(bytes));
+    }
+
+    fn set_fumarole_pending_slots(&self, slots: usize) {
+        self.fumarole_pending_slots.set(clamp_usize(slots));
+    }
+
+    fn set_fumarole_rss_bytes(&self, bytes: u64) {
+        self.fumarole_rss_bytes.set(clamp_i64(bytes));
+    }
+
+    fn observe_fumarole_pressure_flush(&self) {
+        self.fumarole_pressure_flushes_total.inc();
     }
 
     fn observe_flush_duration(&self, table: &str, elapsed_seconds: f64) {
@@ -325,6 +385,26 @@ pub(crate) fn observe_transaction_insert(table: &str, rows: usize) {
 
 pub(crate) fn set_fumarole_data_channel_capacity(capacity: usize) {
     metrics().set_fumarole_data_channel_capacity(capacity);
+}
+
+pub(crate) fn set_fumarole_memory_soft_limit_bytes(bytes: u64) {
+    metrics().set_fumarole_memory_soft_limit_bytes(bytes);
+}
+
+pub(crate) fn set_fumarole_buffered_bytes(bytes: u64) {
+    metrics().set_fumarole_buffered_bytes(bytes);
+}
+
+pub(crate) fn set_fumarole_pending_slots(slots: usize) {
+    metrics().set_fumarole_pending_slots(slots);
+}
+
+pub(crate) fn set_fumarole_rss_bytes(bytes: u64) {
+    metrics().set_fumarole_rss_bytes(bytes);
+}
+
+pub(crate) fn observe_fumarole_pressure_flush() {
+    metrics().observe_fumarole_pressure_flush();
 }
 
 pub(crate) fn observe_flush_duration(table: &str, elapsed_seconds: f64) {

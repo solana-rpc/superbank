@@ -24,6 +24,7 @@ grpc-slot-notifications: true
 # fumarole-data-plane-tcp-connections: 4
 # fumarole-concurrent-download-limit-per-tcp: 2
 # fumarole-data-channel-capacity: 4096
+# fumarole-memory-soft-limit-bytes: 25769803776 # 24 GiB; set 0 to disable
 # fumarole-commit-interval-secs: 10
 # fumarole-no-commit: false
 
