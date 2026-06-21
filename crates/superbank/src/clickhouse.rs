@@ -526,5 +526,6 @@ mod tests {
         assert_eq!(split_qualified_table(".transactions"), None);
         assert_eq!(split_qualified_table("default."), None);
         assert_eq!(split_qualified_table("a.b.c"), None);
+        assert_eq!(split_qualified_table(""), None);
     }
 }
