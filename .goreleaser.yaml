@@ -4,6 +4,7 @@ version: 2
 
 git:
   ignore_tags:
+    - "v*-solparq"
     - "solparq-v*"
 
 builds:

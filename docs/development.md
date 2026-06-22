@@ -268,11 +268,11 @@ archives, and generates `SHA256SUMS.txt`.
 
 `solparq` releases are tagged independently from the main Superbank release line. Before cutting a
 `solparq` release, update `crates/solparq/Cargo.toml`, then create and push an annotated
-`solparq-vX.Y.Z` tag:
+`vX.Y.Z-solparq` tag:
 
 ```bash
-git tag -a solparq-v0.1.0 -m "Release solparq v0.1.0"
-git push origin solparq-v0.1.0
+git tag -a v0.1.0-solparq -m "Release solparq v0.1.0"
+git push origin v0.1.0-solparq
 ```
 
 The `Release solparq` workflow uses `.goreleaser.solparq.yaml` and publishes only the `solparq`

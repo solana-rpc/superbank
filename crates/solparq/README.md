@@ -32,7 +32,7 @@ cargo run -p solparq -- --version
 ## Release
 
 `solparq` is released independently from the main Superbank binaries. The
-release workflow is triggered by tags named `solparq-vX.Y.Z` and uses
+release workflow is triggered by tags named `vX.Y.Z-solparq` and uses
 `.goreleaser.solparq.yaml`.
 
 Before tagging, update the package version in `crates/solparq/Cargo.toml`,
@@ -47,8 +47,8 @@ git push origin <branch-name>
 Then create and push the annotated release tag:
 
 ```bash
-git tag -a solparq-v0.1.0 -m "Release solparq v0.1.0"
-git push origin solparq-v0.1.0
+git tag -a v0.1.0-solparq -m "Release solparq v0.1.0"
+git push origin v0.1.0-solparq
 ```
 
 The tag must point at a commit that already contains

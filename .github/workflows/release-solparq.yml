@@ -3,7 +3,7 @@ name: Release solparq
 on:
   push:
     tags:
-      - "solparq-v*"
+      - "v*-solparq"
 
 concurrency:
   group: release-solparq-${{ github.ref }}

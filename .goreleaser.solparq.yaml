@@ -4,7 +4,8 @@ version: 2
 
 git:
   ignore_tags:
-    - "v*"
+    - "v[0-9]*.[0-9]*.[0-9]"
+    - "solparq-v*"
 
 builds:
   - id: solparq
@@ -25,15 +26,15 @@ builds:
 archives:
   - id: solparq
     ids: [solparq]
-    name_template: solparq-{{ trimprefix .Tag "solparq-" }}-{{ .Os }}-{{ .Arch }}
+    name_template: solparq-{{ trimsuffix .Tag "-solparq" }}-{{ .Os }}-{{ .Arch }}
     formats: [tar.gz]
     files: []
 
 checksum:
-  name_template: solparq-{{ trimprefix .Tag "solparq-" }}-SHA256SUMS.txt
+  name_template: solparq-{{ trimsuffix .Tag "-solparq" }}-SHA256SUMS.txt
 
 release:
-  name_template: 'Solparq {{ trimprefix .Tag "solparq-" }}'
+  name_template: 'Solparq {{ trimsuffix .Tag "-solparq" }}'
   header: |
     rust {{ .Env.RUST_VERSION }}
 
