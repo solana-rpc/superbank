@@ -20,13 +20,13 @@ hourly_988_427236024-427245023.parquet
 From the repository root:
 
 ```bash
-cargo build --manifest-path solparq/Cargo.toml --release
+cargo build -p solparq --release
 ```
 
 ## One-Shot Local Archive
 
 ```bash
-cargo run --manifest-path solparq/Cargo.toml -- \
+cargo run -p solparq -- \
   --db-server 192.168.0.184 \
   --db-user admin \
   --db-password 'change-me' \
@@ -53,7 +53,7 @@ This works with S3-compatible endpoints, including Backblaze-style custom
 endpoints.
 
 ```bash
-cargo run --manifest-path solparq/Cargo.toml -- \
+cargo run -p solparq -- \
   --db-server 192.168.0.184 \
   --db-user admin \
   --db-password 'change-me' \
@@ -77,7 +77,7 @@ s3://<bucket>/<bucket-path>/<archive-type>/<archive-name>
 Server mode runs continuously and can process multiple archive range types.
 
 ```bash
-cargo run --manifest-path solparq/Cargo.toml -- \
+cargo run -p solparq -- \
   --db-server 192.168.0.184 \
   --db-user admin \
   --db-password 'change-me' \

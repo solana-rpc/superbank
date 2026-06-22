@@ -8,12 +8,14 @@ publish = false
 
 [workspace]
 members = [
+    "crates/solparq",
     "crates/superbank",
     "crates/superbank-rpc",
 ]
 
 resolver = "2"
 default-members = [
+    "crates/solparq",
     "crates/superbank",
     "crates/superbank-rpc",
 ]

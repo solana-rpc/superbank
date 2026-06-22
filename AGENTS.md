@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), and `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`).
+- Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`), and `crates/solparq/` (ClickHouse-to-Parquet archiver; bin: `solparq`).
 - ClickHouse DDL: `ddl/`
 - Load tests: `tests/k6/`
 - Helper scripts: `scripts/`
@@ -13,7 +13,7 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
 
 ## Build, Test, and Development Commands
 - Build (release):
-  `cargo build --release -p superbank -p superbank-rpc`
+  `cargo build --release -p superbank -p superbank-rpc -p solparq`
 - Run ingestor with local config:
   `cargo run -p superbank -- --config superbank.yaml`
 - Run RPC server (local ClickHouse):
