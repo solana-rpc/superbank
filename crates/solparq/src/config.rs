@@ -164,7 +164,10 @@ impl Config {
 }
 
 #[derive(Parser, Debug)]
-#[command(about = "Archive Superbank ClickHouse transactions to Parquet")]
+#[command(
+    version,
+    about = "Archive Superbank ClickHouse transactions to Parquet"
+)]
 struct Cli {
     #[arg(long, env = "SOLPARQ_DB_SERVER")]
     db_server: String,

@@ -266,6 +266,18 @@ The release workflow runs the Tilt E2E profile first, then GoReleaser builds bot
 Linux amd64 and Linux arm64, publishes GitHub release notes, uploads `.tar.gz`
 archives, and generates `SHA256SUMS.txt`.
 
+`solparq` releases are tagged independently from the main Superbank release line. Before cutting a
+`solparq` release, update `crates/solparq/Cargo.toml`, then create and push an annotated
+`solparq-vX.Y.Z` tag:
+
+```bash
+git tag -a solparq-v0.1.0 -m "Release solparq v0.1.0"
+git push origin solparq-v0.1.0
+```
+
+The `Release solparq` workflow uses `.goreleaser.solparq.yaml` and publishes only the `solparq`
+Linux amd64 and Linux arm64 archives.
+
 ### Key environment variables
 
 Setup script (`../scripts/dev/setup-tilt.sh`):

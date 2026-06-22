@@ -23,6 +23,58 @@ From the repository root:
 cargo build -p solparq --release
 ```
 
+Check the packaged version with:
+
+```bash
+cargo run -p solparq -- --version
+```
+
+## Release
+
+`solparq` is released independently from the main Superbank binaries. The
+release workflow is triggered by tags named `solparq-vX.Y.Z` and uses
+`.goreleaser.solparq.yaml`.
+
+Before tagging, update the package version in `crates/solparq/Cargo.toml`,
+commit all solparq release changes, and push the branch:
+
+```bash
+git add crates/solparq .goreleaser.solparq.yaml .github/workflows/release-solparq.yml
+git commit -m "Release solparq v0.1.0"
+git push origin <branch-name>
+```
+
+Then create and push the annotated release tag:
+
+```bash
+git tag -a solparq-v0.1.0 -m "Release solparq v0.1.0"
+git push origin solparq-v0.1.0
+```
+
+The tag must point at a commit that already contains
+`.github/workflows/release-solparq.yml` and `.goreleaser.solparq.yaml`; Git tags
+do not include uncommitted working-tree changes.
+
+The workflow builds Linux binaries for:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+
+and publishes GitHub Release assets similar to:
+
+```text
+solparq-v0.1.0-linux-amd64.tar.gz
+solparq-v0.1.0-linux-arm64.tar.gz
+solparq-v0.1.0-SHA256SUMS.txt
+```
+
+To verify the release packaging locally without publishing:
+
+```bash
+goreleaser check --config .goreleaser.solparq.yaml
+goreleaser release --snapshot --clean --config .goreleaser.solparq.yaml
+```
+
 ## One-Shot Local Archive
 
 ```bash

@@ -2,6 +2,10 @@
 
 version: 2
 
+git:
+  ignore_tags:
+    - "solparq-v*"
+
 builds:
   - id: superbank
     builder: rust
@@ -35,21 +39,6 @@ builds:
       - SUPERBANK_GIT_SHA={{ .Commit }}
       - RUSTFLAGS=-C force-frame-pointers=yes
 
-  - id: solparq
-    builder: rust
-    command: zigbuild
-    binary: solparq
-    targets:
-      - x86_64-unknown-linux-gnu
-      - aarch64-unknown-linux-gnu
-    flags:
-      - --release
-      - --locked
-      - --package=solparq
-      - --bin=solparq
-    env:
-      - SUPERBANK_GIT_SHA={{ .Commit }}
-
 archives:
   - id: superbank
     ids: [superbank]
@@ -60,12 +49,6 @@ archives:
   - id: superbank-rpc
     ids: [superbank-rpc]
     name_template: superbank-rpc-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
-    formats: [tar.gz]
-    files: []
-
-  - id: solparq
-    ids: [solparq]
-    name_template: solparq-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
     formats: [tar.gz]
     files: []
 

@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+
+version: 2
+
+git:
+  ignore_tags:
+    - "v*"
+
+builds:
+  - id: solparq
+    builder: rust
+    command: zigbuild
+    binary: solparq
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+      - --package=solparq
+      - --bin=solparq
+    env:
+      - SUPERBANK_GIT_SHA={{ .Commit }}
+
+archives:
+  - id: solparq
+    ids: [solparq]
+    name_template: solparq-{{ trimprefix .Tag "solparq-" }}-{{ .Os }}-{{ .Arch }}
+    formats: [tar.gz]
+    files: []
+
+checksum:
+  name_template: solparq-{{ trimprefix .Tag "solparq-" }}-SHA256SUMS.txt
+
+release:
+  name_template: 'Solparq {{ trimprefix .Tag "solparq-" }}'
+  header: |
+    rust {{ .Env.RUST_VERSION }}
+
+changelog:
+  sort: asc
+  use: github

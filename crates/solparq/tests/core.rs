@@ -1,4 +1,4 @@
-use std::{fs, str::FromStr};
+use std::{fs, process::Command, str::FromStr};
 
 use solparq::{
     archive::{ArchiveKind, ArchiveRunReport, ClickHouseBounds, plan_next_archive},
@@ -113,6 +113,25 @@ fn config_rejects_multiple_archive_types_outside_server_mode() {
         err.to_string()
             .contains("multiple archive range types require --server-mode"),
         "{err}"
+    );
+}
+
+#[test]
+fn binary_reports_crate_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_solparq"))
+        .arg("--version")
+        .output()
+        .expect("run solparq --version");
+
+    assert!(
+        output.status.success(),
+        "solparq --version failed with status {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("solparq ", env!("CARGO_PKG_VERSION"))
     );
 }
 

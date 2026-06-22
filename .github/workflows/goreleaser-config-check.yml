@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - .goreleaser.yaml
+      - .goreleaser.solparq.yaml
   workflow_dispatch:
 
 permissions:
@@ -28,5 +29,8 @@ jobs:
           version: "~> v2"
           install-only: true
 
-      - name: Check config
+      - name: Check main config
         run: goreleaser check --config .goreleaser.yaml
+
+      - name: Check solparq config
+        run: goreleaser check --config .goreleaser.solparq.yaml

@@ -43,7 +43,7 @@ jobs:
             crates/solparq \
             Cargo.toml \
             Cargo.lock \
-            .goreleaser.yaml \
+            .goreleaser.solparq.yaml \
             | grep -q .; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -83,8 +83,12 @@ jobs:
           version: "~> v2"
           install-only: true
 
-      - name: Build snapshot artifacts
+      - name: Build main snapshot artifacts
         run: goreleaser build --snapshot --clean --config .goreleaser.yaml
+
+      - name: Build solparq snapshot artifacts
+        if: github.event_name != 'push' || steps.solparq_changes.outputs.changed == 'true'
+        run: goreleaser build --snapshot --clean --config .goreleaser.solparq.yaml
 
       - name: Upload solparq snapshot artifacts
         if: github.event_name == 'workflow_dispatch' || steps.solparq_changes.outputs.changed == 'true'
