@@ -169,6 +169,7 @@ async fn status(State(ops): State<OpsState>) -> Json<serde_json::Value> {
             "ops_port": ops.config.ops_port,
             "metrics_port": ops.config.metrics_port,
             "archives_to_keep": ops.config.archives_to_keep,
+            "continue_from_last_archive": ops.config.continue_from_last_archive,
             "delete_archived_data_range": ops.config.delete_archived_data_range,
             "force_archive": ops.config.force_archive,
             "archive_check_interval_secs": ops.config.archive_check_interval_secs
@@ -312,6 +313,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
           <tr><th>Transactions table</th><td><code>{transactions_table}</code></td></tr>
           <tr><th>Blocks table</th><td><code>{blocks_table}</code></td></tr>
           <tr><th>Archives to keep</th><td>{archives_to_keep}</td></tr>
+          <tr><th>Continue from last archive</th><td>{continue_from_last_archive}</td></tr>
           <tr><th>Check interval</th><td>{check_interval} seconds</td></tr>
           <tr><th>Skipped</th><td>{archives_skipped}</td></tr>
           <tr><th>Errors</th><td>{archive_errors}</td></tr>
@@ -336,6 +338,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         transactions_table = html_escape(&config.transactions_table),
         blocks_table = html_escape(&config.blocks_table),
         archives_to_keep = format_u64(config.archives_to_keep as u64),
+        continue_from_last_archive = config.continue_from_last_archive,
         check_interval = format_u64(config.archive_check_interval_secs),
         archives_skipped = format_u64(status.archives_skipped),
         archive_errors = format_u64(status.archive_errors),

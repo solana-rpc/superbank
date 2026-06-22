@@ -155,12 +155,13 @@ pub fn plan_next_archive(
     kind: ArchiveKind,
     bounds: ClickHouseBounds,
     last_archive_name: Option<&str>,
+    continue_from_last_archive: bool,
 ) -> Result<Option<ArchivePlan>> {
     if bounds.latest_slot < bounds.earliest_slot {
         return Ok(None);
     }
 
-    let start_slot = match last_archive_name {
+    let start_slot = match last_archive_name.filter(|_| continue_from_last_archive) {
         Some(file_name) => {
             let parsed = parse_archive_name(file_name)
                 .ok_or_else(|| anyhow!("unable to parse last archive name '{file_name}'"))?;
@@ -330,9 +331,23 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
     debug!(
         archive_kind = kind.to_string(),
         last_archive = last_archive.as_deref().unwrap_or("none"),
+        continue_from_last_archive = config.continue_from_last_archive,
         "loaded latest archive state"
     );
-    let Some(plan) = plan_next_archive(kind, bounds, last_archive.as_deref())? else {
+    if !config.continue_from_last_archive {
+        info!(
+            archive_kind = kind.to_string(),
+            last_archive = last_archive.as_deref().unwrap_or("none"),
+            "archive continuation disabled; planning from oldest ClickHouse slot"
+        );
+    }
+    let Some(plan) = plan_next_archive(
+        kind,
+        bounds,
+        last_archive.as_deref(),
+        config.continue_from_last_archive,
+    )?
+    else {
         let mut report = ArchiveRunReport::skipped(
             kind,
             destination.describe(),

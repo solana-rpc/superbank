@@ -45,6 +45,7 @@ pub struct Config {
     pub archives_to_keep: usize,
     pub solana_rpc_url: String,
     pub archive_check_interval_secs: u64,
+    pub continue_from_last_archive: bool,
     pub log_file: Option<PathBuf>,
     pub verbose: u8,
 }
@@ -139,6 +140,7 @@ impl Config {
             archives_to_keep: cli.archives_to_keep,
             solana_rpc_url: cli.solana_rpc_url,
             archive_check_interval_secs: cli.archive_check_interval_secs,
+            continue_from_last_archive: !cli.no_continue_from_last_archive,
             log_file: cli.log_file,
             verbose: cli.verbose,
         })
@@ -320,6 +322,13 @@ struct Cli {
         default_value_t = 60
     )]
     archive_check_interval_secs: u64,
+
+    #[arg(
+        long = "no-continue-from-last-archive",
+        env = "SOLPARQ_NO_CONTINUE_FROM_LAST_ARCHIVE",
+        default_value_t = false
+    )]
+    no_continue_from_last_archive: bool,
 
     #[arg(long = "log-file", env = "SOLPARQ_LOG_FILE", value_name = "PATH")]
     log_file: Option<PathBuf>,

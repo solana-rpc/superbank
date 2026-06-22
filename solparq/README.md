@@ -104,6 +104,15 @@ which archive type is being checked, when a task is ready to run, when an
 archive is created, and why a task is skipped. Use `-v` for more detail about
 archive state and validation counts, or `-vv` for trace-level logs.
 
+By default, each archive type continues from the highest existing archive of
+that same type. If no archive exists for that type, `solparq` starts from the
+oldest transaction slot available in ClickHouse. To ignore existing archives and
+plan from the oldest ClickHouse slot at startup, use:
+
+```bash
+--no-continue-from-last-archive
+```
+
 To mirror logs to a file as well as the terminal:
 
 ```bash
@@ -200,6 +209,10 @@ Common defaults:
 - `--archives-to-keep 5`
 - `--ops-port 30303`
 - `--metrics-port 31313`
+- `--no-continue-from-last-archive` unset
 - `--log-file` unset
 
 Use `-v` for debug logs and `-vv` for trace logs. `RUST_LOG` is also honored.
+
+Environment variables are available for the new startup behavior as
+`SOLPARQ_NO_CONTINUE_FROM_LAST_ARCHIVE`.

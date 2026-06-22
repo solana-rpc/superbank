@@ -18,6 +18,7 @@ fn hourly_plan_uses_prompt_filename_convention() {
             latest_slot: 427_245_023,
         },
         None,
+        true,
     )
     .expect("plan should succeed")
     .expect("enough slots are available");
@@ -38,6 +39,7 @@ fn epoch_plan_aligns_to_epoch_boundary_after_earliest_available_slot() {
             latest_slot: 427_247_999,
         },
         None,
+        true,
     )
     .expect("plan should succeed")
     .expect("enough slots are available");
@@ -58,6 +60,7 @@ fn custom_plan_defaults_to_one_thousand_slots_and_continues_after_last_archive()
             latest_slot: 12_999,
         },
         Some("custom_0_10000-10999.parquet"),
+        true,
     )
     .expect("plan should succeed")
     .expect("enough slots are available");
@@ -66,6 +69,27 @@ fn custom_plan_defaults_to_one_thousand_slots_and_continues_after_last_archive()
     assert_eq!(plan.start_slot, 11_000);
     assert_eq!(plan.end_slot, 11_999);
     assert_eq!(plan.file_name(), "custom_0_11000-11999.parquet");
+}
+
+#[test]
+fn plan_can_start_from_oldest_slot_when_continuation_is_disabled() {
+    let kind = ArchiveKind::Custom { slots: 1_000 };
+    let plan = plan_next_archive(
+        kind,
+        ClickHouseBounds {
+            earliest_slot: 10_000,
+            latest_slot: 12_999,
+        },
+        Some("custom_0_10000-10999.parquet"),
+        false,
+    )
+    .expect("plan should succeed")
+    .expect("enough slots are available");
+
+    assert_eq!(plan.kind, kind);
+    assert_eq!(plan.start_slot, 10_000);
+    assert_eq!(plan.end_slot, 10_999);
+    assert_eq!(plan.file_name(), "custom_0_10000-10999.parquet");
 }
 
 #[test]
@@ -270,6 +294,39 @@ fn config_accepts_optional_log_file() {
 }
 
 #[test]
+fn config_continues_from_last_archive_by_default_and_can_disable_it() {
+    let default_config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "hourly",
+    ])
+    .expect("valid config");
+
+    let disabled_config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "hourly",
+        "--no-continue-from-last-archive",
+    ])
+    .expect("valid config");
+
+    assert!(default_config.continue_from_last_archive);
+    assert!(!disabled_config.continue_from_last_archive);
+}
+
+#[test]
 fn utc_timestamp_formatter_is_human_readable() {
     assert_eq!(format_utc_timestamp(Some(0)), "1970-01-01 00:00:00 UTC");
     assert_eq!(format_utc_timestamp(None), "never");
@@ -366,6 +423,7 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
     assert!(html.contains("1,000"));
     assert!(html.contains("2023-11-14 22:13:20 UTC"));
     assert!(html.contains("Archive timeline"));
+    assert!(html.contains("Continue from last archive"));
     assert!(html.contains("<svg"));
     assert!(html.contains("custom_0_10-1009.parquet"));
 }
