@@ -200,6 +200,17 @@ pub fn plan_next_archive(
     }))
 }
 
+pub fn should_delete_archived_data_range(config: &Config, kind: ArchiveKind) -> bool {
+    config.delete_archived_data_range
+        && config
+            .archive_kinds
+            .iter()
+            .map(|archive_kind| archive_kind.slot_count())
+            .max()
+            .map(|max_slots| kind.slot_count() == max_slots)
+            .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveRunReport {
     pub timestamp_unix: u64,
@@ -278,8 +289,20 @@ impl ArchiveRunReport {
                 validation.missing_blocks.len()
             ));
             lines.push(format!(
+                "validation_missing_block_ranges: {}",
+                ValidationReport::format_ranges(&validation.missing_block_ranges)
+            ));
+            lines.push(format!(
+                "validation_not_produced_slot_ranges: {}",
+                ValidationReport::format_ranges(&validation.not_produced_slot_ranges)
+            ));
+            lines.push(format!(
                 "validation_transaction_mismatches: {}",
                 validation.transaction_mismatches.len()
+            ));
+            lines.push(format!(
+                "validation_transaction_mismatch_ranges: {}",
+                ValidationReport::format_ranges(&validation.transaction_mismatch_ranges)
             ));
             if let Some(error) = &validation.rpc_check_error {
                 lines.push(format!("validation_rpc_check_error: {error}"));
@@ -309,7 +332,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         "checking ClickHouse archive source"
     );
     client
-        .check_tables(&tables, config.delete_archived_data_range)
+        .check_tables(&tables, should_delete_archived_data_range(config, kind))
         .await?;
 
     let Some(bounds) = client.fetch_bounds(&tables.transactions_table).await? else {
@@ -379,6 +402,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or("none"),
         "archive validation completed"
     );
+    log_validation_gaps(kind, &validation);
     if validation.has_warnings() && !config.force_archive {
         if config.server_mode {
             let mut report = ArchiveRunReport::skipped(
@@ -443,7 +467,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
     }
 
     let mut deleted_clickhouse_range = false;
-    if config.delete_archived_data_range {
+    if should_delete_archived_data_range(config, kind) {
         info!(
             archive_kind = kind.to_string(),
             start_slot = plan.start_slot,
@@ -454,6 +478,18 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             .delete_archived_range(&tables, plan.start_slot, plan.end_slot)
             .await?;
         deleted_clickhouse_range = true;
+    } else if config.delete_archived_data_range {
+        info!(
+            archive_kind = kind.to_string(),
+            archive_slots = kind.slot_count(),
+            max_configured_archive_slots = config
+                .archive_kinds
+                .iter()
+                .map(|archive_kind| archive_kind.slot_count())
+                .max()
+                .unwrap_or(kind.slot_count()),
+            "deferring ClickHouse data cleanup until largest configured archive type completes"
+        );
     }
 
     let cleaned_archives = storage::cleanup_archives(config, kind).await?;
@@ -480,6 +516,22 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         "archive task completed"
     );
     Ok(report)
+}
+
+fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {
+    info!(
+        archive_kind = kind.to_string(),
+        missing_block_gap_count = validation.missing_block_ranges.len(),
+        missing_block_ranges = ValidationReport::format_ranges(&validation.missing_block_ranges),
+        not_produced_gap_count = validation.not_produced_slot_ranges.len(),
+        not_produced_slot_ranges =
+            ValidationReport::format_ranges(&validation.not_produced_slot_ranges),
+        transaction_mismatch_gap_count = validation.transaction_mismatch_ranges.len(),
+        transaction_mismatch_ranges =
+            ValidationReport::format_ranges(&validation.transaction_mismatch_ranges),
+        rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or("none"),
+        "archive validation gap summary"
+    );
 }
 
 fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport) -> Result<bool> {

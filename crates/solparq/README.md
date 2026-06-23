@@ -156,6 +156,16 @@ which archive type is being checked, when a task is ready to run, when an
 archive is created, and why a task is skipped. Use `-v` for more detail about
 archive state and validation counts, or `-vv` for trace-level logs.
 
+Before creating an archive, validation logs a gap summary even when
+`--force-archive` is set. The summary includes:
+
+- `missing_block_ranges`: produced Solana slots missing from `blocks_metadata`;
+  these need backfill.
+- `not_produced_slot_ranges`: slots not returned by Solana `getBlocks`; these
+  are expected leader/production gaps.
+- `transaction_mismatch_ranges`: slots where block transaction counts do not
+  match transaction rows.
+
 By default, each archive type continues from the highest existing archive of
 that same type. If no archive exists for that type, `solparq` starts from the
 oldest transaction slot available in ClickHouse. To ignore existing archives and
@@ -173,7 +183,8 @@ To mirror logs to a file as well as the terminal:
 
 The ops dashboard refreshes every 30 seconds. It shows human-readable UTC
 timestamps for last run and last success, the number of transaction slots
-available in ClickHouse, startup settings, and a color-coded archive timeline.
+available in ClickHouse, startup settings, skip reasons, known data gaps, and a
+color-coded archive timeline.
 
 On shutdown, `solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
 shutdown signal stops new archive tasks from starting and waits for any archive
@@ -235,6 +246,11 @@ To delete the archived ClickHouse data range after a successful archive:
 ```bash
 --delete-archived-data-range
 ```
+
+When multiple archive types are configured, ClickHouse data deletion only runs
+after the archive type with the largest slot range completes. For example, if
+`custom:500` and `hourly` are both configured, `custom:500` archives will not
+delete ClickHouse rows; deletion waits until the `hourly` archive succeeds.
 
 That deletes matching slots from:
 

@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     archive,
     config::Config,
-    metrics::{AppState, ArchiveEvent, PublicStatus},
+    metrics::{AppState, ArchiveEvent, KnownDataGap, PublicStatus},
 };
 
 type ArchiveRunFuture = Pin<Box<dyn Future<Output = Result<archive::ArchiveRunReport>> + Send>>;
@@ -406,6 +406,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         .unwrap_or_else(|| "unknown".to_string());
     let timeline = render_timeline(&status.recent_events);
     let event_rows = render_event_rows(&status.recent_events);
+    let gap_rows = render_gap_rows(&status.known_gaps);
     format!(
         r#"<!doctype html>
 <html>
@@ -452,9 +453,11 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     tr:last-child th, tr:last-child td {{ border-bottom: 0; }}
     .timeline svg {{ width: 100%; height: auto; display: block; }}
     .events {{ margin-top: 12px; max-height: 260px; overflow: auto; border-top: 1px solid var(--line); }}
-    .event {{ display: grid; grid-template-columns: 164px 78px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14px; }}
+    .event {{ display: grid; grid-template-columns: 164px 142px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14px; }}
     .event:last-child {{ border-bottom: 0; }}
     .badge {{ display: inline-flex; justify-content: center; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; color: #fff; }}
+    .gaps {{ overflow: auto; }}
+    .gaps table {{ min-width: 760px; }}
     .created {{ background: var(--green); }}
     .skipped {{ background: var(--amber); }}
     .error {{ background: var(--red); }}
@@ -509,6 +512,10 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         </table>
       </section>
     </div>
+    <section class="gaps">
+      <h2>Known data gaps</h2>
+      {gap_rows}
+    </section>
   </main>
 </body>
 </html>"#,
@@ -520,6 +527,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         last_success = html_escape(&format_utc_timestamp(status.last_success_at_unix)),
         timeline = timeline,
         event_rows = event_rows,
+        gap_rows = gap_rows,
         archive_types = html_escape(&archive_types),
         location = html_escape(&format!("{:?}", config.archive_location)),
         output = html_escape(&config.output_location.display().to_string()),
@@ -601,16 +609,52 @@ fn render_event_rows(events: &[ArchiveEvent]) -> String {
                 .as_deref()
                 .or(event.reason.as_deref())
                 .unwrap_or("");
+            let badge_label = match (&event.outcome, &event.skip_reason_code) {
+                (outcome, Some(skip_reason_code)) if outcome == "skipped" => {
+                    format!("{outcome}: {skip_reason_code}")
+                }
+                (outcome, _) => outcome.clone(),
+            };
             format!(
                 "<div class=\"event\"><div>{}</div><div><span class=\"badge {}\">{}</span></div><div><strong>{}</strong> {}</div></div>",
                 html_escape(&format_utc_timestamp(Some(event.timestamp_unix))),
                 html_escape(&event.outcome),
-                html_escape(&event.outcome),
+                html_escape(&badge_label),
                 html_escape(&event.archive_kind),
                 html_escape(detail)
             )
         })
         .collect::<String>()
+}
+
+fn render_gap_rows(gaps: &[KnownDataGap]) -> String {
+    if gaps.is_empty() {
+        return "<p>No known data gaps from recent archive validations.</p>".to_string();
+    }
+    let rows = gaps
+        .iter()
+        .rev()
+        .take(24)
+        .map(|gap| {
+            let range = if gap.start_slot == gap.end_slot {
+                gap.start_slot.to_string()
+            } else {
+                format!("{}-{}", gap.start_slot, gap.end_slot)
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&format_utc_timestamp(Some(gap.timestamp_unix))),
+                html_escape(&gap.archive_kind),
+                html_escape(&gap.classification),
+                html_escape(&range),
+                format_u64(gap.slot_count),
+                html_escape(&gap.detail)
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<table><thead><tr><th>Seen</th><th>Archive type</th><th>Classification</th><th>Range</th><th>Slots</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
 }
 
 fn event_color(outcome: &str) -> &'static str {

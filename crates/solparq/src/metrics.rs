@@ -8,7 +8,10 @@ use std::{
 
 use serde::Serialize;
 
-use crate::archive::{ArchiveKind, ArchiveRunReport, ClickHouseBounds};
+use crate::{
+    archive::{ArchiveKind, ArchiveRunReport, ClickHouseBounds},
+    clickhouse::SlotRange,
+};
 
 const MAX_RECENT_EVENTS: usize = 50;
 
@@ -21,6 +24,7 @@ pub struct PublicStatus {
     pub last_report: Option<ArchiveRunReport>,
     pub db_slots: Option<DbSlotStatus>,
     pub recent_events: Vec<ArchiveEvent>,
+    pub known_gaps: Vec<KnownDataGap>,
     pub archives_created: u64,
     pub archives_skipped: u64,
     pub archive_errors: u64,
@@ -50,8 +54,20 @@ pub struct ArchiveEvent {
     pub outcome: String,
     pub archive_name: Option<String>,
     pub reason: Option<String>,
+    pub skip_reason_code: Option<String>,
     pub start_slot: Option<u64>,
     pub end_slot: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KnownDataGap {
+    pub timestamp_unix: u64,
+    pub archive_kind: String,
+    pub classification: String,
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub slot_count: u64,
+    pub detail: String,
 }
 
 #[derive(Debug)]
@@ -66,6 +82,7 @@ pub struct AppState {
     last_report: Mutex<Option<ArchiveRunReport>>,
     db_slots: Mutex<Option<DbSlotStatus>>,
     recent_events: Mutex<Vec<ArchiveEvent>>,
+    known_gaps: Mutex<Vec<KnownDataGap>>,
 }
 
 impl AppState {
@@ -81,6 +98,7 @@ impl AppState {
             last_report: Mutex::new(None),
             db_slots: Mutex::new(None),
             recent_events: Mutex::new(Vec::new()),
+            known_gaps: Mutex::new(Vec::new()),
         })
     }
 
@@ -97,6 +115,7 @@ impl AppState {
             outcome: "checking".to_string(),
             archive_name: None,
             reason: None,
+            skip_reason_code: None,
             start_slot: None,
             end_slot: None,
         });
@@ -115,7 +134,9 @@ impl AppState {
         } else {
             self.archives_skipped.fetch_add(1, Ordering::Relaxed);
         }
+        self.record_known_gaps(&report);
         *self.last_error.lock().expect("last_error poisoned") = None;
+        let skip_reason_code = classify_skip_reason(&report);
         self.push_event(ArchiveEvent {
             timestamp_unix: report.timestamp_unix,
             archive_kind: report.archive_kind.label().to_string(),
@@ -126,6 +147,7 @@ impl AppState {
             },
             archive_name: report.archive_name.clone(),
             reason: report.archive_skipped_reason.clone(),
+            skip_reason_code,
             start_slot: report.archive_slot_start,
             end_slot: report.archive_slot_end,
         });
@@ -151,6 +173,7 @@ impl AppState {
             outcome: "error".to_string(),
             archive_name: None,
             reason: Some(error),
+            skip_reason_code: None,
             start_slot: None,
             end_slot: None,
         });
@@ -173,6 +196,7 @@ impl AppState {
                 .lock()
                 .expect("recent_events poisoned")
                 .clone(),
+            known_gaps: self.known_gaps.lock().expect("known_gaps poisoned").clone(),
             archives_created: self.archives_created.load(Ordering::Relaxed),
             archives_skipped: self.archives_skipped.load(Ordering::Relaxed),
             archive_errors: self.archive_errors.load(Ordering::Relaxed),
@@ -243,6 +267,89 @@ impl AppState {
             events.drain(0..overflow);
         }
     }
+
+    fn record_known_gaps(&self, report: &ArchiveRunReport) {
+        let Some(validation) = &report.validation else {
+            return;
+        };
+        let mut gaps = self.known_gaps.lock().expect("known_gaps poisoned");
+        for range in &validation.missing_block_ranges {
+            gaps.push(known_gap(
+                report,
+                "Needs backfill",
+                *range,
+                "Produced block missing from blocks_metadata",
+            ));
+        }
+        for range in &validation.not_produced_slot_ranges {
+            gaps.push(known_gap(
+                report,
+                "Legit not-produced",
+                *range,
+                "Slot not returned by Solana getBlocks",
+            ));
+        }
+        for range in &validation.transaction_mismatch_ranges {
+            gaps.push(known_gap(
+                report,
+                "Transaction mismatch",
+                *range,
+                "Block transaction count does not match transaction rows",
+            ));
+        }
+        let overflow = gaps.len().saturating_sub(MAX_RECENT_EVENTS);
+        if overflow > 0 {
+            gaps.drain(0..overflow);
+        }
+    }
+}
+
+fn known_gap(
+    report: &ArchiveRunReport,
+    classification: impl Into<String>,
+    range: SlotRange,
+    detail: impl Into<String>,
+) -> KnownDataGap {
+    KnownDataGap {
+        timestamp_unix: report.timestamp_unix,
+        archive_kind: report.archive_kind.label().to_string(),
+        classification: classification.into(),
+        start_slot: range.start_slot,
+        end_slot: range.end_slot,
+        slot_count: range.slot_count,
+        detail: detail.into(),
+    }
+}
+
+fn classify_skip_reason(report: &ArchiveRunReport) -> Option<String> {
+    if report.archive_created {
+        return None;
+    }
+    let reason = report.archive_skipped_reason.as_deref().unwrap_or_default();
+    if reason.contains("not enough ClickHouse slots") {
+        return Some("not-enough-slots".to_string());
+    }
+    if reason.contains("no transactions") {
+        return Some("no-data".to_string());
+    }
+    if reason.contains("user declined") {
+        return Some("user-declined".to_string());
+    }
+    if reason.contains("validation warnings") {
+        if report
+            .validation
+            .as_ref()
+            .map(|validation| {
+                !validation.missing_block_ranges.is_empty()
+                    || !validation.transaction_mismatch_ranges.is_empty()
+            })
+            .unwrap_or(false)
+        {
+            return Some("data-gap".to_string());
+        }
+        return Some("validation-warning".to_string());
+    }
+    Some("skipped".to_string())
 }
 
 fn nonzero(value: u64) -> Option<u64> {

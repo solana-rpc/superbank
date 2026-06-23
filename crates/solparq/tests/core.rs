@@ -1,8 +1,14 @@
 use std::{fs, process::Command, str::FromStr};
 
 use solparq::{
-    archive::{ArchiveKind, ArchiveRunReport, ClickHouseBounds, plan_next_archive},
-    clickhouse::{S3ArchiveSql, build_delete_sql, build_local_parquet_query, build_s3_archive_sql},
+    archive::{
+        ArchiveKind, ArchiveRunReport, ClickHouseBounds, plan_next_archive,
+        should_delete_archived_data_range,
+    },
+    clickhouse::{
+        S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport, build_delete_sql,
+        build_local_parquet_query, build_s3_archive_sql,
+    },
     config::{ArchiveLocation, Config},
     metrics::AppState,
     server::{format_utc_timestamp, render_dashboard},
@@ -235,6 +241,62 @@ fn delete_sql_covers_all_configured_tables() {
 }
 
 #[test]
+fn validation_report_groups_legit_and_backfill_gap_ranges() {
+    let report = ValidationReport::from_observed_slots(
+        10,
+        20,
+        vec![10, 15, 20],
+        vec![10, 11, 15, 20],
+        vec![TransactionMismatch {
+            slot: 20,
+            expected: 2,
+            actual: 1,
+        }],
+        None,
+    );
+
+    assert_eq!(
+        report.not_produced_slot_ranges,
+        vec![SlotRange::new(12, 14), SlotRange::new(16, 19),]
+    );
+    assert_eq!(report.missing_block_ranges, vec![SlotRange::new(11, 11)]);
+    assert_eq!(
+        report.transaction_mismatch_ranges,
+        vec![SlotRange::new(20, 20)]
+    );
+    assert!(report.has_warnings());
+}
+
+#[test]
+fn clickhouse_cleanup_only_runs_for_largest_configured_archive_type() {
+    let config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom:500",
+        "--archive-range-type",
+        "hourly",
+        "--server-mode",
+        "--delete-archived-data-range",
+    ])
+    .expect("valid config");
+
+    assert!(!should_delete_archived_data_range(
+        &config,
+        ArchiveKind::Custom { slots: 500 }
+    ));
+    assert!(should_delete_archived_data_range(
+        &config,
+        ArchiveKind::Hourly
+    ));
+}
+
+#[test]
 fn local_retention_deletes_oldest_archives_for_each_kind() {
     let dir = tempfile::tempdir().expect("tempdir");
     for file in [
@@ -445,4 +507,69 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
     assert!(html.contains("Continue from last archive"));
     assert!(html.contains("<svg"));
     assert!(html.contains("custom_0_10-1009.parquet"));
+}
+
+#[test]
+fn dashboard_renders_skip_reasons_and_known_gap_tables() {
+    let config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+    ])
+    .expect("valid config");
+    let state = AppState::new();
+    let validation = ValidationReport::from_observed_slots(
+        100,
+        110,
+        vec![100, 105, 110],
+        vec![100, 101, 105, 110],
+        Vec::new(),
+        None,
+    );
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_100,
+        archive_created: false,
+        archive_skipped_reason: Some(
+            "validation warnings require --force-archive in server mode".to_string(),
+        ),
+        archive_name: None,
+        archive_kind: ArchiveKind::Custom { slots: 1_000 },
+        archive_epoch: Some(0),
+        archive_slot_start: Some(100),
+        archive_slot_end: Some(110),
+        db_bounds: Some(ClickHouseBounds {
+            earliest_slot: 100,
+            latest_slot: 110,
+        }),
+        destination: "./".to_string(),
+        validation: Some(validation),
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+    });
+
+    let status = state.public_status();
+    assert_eq!(
+        status
+            .recent_events
+            .last()
+            .and_then(|event| event.skip_reason_code.as_deref()),
+        Some("data-gap")
+    );
+    assert_eq!(status.known_gaps.len(), 3);
+
+    let html = render_dashboard(&config, &status);
+
+    assert!(html.contains("Known data gaps"));
+    assert!(html.contains("Needs backfill"));
+    assert!(html.contains("Legit not-produced"));
+    assert!(html.contains("101"));
+    assert!(html.contains("102-104"));
+    assert!(html.contains("skipped: data-gap"));
 }

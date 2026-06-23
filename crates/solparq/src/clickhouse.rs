@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, fmt, path::Path};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -101,31 +101,24 @@ impl ClickHouseClient {
         let db_block_slots = self
             .fetch_block_slots(&tables.blocks_table, start_slot, end_slot)
             .await?;
-        let db_block_slot_set: HashSet<u64> = db_block_slots.iter().copied().collect();
         let (produced_slots, rpc_check_error) =
             match fetch_solana_produced_slots(solana_rpc_url, start_slot, end_slot).await {
                 Ok(slots) => (slots, None),
                 Err(err) => (Vec::new(), Some(err.to_string())),
             };
-        let missing_blocks = produced_slots
-            .iter()
-            .copied()
-            .filter(|slot| !db_block_slot_set.contains(slot))
-            .collect();
 
         let transaction_mismatches = self
             .fetch_transaction_mismatches(tables, start_slot, end_slot)
             .await?;
 
-        Ok(ValidationReport {
+        Ok(ValidationReport::from_observed_slots(
             start_slot,
             end_slot,
-            db_block_slots: db_block_slots.len() as u64,
-            rpc_produced_slots: produced_slots.len() as u64,
-            missing_blocks,
+            db_block_slots,
+            produced_slots,
             transaction_mismatches,
             rpc_check_error,
-        })
+        ))
     }
 
     pub async fn stream_local_parquet(
@@ -270,6 +263,33 @@ impl ClickHouseClient {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SlotRange {
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub slot_count: u64,
+}
+
+impl SlotRange {
+    pub fn new(start_slot: u64, end_slot: u64) -> Self {
+        Self {
+            start_slot,
+            end_slot,
+            slot_count: end_slot.saturating_sub(start_slot).saturating_add(1),
+        }
+    }
+}
+
+impl fmt::Display for SlotRange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.start_slot == self.end_slot {
+            write!(formatter, "{}", self.start_slot)
+        } else {
+            write!(formatter, "{}-{}", self.start_slot, self.end_slot)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ValidationReport {
     pub start_slot: u64,
@@ -277,15 +297,77 @@ pub struct ValidationReport {
     pub db_block_slots: u64,
     pub rpc_produced_slots: u64,
     pub missing_blocks: Vec<u64>,
+    pub missing_block_ranges: Vec<SlotRange>,
+    pub not_produced_slot_ranges: Vec<SlotRange>,
     pub transaction_mismatches: Vec<TransactionMismatch>,
+    pub transaction_mismatch_ranges: Vec<SlotRange>,
     pub rpc_check_error: Option<String>,
 }
 
 impl ValidationReport {
+    pub fn from_observed_slots(
+        start_slot: u64,
+        end_slot: u64,
+        db_block_slots: Vec<u64>,
+        produced_slots: Vec<u64>,
+        transaction_mismatches: Vec<TransactionMismatch>,
+        rpc_check_error: Option<String>,
+    ) -> Self {
+        let db_block_slot_set: HashSet<u64> = db_block_slots.iter().copied().collect();
+        let mut produced_slots = produced_slots;
+        produced_slots.sort_unstable();
+        produced_slots.dedup();
+        let missing_blocks = produced_slots
+            .iter()
+            .copied()
+            .filter(|slot| !db_block_slot_set.contains(slot))
+            .collect::<Vec<_>>();
+        let mismatch_slots = transaction_mismatches
+            .iter()
+            .map(|mismatch| mismatch.slot)
+            .collect::<Vec<_>>();
+        let not_produced_slot_ranges = if rpc_check_error.is_none() {
+            missing_ranges(start_slot, end_slot, &produced_slots)
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            start_slot,
+            end_slot,
+            db_block_slots: db_block_slots.len() as u64,
+            rpc_produced_slots: produced_slots.len() as u64,
+            missing_block_ranges: slot_ranges(&missing_blocks),
+            not_produced_slot_ranges,
+            transaction_mismatch_ranges: slot_ranges(&mismatch_slots),
+            missing_blocks,
+            transaction_mismatches,
+            rpc_check_error,
+        }
+    }
+
     pub fn has_warnings(&self) -> bool {
         !self.missing_blocks.is_empty()
             || !self.transaction_mismatches.is_empty()
             || self.rpc_check_error.is_some()
+    }
+
+    pub fn has_known_data_gaps(&self) -> bool {
+        !self.missing_block_ranges.is_empty()
+            || !self.not_produced_slot_ranges.is_empty()
+            || !self.transaction_mismatch_ranges.is_empty()
+    }
+
+    pub fn format_ranges(ranges: &[SlotRange]) -> String {
+        if ranges.is_empty() {
+            "none".to_string()
+        } else {
+            ranges
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
     }
 }
 
@@ -294,6 +376,49 @@ pub struct TransactionMismatch {
     pub slot: u64,
     pub expected: u64,
     pub actual: u64,
+}
+
+fn slot_ranges(slots: &[u64]) -> Vec<SlotRange> {
+    if slots.is_empty() {
+        return Vec::new();
+    }
+    let mut slots = slots.to_vec();
+    slots.sort_unstable();
+    slots.dedup();
+
+    let mut ranges = Vec::new();
+    let mut start = slots[0];
+    let mut prev = slots[0];
+    for slot in slots.into_iter().skip(1) {
+        if slot == prev.saturating_add(1) {
+            prev = slot;
+        } else {
+            ranges.push(SlotRange::new(start, prev));
+            start = slot;
+            prev = slot;
+        }
+    }
+    ranges.push(SlotRange::new(start, prev));
+    ranges
+}
+
+fn missing_ranges(start_slot: u64, end_slot: u64, present_slots: &[u64]) -> Vec<SlotRange> {
+    if end_slot < start_slot {
+        return Vec::new();
+    }
+    let present = present_slots.iter().copied().collect::<HashSet<_>>();
+    let mut missing = Vec::new();
+    let mut cursor = start_slot;
+    while cursor <= end_slot {
+        if !present.contains(&cursor) {
+            missing.push(cursor);
+        }
+        if cursor == u64::MAX {
+            break;
+        }
+        cursor += 1;
+    }
+    slot_ranges(&missing)
 }
 
 pub fn build_local_parquet_query(
