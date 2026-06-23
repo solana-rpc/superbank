@@ -80,7 +80,7 @@ fn commitment_label(commitment: CommitmentLevel) -> &'static str {
     }
 }
 
-enum SlotRefreshRole {
+enum CacheRefreshRole {
     Leader(Arc<Notify>),
     Waiter(OwnedNotified),
 }
@@ -125,16 +125,16 @@ impl LatestSlotCache {
 
                 if let Some(inflight) = guard.as_ref() {
                     // Create the wait future while holding the lock so we can't miss a notify.
-                    SlotRefreshRole::Waiter(inflight.clone().notified_owned())
+                    CacheRefreshRole::Waiter(inflight.clone().notified_owned())
                 } else {
                     let inflight = Arc::new(Notify::new());
                     *guard = Some(inflight.clone());
-                    SlotRefreshRole::Leader(inflight)
+                    CacheRefreshRole::Leader(inflight)
                 }
             };
 
             match role {
-                SlotRefreshRole::Leader(notify) => {
+                CacheRefreshRole::Leader(notify) => {
                     let fetch_result = async {
                         let slot_opt = clickhouse.get_latest_finalized_slot().await?;
                         slot_opt.ok_or_else(|| {
@@ -163,7 +163,7 @@ impl LatestSlotCache {
                         }
                     }
                 }
-                SlotRefreshRole::Waiter(notified) => {
+                CacheRefreshRole::Waiter(notified) => {
                     notified.await;
                 }
             }
@@ -227,16 +227,16 @@ impl LatestBlockHeightCache {
 
                 if let Some(inflight) = guard.as_ref() {
                     // Create the wait future while holding the lock so we can't miss a notify.
-                    SlotRefreshRole::Waiter(inflight.clone().notified_owned())
+                    CacheRefreshRole::Waiter(inflight.clone().notified_owned())
                 } else {
                     let inflight = Arc::new(Notify::new());
                     *guard = Some(inflight.clone());
-                    SlotRefreshRole::Leader(inflight)
+                    CacheRefreshRole::Leader(inflight)
                 }
             };
 
             match role {
-                SlotRefreshRole::Leader(notify) => {
+                CacheRefreshRole::Leader(notify) => {
                     let result = clickhouse.get_blockhash_height_by_slot(slot).await.map(
                         |(row_opt, timings)| {
                             (row_opt.and_then(|(_blockhash, height)| height), timings)
@@ -264,7 +264,7 @@ impl LatestBlockHeightCache {
                     let cached = self.value.load(Ordering::Relaxed);
                     return Ok((cached != Self::NONE_SENTINEL).then_some(cached));
                 }
-                SlotRefreshRole::Waiter(notified) => {
+                CacheRefreshRole::Waiter(notified) => {
                     notified.await;
                 }
             }
