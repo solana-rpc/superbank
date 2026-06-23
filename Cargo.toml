@@ -9,6 +9,7 @@ publish = false
 [workspace]
 members = [
     "crates/solparq",
+    "crates/solparq-read",
     "crates/superbank",
     "crates/superbank-rpc",
 ]
@@ -16,6 +17,7 @@ members = [
 resolver = "2"
 default-members = [
     "crates/solparq",
+    "crates/solparq-read",
     "crates/superbank",
     "crates/superbank-rpc",
 ]

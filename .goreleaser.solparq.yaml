@@ -22,11 +22,30 @@ builds:
       - --bin=solparq
     env:
       - SUPERBANK_GIT_SHA={{ .Commit }}
+  - id: solparq-read
+    builder: rust
+    command: zigbuild
+    binary: solparq-read
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+      - --package=solparq-read
+      - --bin=solparq-read
+    env:
+      - SUPERBANK_GIT_SHA={{ .Commit }}
 
 archives:
   - id: solparq
     ids: [solparq]
     name_template: solparq-{{ trimsuffix .Tag "-solparq" }}-{{ .Os }}-{{ .Arch }}
+    formats: [tar.gz]
+    files: []
+  - id: solparq-read
+    ids: [solparq-read]
+    name_template: solparq-read-{{ trimsuffix .Tag "-solparq" }}-{{ .Os }}-{{ .Arch }}
     formats: [tar.gz]
     files: []
 

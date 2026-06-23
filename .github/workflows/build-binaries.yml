@@ -41,6 +41,7 @@ jobs:
           fi
           if git diff --name-only "$before" "$after" -- \
             crates/solparq \
+            crates/solparq-read \
             Cargo.toml \
             Cargo.lock \
             .goreleaser.solparq.yaml \
@@ -96,4 +97,6 @@ jobs:
         with:
           name: solparq-${{ github.sha }}
           if-no-files-found: error
-          path: dist/solparq_*/solparq
+          path: |
+            dist/solparq_*/solparq
+            dist/solparq-read_*/solparq-read

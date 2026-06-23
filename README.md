@@ -9,7 +9,7 @@
 
 Ingest Solana ledger data into ClickHouse and serve Solana-compatible JSON-RPC from that data.
 
-[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [Solparq](crates/solparq/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md)
+[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [Solparq](crates/solparq/README.md) · [Solparq reader](crates/solparq-read/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md)
 
 </div>
 
@@ -29,6 +29,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Store blocks + transactions in ClickHouse (`ddl/`)
 - Serve Solana-compatible JSON-RPC backed by ClickHouse (`crates/superbank-rpc`)
 - Archive ClickHouse transaction data to Parquet (`crates/solparq`)
+- Inspect and read solparq Parquet archives from local files or S3 (`crates/solparq-read`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
 ## Architecture

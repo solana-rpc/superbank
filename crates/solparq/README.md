@@ -29,6 +29,12 @@ Check the packaged version with:
 cargo run -p solparq -- --version
 ```
 
+The companion archive reader is built separately:
+
+```bash
+cargo build -p solparq-read --release
+```
+
 ## Release
 
 `solparq` is released independently from the main Superbank binaries. The
@@ -65,6 +71,8 @@ and publishes GitHub Release assets similar to:
 ```text
 solparq-v0.1.0-linux-amd64.tar.gz
 solparq-v0.1.0-linux-arm64.tar.gz
+solparq-read-v0.1.0-linux-amd64.tar.gz
+solparq-read-v0.1.0-linux-arm64.tar.gz
 solparq-v0.1.0-SHA256SUMS.txt
 ```
 
@@ -122,6 +130,40 @@ The object path is:
 
 ```text
 s3://<bucket>/<bucket-path>/<archive-type>/<archive-name>
+```
+
+## Read Archives
+
+Use `solparq-read` to inspect local or S3 archives without connecting to
+ClickHouse.
+
+```bash
+cargo run -p solparq-read -- list \
+  --archive-dir ./crates/solparq/archives
+
+cargo run -p solparq-read -- summary \
+  --archive ./crates/solparq/archives/hourly_989_427299625-427308624.parquet
+
+cargo run -p solparq-read -- scan \
+  --archive ./crates/solparq/archives/hourly_989_427299625-427308624.parquet \
+  --slot-range 427300000-427300500 \
+  --columns slot,signature \
+  --format jsonl
+```
+
+S3 reads use the same endpoint, bucket, path, and credentials model as
+`solparq`. In S3 mode, `--archive` is the object key relative to
+`--archive-s3-bucket-path`:
+
+```bash
+cargo run -p solparq-read -- summary \
+  --archive-location-type s3 \
+  --archive-s3-endpoint https://s3.eu-central-003.backblazeb2.com \
+  --archive-s3-bucket-name solparq \
+  --archive-s3-bucket-path archives/test \
+  --archive-s3-auth-key "$S3_ACCESS_KEY" \
+  --archive-s3-auth-secret-key "$S3_SECRET_KEY" \
+  --archive hourly/hourly_989_427299625-427308624.parquet
 ```
 
 ## Server Mode
