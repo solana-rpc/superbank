@@ -232,11 +232,23 @@ pub(crate) async fn flush_buffers_with_retry(
 ) -> Result<()> {
     let mut attempt = 0u32;
     loop {
-        match flush_buffers(client, tables, transaction_rows, block_rows, entry_rows, progress).await {
+        match flush_buffers(
+            client,
+            tables,
+            transaction_rows,
+            block_rows,
+            entry_rows,
+            progress,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(err) if attempt < retry.max_retries => {
                 attempt += 1;
-                let delay_ms = retry.base_ms.saturating_mul(1u64 << (attempt - 1).min(62)).min(retry.max_ms);
+                let delay_ms = retry
+                    .base_ms
+                    .saturating_mul(1u64 << (attempt - 1).min(62))
+                    .min(retry.max_ms);
                 warn!(
                     attempt,
                     max_retries = retry.max_retries,
@@ -246,7 +258,15 @@ pub(crate) async fn flush_buffers_with_retry(
                 );
                 sleep(Duration::from_millis(delay_ms)).await;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                warn!(
+                    attempt,
+                    max_retries = retry.max_retries,
+                    error = %err,
+                    "ClickHouse insert failed, giving up"
+                );
+                return Err(err);
+            }
         }
     }
 }
@@ -553,6 +573,9 @@ mod tests {
             blocks_flush_rows: 2_000,
             flush_interval_secs: 5,
             flush_every_block: false,
+            insert_max_retries: 5,
+            insert_retry_base_ms: 1_000,
+            insert_retry_max_ms: 30_000,
         }
     }
 

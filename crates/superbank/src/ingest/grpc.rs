@@ -235,6 +235,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
             &insert_tables,
             &clickhouse,
             &mut buffered_rows,
+            Some(&retry_config),
         )
         .await?;
     }
@@ -309,6 +310,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                             &insert_tables,
                             &clickhouse,
                             &mut buffered_rows,
+                            Some(&retry_config),
                         )
                         .await?;
                     }
@@ -740,6 +742,7 @@ pub(crate) async fn process_update(
     insert_tables: &InsertTables,
     clickhouse: &ClickHouseClient,
     buffered_rows: &mut BufferedRows,
+    retry: Option<&RetryConfig>,
 ) -> Result<bool> {
     let mut flushed = false;
     match update.update_oneof {
@@ -762,7 +765,14 @@ pub(crate) async fn process_update(
                 || buffered_rows.block_rows.len() >= args.blocks_flush_rows
                 || buffered_rows.entry_rows.len() >= args.transactions_flush_rows
             {
-                buffered_rows.flush(clickhouse, insert_tables).await?;
+                match retry {
+                    Some(r) => {
+                        buffered_rows
+                            .flush_with_retry(clickhouse, insert_tables, r)
+                            .await?
+                    }
+                    None => buffered_rows.flush(clickhouse, insert_tables).await?,
+                }
                 flushed = true;
             }
         }

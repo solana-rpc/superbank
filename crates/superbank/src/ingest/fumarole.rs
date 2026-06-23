@@ -159,6 +159,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                                     &insert_tables,
                                     &clickhouse,
                                     &mut buffered_rows,
+                                    None,
                                 )
                                 .await?
                                 {
@@ -177,6 +178,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                                 &insert_tables,
                                 &clickhouse,
                                 &mut buffered_rows,
+                                None,
                             )
                             .await?
                             {

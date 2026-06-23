@@ -687,6 +687,7 @@ async fn flush_bigtable_batch(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_bigtable_flush(
     insert_tasks: &mut JoinSet<Result<()>>,
     insert_concurrency: usize,
