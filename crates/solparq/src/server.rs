@@ -1,6 +1,15 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::State,
@@ -10,9 +19,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use tokio::{net::TcpListener, task::JoinSet};
+use tokio::{
+    net::TcpListener,
+    sync::Notify,
+    task::{JoinHandle, JoinSet},
+};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     archive,
@@ -20,9 +33,77 @@ use crate::{
     metrics::{AppState, ArchiveEvent, PublicStatus},
 };
 
+type ArchiveRunFuture = Pin<Box<dyn Future<Output = Result<archive::ArchiveRunReport>> + Send>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSignal {
+    CtrlC,
+    SigTerm,
+}
+
+impl std::fmt::Display for ShutdownSignal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShutdownSignal::CtrlC => formatter.write_str("ctrl-c"),
+            ShutdownSignal::SigTerm => formatter.write_str("sigterm"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownWaitOutcome {
+    ArchiveFinished,
+    Forced,
+}
+
+#[derive(Clone)]
+struct ShutdownToken {
+    inner: Arc<ShutdownState>,
+}
+
+struct ShutdownState {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl ShutdownToken {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ShutdownState {
+                requested: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn request(&self) {
+        if !self.inner.requested.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        self.inner.requested.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_requested() {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let state = AppState::new();
     let mut servers = JoinSet::new();
+    let shutdown = ShutdownToken::new();
 
     servers.spawn(serve_ops(config.ops_port, state.clone(), config.clone()));
     servers.spawn(serve_metrics(config.metrics_port, state.clone()));
@@ -35,68 +116,175 @@ pub async fn run(config: Config) -> Result<()> {
 
     let loop_state = state.clone();
     let loop_config = config.clone();
-    servers.spawn(async move { archive_loop(loop_config, loop_state).await });
+    let loop_shutdown = shutdown.clone();
+    let mut archive_task =
+        tokio::spawn(async move { archive_loop(loop_config, loop_state, loop_shutdown).await });
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("shutdown signal received");
+        signal = wait_for_shutdown_signal() => {
+            let signal = signal?;
+            info!(%signal, "shutdown signal received; finishing current archive before exit");
+            shutdown.request();
         }
         result = servers.join_next() => {
             if let Some(result) = result {
-                result??;
+                match result {
+                    Ok(Ok(())) => {
+                        info!("server task stopped; shutting down archive loop");
+                        shutdown.request();
+                    }
+                    Ok(Err(err)) => {
+                        archive_task.abort();
+                        servers.abort_all();
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        archive_task.abort();
+                        servers.abort_all();
+                        return Err(anyhow!("server task failed: {err}"));
+                    }
+                }
+            } else {
+                shutdown.request();
             }
         }
+        result = &mut archive_task => {
+            servers.abort_all();
+            result??;
+            return Ok(());
+        }
+    }
+
+    let outcome =
+        match wait_for_archive_task_or_forced_signal(&mut archive_task, wait_for_shutdown_signal())
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                servers.abort_all();
+                return Err(err);
+            }
+        };
+    if outcome == ShutdownWaitOutcome::ArchiveFinished {
+        info!("graceful shutdown completed");
     }
     servers.abort_all();
     Ok(())
 }
 
-async fn archive_loop(config: Config, state: Arc<AppState>) -> Result<()> {
+async fn archive_loop(config: Config, state: Arc<AppState>, shutdown: ShutdownToken) -> Result<()> {
     let mut interval =
         tokio::time::interval(Duration::from_secs(config.archive_check_interval_secs));
+    let run_config = config.clone();
+    let mut run_once = move |kind| {
+        let config = run_config.clone();
+        Box::pin(async move { archive::run_once_for_kind(&config, kind).await }) as ArchiveRunFuture
+    };
     loop {
-        interval.tick().await;
-        info!(
-            archive_types = config.archive_kinds.len(),
-            "checking for archiving tasks"
-        );
-        for kind in config.archive_kinds.iter().copied() {
-            state.record_check_started(kind, None);
-            info!(archive_kind = kind.to_string(), "checking archive task");
-            match archive::run_once_for_kind(&config, kind).await {
-                Ok(report) => {
-                    if report.archive_created {
-                        info!(
-                            archive_kind = kind.to_string(),
-                            archive_name = report.archive_name.as_deref().unwrap_or("unknown"),
-                            start_slot = report.archive_slot_start,
-                            end_slot = report.archive_slot_end,
-                            destination = report.destination,
-                            "archive task created archive"
-                        );
-                    } else {
-                        info!(
-                            archive_kind = kind.to_string(),
-                            reason = report
-                                .archive_skipped_reason
-                                .as_deref()
-                                .unwrap_or("no reason reported"),
-                            "archive task skipped"
-                        );
-                    }
-                    debug!(
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("archive loop shutdown requested before next check");
+                return Ok(());
+            }
+            _ = interval.tick() => {}
+        }
+        if !run_archive_cycle(&config, &state, &shutdown, &mut run_once).await? {
+            return Ok(());
+        }
+    }
+}
+
+async fn run_archive_cycle(
+    config: &Config,
+    state: &Arc<AppState>,
+    shutdown: &ShutdownToken,
+    run_once: &mut impl FnMut(archive::ArchiveKind) -> ArchiveRunFuture,
+) -> Result<bool> {
+    info!(
+        archive_types = config.archive_kinds.len(),
+        "checking for archiving tasks"
+    );
+    for kind in config.archive_kinds.iter().copied() {
+        if shutdown.is_requested() {
+            info!("archive loop shutdown requested; not starting new archive task");
+            return Ok(false);
+        }
+        state.record_check_started(kind, None);
+        info!(archive_kind = kind.to_string(), "checking archive task");
+        match run_once(kind).await {
+            Ok(report) => {
+                if report.archive_created {
+                    info!(
                         archive_kind = kind.to_string(),
-                        report = report.to_text(),
-                        "archive task report"
+                        archive_name = report.archive_name.as_deref().unwrap_or("unknown"),
+                        start_slot = report.archive_slot_start,
+                        end_slot = report.archive_slot_end,
+                        destination = report.destination,
+                        "archive task created archive"
                     );
-                    state.record_report(report);
+                } else {
+                    info!(
+                        archive_kind = kind.to_string(),
+                        reason = report
+                            .archive_skipped_reason
+                            .as_deref()
+                            .unwrap_or("no reason reported"),
+                        "archive task skipped"
+                    );
                 }
-                Err(err) => {
-                    error!(archive_kind = kind.to_string(), ?err, "archive task failed");
-                    state.record_task_error(kind, err.to_string());
-                }
+                debug!(
+                    archive_kind = kind.to_string(),
+                    report = report.to_text(),
+                    "archive task report"
+                );
+                state.record_report(report);
+            }
+            Err(err) => {
+                error!(archive_kind = kind.to_string(), ?err, "archive task failed");
+                state.record_task_error(kind, err.to_string());
             }
         }
+    }
+    Ok(true)
+}
+
+async fn wait_for_archive_task_or_forced_signal(
+    archive_task: &mut JoinHandle<Result<()>>,
+    forced_shutdown: impl Future<Output = Result<ShutdownSignal>>,
+) -> Result<ShutdownWaitOutcome> {
+    tokio::pin!(forced_shutdown);
+    tokio::select! {
+        result = &mut *archive_task => {
+            result??;
+            Ok(ShutdownWaitOutcome::ArchiveFinished)
+        }
+        signal = &mut forced_shutdown => {
+            let signal = signal?;
+            warn!(%signal, "second shutdown signal received; aborting immediately");
+            archive_task.abort();
+            Ok(ShutdownWaitOutcome::Forced)
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<ShutdownSignal> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("install SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("listen for Ctrl+C")?;
+                Ok(ShutdownSignal::CtrlC)
+            }
+            _ = sigterm.recv() => Ok(ShutdownSignal::SigTerm),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("listen for Ctrl+C")?;
+        Ok(ShutdownSignal::CtrlC)
     }
 }
 
@@ -453,4 +641,98 @@ fn html_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::{
+        archive::{ArchiveKind, ArchiveRunReport},
+        config::Config,
+    };
+
+    fn test_server_config() -> Config {
+        Config::try_parse_from([
+            "solparq",
+            "--db-server",
+            "127.0.0.1",
+            "--db-user",
+            "admin",
+            "--db-password",
+            "secret",
+            "--archive-range-type",
+            "hourly",
+            "--archive-range-type",
+            "custom:500",
+            "--server-mode",
+        ])
+        .expect("valid config")
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_finishes_current_archive_and_skips_new_work() {
+        let config = test_server_config();
+        let state = AppState::new();
+        let shutdown = ShutdownToken::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+
+        let seen_for_runner = seen.clone();
+        let mut started_tx = Some(started_tx);
+        let mut finish_rx = Some(finish_rx);
+        let shutdown_for_task = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let mut run_once = move |kind| {
+                let seen = seen_for_runner.clone();
+                let started_tx = started_tx.take();
+                let finish_rx = finish_rx.take();
+                Box::pin(async move {
+                    seen.lock().expect("seen lock").push(kind);
+                    if let Some(started_tx) = started_tx {
+                        let _ = started_tx.send(());
+                    }
+                    if let Some(finish_rx) = finish_rx {
+                        let _ = finish_rx.await;
+                    }
+                    Ok(ArchiveRunReport::skipped(kind, "test".to_string(), "test"))
+                }) as ArchiveRunFuture
+            };
+            run_archive_cycle(&config, &state, &shutdown_for_task, &mut run_once).await
+        });
+
+        started_rx.await.expect("archive runner should start");
+        shutdown.request();
+        assert_eq!(*seen.lock().expect("seen lock"), vec![ArchiveKind::Hourly]);
+
+        finish_tx.send(()).expect("finish archive");
+        let continue_running = handle.await.expect("cycle task should not panic").unwrap();
+
+        assert!(!continue_running);
+        assert_eq!(
+            *seen.lock().expect("seen lock"),
+            vec![ArchiveKind::Hourly],
+            "shutdown should not start the next archive kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_shutdown_signal_aborts_graceful_wait() {
+        let mut archive_task = tokio::spawn(async { std::future::pending::<Result<()>>().await });
+        let (force_tx, force_rx) = oneshot::channel();
+        force_tx.send(()).expect("send forced shutdown signal");
+
+        let outcome = wait_for_archive_task_or_forced_signal(&mut archive_task, async {
+            force_rx.await.expect("forced shutdown signal");
+            Ok(ShutdownSignal::CtrlC)
+        })
+        .await
+        .expect("forced shutdown should be handled");
+
+        assert_eq!(outcome, ShutdownWaitOutcome::Forced);
+    }
 }

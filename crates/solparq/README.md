@@ -175,6 +175,12 @@ The ops dashboard refreshes every 30 seconds. It shows human-readable UTC
 timestamps for last run and last success, the number of transaction slots
 available in ClickHouse, startup settings, and a color-coded archive timeline.
 
+On shutdown, `solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
+shutdown signal stops new archive tasks from starting and waits for any archive
+currently being written to finish, including its report, cleanup, and optional
+ClickHouse delete step. Press `Ctrl+C` again, or send another `SIGTERM`, to
+abort immediately without waiting for the active archive task.
+
 ## Archive Ranges
 
 - `hourly`: 9000 slots
