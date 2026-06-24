@@ -49,20 +49,36 @@ impl S3ArchiveConfig {
 
 pub fn archive_input_from_args(args: &ArchiveArgs) -> Result<ArchiveInput> {
     match args.source.archive_location_type {
-        ArchiveLocationType::Local => Ok(ArchiveInput::LocalFile(PathBuf::from(&args.archive))),
+        ArchiveLocationType::Local => {
+            let path = PathBuf::from(&args.archive);
+            if path.is_dir() {
+                Ok(ArchiveInput::LocalBundle {
+                    dir: path,
+                    table: args.table,
+                })
+            } else {
+                Ok(ArchiveInput::LocalFile(path))
+            }
+        }
         ArchiveLocationType::S3 => {
             let config = s3_config_from_source(&args.source)?;
             let store = build_s3_store(&config)?;
             let path = config.object_key(&args.archive);
-            Ok(ArchiveInput::S3Object {
-                store,
-                path,
-                display_path: format!(
-                    "s3://{}/{}",
-                    config.bucket_name,
-                    config.object_key(&args.archive)
-                ),
-            })
+            let display_path = format!("s3://{}/{}", config.bucket_name, path);
+            if args.archive.ends_with(".parquet") {
+                Ok(ArchiveInput::S3Object {
+                    store,
+                    path,
+                    display_path,
+                })
+            } else {
+                Ok(ArchiveInput::S3Bundle {
+                    store,
+                    prefix: path,
+                    table: args.table,
+                    display_path,
+                })
+            }
         }
     }
 }
@@ -110,7 +126,10 @@ fn list_local_archives(dir: &PathBuf) -> Result<Vec<ArchiveObject>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("parquet") {
+        let is_bundle = path.is_dir() && path.join("manifest.json").is_file();
+        let is_parquet =
+            path.extension().and_then(|extension| extension.to_str()) == Some("parquet");
+        if !is_parquet && !is_bundle {
             continue;
         }
         let metadata = entry.metadata()?;
@@ -133,14 +152,23 @@ async fn list_s3_archives(
     let mut stream = store.list(prefix.as_ref());
     let mut archives = Vec::new();
     while let Some(meta) = stream.try_next().await? {
-        if !meta.location.as_ref().ends_with(".parquet") {
+        let location = meta.location.as_ref();
+        let is_bundle_manifest = location.ends_with("/manifest.json");
+        if !location.ends_with(".parquet") && !is_bundle_manifest {
             continue;
         }
-        let name = meta
-            .location
-            .filename()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| meta.location.to_string());
+        let name = if is_bundle_manifest {
+            location
+                .rsplit_once('/')
+                .and_then(|(parent, _)| parent.rsplit_once('/').map(|(_, name)| name))
+                .unwrap_or(location)
+                .to_string()
+        } else {
+            meta.location
+                .filename()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| meta.location.to_string())
+        };
         archives.push(ArchiveObject {
             path: meta.location.to_string(),
             parsed_name: parse_archive_name(&name),

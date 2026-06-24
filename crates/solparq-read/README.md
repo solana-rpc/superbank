@@ -2,6 +2,8 @@
 
 `solparq-read` inspects and reads Parquet archives created by `solparq`.
 It is read-only and works with local archives or S3-compatible object stores.
+It supports current DB archive bundles and older single-file transaction
+Parquet archives.
 
 ## Build
 
@@ -24,23 +26,35 @@ Show archive counts and metadata:
 
 ```bash
 cargo run -p solparq-read -- summary \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124.parquet
+  --archive ./crates/solparq/archives/custom_989_427299625-427300124
 ```
 
 Show the Parquet schema:
 
 ```bash
 cargo run -p solparq-read -- schema \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124.parquet
+  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
+  --table transactions
 ```
 
 Read transactions in an inclusive slot range:
 
 ```bash
 cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124.parquet \
+  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
   --slot-range 427299700-427299800 \
   --columns slot,signature \
+  --format jsonl
+```
+
+Read block metadata from the same bundle:
+
+```bash
+cargo run -p solparq-read -- scan \
+  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
+  --table blocks_metadata \
+  --slot-range 427299700-427299800 \
+  --columns slot,block_time,executed_transaction_count \
   --format jsonl
 ```
 
@@ -48,7 +62,7 @@ Read the full archive explicitly:
 
 ```bash
 cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124.parquet \
+  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
   --all \
   --format csv
 ```
@@ -84,21 +98,21 @@ cargo run -p solparq-read -- summary \
   --archive-s3-bucket-path archives/test \
   --archive-s3-auth-key "$S3_ACCESS_KEY" \
   --archive-s3-auth-secret-key "$S3_SECRET_KEY" \
-  --archive custom/custom_989_427299625-427300124.parquet
+  --archive custom/custom_989_427299625-427300124
 ```
 
 ## Output
 
-`summary` reports transaction rows, actual min/max slot, distinct observed
-slots, observed blocks, row groups, columns, and file size. Because current
-`solparq` archives contain transaction rows, observed blocks are counted as
-distinct slots present in the archive.
+`summary` reports the archive format, transaction rows, actual min/max slot,
+distinct observed slots, observed blocks, row groups, columns, file size, and
+per-table row counts from `manifest.json` when reading a bundle.
 
 `scan` supports:
 
 - `--format jsonl`
 - `--format json`
 - `--format csv`
+- `--table transactions|blocks_metadata|entries|gsfa|gsfa_hot|signatures|token_owner_activity`
 - `--columns slot,signature,fee`
 - `--limit 1000`
 
@@ -109,7 +123,11 @@ you need, for example:
 
 ```bash
 cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124.parquet \
+  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
   --slot-range 427299700-427299800 \
   --columns slot,signature,meta_fee
 ```
+
+For legacy single-file transaction archives, pass the `.parquet` file path or
+S3 object key directly. The `--table` option is ignored for single-file
+archives.

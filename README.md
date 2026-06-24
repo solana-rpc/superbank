@@ -28,7 +28,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Ingest from Yellowstone Fumarole, Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable
 - Store blocks + transactions in ClickHouse (`ddl/`)
 - Serve Solana-compatible JSON-RPC backed by ClickHouse (`crates/superbank-rpc`)
-- Archive ClickHouse transaction data to Parquet (`crates/solparq`)
+- Archive Superbank ClickHouse table bundles to Parquet (`crates/solparq`)
 - Inspect and read solparq Parquet archives from local files or S3 (`crates/solparq-read`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
@@ -238,7 +238,7 @@ rows already present on the target by exact table key instead of failing the run
 
 - `crates/superbank` ingestor binary (Yellowstone Fumarole, Yellowstone gRPC, Solana JSON-RPC, or Solana Bigtable sources)
 - `crates/superbank-rpc` Solana-compatible JSON-RPC server backed by ClickHouse
-- `crates/solparq` ClickHouse transaction archiver that writes Parquet locally or to S3-compatible storage
+- `crates/solparq` ClickHouse table archiver that writes Parquet bundles locally or to S3-compatible storage
 - `ddl/` ClickHouse schemas (transactions, block metadata, optional PoH entries, GSFA/signatures, token owner activity)
 - `tests/k6/` load/validation tests for `superbank-rpc`
 - `scripts/` helper scripts (local runs, analysis, k6 orchestration)

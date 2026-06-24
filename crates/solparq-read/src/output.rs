@@ -58,9 +58,10 @@ pub fn format_summary(summary: &ArchiveSummary) -> String {
         })
         .unwrap_or_else(|| "unparsed".to_string());
     format!(
-        "archive: {}\npath: {}\nparsed: {}\ntransaction_rows: {}\nactual_min_slot: {}\nactual_max_slot: {}\nobserved_slots: {}\nobserved_blocks: {}\nrow_groups: {}\ncolumns: {}\nsize_bytes: {}\n",
+        "archive: {}\npath: {}\narchive_format: {}\nparsed: {}\ntransaction_rows: {}\nactual_min_slot: {}\nactual_max_slot: {}\nobserved_slots: {}\nobserved_blocks: {}\nrow_groups: {}\ncolumns: {}\nsize_bytes: {}\n{}",
         summary.archive_name,
         summary.archive_path,
+        summary.archive_format,
         parsed,
         summary.transaction_rows,
         option_u64(summary.actual_min_slot),
@@ -70,7 +71,16 @@ pub fn format_summary(summary: &ArchiveSummary) -> String {
         summary.row_groups,
         summary.columns,
         option_u64(summary.size_bytes),
+        format_table_summaries(summary),
     )
+}
+
+fn format_table_summaries(summary: &ArchiveSummary) -> String {
+    let mut output = String::new();
+    for table in &summary.tables {
+        output.push_str(&format!("table_{}_rows: {}\n", table.kind, table.row_count));
+    }
+    output
 }
 
 pub fn format_schema(schema: &ArchiveSchema) -> String {

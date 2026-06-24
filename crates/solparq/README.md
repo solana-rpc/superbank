@@ -1,19 +1,34 @@
 # solparq
 
-`solparq` archives Superbank/Solana ClickHouse transaction data to Parquet.
+`solparq` archives Superbank/Solana ClickHouse tables to Parquet bundles.
 It can run once or continuously in server mode.
 
-Archive files use:
+Archive bundles use:
 
 ```text
-type_epoch_from-slot_to-slot.parquet
+type_epoch_from-slot_to-slot/
+  manifest.json
+  report.txt
+  transactions.parquet
+  blocks_metadata.parquet
+  entries.parquet
+  gsfa.parquet
+  gsfa_hot.parquet
+  signatures.parquet
+  token_owner_activity.parquet
 ```
 
 Example:
 
 ```text
-hourly_988_427236024-427245023.parquet
+hourly_988_427236024-427245023/
 ```
+
+`transactions` and `blocks_metadata` are required. Other Superbank tables are
+included when they exist on the ClickHouse server and are recorded as skipped in
+`manifest.json` when absent. This lets RPC/Bigtable deployments archive cleanly
+without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
+entries for later PoH-specific tooling.
 
 ## Build
 
@@ -94,7 +109,8 @@ cargo run -p solparq -- \
   --archive-file-output-location ./archives
 ```
 
-By default this creates local Parquet files. Local output streams:
+By default this creates a local bundle directory. Each available table streams
+with a table-specific stable order, for example:
 
 ```sql
 SELECT *
@@ -104,7 +120,8 @@ ORDER BY slot, slot_idx, signature
 FORMAT Parquet
 ```
 
-The stream is written to a temporary file and then moved into place.
+Local bundles are written to a staging directory and moved into place after the
+table Parquet files and `manifest.json` are written.
 
 ## One-Shot S3 Archive
 
@@ -126,11 +143,15 @@ cargo run -p solparq -- \
   --archive-s3-auth-secret-key "$S3_SECRET_KEY"
 ```
 
-The object path is:
+The object paths are:
 
 ```text
-s3://<bucket>/<bucket-path>/<archive-type>/<archive-name>
+s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/<table>.parquet
+s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/manifest.json
 ```
+
+`manifest.json` is written after the table objects so readers can treat its
+presence as the data-completion marker.
 
 ## Read Archives
 
@@ -142,14 +163,17 @@ cargo run -p solparq-read -- list \
   --archive-dir ./crates/solparq/archives
 
 cargo run -p solparq-read -- summary \
-  --archive ./crates/solparq/archives/hourly_989_427299625-427308624.parquet
+  --archive ./crates/solparq/archives/hourly_989_427299625-427308624
 
 cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/hourly_989_427299625-427308624.parquet \
+  --archive ./crates/solparq/archives/hourly_989_427299625-427308624 \
   --slot-range 427300000-427300500 \
   --columns slot,signature \
   --format jsonl
 ```
+
+Use `--table` to read a non-transaction table from a bundle, for example
+`--table blocks_metadata` or `--table entries`.
 
 S3 reads use the same endpoint, bucket, path, and credentials model as
 `solparq`. In S3 mode, `--archive` is the object key relative to
@@ -163,7 +187,7 @@ cargo run -p solparq-read -- summary \
   --archive-s3-bucket-path archives/test \
   --archive-s3-auth-key "$S3_ACCESS_KEY" \
   --archive-s3-auth-secret-key "$S3_SECRET_KEY" \
-  --archive hourly/hourly_989_427299625-427308624.parquet
+  --archive hourly/hourly_989_427299625-427308624
 ```
 
 ## Server Mode
@@ -298,10 +322,13 @@ That deletes matching slots from:
 
 - `transactions`
 - `blocks_metadata`
+- `entries`
 - `gsfa`
+- `gsfa_hot`
 - `signatures`
+- `token_owner_activity`
 
-`gsfa` and `signatures` only need to exist when this delete flag is enabled.
+Optional tables are deleted only when they were available for the archive run.
 
 ## Options
 
@@ -318,8 +345,11 @@ Common defaults:
 - `--db-database default`
 - `--db-transactions-table-name transactions`
 - `--db-blocks-table-name blocks_metadata`
+- `--db-entries-table-name entries`
 - `--db-gsfa-table-name gsfa`
+- `--db-gsfa-hot-table-name gsfa_hot`
 - `--db-signatures-table-name signatures`
+- `--db-token-owner-activity-table-name token_owner_activity`
 - `--archive-location-type local`
 - `--archive-file-output-location ./`
 - `--archives-to-keep 5`

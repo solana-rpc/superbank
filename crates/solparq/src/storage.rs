@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,6 +12,7 @@ use tokio::fs;
 use crate::{
     archive::{ArchiveKind, parse_archive_name, report_path_for_local_archive},
     config::{ArchiveLocation, Config, S3Config},
+    manifest::{ArchiveManifest, MANIFEST_FILE_NAME, REPORT_FILE_NAME},
 };
 
 #[derive(Debug, Clone)]
@@ -73,9 +75,15 @@ pub async fn cleanup_archives(config: &Config, kind: ArchiveKind) -> Result<Vec<
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                fs::remove_file(&path)
-                    .await
-                    .with_context(|| format!("delete local archive {}", path.display()))?;
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).await.with_context(|| {
+                        format!("delete local archive bundle {}", path.display())
+                    })?;
+                } else {
+                    fs::remove_file(&path)
+                        .await
+                        .with_context(|| format!("delete local archive {}", path.display()))?;
+                }
                 let report_path =
                     report_path_for_local_archive(config.output_location.clone(), &name);
                 let _ = fs::remove_file(report_path).await;
@@ -95,8 +103,14 @@ pub async fn write_report(
 ) -> Result<()> {
     match config.archive_location {
         ArchiveLocation::Local => {
-            fs::create_dir_all(&config.output_location).await?;
-            let path = report_path_for_local_archive(config.output_location.clone(), archive_name);
+            let path = if archive_name.ends_with(".parquet") {
+                fs::create_dir_all(&config.output_location).await?;
+                report_path_for_local_archive(config.output_location.clone(), archive_name)
+            } else {
+                let bundle_dir = local_bundle_dir(&config.output_location, archive_name);
+                fs::create_dir_all(&bundle_dir).await?;
+                bundle_dir.join(REPORT_FILE_NAME)
+            };
             fs::write(&path, report)
                 .await
                 .with_context(|| format!("write archive report {}", path.display()))?;
@@ -107,11 +121,47 @@ pub async fn write_report(
                 .as_ref()
                 .ok_or_else(|| anyhow!("archive-location-type=s3 requires S3 config"))?;
             let store = build_s3_store(s3)?;
-            let key = object_path_for_report(s3, kind, archive_name);
+            let key = if archive_name.ends_with(".parquet") {
+                object_path_for_report(s3, kind, archive_name)
+            } else {
+                object_path_for_bundle_file(s3, kind, archive_name, REPORT_FILE_NAME)
+            };
             store
                 .put(&key, PutPayload::from(report.as_bytes().to_vec()))
                 .await
                 .with_context(|| format!("write S3 report {}", key.as_ref()))?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn write_manifest(
+    config: &Config,
+    kind: ArchiveKind,
+    archive_id: &str,
+    manifest: &ArchiveManifest,
+) -> Result<()> {
+    let json = serde_json::to_vec_pretty(manifest).context("serialize archive manifest")?;
+    match config.archive_location {
+        ArchiveLocation::Local => {
+            let bundle_dir = local_bundle_dir(&config.output_location, archive_id);
+            fs::create_dir_all(&bundle_dir).await?;
+            let path = bundle_dir.join(MANIFEST_FILE_NAME);
+            fs::write(&path, json)
+                .await
+                .with_context(|| format!("write archive manifest {}", path.display()))?;
+        }
+        ArchiveLocation::S3 => {
+            let s3 = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| anyhow!("archive-location-type=s3 requires S3 config"))?;
+            let store = build_s3_store(s3)?;
+            let key = object_path_for_bundle_file(s3, kind, archive_id, MANIFEST_FILE_NAME);
+            store
+                .put(&key, PutPayload::from(json))
+                .await
+                .with_context(|| format!("write S3 manifest {}", key.as_ref()))?;
         }
     }
     Ok(())
@@ -131,7 +181,7 @@ pub fn local_archives_to_delete(
     {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() && !path.is_dir() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -163,7 +213,7 @@ async fn list_local_archive_names(directory: &Path, kind: ArchiveKind) -> Result
         .with_context(|| format!("scan archive directory {}", directory.display()))?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() && !path.is_dir() {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -191,15 +241,36 @@ async fn list_s3_archive_names(config: &Config, kind: ArchiveKind) -> Result<Vec
         .try_collect::<Vec<_>>()
         .await
         .context("list S3 archives")?;
-    Ok(objects
-        .into_iter()
-        .filter_map(|meta| {
-            let name = meta.location.filename()?.to_string();
-            parse_archive_name(&name)
+    let prefix_text = s3_prefix_for_kind(s3, kind);
+    let prefix_with_slash = format!("{prefix_text}/");
+    let mut names = HashSet::new();
+    for meta in objects {
+        let location = meta.location.as_ref();
+        if location.ends_with(".parquet") {
+            if let Some(name) = meta.location.filename().map(ToOwned::to_owned)
+                && parse_archive_name(&name)
+                    .filter(|parsed| parsed.kind_label == kind.label())
+                    .is_some()
+            {
+                names.insert(name);
+            }
+            continue;
+        }
+        let Some(relative) = location.strip_prefix(&prefix_with_slash) else {
+            continue;
+        };
+        let Some((archive_id, file_name)) = relative.split_once('/') else {
+            continue;
+        };
+        if file_name == MANIFEST_FILE_NAME
+            && parse_archive_name(archive_id)
                 .filter(|parsed| parsed.kind_label == kind.label())
-                .map(|_| name)
-        })
-        .collect())
+                .is_some()
+        {
+            names.insert(archive_id.to_string());
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 async fn cleanup_s3_archives(config: &Config, kind: ArchiveKind) -> Result<Vec<String>> {
@@ -217,13 +288,31 @@ async fn cleanup_s3_archives(config: &Config, kind: ArchiveKind) -> Result<Vec<S
     let delete_count = archives.len().saturating_sub(config.archives_to_keep);
     let mut deleted = Vec::new();
     for (_, name) in archives.into_iter().take(delete_count) {
-        let archive_key = object_path_for_archive(s3, kind, &name);
-        store
-            .delete(&archive_key)
-            .await
-            .with_context(|| format!("delete S3 archive {}", archive_key.as_ref()))?;
-        let report_key = object_path_for_report(s3, kind, &name);
-        let _ = store.delete(&report_key).await;
+        if name.ends_with(".parquet") {
+            let archive_key = object_path_for_archive(s3, kind, &name);
+            store
+                .delete(&archive_key)
+                .await
+                .with_context(|| format!("delete S3 archive {}", archive_key.as_ref()))?;
+            let report_key = object_path_for_report(s3, kind, &name);
+            let _ = store.delete(&report_key).await;
+        } else {
+            let bundle_prefix =
+                ObjectPath::from(format!("{}/{}/", s3_prefix_for_kind(s3, kind), name));
+            let objects = store
+                .list(Some(&bundle_prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .with_context(|| format!("list S3 archive bundle {}", bundle_prefix.as_ref()))?;
+            for object in objects {
+                store.delete(&object.location).await.with_context(|| {
+                    format!(
+                        "delete S3 archive bundle object {}",
+                        object.location.as_ref()
+                    )
+                })?;
+            }
+        }
         deleted.push(name);
     }
     Ok(deleted)
@@ -264,5 +353,27 @@ fn object_path_for_report(config: &S3Config, kind: ArchiveKind, archive_name: &s
         "{}/.{}.report.txt",
         s3_prefix_for_kind(config, kind),
         archive_name
+    ))
+}
+
+pub fn local_bundle_dir(directory: &Path, archive_id: &str) -> PathBuf {
+    directory.join(archive_id)
+}
+
+pub fn local_staging_bundle_dir(directory: &Path, archive_id: &str) -> PathBuf {
+    directory.join(format!(".{archive_id}.tmp"))
+}
+
+fn object_path_for_bundle_file(
+    config: &S3Config,
+    kind: ArchiveKind,
+    archive_id: &str,
+    file_name: &str,
+) -> ObjectPath {
+    ObjectPath::from(format!(
+        "{}/{}/{}",
+        s3_prefix_for_kind(config, kind),
+        archive_id,
+        file_name
     ))
 }

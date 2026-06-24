@@ -8,11 +8,13 @@ use parquet::{
     file::{properties::WriterProperties, writer::SerializedFileWriter},
     schema::parser::parse_message_type,
 };
+use serde_json::Value;
 use serde_json::json;
 use solparq_read::{
     archive_name::{ParsedArchiveName, parse_archive_name},
     config::{Cli, ScanSelection},
     query::{ArchiveInput, ScanOptions, scan_archive, summarize_archive},
+    render,
 };
 use tempfile::TempDir;
 
@@ -66,6 +68,25 @@ async fn summary_projects_slot_column_and_ignores_invalid_utf8_columns() {
 }
 
 #[tokio::test]
+async fn summary_reads_db_archive_bundle_manifest_and_table_counts() {
+    let (_dir, bundle_path) = write_test_bundle();
+    let cli = Cli::try_parse_from([
+        "solparq-read",
+        "summary",
+        "--archive",
+        bundle_path.to_str().expect("bundle path"),
+    ])
+    .expect("valid summary command");
+
+    let output = render(cli).await.expect("render summary");
+
+    assert!(output.contains("archive_format: bundle"));
+    assert!(output.contains("archive: custom_0_10-13"));
+    assert!(output.contains("table_transactions_rows: 5"));
+    assert!(output.contains("table_blocks_metadata_rows: 4"));
+}
+
+#[tokio::test]
 async fn scan_filters_transactions_by_inclusive_slot_range() {
     let (_dir, archive_path) = write_test_archive();
 
@@ -82,6 +103,36 @@ async fn scan_filters_transactions_by_inclusive_slot_range() {
     )
     .await
     .expect("scan archive");
+
+    assert_eq!(
+        rows,
+        vec![
+            json!({"slot": 11, "signature": "sig-b"}),
+            json!({"slot": 12, "signature": "sig-c"}),
+            json!({"slot": 12, "signature": "sig-d"}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn scan_reads_transactions_from_db_archive_bundle_by_default() {
+    let (_dir, bundle_path) = write_test_bundle();
+    let cli = Cli::try_parse_from([
+        "solparq-read",
+        "scan",
+        "--archive",
+        bundle_path.to_str().expect("bundle path"),
+        "--slot-range",
+        "11-12",
+        "--columns",
+        "slot,signature",
+        "--format",
+        "json",
+    ])
+    .expect("valid scan command");
+
+    let output = render(cli).await.expect("render scan");
+    let rows: Vec<Value> = serde_json::from_str(&output).expect("json rows");
 
     assert_eq!(
         rows,
@@ -193,6 +244,44 @@ fn write_test_archive() -> (TempDir, std::path::PathBuf) {
     (dir, archive_path)
 }
 
+fn write_test_bundle() -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().expect("temp dir");
+    let bundle_path = dir.path().join("custom_0_10-13");
+    std::fs::create_dir(&bundle_path).expect("create bundle");
+    write_parquet(&bundle_path.join("transactions.parquet"));
+    write_blocks_parquet(&bundle_path.join("blocks_metadata.parquet"));
+    std::fs::write(
+        bundle_path.join("manifest.json"),
+        r#"{
+          "format_version": 1,
+          "archive_id": "custom_0_10-13",
+          "archive_kind": "custom:4",
+          "start_slot": 10,
+          "end_slot": 13,
+          "tables": [
+            {
+              "kind": "transactions",
+              "table_name": "transactions",
+              "file_name": "transactions.parquet",
+              "row_count": 5,
+              "required": true
+            },
+            {
+              "kind": "blocks_metadata",
+              "table_name": "blocks_metadata",
+              "file_name": "blocks_metadata.parquet",
+              "row_count": 4,
+              "required": true
+            }
+          ],
+          "skipped_tables": [],
+          "poh_tool_ready": true
+        }"#,
+    )
+    .expect("write manifest");
+    (dir, bundle_path)
+}
+
 fn write_parquet(path: &Path) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("slot", DataType::UInt64, false),
@@ -215,6 +304,26 @@ fn write_parquet(path: &Path) {
                 Some("ok"),
                 None,
             ])) as ArrayRef,
+        ],
+    )
+    .expect("record batch");
+
+    let file = File::create(path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_blocks_parquet(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slot", DataType::UInt64, false),
+        Field::new("executed_transaction_count", DataType::UInt64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 11, 12, 13])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![1, 1, 2, 1])) as ArrayRef,
         ],
     )
     .expect("record batch");

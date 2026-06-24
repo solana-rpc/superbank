@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt,
     io::{self, IsTerminal, Write},
     path::PathBuf,
@@ -8,11 +9,13 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use serde::Serialize;
+use tokio::fs;
 use tracing::{debug, info};
 
 use crate::{
-    clickhouse::{ClickHouseClient, DbTables, ValidationReport},
+    clickhouse::{ArchiveDbTable, ClickHouseClient, DbTables, ValidationReport},
     config::Config,
+    manifest::{ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, SkippedArchiveTable},
     storage::{self, ArchiveDestination},
 };
 
@@ -114,14 +117,18 @@ pub struct ArchivePlan {
 }
 
 impl ArchivePlan {
-    pub fn file_name(&self) -> String {
+    pub fn archive_id(&self) -> String {
         format!(
-            "{}_{}_{}-{}.parquet",
+            "{}_{}_{}-{}",
             self.kind.label(),
             self.epoch,
             self.start_slot,
             self.end_slot
         )
+    }
+
+    pub fn file_name(&self) -> String {
+        format!("{}.parquet", self.archive_id())
     }
 }
 
@@ -134,7 +141,7 @@ pub struct ParsedArchiveName {
 }
 
 pub fn parse_archive_name(file_name: &str) -> Option<ParsedArchiveName> {
-    let stem = file_name.strip_suffix(".parquet")?;
+    let stem = file_name.strip_suffix(".parquet").unwrap_or(file_name);
     let mut parts = stem.split('_');
     let kind_label = parts.next()?.to_string();
     let epoch = parts.next()?.parse().ok()?;
@@ -331,9 +338,14 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         blocks_table = tables.blocks_table,
         "checking ClickHouse archive source"
     );
-    client
-        .check_tables(&tables, should_delete_archived_data_range(config, kind))
-        .await?;
+    let available_archive_tables = client.check_tables(&tables).await?;
+    let skipped_archive_tables = skipped_archive_tables(&tables, &available_archive_tables);
+    info!(
+        archive_kind = kind.to_string(),
+        archive_tables = available_archive_tables.len(),
+        skipped_optional_archive_tables = skipped_archive_tables.len(),
+        "resolved DB archive table set"
+    );
 
     let Some(bounds) = client.fetch_bounds(&tables.transactions_table).await? else {
         return Ok(ArchiveRunReport::skipped(
@@ -426,7 +438,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         }
     }
 
-    let archive_name = plan.file_name();
+    let archive_name = plan.archive_id();
     info!(
         archive_kind = kind.to_string(),
         archive_name,
@@ -434,35 +446,90 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         end_slot = plan.end_slot,
         "creating archive"
     );
+    let mut manifest_tables = Vec::new();
     match &destination {
         ArchiveDestination::Local { directory } => {
-            let path = directory.join(&archive_name);
-            client
-                .stream_local_parquet(
-                    &tables.transactions_table,
-                    plan.start_slot,
-                    plan.end_slot,
-                    &path,
-                )
-                .await?;
+            let staging_dir = storage::local_staging_bundle_dir(directory, &archive_name);
+            if staging_dir.exists() {
+                fs::remove_dir_all(&staging_dir).await?;
+            }
+            fs::create_dir_all(&staging_dir).await?;
+            for table in &available_archive_tables {
+                let path = staging_dir.join(table.file_name());
+                info!(
+                    archive_kind = kind.to_string(),
+                    archive_name,
+                    archive_table = table.kind.as_str(),
+                    table_name = table.table_name.as_str(),
+                    path = path.display().to_string(),
+                    "creating archive table parquet"
+                );
+                client
+                    .stream_local_table_parquet(table, plan.start_slot, plan.end_slot, &path)
+                    .await?;
+                let row_count = client
+                    .count_table_rows(table, plan.start_slot, plan.end_slot)
+                    .await?;
+                manifest_tables.push(ArchiveManifestTable::from_table(table, row_count));
+            }
+            let manifest = ArchiveManifest::new(
+                archive_name.clone(),
+                kind,
+                plan.epoch,
+                plan.start_slot,
+                plan.end_slot,
+                manifest_tables.clone(),
+                skipped_archive_tables.clone(),
+            );
+            let manifest_json = serde_json::to_vec_pretty(&manifest).map_err(|err| anyhow!(err))?;
+            fs::write(staging_dir.join(MANIFEST_FILE_NAME), manifest_json).await?;
+            fs::rename(
+                &staging_dir,
+                storage::local_bundle_dir(directory, &archive_name),
+            )
+            .await?;
         }
         ArchiveDestination::S3 { prefix, .. } => {
             let s3 = config
                 .s3
                 .as_ref()
                 .ok_or_else(|| anyhow!("S3 destination requested without S3 config"))?;
-            let sql = crate::clickhouse::build_s3_archive_sql(crate::clickhouse::S3ArchiveSql {
-                transactions_table: &tables.transactions_table,
-                start_slot: plan.start_slot,
-                end_slot: plan.end_slot,
-                endpoint: &s3.endpoint,
-                bucket: &s3.bucket_name,
-                bucket_path: prefix,
-                archive_name: &archive_name,
-                access_key: &s3.auth_key,
-                secret_key: &s3.auth_secret_key,
-            });
-            client.execute(&sql).await?;
+            for table in &available_archive_tables {
+                info!(
+                    archive_kind = kind.to_string(),
+                    archive_name,
+                    archive_table = table.kind.as_str(),
+                    table_name = table.table_name.as_str(),
+                    "creating S3 archive table parquet"
+                );
+                let sql =
+                    crate::clickhouse::build_s3_archive_sql(crate::clickhouse::S3ArchiveSql {
+                        table,
+                        start_slot: plan.start_slot,
+                        end_slot: plan.end_slot,
+                        endpoint: &s3.endpoint,
+                        bucket: &s3.bucket_name,
+                        bucket_path: prefix,
+                        archive_name: &archive_name,
+                        access_key: &s3.auth_key,
+                        secret_key: &s3.auth_secret_key,
+                    });
+                client.execute(&sql).await?;
+                let row_count = client
+                    .count_table_rows(table, plan.start_slot, plan.end_slot)
+                    .await?;
+                manifest_tables.push(ArchiveManifestTable::from_table(table, row_count));
+            }
+            let manifest = ArchiveManifest::new(
+                archive_name.clone(),
+                kind,
+                plan.epoch,
+                plan.start_slot,
+                plan.end_slot,
+                manifest_tables.clone(),
+                skipped_archive_tables.clone(),
+            );
+            storage::write_manifest(config, kind, &archive_name, &manifest).await?;
         }
     }
 
@@ -475,7 +542,11 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             "deleting archived ClickHouse data range"
         );
         client
-            .delete_archived_range(&tables, plan.start_slot, plan.end_slot)
+            .delete_archived_range_for_tables(
+                &available_archive_tables,
+                plan.start_slot,
+                plan.end_slot,
+            )
             .await?;
         deleted_clickhouse_range = true;
     } else if config.delete_archived_data_range {
@@ -532,6 +603,22 @@ fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {
         rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or("none"),
         "archive validation gap summary"
     );
+}
+
+fn skipped_archive_tables(
+    tables: &DbTables,
+    available_archive_tables: &[ArchiveDbTable],
+) -> Vec<SkippedArchiveTable> {
+    let available = available_archive_tables
+        .iter()
+        .map(|table| (table.kind, table.table_name.as_str()))
+        .collect::<HashSet<_>>();
+    tables
+        .archive_tables()
+        .into_iter()
+        .filter(|table| !available.contains(&(table.kind, table.table_name.as_str())))
+        .map(|table| SkippedArchiveTable::unavailable(&table))
+        .collect()
 }
 
 fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport) -> Result<bool> {

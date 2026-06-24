@@ -31,8 +31,11 @@ pub struct Config {
     pub db_password: String,
     pub transactions_table: String,
     pub blocks_table: String,
+    pub entries_table: String,
     pub gsfa_table: String,
+    pub gsfa_hot_table: String,
     pub signatures_table: String,
+    pub token_owner_activity_table: String,
     pub archive_kinds: Vec<ArchiveKind>,
     pub archive_location: ArchiveLocation,
     pub output_location: PathBuf,
@@ -88,8 +91,11 @@ impl Config {
         for table in [
             &cli.transactions_table,
             &cli.blocks_table,
+            &cli.entries_table,
             &cli.gsfa_table,
+            &cli.gsfa_hot_table,
             &cli.signatures_table,
+            &cli.token_owner_activity_table,
         ] {
             validate_table_name(table)?;
         }
@@ -126,8 +132,11 @@ impl Config {
             db_password: cli.db_password,
             transactions_table: cli.transactions_table,
             blocks_table: cli.blocks_table,
+            entries_table: cli.entries_table,
             gsfa_table: cli.gsfa_table,
+            gsfa_hot_table: cli.gsfa_hot_table,
             signatures_table: cli.signatures_table,
+            token_owner_activity_table: cli.token_owner_activity_table,
             archive_kinds,
             archive_location: cli.archive_location,
             output_location: cli.archive_file_output_location,
@@ -164,10 +173,7 @@ impl Config {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "Archive Superbank ClickHouse transactions to Parquet"
-)]
+#[command(version, about = "Archive Superbank ClickHouse tables to Parquet")]
 struct Cli {
     #[arg(long, env = "SOLPARQ_DB_SERVER")]
     db_server: String,
@@ -201,6 +207,14 @@ struct Cli {
     blocks_table: String,
 
     #[arg(
+        long = "db-entries-table-name",
+        alias = "entries-table",
+        env = "SOLPARQ_DB_ENTRIES_TABLE_NAME",
+        default_value = "entries"
+    )]
+    entries_table: String,
+
+    #[arg(
         long = "db-gsfa-table-name",
         alias = "gsfa-table",
         env = "SOLPARQ_DB_GSFA_TABLE_NAME",
@@ -209,12 +223,28 @@ struct Cli {
     gsfa_table: String,
 
     #[arg(
+        long = "db-gsfa-hot-table-name",
+        alias = "gsfa-hot-table",
+        env = "SOLPARQ_DB_GSFA_HOT_TABLE_NAME",
+        default_value = "gsfa_hot"
+    )]
+    gsfa_hot_table: String,
+
+    #[arg(
         long = "db-signatures-table-name",
         alias = "signatures-table",
         env = "SOLPARQ_DB_SIGNATURES_TABLE_NAME",
         default_value = "signatures"
     )]
     signatures_table: String,
+
+    #[arg(
+        long = "db-token-owner-activity-table-name",
+        alias = "token-owner-activity-table",
+        env = "SOLPARQ_DB_TOKEN_OWNER_ACTIVITY_TABLE_NAME",
+        default_value = "token_owner_activity"
+    )]
+    token_owner_activity_table: String,
 
     #[arg(
         long = "archive-range-type",

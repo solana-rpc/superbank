@@ -1,4 +1,9 @@
-use std::{collections::HashSet, fs::File, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array};
@@ -11,20 +16,30 @@ use parquet::arrow::{
     arrow_reader::ParquetRecordBatchReaderBuilder,
     async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
     archive_name::{ParsedArchiveName, parse_archive_name},
-    config::ScanSelection,
+    config::{ArchiveTable, ScanSelection},
 };
 
 #[derive(Clone)]
 pub enum ArchiveInput {
     LocalFile(PathBuf),
+    LocalBundle {
+        dir: PathBuf,
+        table: ArchiveTable,
+    },
     S3Object {
         store: Arc<dyn ObjectStore>,
         path: ObjectPath,
+        display_path: String,
+    },
+    S3Bundle {
+        store: Arc<dyn ObjectStore>,
+        prefix: ObjectPath,
+        table: ArchiveTable,
         display_path: String,
     },
 }
@@ -38,9 +53,11 @@ pub struct ScanOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArchiveSummary {
+    pub archive_format: String,
     pub archive_path: String,
     pub archive_name: String,
     pub parsed_name: Option<ParsedArchiveName>,
+    pub tables: Vec<ArchiveTableSummary>,
     pub transaction_rows: u64,
     pub actual_min_slot: Option<u64>,
     pub actual_max_slot: Option<u64>,
@@ -49,6 +66,15 @@ pub struct ArchiveSummary {
     pub row_groups: usize,
     pub columns: usize,
     pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveTableSummary {
+    pub kind: String,
+    pub table_name: String,
+    pub file_name: String,
+    pub row_count: u64,
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,7 +101,57 @@ struct OpenArchive {
     batches: Vec<RecordBatch>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BundleManifest {
+    archive_id: String,
+    tables: Vec<BundleManifestTable>,
+}
+
+impl BundleManifest {
+    fn file_for_table(&self, table: ArchiveTable) -> Option<&str> {
+        self.tables
+            .iter()
+            .find(|entry| entry.kind == table.as_str())
+            .map(|entry| entry.file_name.as_str())
+    }
+
+    fn table_summaries(&self) -> Vec<ArchiveTableSummary> {
+        self.tables
+            .iter()
+            .map(|table| ArchiveTableSummary {
+                kind: table.kind.clone(),
+                table_name: table.table_name.clone(),
+                file_name: table.file_name.clone(),
+                row_count: table.row_count,
+                required: table.required,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BundleManifestTable {
+    kind: String,
+    table_name: String,
+    file_name: String,
+    row_count: u64,
+    required: bool,
+}
+
 pub async fn summarize_archive(input: ArchiveInput) -> Result<ArchiveSummary> {
+    match input {
+        ArchiveInput::LocalBundle { dir, .. } => summarize_local_bundle(dir).await,
+        ArchiveInput::S3Bundle {
+            store,
+            prefix,
+            display_path,
+            ..
+        } => summarize_s3_bundle(store, prefix, display_path).await,
+        input => summarize_parquet_archive(input).await,
+    }
+}
+
+async fn summarize_parquet_archive(input: ArchiveInput) -> Result<ArchiveSummary> {
     let archive = read_archive(input, Projection::Columns(vec!["slot".to_string()])).await?;
     let mut distinct_slots = HashSet::new();
     let mut min_slot = None;
@@ -96,10 +172,19 @@ pub async fn summarize_archive(input: ArchiveInput) -> Result<ArchiveSummary> {
         }
     }
 
+    let archive_name = archive.name.clone();
     Ok(ArchiveSummary {
+        archive_format: "legacy-parquet".to_string(),
         archive_path: archive.path,
-        archive_name: archive.name,
+        archive_name: archive_name.clone(),
         parsed_name: archive.parsed_name,
+        tables: vec![ArchiveTableSummary {
+            kind: "transactions".to_string(),
+            table_name: "transactions".to_string(),
+            file_name: archive_name,
+            row_count: archive.transaction_rows,
+            required: true,
+        }],
         transaction_rows: archive.transaction_rows,
         actual_min_slot: min_slot,
         actual_max_slot: max_slot,
@@ -109,6 +194,132 @@ pub async fn summarize_archive(input: ArchiveInput) -> Result<ArchiveSummary> {
         columns: archive.schema.fields().len(),
         size_bytes: archive.size_bytes,
     })
+}
+
+fn bundle_summary(
+    manifest: BundleManifest,
+    archive_path: String,
+    tx_summary: ArchiveSummary,
+    size_bytes: Option<u64>,
+) -> ArchiveSummary {
+    let transaction_rows = manifest
+        .tables
+        .iter()
+        .find(|table| table.kind == ArchiveTable::Transactions.as_str())
+        .map(|table| table.row_count)
+        .unwrap_or(tx_summary.transaction_rows);
+    ArchiveSummary {
+        archive_format: "bundle".to_string(),
+        archive_path,
+        archive_name: manifest.archive_id.clone(),
+        parsed_name: parse_archive_name(&manifest.archive_id),
+        tables: manifest.table_summaries(),
+        transaction_rows,
+        actual_min_slot: tx_summary.actual_min_slot,
+        actual_max_slot: tx_summary.actual_max_slot,
+        observed_slots: tx_summary.observed_slots,
+        observed_blocks: tx_summary.observed_blocks,
+        row_groups: tx_summary.row_groups,
+        columns: tx_summary.columns,
+        size_bytes,
+    }
+}
+
+fn empty_bundle_parquet_summary(archive_id: &str, archive_path: String) -> ArchiveSummary {
+    ArchiveSummary {
+        archive_format: "bundle".to_string(),
+        archive_path,
+        archive_name: archive_id.to_string(),
+        parsed_name: parse_archive_name(archive_id),
+        tables: Vec::new(),
+        transaction_rows: 0,
+        actual_min_slot: None,
+        actual_max_slot: None,
+        observed_slots: 0,
+        observed_blocks: 0,
+        row_groups: 0,
+        columns: 0,
+        size_bytes: None,
+    }
+}
+
+fn read_local_manifest(dir: &Path) -> Result<BundleManifest> {
+    let path = dir.join("manifest.json");
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read archive bundle manifest {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse manifest {}", path.display()))
+}
+
+async fn read_s3_manifest(
+    store: Arc<dyn ObjectStore>,
+    prefix: &ObjectPath,
+    display_path: &str,
+) -> Result<BundleManifest> {
+    let manifest_path = bundle_object_path(prefix, "manifest.json");
+    let bytes = store
+        .get(&manifest_path)
+        .await
+        .with_context(|| format!("read S3 archive bundle manifest {display_path}/manifest.json"))?
+        .bytes()
+        .await
+        .context("read S3 manifest bytes")?;
+    serde_json::from_slice(&bytes).context("parse S3 archive bundle manifest")
+}
+
+fn bundle_object_path(prefix: &ObjectPath, file_name: &str) -> ObjectPath {
+    ObjectPath::from(format!(
+        "{}/{}",
+        prefix.as_ref().trim_end_matches('/'),
+        file_name
+    ))
+}
+
+fn local_bundle_size_bytes(dir: &Path) -> Option<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let metadata = entry.metadata().ok()?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Some(total)
+}
+
+async fn summarize_local_bundle(dir: PathBuf) -> Result<ArchiveSummary> {
+    let manifest = read_local_manifest(&dir)?;
+    let transactions_file = manifest.file_for_table(ArchiveTable::Transactions);
+    let tx_summary = if let Some(file_name) = transactions_file {
+        summarize_parquet_archive(ArchiveInput::LocalFile(dir.join(file_name))).await?
+    } else {
+        empty_bundle_parquet_summary(&manifest.archive_id, dir.display().to_string())
+    };
+    Ok(bundle_summary(
+        manifest,
+        dir.display().to_string(),
+        tx_summary,
+        local_bundle_size_bytes(&dir),
+    ))
+}
+
+async fn summarize_s3_bundle(
+    store: Arc<dyn ObjectStore>,
+    prefix: ObjectPath,
+    display_path: String,
+) -> Result<ArchiveSummary> {
+    let manifest = read_s3_manifest(store.clone(), &prefix, &display_path).await?;
+    let transactions_file = manifest.file_for_table(ArchiveTable::Transactions);
+    let tx_summary = if let Some(file_name) = transactions_file {
+        summarize_parquet_archive(ArchiveInput::S3Object {
+            store,
+            path: bundle_object_path(&prefix, file_name),
+            display_path: format!("{display_path}/{file_name}"),
+        })
+        .await?
+    } else {
+        empty_bundle_parquet_summary(&manifest.archive_id, display_path.clone())
+    };
+    Ok(bundle_summary(manifest, display_path, tx_summary, None))
 }
 
 pub async fn schema_archive(input: ArchiveInput) -> Result<ArchiveSchema> {
@@ -158,11 +369,36 @@ enum Projection {
 async fn read_archive(input: ArchiveInput, projection: Projection) -> Result<OpenArchive> {
     match input {
         ArchiveInput::LocalFile(path) => read_local_archive(path, projection).await,
+        ArchiveInput::LocalBundle { dir, table } => {
+            let manifest = read_local_manifest(&dir)?;
+            let file_name = manifest.file_for_table(table).ok_or_else(|| {
+                anyhow!("archive bundle does not contain table '{}'", table.as_str())
+            })?;
+            read_local_archive(dir.join(file_name), projection).await
+        }
         ArchiveInput::S3Object {
             store,
             path,
             display_path,
         } => read_s3_archive(store, path, display_path, projection).await,
+        ArchiveInput::S3Bundle {
+            store,
+            prefix,
+            table,
+            display_path,
+        } => {
+            let manifest = read_s3_manifest(store.clone(), &prefix, &display_path).await?;
+            let file_name = manifest.file_for_table(table).ok_or_else(|| {
+                anyhow!("archive bundle does not contain table '{}'", table.as_str())
+            })?;
+            read_s3_archive(
+                store,
+                bundle_object_path(&prefix, file_name),
+                format!("{display_path}/{file_name}"),
+                projection,
+            )
+            .await
+        }
     }
 }
 

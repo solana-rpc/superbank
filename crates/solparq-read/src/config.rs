@@ -94,6 +94,10 @@ pub struct ArchiveArgs {
     /// Local archive file path, or S3 object key relative to --archive-s3-bucket-path.
     #[arg(long = "archive")]
     pub archive: String,
+
+    /// Table to read when --archive points at a DB archive bundle.
+    #[arg(long = "table", value_enum, default_value_t = ArchiveTable::Transactions)]
+    pub table: ArchiveTable,
 }
 
 #[derive(Debug, Args)]
@@ -178,6 +182,32 @@ pub struct SourceArgs {
 pub enum ArchiveLocationType {
     Local,
     S3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum ArchiveTable {
+    Transactions,
+    BlocksMetadata,
+    Entries,
+    Gsfa,
+    GsfaHot,
+    Signatures,
+    TokenOwnerActivity,
+}
+
+impl ArchiveTable {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArchiveTable::Transactions => "transactions",
+            ArchiveTable::BlocksMetadata => "blocks_metadata",
+            ArchiveTable::Entries => "entries",
+            ArchiveTable::Gsfa => "gsfa",
+            ArchiveTable::GsfaHot => "gsfa_hot",
+            ArchiveTable::Signatures => "signatures",
+            ArchiveTable::TokenOwnerActivity => "token_owner_activity",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

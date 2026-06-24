@@ -12,8 +12,11 @@ use crate::{archive::ClickHouseBounds, config::Config};
 pub struct DbTables {
     pub transactions_table: String,
     pub blocks_table: String,
+    pub entries_table: String,
     pub gsfa_table: String,
+    pub gsfa_hot_table: String,
     pub signatures_table: String,
+    pub token_owner_activity_table: String,
 }
 
 impl DbTables {
@@ -21,9 +24,125 @@ impl DbTables {
         Self {
             transactions_table: config.transactions_table.clone(),
             blocks_table: config.blocks_table.clone(),
+            entries_table: config.entries_table.clone(),
             gsfa_table: config.gsfa_table.clone(),
+            gsfa_hot_table: config.gsfa_hot_table.clone(),
             signatures_table: config.signatures_table.clone(),
+            token_owner_activity_table: config.token_owner_activity_table.clone(),
         }
+    }
+
+    pub fn archive_tables(&self) -> Vec<ArchiveDbTable> {
+        vec![
+            ArchiveDbTable::new(
+                ArchiveTableKind::Transactions,
+                self.transactions_table.clone(),
+                "slot, slot_idx, signature",
+                true,
+            ),
+            ArchiveDbTable::new(
+                ArchiveTableKind::BlocksMetadata,
+                self.blocks_table.clone(),
+                "slot",
+                true,
+            ),
+            ArchiveDbTable::new(
+                ArchiveTableKind::Entries,
+                self.entries_table.clone(),
+                "slot, entry_index",
+                false,
+            ),
+            ArchiveDbTable::new(
+                ArchiveTableKind::Gsfa,
+                self.gsfa_table.clone(),
+                "slot, slot_idx, signature",
+                false,
+            ),
+            ArchiveDbTable::new(
+                ArchiveTableKind::GsfaHot,
+                self.gsfa_hot_table.clone(),
+                "slot, slot_idx, signature",
+                false,
+            ),
+            ArchiveDbTable::new(
+                ArchiveTableKind::Signatures,
+                self.signatures_table.clone(),
+                "slot, slot_idx, signature",
+                false,
+            ),
+            ArchiveDbTable::new(
+                ArchiveTableKind::TokenOwnerActivity,
+                self.token_owner_activity_table.clone(),
+                "slot, slot_idx, signature",
+                false,
+            ),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveTableKind {
+    Transactions,
+    BlocksMetadata,
+    Entries,
+    Gsfa,
+    GsfaHot,
+    Signatures,
+    TokenOwnerActivity,
+}
+
+impl ArchiveTableKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArchiveTableKind::Transactions => "transactions",
+            ArchiveTableKind::BlocksMetadata => "blocks_metadata",
+            ArchiveTableKind::Entries => "entries",
+            ArchiveTableKind::Gsfa => "gsfa",
+            ArchiveTableKind::GsfaHot => "gsfa_hot",
+            ArchiveTableKind::Signatures => "signatures",
+            ArchiveTableKind::TokenOwnerActivity => "token_owner_activity",
+        }
+    }
+
+    pub fn file_name(self) -> &'static str {
+        match self {
+            ArchiveTableKind::Transactions => "transactions.parquet",
+            ArchiveTableKind::BlocksMetadata => "blocks_metadata.parquet",
+            ArchiveTableKind::Entries => "entries.parquet",
+            ArchiveTableKind::Gsfa => "gsfa.parquet",
+            ArchiveTableKind::GsfaHot => "gsfa_hot.parquet",
+            ArchiveTableKind::Signatures => "signatures.parquet",
+            ArchiveTableKind::TokenOwnerActivity => "token_owner_activity.parquet",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveDbTable {
+    pub kind: ArchiveTableKind,
+    pub table_name: String,
+    pub order_by: String,
+    pub required: bool,
+}
+
+impl ArchiveDbTable {
+    fn new(
+        kind: ArchiveTableKind,
+        table_name: String,
+        order_by: impl Into<String>,
+        required: bool,
+    ) -> Self {
+        Self {
+            kind,
+            table_name,
+            order_by: order_by.into(),
+            required,
+        }
+    }
+
+    pub fn file_name(&self) -> &'static str {
+        self.kind.file_name()
     }
 }
 
@@ -49,23 +168,26 @@ impl ClickHouseClient {
         })
     }
 
-    pub async fn check_tables(
-        &self,
-        tables: &DbTables,
-        require_cleanup_tables: bool,
-    ) -> Result<()> {
-        let mut required_tables = vec![&tables.transactions_table, &tables.blocks_table];
-        if require_cleanup_tables {
-            required_tables.push(&tables.gsfa_table);
-            required_tables.push(&tables.signatures_table);
+    pub async fn check_tables(&self, tables: &DbTables) -> Result<Vec<ArchiveDbTable>> {
+        let mut available = Vec::new();
+        for table in tables.archive_tables() {
+            let sql = format!("SELECT count() FROM {} WHERE 0", table.table_name);
+            match self.execute(&sql).await {
+                Ok(()) => available.push(table),
+                Err(err) if table.required => {
+                    return Err(err)
+                        .with_context(|| format!("check ClickHouse table {}", table.table_name));
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        archive_table = table.kind.as_str(),
+                        table_name = table.table_name,
+                        "optional ClickHouse archive table is not available"
+                    );
+                }
+            }
         }
-        for table in required_tables {
-            let sql = format!("SELECT count() FROM {table} WHERE 0");
-            self.execute(&sql)
-                .await
-                .with_context(|| format!("check ClickHouse table {table}"))?;
-        }
-        Ok(())
+        Ok(available)
     }
 
     pub async fn fetch_bounds(&self, transactions_table: &str) -> Result<Option<ClickHouseBounds>> {
@@ -156,6 +278,41 @@ impl ClickHouseClient {
         Ok(())
     }
 
+    pub async fn stream_local_table_parquet(
+        &self,
+        table: &ArchiveDbTable,
+        start_slot: u64,
+        end_slot: u64,
+        path: &Path,
+    ) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create archive directory {}", parent.display()))?;
+        }
+
+        let tmp_path = path.with_extension("parquet.tmp");
+        let query = build_local_table_parquet_query(table, start_slot, end_slot);
+        let response = self.post_sql(&query).await?;
+        let mut stream = response.bytes_stream();
+        let mut file = fs::File::create(&tmp_path)
+            .await
+            .with_context(|| format!("create temporary archive {}", tmp_path.display()))?;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read ClickHouse parquet response chunk")?;
+            file.write_all(&chunk)
+                .await
+                .context("write parquet archive chunk")?;
+        }
+        file.flush().await.context("flush parquet archive")?;
+        drop(file);
+        fs::rename(&tmp_path, path)
+            .await
+            .with_context(|| format!("move archive into place {}", path.display()))?;
+        Ok(())
+    }
+
     pub async fn execute(&self, sql: &str) -> Result<()> {
         self.post_sql(sql).await?;
         Ok(())
@@ -167,17 +324,46 @@ impl ClickHouseClient {
         start_slot: u64,
         end_slot: u64,
     ) -> Result<()> {
-        for sql in build_delete_sql(
-            &tables.transactions_table,
-            &tables.blocks_table,
-            &tables.gsfa_table,
-            &tables.signatures_table,
-            start_slot,
-            end_slot,
-        ) {
+        for sql in build_delete_sql(tables, start_slot, end_slot) {
             self.execute(&sql).await?;
         }
         Ok(())
+    }
+
+    pub async fn delete_archived_range_for_tables(
+        &self,
+        tables: &[ArchiveDbTable],
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<()> {
+        for table in tables {
+            self.execute(&build_delete_table_sql(
+                &table.table_name,
+                start_slot,
+                end_slot,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn count_table_rows(
+        &self,
+        table: &ArchiveDbTable,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<u64> {
+        #[derive(Debug, Deserialize)]
+        struct CountRow {
+            rows: u64,
+        }
+
+        let sql = format!(
+            "SELECT count() AS rows FROM {} WHERE slot BETWEEN {start_slot} AND {end_slot}",
+            table.table_name
+        );
+        let rows = self.query_json_rows::<CountRow>(&sql).await?;
+        Ok(rows.into_iter().next().map(|row| row.rows).unwrap_or(0))
     }
 
     async fn fetch_block_slots(
@@ -431,9 +617,21 @@ pub fn build_local_parquet_query(
     )
 }
 
+pub fn build_local_table_parquet_query(
+    table: &ArchiveDbTable,
+    start_slot: u64,
+    end_slot: u64,
+) -> String {
+    format!(
+        "SELECT * FROM {table_name} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY {order_by} FORMAT Parquet",
+        table_name = table.table_name,
+        order_by = table.order_by
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct S3ArchiveSql<'a> {
-    pub transactions_table: &'a str,
+    pub table: &'a ArchiveDbTable,
     pub start_slot: u64,
     pub end_slot: u64,
     pub endpoint: &'a str,
@@ -445,42 +643,38 @@ pub struct S3ArchiveSql<'a> {
 }
 
 pub fn build_s3_archive_sql(params: S3ArchiveSql<'_>) -> String {
+    build_s3_table_archive_sql(params)
+}
+
+pub fn build_s3_table_archive_sql(params: S3ArchiveSql<'_>) -> String {
     let url = join_s3_url(
         params.endpoint,
         params.bucket,
         params.bucket_path,
-        params.archive_name,
+        &format!("{}/{}", params.archive_name, params.table.file_name()),
     );
     format!(
-        "INSERT INTO FUNCTION s3(\n  '{}',\n  '{}',\n  '{}',\n  'Parquet'\n)\nSELECT *\nFROM {transactions_table}\nWHERE slot BETWEEN {start_slot} AND {end_slot}\nORDER BY slot, slot_idx, signature",
+        "INSERT INTO FUNCTION s3(\n  '{}',\n  '{}',\n  '{}',\n  'Parquet'\n)\nSELECT *\nFROM {table_name}\nWHERE slot BETWEEN {start_slot} AND {end_slot}\nORDER BY {order_by}",
         escape_sql_string(&url),
         escape_sql_string(params.access_key),
         escape_sql_string(params.secret_key),
-        transactions_table = params.transactions_table,
+        table_name = params.table.table_name,
         start_slot = params.start_slot,
-        end_slot = params.end_slot
+        end_slot = params.end_slot,
+        order_by = params.table.order_by,
     )
 }
 
-pub fn build_delete_sql(
-    transactions_table: &str,
-    blocks_table: &str,
-    gsfa_table: &str,
-    signatures_table: &str,
-    start_slot: u64,
-    end_slot: u64,
-) -> Vec<String> {
-    [
-        transactions_table,
-        blocks_table,
-        gsfa_table,
-        signatures_table,
-    ]
-    .into_iter()
-    .map(|table| {
-        format!("ALTER TABLE {table} DELETE WHERE slot BETWEEN {start_slot} AND {end_slot}")
-    })
-    .collect()
+pub fn build_delete_sql(tables: &DbTables, start_slot: u64, end_slot: u64) -> Vec<String> {
+    tables
+        .archive_tables()
+        .into_iter()
+        .map(|table| build_delete_table_sql(&table.table_name, start_slot, end_slot))
+        .collect()
+}
+
+fn build_delete_table_sql(table: &str, start_slot: u64, end_slot: u64) -> String {
+    format!("ALTER TABLE {table} DELETE WHERE slot BETWEEN {start_slot} AND {end_slot}")
 }
 
 async fn fetch_solana_produced_slots(

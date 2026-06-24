@@ -6,8 +6,8 @@ use solparq::{
         should_delete_archived_data_range,
     },
     clickhouse::{
-        S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport, build_delete_sql,
-        build_local_parquet_query, build_s3_archive_sql,
+        DbTables, S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport, build_delete_sql,
+        build_local_parquet_query, build_s3_archive_sql, build_s3_table_archive_sql,
     },
     config::{ArchiveLocation, Config},
     metrics::AppState,
@@ -169,8 +169,11 @@ fn config_applies_required_defaults_and_s3_validation() {
     assert_eq!(config.clickhouse_url(), "http://192.168.0.184:8123");
     assert_eq!(config.transactions_table, "transactions");
     assert_eq!(config.blocks_table, "blocks_metadata");
+    assert_eq!(config.entries_table, "entries");
     assert_eq!(config.gsfa_table, "gsfa");
+    assert_eq!(config.gsfa_hot_table, "gsfa_hot");
     assert_eq!(config.signatures_table, "signatures");
+    assert_eq!(config.token_owner_activity_table, "token_owner_activity");
     assert_eq!(
         config.archive_kinds,
         vec![ArchiveKind::Custom { slots: 1_000 }]
@@ -183,29 +186,164 @@ fn config_applies_required_defaults_and_s3_validation() {
 }
 
 #[test]
+fn db_archive_tables_cover_superbank_base_and_index_tables() {
+    let config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "hourly",
+    ])
+    .expect("valid config");
+
+    let tables = DbTables::from_config(&config).archive_tables();
+    let table_specs = tables
+        .iter()
+        .map(|table| {
+            (
+                table.kind.as_str(),
+                table.table_name.as_str(),
+                table.file_name(),
+                table.order_by.as_str(),
+                table.required,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        table_specs,
+        vec![
+            (
+                "transactions",
+                "transactions",
+                "transactions.parquet",
+                "slot, slot_idx, signature",
+                true
+            ),
+            (
+                "blocks_metadata",
+                "blocks_metadata",
+                "blocks_metadata.parquet",
+                "slot",
+                true
+            ),
+            (
+                "entries",
+                "entries",
+                "entries.parquet",
+                "slot, entry_index",
+                false
+            ),
+            (
+                "gsfa",
+                "gsfa",
+                "gsfa.parquet",
+                "slot, slot_idx, signature",
+                false
+            ),
+            (
+                "gsfa_hot",
+                "gsfa_hot",
+                "gsfa_hot.parquet",
+                "slot, slot_idx, signature",
+                false
+            ),
+            (
+                "signatures",
+                "signatures",
+                "signatures.parquet",
+                "slot, slot_idx, signature",
+                false
+            ),
+            (
+                "token_owner_activity",
+                "token_owner_activity",
+                "token_owner_activity.parquet",
+                "slot, slot_idx, signature",
+                false
+            ),
+        ]
+    );
+}
+
+#[test]
 fn s3_archive_sql_uses_clickhouse_s3_function_and_stable_order() {
+    let table = DbTables {
+        transactions_table: "transactions".to_string(),
+        blocks_table: "blocks_metadata".to_string(),
+        entries_table: "entries".to_string(),
+        gsfa_table: "gsfa".to_string(),
+        gsfa_hot_table: "gsfa_hot".to_string(),
+        signatures_table: "signatures".to_string(),
+        token_owner_activity_table: "token_owner_activity".to_string(),
+    }
+    .archive_tables()
+    .into_iter()
+    .find(|table| table.kind.as_str() == "transactions")
+    .expect("transactions table");
+
     let sql = build_s3_archive_sql(S3ArchiveSql {
-        transactions_table: "transactions",
+        table: &table,
         start_slot: 42,
         end_slot: 84,
         endpoint: "https://s3.us-west.example",
         bucket: "bucket",
         bucket_path: "prefix/hourly",
-        archive_name: "hourly_0_42-84.parquet",
+        archive_name: "hourly_0_42-84",
         access_key: "access",
         secret_key: "secret",
     });
 
     assert!(sql.contains("INSERT INTO FUNCTION s3("));
-    assert!(
-        sql.contains("'https://s3.us-west.example/bucket/prefix/hourly/hourly_0_42-84.parquet'")
-    );
+    assert!(sql.contains(
+        "'https://s3.us-west.example/bucket/prefix/hourly/hourly_0_42-84/transactions.parquet'"
+    ));
     assert!(sql.contains("'access'"));
     assert!(sql.contains("'secret'"));
     assert!(sql.contains("'Parquet'"));
     assert!(sql.contains("FROM transactions"));
     assert!(sql.contains("WHERE slot BETWEEN 42 AND 84"));
     assert!(sql.contains("ORDER BY slot, slot_idx, signature"));
+}
+
+#[test]
+fn s3_table_archive_sql_writes_bundle_table_object() {
+    let table = DbTables {
+        transactions_table: "transactions".to_string(),
+        blocks_table: "blocks_metadata".to_string(),
+        entries_table: "entries".to_string(),
+        gsfa_table: "gsfa".to_string(),
+        gsfa_hot_table: "gsfa_hot".to_string(),
+        signatures_table: "signatures".to_string(),
+        token_owner_activity_table: "token_owner_activity".to_string(),
+    }
+    .archive_tables()
+    .into_iter()
+    .find(|table| table.kind.as_str() == "entries")
+    .expect("entries table");
+
+    let sql = build_s3_table_archive_sql(S3ArchiveSql {
+        table: &table,
+        start_slot: 42,
+        end_slot: 84,
+        endpoint: "https://s3.us-west.example",
+        bucket: "bucket",
+        bucket_path: "prefix/hourly",
+        archive_name: "hourly_0_42-84",
+        access_key: "access",
+        secret_key: "secret",
+    });
+
+    assert!(sql.contains(
+        "'https://s3.us-west.example/bucket/prefix/hourly/hourly_0_42-84/entries.parquet'"
+    ));
+    assert!(sql.contains("FROM entries"));
+    assert!(sql.contains("WHERE slot BETWEEN 42 AND 84"));
+    assert!(sql.contains("ORDER BY slot, entry_index"));
 }
 
 #[test]
@@ -220,22 +358,27 @@ fn local_parquet_query_streams_parquet_with_stable_order() {
 
 #[test]
 fn delete_sql_covers_all_configured_tables() {
-    let statements = build_delete_sql(
-        "transactions",
-        "blocks_metadata",
-        "gsfa",
-        "signatures",
-        100,
-        123,
-    );
+    let tables = DbTables {
+        transactions_table: "transactions".to_string(),
+        blocks_table: "blocks_metadata".to_string(),
+        entries_table: "entries".to_string(),
+        gsfa_table: "gsfa".to_string(),
+        gsfa_hot_table: "gsfa_hot".to_string(),
+        signatures_table: "signatures".to_string(),
+        token_owner_activity_table: "token_owner_activity".to_string(),
+    };
+    let statements = build_delete_sql(&tables, 100, 123);
 
     assert_eq!(
         statements,
         vec![
             "ALTER TABLE transactions DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
             "ALTER TABLE blocks_metadata DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
+            "ALTER TABLE entries DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
             "ALTER TABLE gsfa DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
+            "ALTER TABLE gsfa_hot DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
             "ALTER TABLE signatures DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
+            "ALTER TABLE token_owner_activity DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
         ]
     );
 }
@@ -316,6 +459,30 @@ fn local_retention_deletes_oldest_archives_for_each_kind() {
         .collect();
 
     assert_eq!(names, vec!["hourly_0_1000-9999.parquet"]);
+}
+
+#[test]
+fn local_retention_deletes_oldest_bundle_directories_for_each_kind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for bundle in [
+        "custom_0_10-19",
+        "custom_0_20-29",
+        "custom_0_30-39",
+        "hourly_0_10-9009",
+    ] {
+        let bundle_dir = dir.path().join(bundle);
+        fs::create_dir(&bundle_dir).expect("create bundle");
+        fs::write(bundle_dir.join("manifest.json"), b"{}").expect("write manifest");
+    }
+
+    let to_delete = local_archives_to_delete(dir.path(), ArchiveKind::Custom { slots: 10 }, 2)
+        .expect("retention should scan");
+    let names: Vec<_> = to_delete
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+
+    assert_eq!(names, vec!["custom_0_10-19"]);
 }
 
 #[test]
