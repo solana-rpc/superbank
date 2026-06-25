@@ -158,6 +158,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
+        emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         #[cfg(feature = "grpc-head-cache")]
@@ -177,6 +178,15 @@ fn test_state_with_metrics_header_capture(capture: MetricsHeaderCaptureConfig) -
         Err(_) => panic!("test_state should have a single Arc owner"),
     };
     state.metrics_header_capture = capture;
+    Arc::new(state)
+}
+
+fn test_state_with_emit_http_errors(state: Arc<AppState>) -> Arc<AppState> {
+    let mut state = match Arc::try_unwrap(state) {
+        Ok(state) => state,
+        Err(_) => panic!("test_state should have a single Arc owner"),
+    };
+    state.emit_http_errors = true;
     Arc::new(state)
 }
 
@@ -227,6 +237,7 @@ fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
+        emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         #[cfg(feature = "grpc-head-cache")]
@@ -281,6 +292,7 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
+        emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         #[cfg(feature = "grpc-head-cache")]
@@ -327,6 +339,7 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
+        emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         head_cache: Some(head_cache),
@@ -375,6 +388,7 @@ fn test_state_with_head_cache_and_clickhouse_url(
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
+        emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         head_cache: Some(head_cache),
@@ -430,6 +444,7 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
+        emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         head_cache: Some(head_cache),
@@ -3405,6 +3420,177 @@ async fn handle_json_rpc_invalid_json_returns_parse_error() {
     assert_eq!(err.code, -32700);
     assert_eq!(err.message, "Parse error");
     assert_eq!(parsed.id, Value::Null);
+}
+
+#[tokio::test]
+async fn emit_http_errors_promotes_clickhouse_unreachable_server_error_without_body_change() {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getHealth",
+        "params": []
+    });
+
+    let disabled_response = handle_json_rpc_value(
+        test_state_with_clickhouse_url("http://127.0.0.1:1"),
+        &request,
+    )
+    .await;
+    assert_eq!(disabled_response.status(), StatusCode::OK);
+    let disabled_body = parse_json_value_response(disabled_response).await;
+
+    let enabled_response = handle_json_rpc_value(
+        test_state_with_emit_http_errors(test_state_with_clickhouse_url("http://127.0.0.1:1")),
+        &request,
+    )
+    .await;
+    assert_eq!(enabled_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let enabled_body = parse_json_value_response(enabled_response).await;
+
+    assert_eq!(enabled_body, disabled_body);
+    assert_eq!(
+        enabled_body
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64),
+        Some(-32005)
+    );
+}
+
+#[tokio::test]
+async fn emit_http_errors_keeps_malformed_and_client_errors_http_200() {
+    let state = test_state_with_emit_http_errors(test_state());
+
+    let response = handle_json_rpc_body_with_headers(
+        state.clone(),
+        HeaderMap::new(),
+        Bytes::from_static(br#"{"jsonrpc":"2.0""#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.error.expect("parse error").code, -32700);
+
+    let invalid_params = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "getSignaturesForAddress",
+        "params": []
+    });
+    let response = handle_json_rpc_value(state.clone(), &invalid_params).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.error.expect("invalid params").code, -32602);
+
+    let method_not_found = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "unknownMethod",
+        "params": []
+    });
+    let response = handle_json_rpc_value(state, &method_not_found).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.error.expect("method not found").code, -32601);
+}
+
+#[tokio::test]
+async fn emit_http_errors_keeps_success_http_200() {
+    let state = test_state_with_emit_http_errors(test_state());
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSlot",
+        "params": []
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.result, Some(json!(1)));
+    assert!(parsed.error.is_none());
+}
+
+#[tokio::test]
+async fn emit_http_errors_promotes_mixed_batch_with_server_error() {
+    let state =
+        test_state_with_emit_http_errors(test_state_with_clickhouse_url("http://127.0.0.1:1"));
+    let request = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getHealth",
+            "params": []
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "unknownMethod",
+            "params": []
+        }
+    ]);
+
+    let response = handle_json_rpc_value(state, &request).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let parsed = parse_json_value_response(response).await;
+    let items = parsed.as_array().expect("batch response array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64),
+        Some(-32005)
+    );
+    assert_eq!(
+        items[1]
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64),
+        Some(-32601)
+    );
+}
+
+#[tokio::test]
+async fn emit_http_errors_keeps_client_error_only_batch_http_200() {
+    let state = test_state_with_emit_http_errors(test_state());
+    let request = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "unknownMethod",
+            "params": []
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "getSignaturesForAddress",
+            "params": []
+        }
+    ]);
+
+    let response = handle_json_rpc_value(state, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let parsed = parse_json_value_response(response).await;
+    let items = parsed.as_array().expect("batch response array");
+    assert_eq!(items.len(), 3);
+    let codes: Vec<i64> = items
+        .iter()
+        .map(|item| {
+            item.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64)
+                .expect("error code")
+        })
+        .collect();
+    assert_eq!(codes, vec![-32600, -32601, -32602]);
 }
 
 #[tokio::test]

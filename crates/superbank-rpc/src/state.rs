@@ -37,6 +37,7 @@ pub(crate) struct AppState {
     pub(crate) latest_slot_cache: LatestSlotCache,
     pub(crate) latest_block_height_cache: LatestBlockHeightCache,
     pub(crate) rpc_request_timeout: Duration,
+    pub(crate) emit_http_errors: bool,
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
     #[cfg(feature = "grpc-head-cache")]
