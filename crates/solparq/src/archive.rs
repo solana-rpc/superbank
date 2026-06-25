@@ -23,6 +23,46 @@ pub const HOURLY_SLOTS: u64 = 9_000;
 pub const EPOCH_SLOTS: u64 = 432_000;
 pub const DEFAULT_CUSTOM_SLOTS: u64 = 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ArchiveSlotRange {
+    pub start_slot: u64,
+    pub end_slot: u64,
+}
+
+impl ArchiveSlotRange {
+    pub fn new(start_slot: u64, end_slot: u64) -> Result<Self> {
+        if start_slot > end_slot {
+            return Err(anyhow!(
+                "archive slot range start must be less than or equal to end"
+            ));
+        }
+        Ok(Self {
+            start_slot,
+            end_slot,
+        })
+    }
+}
+
+impl FromStr for ArchiveSlotRange {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (start, end) = value
+            .trim()
+            .split_once('-')
+            .ok_or_else(|| "archive slot range must use START-END format".to_string())?;
+        let start_slot = start
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid archive slot range start in '{value}'"))?;
+        let end_slot = end
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid archive slot range end in '{value}'"))?;
+        Self::new(start_slot, end_slot).map_err(|err| err.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ArchiveKind {
@@ -207,15 +247,70 @@ pub fn plan_next_archive(
     }))
 }
 
-pub fn should_delete_archived_data_range(config: &Config, kind: ArchiveKind) -> bool {
-    config.delete_archived_data_range
-        && config
-            .archive_kinds
+pub fn plan_archive_slot_range(
+    kind: ArchiveKind,
+    bounds: ClickHouseBounds,
+    slot_range: ArchiveSlotRange,
+) -> Result<Option<ArchivePlan>> {
+    if bounds.latest_slot < bounds.earliest_slot {
+        return Ok(None);
+    }
+    if slot_range.start_slot > slot_range.end_slot {
+        return Err(anyhow!(
+            "archive slot range start must be less than or equal to end"
+        ));
+    }
+    if slot_range.start_slot < bounds.earliest_slot || slot_range.end_slot > bounds.latest_slot {
+        return Ok(None);
+    }
+
+    Ok(Some(ArchivePlan {
+        kind,
+        epoch: slot_range.start_slot / EPOCH_SLOTS,
+        start_slot: slot_range.start_slot,
+        end_slot: slot_range.end_slot,
+    }))
+}
+
+pub fn safe_delete_archived_data_range(
+    config: &Config,
+    current_start_slot: u64,
+    current_end_slot: u64,
+    latest_archive_names: &[(ArchiveKind, Option<String>)],
+) -> Result<Option<crate::clickhouse::SlotRange>> {
+    if !config.delete_archived_data_range {
+        return Ok(None);
+    }
+
+    let mut safe_end_slot = current_end_slot;
+    for kind in config.archive_kinds.iter().copied() {
+        let Some(latest_archive_name) = latest_archive_names
             .iter()
-            .map(|archive_kind| archive_kind.slot_count())
-            .max()
-            .map(|max_slots| kind.slot_count() == max_slots)
-            .unwrap_or(false)
+            .find(|(latest_kind, _)| *latest_kind == kind)
+            .and_then(|(_, latest_archive_name)| latest_archive_name.as_deref())
+        else {
+            return Ok(None);
+        };
+        let parsed = parse_archive_name(latest_archive_name).ok_or_else(|| {
+            anyhow!("unable to parse latest archive name '{latest_archive_name}'")
+        })?;
+        if parsed.kind_label != kind.label() {
+            return Err(anyhow!(
+                "latest archive name '{latest_archive_name}' does not match archive type '{}'",
+                kind.label()
+            ));
+        }
+        safe_end_slot = safe_end_slot.min(parsed.end_slot);
+    }
+
+    if safe_end_slot < current_start_slot {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::clickhouse::SlotRange::new(
+        current_start_slot,
+        safe_end_slot,
+    )))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -362,32 +457,44 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         "ClickHouse archive source has slots available"
     );
 
-    let last_archive = storage::latest_archive_name(config, kind).await?;
-    debug!(
-        archive_kind = kind.to_string(),
-        last_archive = last_archive.as_deref().unwrap_or("none"),
-        continue_from_last_archive = config.continue_from_last_archive,
-        "loaded latest archive state"
-    );
-    if !config.continue_from_last_archive {
+    let (plan, skipped_reason) = if let Some(slot_range) = config.archive_slot_range {
         info!(
             archive_kind = kind.to_string(),
+            start_slot = slot_range.start_slot,
+            end_slot = slot_range.end_slot,
+            "using explicit one-shot archive slot range"
+        );
+        (
+            plan_archive_slot_range(kind, bounds, slot_range)?,
+            "requested archive slot range is not fully available in ClickHouse",
+        )
+    } else {
+        let last_archive = storage::latest_archive_name(config, kind).await?;
+        debug!(
+            archive_kind = kind.to_string(),
             last_archive = last_archive.as_deref().unwrap_or("none"),
-            "archive continuation disabled; planning from oldest ClickHouse slot"
+            continue_from_last_archive = config.continue_from_last_archive,
+            "loaded latest archive state"
         );
-    }
-    let Some(plan) = plan_next_archive(
-        kind,
-        bounds,
-        last_archive.as_deref(),
-        config.continue_from_last_archive,
-    )?
-    else {
-        let mut report = ArchiveRunReport::skipped(
-            kind,
-            destination.describe(),
+        if !config.continue_from_last_archive {
+            info!(
+                archive_kind = kind.to_string(),
+                last_archive = last_archive.as_deref().unwrap_or("none"),
+                "archive continuation disabled; planning from oldest ClickHouse slot"
+            );
+        }
+        (
+            plan_next_archive(
+                kind,
+                bounds,
+                last_archive.as_deref(),
+                config.continue_from_last_archive,
+            )?,
             "not enough ClickHouse slots available for the next archive",
-        );
+        )
+    };
+    let Some(plan) = plan else {
+        let mut report = ArchiveRunReport::skipped(kind, destination.describe(), skipped_reason);
         report.db_bounds = Some(bounds);
         return Ok(report);
     };
@@ -534,33 +641,39 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
     }
 
     let mut deleted_clickhouse_range = false;
-    if should_delete_archived_data_range(config, kind) {
-        info!(
-            archive_kind = kind.to_string(),
-            start_slot = plan.start_slot,
-            end_slot = plan.end_slot,
-            "deleting archived ClickHouse data range"
-        );
-        client
-            .delete_archived_range_for_tables(
-                &available_archive_tables,
-                plan.start_slot,
-                plan.end_slot,
-            )
-            .await?;
-        deleted_clickhouse_range = true;
-    } else if config.delete_archived_data_range {
-        info!(
-            archive_kind = kind.to_string(),
-            archive_slots = kind.slot_count(),
-            max_configured_archive_slots = config
-                .archive_kinds
-                .iter()
-                .map(|archive_kind| archive_kind.slot_count())
-                .max()
-                .unwrap_or(kind.slot_count()),
-            "deferring ClickHouse data cleanup until largest configured archive type completes"
-        );
+    if config.delete_archived_data_range {
+        let latest_archive_names = storage::latest_archive_names(config).await?;
+        let safe_delete_range = safe_delete_archived_data_range(
+            config,
+            plan.start_slot,
+            plan.end_slot,
+            &latest_archive_names,
+        )?;
+        if let Some(range) = safe_delete_range {
+            info!(
+                archive_kind = kind.to_string(),
+                start_slot = range.start_slot,
+                end_slot = range.end_slot,
+                current_archive_start_slot = plan.start_slot,
+                current_archive_end_slot = plan.end_slot,
+                "deleting archived ClickHouse data range covered by all configured archive types"
+            );
+            client
+                .delete_archived_range_for_tables(
+                    &available_archive_tables,
+                    range.start_slot,
+                    range.end_slot,
+                )
+                .await?;
+            deleted_clickhouse_range = true;
+        } else {
+            info!(
+                archive_kind = kind.to_string(),
+                start_slot = plan.start_slot,
+                end_slot = plan.end_slot,
+                "deferring ClickHouse data cleanup until all configured archive types cover this range"
+            );
+        }
     }
 
     let cleaned_archives = storage::cleanup_archives(config, kind).await?;

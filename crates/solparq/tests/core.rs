@@ -2,8 +2,8 @@ use std::{fs, process::Command, str::FromStr};
 
 use solparq::{
     archive::{
-        ArchiveKind, ArchiveRunReport, ClickHouseBounds, plan_next_archive,
-        should_delete_archived_data_range,
+        ArchiveKind, ArchiveRunReport, ArchiveSlotRange, ClickHouseBounds, plan_archive_slot_range,
+        plan_next_archive, safe_delete_archived_data_range,
     },
     clickhouse::{
         DbTables, S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport, build_delete_sql,
@@ -99,6 +99,41 @@ fn plan_can_start_from_oldest_slot_when_continuation_is_disabled() {
 }
 
 #[test]
+fn explicit_slot_range_plan_uses_requested_inclusive_range() {
+    let plan = plan_archive_slot_range(
+        ArchiveKind::Hourly,
+        ClickHouseBounds {
+            earliest_slot: 500,
+            latest_slot: 4_000,
+        },
+        ArchiveSlotRange::new(1_000, 3_222).expect("valid slot range"),
+    )
+    .expect("plan should succeed")
+    .expect("requested range is available");
+
+    assert_eq!(plan.kind, ArchiveKind::Hourly);
+    assert_eq!(plan.epoch, 0);
+    assert_eq!(plan.start_slot, 1_000);
+    assert_eq!(plan.end_slot, 3_222);
+    assert_eq!(plan.file_name(), "hourly_0_1000-3222.parquet");
+}
+
+#[test]
+fn explicit_slot_range_plan_requires_clickhouse_to_cover_range() {
+    let plan = plan_archive_slot_range(
+        ArchiveKind::Custom { slots: 1_000 },
+        ClickHouseBounds {
+            earliest_slot: 1_500,
+            latest_slot: 3_000,
+        },
+        ArchiveSlotRange::new(1_000, 3_222).expect("valid slot range"),
+    )
+    .expect("plan should succeed");
+
+    assert_eq!(plan, None);
+}
+
+#[test]
 fn config_rejects_multiple_archive_types_outside_server_mode() {
     let err = Config::try_parse_from([
         "solparq",
@@ -118,6 +153,128 @@ fn config_rejects_multiple_archive_types_outside_server_mode() {
     assert!(
         err.to_string()
             .contains("multiple archive range types require --server-mode"),
+        "{err}"
+    );
+}
+
+#[test]
+fn config_accepts_one_shot_archive_slot_range() {
+    let config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--archive-slot-range",
+        "1000-3222",
+    ])
+    .expect("valid config");
+
+    assert_eq!(
+        config.archive_slot_range,
+        Some(ArchiveSlotRange::new(1_000, 3_222).expect("valid slot range"))
+    );
+}
+
+#[test]
+fn config_rejects_archive_slot_range_in_server_mode() {
+    let err = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+        "--archive-slot-range",
+        "1000-3222",
+    ])
+    .expect_err("explicit archive slot range should be one-shot only");
+
+    assert!(
+        err.to_string()
+            .contains("--archive-slot-range is only supported for one-shot archives"),
+        "{err}"
+    );
+}
+
+#[test]
+fn config_rejects_invalid_archive_slot_range() {
+    let err = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--archive-slot-range",
+        "3222-1000",
+    ])
+    .expect_err("reversed archive slot range should fail");
+
+    assert!(
+        err.to_string()
+            .contains("archive slot range start must be less than or equal to end"),
+        "{err}"
+    );
+}
+
+#[test]
+fn config_rejects_multiple_custom_archive_sizes() {
+    let err = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom:500",
+        "--archive-range-type",
+        "custom:1000",
+        "--server-mode",
+    ])
+    .expect_err("multiple custom archive sizes should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("only one custom archive range size can be configured"),
+        "{err}"
+    );
+}
+
+#[test]
+fn config_rejects_duplicate_archive_types() {
+    let err = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "hourly",
+        "--archive-range-type",
+        "hourly",
+        "--server-mode",
+    ])
+    .expect_err("duplicate archive types should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("duplicate archive range type 'hourly'"),
         "{err}"
     );
 }
@@ -411,7 +568,7 @@ fn validation_report_groups_legit_and_backfill_gap_ranges() {
 }
 
 #[test]
-fn clickhouse_cleanup_only_runs_for_largest_configured_archive_type() {
+fn clickhouse_cleanup_waits_until_all_archive_types_cover_range() {
     let config = Config::try_parse_from([
         "solparq",
         "--db-server",
@@ -429,14 +586,96 @@ fn clickhouse_cleanup_only_runs_for_largest_configured_archive_type() {
     ])
     .expect("valid config");
 
-    assert!(!should_delete_archived_data_range(
+    let delete_range = safe_delete_archived_data_range(
         &config,
-        ArchiveKind::Custom { slots: 500 }
-    ));
-    assert!(should_delete_archived_data_range(
+        0,
+        499,
+        &[
+            (
+                ArchiveKind::Custom { slots: 500 },
+                Some("custom_0_0-499".to_string()),
+            ),
+            (ArchiveKind::Hourly, None),
+        ],
+    )
+    .expect("safe delete check");
+
+    assert_eq!(delete_range, None);
+}
+
+#[test]
+fn clickhouse_cleanup_allows_smaller_kind_after_larger_kind_covers_range() {
+    let config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom:500",
+        "--archive-range-type",
+        "hourly",
+        "--server-mode",
+        "--delete-archived-data-range",
+    ])
+    .expect("valid config");
+
+    let delete_range = safe_delete_archived_data_range(
         &config,
-        ArchiveKind::Hourly
-    ));
+        0,
+        499,
+        &[
+            (
+                ArchiveKind::Custom { slots: 500 },
+                Some("custom_0_0-499".to_string()),
+            ),
+            (ArchiveKind::Hourly, Some("hourly_0_0-8999".to_string())),
+        ],
+    )
+    .expect("safe delete check");
+
+    assert_eq!(delete_range, Some(SlotRange::new(0, 499)));
+}
+
+#[test]
+fn clickhouse_cleanup_deletes_only_safe_prefix_when_other_kinds_lag() {
+    let config = Config::try_parse_from([
+        "solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom:500",
+        "--archive-range-type",
+        "hourly",
+        "--archive-range-type",
+        "epoch",
+        "--server-mode",
+        "--delete-archived-data-range",
+    ])
+    .expect("valid config");
+
+    let delete_range = safe_delete_archived_data_range(
+        &config,
+        0,
+        431_999,
+        &[
+            (
+                ArchiveKind::Custom { slots: 500 },
+                Some("custom_0_0-999".to_string()),
+            ),
+            (ArchiveKind::Hourly, Some("hourly_0_0-8999".to_string())),
+            (ArchiveKind::Epoch, Some("epoch_0_0-431999".to_string())),
+        ],
+    )
+    .expect("safe delete check");
+
+    assert_eq!(delete_range, Some(SlotRange::new(0, 999)));
 }
 
 #[test]

@@ -1,6 +1,8 @@
 use std::{
+    collections::HashSet,
     future::Future,
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
         Arc,
@@ -18,6 +20,7 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use serde_json::json;
 use tokio::{
     net::TcpListener,
@@ -34,6 +37,9 @@ use crate::{
 };
 
 type ArchiveRunFuture = Pin<Box<dyn Future<Output = Result<archive::ArchiveRunReport>> + Send>>;
+type ArchiveRunFactory =
+    Arc<dyn Fn(archive::ArchiveKind) -> ArchiveRunFuture + Send + Sync + 'static>;
+type ArchiveTaskOutput = (archive::ArchiveKind, Result<archive::ArchiveRunReport>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownSignal {
@@ -176,29 +182,49 @@ async fn archive_loop(config: Config, state: Arc<AppState>, shutdown: ShutdownTo
     let mut interval =
         tokio::time::interval(Duration::from_secs(config.archive_check_interval_secs));
     let run_config = config.clone();
-    let mut run_once = move |kind| {
+    let run_once: ArchiveRunFactory = Arc::new(move |kind| {
         let config = run_config.clone();
         Box::pin(async move { archive::run_once_for_kind(&config, kind).await }) as ArchiveRunFuture
-    };
+    });
+    let mut active_kinds = HashSet::new();
+    let mut archive_tasks = JoinSet::new();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
                 info!("archive loop shutdown requested before next check");
-                return Ok(());
+                break;
             }
-            _ = interval.tick() => {}
-        }
-        if !run_archive_cycle(&config, &state, &shutdown, &mut run_once).await? {
-            return Ok(());
+            _ = interval.tick() => {
+                if !schedule_archive_cycle(
+                    &config,
+                    &state,
+                    &shutdown,
+                    &mut active_kinds,
+                    &mut archive_tasks,
+                    run_once.clone(),
+                )? {
+                    break;
+                }
+            }
+            result = archive_tasks.join_next(), if !archive_tasks.is_empty() => {
+                handle_archive_task_join(&state, &mut active_kinds, result).await?;
+            }
         }
     }
+
+    while let Some(result) = archive_tasks.join_next().await {
+        handle_archive_task_join(&state, &mut active_kinds, Some(result)).await?;
+    }
+    Ok(())
 }
 
-async fn run_archive_cycle(
+fn schedule_archive_cycle(
     config: &Config,
     state: &Arc<AppState>,
     shutdown: &ShutdownToken,
-    run_once: &mut impl FnMut(archive::ArchiveKind) -> ArchiveRunFuture,
+    active_kinds: &mut HashSet<archive::ArchiveKind>,
+    archive_tasks: &mut JoinSet<ArchiveTaskOutput>,
+    run_once: ArchiveRunFactory,
 ) -> Result<bool> {
     info!(
         archive_types = config.archive_kinds.len(),
@@ -209,43 +235,86 @@ async fn run_archive_cycle(
             info!("archive loop shutdown requested; not starting new archive task");
             return Ok(false);
         }
+        if active_kinds.contains(&kind) {
+            info!(
+                archive_kind = kind.to_string(),
+                reason = "archive task already running",
+                "archive task not started"
+            );
+            continue;
+        }
         state.record_check_started(kind, None);
         info!(archive_kind = kind.to_string(), "checking archive task");
-        match run_once(kind).await {
-            Ok(report) => {
-                if report.archive_created {
-                    info!(
-                        archive_kind = kind.to_string(),
-                        archive_name = report.archive_name.as_deref().unwrap_or("unknown"),
-                        start_slot = report.archive_slot_start,
-                        end_slot = report.archive_slot_end,
-                        destination = report.destination,
-                        "archive task created archive"
-                    );
-                } else {
-                    info!(
-                        archive_kind = kind.to_string(),
-                        reason = report
-                            .archive_skipped_reason
-                            .as_deref()
-                            .unwrap_or("no reason reported"),
-                        "archive task skipped"
-                    );
-                }
-                debug!(
-                    archive_kind = kind.to_string(),
-                    report = report.to_text(),
-                    "archive task report"
-                );
-                state.record_report(report);
-            }
-            Err(err) => {
-                error!(archive_kind = kind.to_string(), ?err, "archive task failed");
-                state.record_task_error(kind, err.to_string());
-            }
-        }
+        active_kinds.insert(kind);
+        spawn_archive_task(archive_tasks, run_once.clone(), kind);
     }
     Ok(true)
+}
+
+fn spawn_archive_task(
+    archive_tasks: &mut JoinSet<ArchiveTaskOutput>,
+    run_once: ArchiveRunFactory,
+    kind: archive::ArchiveKind,
+) {
+    archive_tasks.spawn(async move {
+        let result = AssertUnwindSafe(run_once(kind)).catch_unwind().await;
+        let result = result.unwrap_or_else(|_| Err(anyhow!("archive task panicked")));
+        (kind, result)
+    });
+}
+
+async fn handle_archive_task_join(
+    state: &Arc<AppState>,
+    active_kinds: &mut HashSet<archive::ArchiveKind>,
+    result: Option<std::result::Result<ArchiveTaskOutput, tokio::task::JoinError>>,
+) -> Result<()> {
+    let Some(result) = result else {
+        return Ok(());
+    };
+    let (kind, result) = result.map_err(|err| anyhow!("archive task join failed: {err}"))?;
+    active_kinds.remove(&kind);
+    record_archive_task_result(state, kind, result);
+    Ok(())
+}
+
+fn record_archive_task_result(
+    state: &Arc<AppState>,
+    kind: archive::ArchiveKind,
+    result: Result<archive::ArchiveRunReport>,
+) {
+    match result {
+        Ok(report) => {
+            if report.archive_created {
+                info!(
+                    archive_kind = kind.to_string(),
+                    archive_name = report.archive_name.as_deref().unwrap_or("unknown"),
+                    start_slot = report.archive_slot_start,
+                    end_slot = report.archive_slot_end,
+                    destination = report.destination,
+                    "archive task created archive"
+                );
+            } else {
+                info!(
+                    archive_kind = kind.to_string(),
+                    reason = report
+                        .archive_skipped_reason
+                        .as_deref()
+                        .unwrap_or("no reason reported"),
+                    "archive task skipped"
+                );
+            }
+            debug!(
+                archive_kind = kind.to_string(),
+                report = report.to_text(),
+                "archive task report"
+            );
+            state.record_report(report);
+        }
+        Err(err) => {
+            error!(archive_kind = kind.to_string(), ?err, "archive task failed");
+            state.record_task_error(kind, err.to_string());
+        }
+    }
 }
 
 async fn wait_for_archive_task_or_forced_signal(
@@ -691,7 +760,7 @@ fn html_escape(value: &str) -> String {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::*;
     use crate::{
@@ -718,50 +787,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graceful_shutdown_finishes_current_archive_and_skips_new_work() {
+    async fn shutdown_requested_before_cycle_does_not_start_new_archive_tasks() {
         let config = test_server_config();
         let state = AppState::new();
         let shutdown = ShutdownToken::new();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let (started_tx, started_rx) = oneshot::channel();
-        let (finish_tx, finish_rx) = oneshot::channel();
-
-        let seen_for_runner = seen.clone();
-        let mut started_tx = Some(started_tx);
-        let mut finish_rx = Some(finish_rx);
-        let shutdown_for_task = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            let mut run_once = move |kind| {
-                let seen = seen_for_runner.clone();
-                let started_tx = started_tx.take();
-                let finish_rx = finish_rx.take();
-                Box::pin(async move {
-                    seen.lock().expect("seen lock").push(kind);
-                    if let Some(started_tx) = started_tx {
-                        let _ = started_tx.send(());
-                    }
-                    if let Some(finish_rx) = finish_rx {
-                        let _ = finish_rx.await;
-                    }
-                    Ok(ArchiveRunReport::skipped(kind, "test".to_string(), "test"))
-                }) as ArchiveRunFuture
-            };
-            run_archive_cycle(&config, &state, &shutdown_for_task, &mut run_once).await
-        });
-
-        started_rx.await.expect("archive runner should start");
         shutdown.request();
-        assert_eq!(*seen.lock().expect("seen lock"), vec![ArchiveKind::Hourly]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_runner = seen.clone();
+        let run_once: ArchiveRunFactory = Arc::new(move |kind| {
+            let seen = seen_for_runner.clone();
+            Box::pin(async move {
+                seen.lock().expect("seen lock").push(kind);
+                Ok(ArchiveRunReport::skipped(kind, "test".to_string(), "test"))
+            }) as ArchiveRunFuture
+        });
+        let mut active_kinds = HashSet::new();
+        let mut archive_tasks = JoinSet::new();
 
-        finish_tx.send(()).expect("finish archive");
-        let continue_running = handle.await.expect("cycle task should not panic").unwrap();
+        let continue_running = schedule_archive_cycle(
+            &config,
+            &state,
+            &shutdown,
+            &mut active_kinds,
+            &mut archive_tasks,
+            run_once,
+        )
+        .expect("schedule cycle");
 
         assert!(!continue_running);
         assert_eq!(
             *seen.lock().expect("seen lock"),
-            vec![ArchiveKind::Hourly],
-            "shutdown should not start the next archive kind"
+            Vec::<ArchiveKind>::new(),
+            "shutdown should not start archive tasks"
         );
+    }
+
+    #[tokio::test]
+    async fn archive_cycle_starts_other_kinds_while_one_kind_is_running() {
+        let config = test_server_config();
+        let state = AppState::new();
+        let shutdown = ShutdownToken::new();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (finish_hourly_tx, finish_hourly_rx) = oneshot::channel();
+
+        let finish_hourly_rx = Arc::new(Mutex::new(Some(finish_hourly_rx)));
+        let run_once: ArchiveRunFactory = Arc::new(move |kind| {
+            let started_tx = started_tx.clone();
+            let finish_hourly_rx = finish_hourly_rx.clone();
+            Box::pin(async move {
+                started_tx.send(kind).expect("record started archive");
+                let finish_hourly_rx = {
+                    if kind == ArchiveKind::Hourly {
+                        finish_hourly_rx.lock().expect("finish lock").take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(finish_hourly_rx) = finish_hourly_rx {
+                    finish_hourly_rx.await.expect("finish hourly");
+                }
+                Ok(ArchiveRunReport::skipped(kind, "test".to_string(), "test"))
+            }) as ArchiveRunFuture
+        });
+        let mut active_kinds = HashSet::new();
+        let mut archive_tasks = JoinSet::new();
+
+        schedule_archive_cycle(
+            &config,
+            &state,
+            &shutdown,
+            &mut active_kinds,
+            &mut archive_tasks,
+            run_once,
+        )
+        .expect("schedule cycle");
+
+        assert_eq!(started_rx.recv().await, Some(ArchiveKind::Hourly));
+        let next_started = tokio::time::timeout(Duration::from_millis(50), started_rx.recv())
+            .await
+            .expect("custom archive should start while hourly is still running");
+        assert_eq!(next_started, Some(ArchiveKind::Custom { slots: 500 }));
+
+        finish_hourly_tx.send(()).expect("finish hourly");
+        while !archive_tasks.is_empty() {
+            let result = archive_tasks.join_next().await;
+            handle_archive_task_join(&state, &mut active_kinds, result)
+                .await
+                .expect("handle archive task");
+        }
+        assert!(active_kinds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_cycle_does_not_start_duplicate_kind_while_active() {
+        let config = Config::try_parse_from([
+            "solparq",
+            "--db-server",
+            "127.0.0.1",
+            "--db-user",
+            "admin",
+            "--db-password",
+            "secret",
+            "--archive-range-type",
+            "custom:500",
+            "--server-mode",
+        ])
+        .expect("valid config");
+        let state = AppState::new();
+        let shutdown = ShutdownToken::new();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (_finish_tx, finish_rx) = oneshot::channel::<()>();
+        let finish_rx = Arc::new(Mutex::new(Some(finish_rx)));
+        let run_once: ArchiveRunFactory = Arc::new(move |kind| {
+            let started_tx = started_tx.clone();
+            let finish_rx = finish_rx.clone();
+            Box::pin(async move {
+                started_tx.send(kind).expect("record started archive");
+                let finish_rx = finish_rx.lock().expect("finish lock").take();
+                if let Some(finish_rx) = finish_rx {
+                    let _ = finish_rx.await;
+                }
+                Ok(ArchiveRunReport::skipped(kind, "test".to_string(), "test"))
+            }) as ArchiveRunFuture
+        });
+        let mut active_kinds = HashSet::new();
+        let mut archive_tasks = JoinSet::new();
+
+        schedule_archive_cycle(
+            &config,
+            &state,
+            &shutdown,
+            &mut active_kinds,
+            &mut archive_tasks,
+            run_once.clone(),
+        )
+        .expect("first schedule");
+        schedule_archive_cycle(
+            &config,
+            &state,
+            &shutdown,
+            &mut active_kinds,
+            &mut archive_tasks,
+            run_once,
+        )
+        .expect("second schedule");
+
+        assert_eq!(
+            started_rx.recv().await,
+            Some(ArchiveKind::Custom { slots: 500 })
+        );
+        let duplicate = tokio::time::timeout(Duration::from_millis(50), started_rx.recv()).await;
+        assert!(duplicate.is_err(), "same archive kind should not overlap");
     }
 
     #[tokio::test]

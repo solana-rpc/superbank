@@ -109,6 +109,24 @@ cargo run -p solparq -- \
   --archive-file-output-location ./archives
 ```
 
+To archive an exact inclusive slot range in one-shot mode, pass
+`--archive-slot-range START-END`:
+
+```bash
+cargo run -p solparq -- \
+  --db-server 192.168.0.184 \
+  --db-user admin \
+  --db-password 'change-me' \
+  --archive-range-type custom \
+  --archive-slot-range 1000-3222 \
+  --archive-file-output-location ./archives
+```
+
+The configured `--archive-range-type` still controls the archive kind/name and
+destination grouping, but the requested slot range is archived exactly. The
+range must already be fully available in ClickHouse. `--archive-slot-range` is
+only supported for one-shot archives and is rejected with `--server-mode`.
+
 By default this creates a local bundle directory. Each available table streams
 with a table-specific stable order, for example:
 
@@ -213,6 +231,12 @@ Defaults:
 - Prometheus metrics: `http://0.0.0.0:31313/metrics`
 - Archive check interval: `60` seconds
 
+Archive range types run independently in server mode. For example, a
+`custom:500` archive check can start while a larger `hourly` or `epoch` archive
+is still being written. `solparq` does not start a second task for the same
+archive type while that type is already running; it logs that the task is
+already active and checks again on the next interval.
+
 Server mode skips an archive with validation warnings unless
 `--force-archive` is set. This avoids a non-interactive process silently
 archiving questionable data.
@@ -254,9 +278,10 @@ color-coded archive timeline.
 
 On shutdown, `solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
 shutdown signal stops new archive tasks from starting and waits for any archive
-currently being written to finish, including its report, cleanup, and optional
-ClickHouse delete step. Press `Ctrl+C` again, or send another `SIGTERM`, to
-abort immediately without waiting for the active archive task.
+currently being written to finish, including parallel archive tasks, their
+reports, cleanup, and optional ClickHouse delete steps. Press `Ctrl+C` again,
+or send another `SIGTERM`, to abort immediately without waiting for active
+archive tasks.
 
 ## Archive Ranges
 
@@ -272,6 +297,8 @@ You can also set the custom default with:
 ```
 
 Multiple `--archive-range-type` values are allowed only with `--server-mode`.
+Only one custom archive range size can be configured at a time, because custom
+archives use the shared `custom_*` archive namespace.
 
 ## Validation
 
@@ -313,10 +340,14 @@ To delete the archived ClickHouse data range after a successful archive:
 --delete-archived-data-range
 ```
 
-When multiple archive types are configured, ClickHouse data deletion only runs
-after the archive type with the largest slot range completes. For example, if
-`custom:500` and `hourly` are both configured, `custom:500` archives will not
-delete ClickHouse rows; deletion waits until the `hourly` archive succeeds.
+When multiple archive types are configured, ClickHouse data deletion is gated by
+the completed archive high-watermark for every configured type. After any
+archive succeeds, `solparq` checks the latest completed archive for each type
+and deletes only the part of the current archive range that all types have
+already covered. For example, if `custom:500` and `hourly` are both configured,
+early `custom:500` archives will defer deletion until an `hourly` archive covers
+the same slots. Once the `hourly` archive exists, later `custom:500` completions
+can delete their safe ranges without waiting for another hourly cycle.
 
 That deletes matching slots from:
 
@@ -355,10 +386,12 @@ Common defaults:
 - `--archives-to-keep 5`
 - `--ops-port 30303`
 - `--metrics-port 31313`
+- `--archive-slot-range` unset
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset
 
 Use `-v` for debug logs and `-vv` for trace logs. `RUST_LOG` is also honored.
 
 Environment variables are available for the new startup behavior as
-`SOLPARQ_NO_CONTINUE_FROM_LAST_ARCHIVE`.
+`SOLPARQ_NO_CONTINUE_FROM_LAST_ARCHIVE`, and for one-shot explicit ranges as
+`SOLPARQ_ARCHIVE_SLOT_RANGE`.

@@ -1,9 +1,9 @@
-use std::{ffi::OsString, path::PathBuf, str::FromStr};
+use std::{collections::HashSet, ffi::OsString, path::PathBuf, str::FromStr};
 
 use anyhow::{Result, anyhow};
 use clap::{ArgAction, Parser, ValueEnum, error::ErrorKind};
 
-use crate::archive::{ArchiveKind, DEFAULT_CUSTOM_SLOTS};
+use crate::archive::{ArchiveKind, ArchiveSlotRange, DEFAULT_CUSTOM_SLOTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -49,6 +49,7 @@ pub struct Config {
     pub solana_rpc_url: String,
     pub archive_check_interval_secs: u64,
     pub continue_from_last_archive: bool,
+    pub archive_slot_range: Option<ArchiveSlotRange>,
     pub log_file: Option<PathBuf>,
     pub verbose: u8,
 }
@@ -85,6 +86,11 @@ impl Config {
         if !cli.server_mode && archive_kinds.len() > 1 {
             return Err(anyhow!(
                 "multiple archive range types require --server-mode"
+            ));
+        }
+        if cli.server_mode && cli.archive_slot_range.is_some() {
+            return Err(anyhow!(
+                "--archive-slot-range is only supported for one-shot archives and cannot be used with --server-mode"
             ));
         }
 
@@ -150,6 +156,7 @@ impl Config {
             solana_rpc_url: cli.solana_rpc_url,
             archive_check_interval_secs: cli.archive_check_interval_secs,
             continue_from_last_archive: !cli.no_continue_from_last_archive,
+            archive_slot_range: cli.archive_slot_range,
             log_file: cli.log_file,
             verbose: cli.verbose,
         })
@@ -357,6 +364,13 @@ struct Cli {
     archive_check_interval_secs: u64,
 
     #[arg(
+        long = "archive-slot-range",
+        env = "SOLPARQ_ARCHIVE_SLOT_RANGE",
+        value_name = "START-END"
+    )]
+    archive_slot_range: Option<ArchiveSlotRange>,
+
+    #[arg(
         long = "no-continue-from-last-archive",
         env = "SOLPARQ_NO_CONTINUE_FROM_LAST_ARCHIVE",
         default_value_t = false
@@ -375,6 +389,8 @@ fn parse_archive_kinds(values: &[String], custom_slot_range: u64) -> Result<Vec<
         return Err(anyhow!("custom-slot-range must be greater than zero"));
     }
     let mut kinds = Vec::new();
+    let mut seen = HashSet::new();
+    let mut custom_slots = None;
     for value in values {
         let kind = if value.eq_ignore_ascii_case("custom") {
             ArchiveKind::Custom {
@@ -383,6 +399,20 @@ fn parse_archive_kinds(values: &[String], custom_slot_range: u64) -> Result<Vec<
         } else {
             ArchiveKind::from_str(value).map_err(|err| anyhow!(err))?
         };
+        if !seen.insert(kind) {
+            return Err(anyhow!("duplicate archive range type '{kind}'"));
+        }
+        if let ArchiveKind::Custom { slots } = kind {
+            if let Some(previous_slots) = custom_slots {
+                if previous_slots != slots {
+                    return Err(anyhow!(
+                        "only one custom archive range size can be configured at a time; custom archives share the custom_* storage namespace"
+                    ));
+                }
+            } else {
+                custom_slots = Some(slots);
+            }
+        }
         kinds.push(kind);
     }
     Ok(kinds)
