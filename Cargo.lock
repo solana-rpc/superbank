@@ -6890,7 +6890,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-solparq"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -6915,7 +6915,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-solparq-read"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arrow-array",

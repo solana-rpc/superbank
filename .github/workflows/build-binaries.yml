@@ -28,29 +28,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect superbank-solparq source changes
-        id: superbank_solparq_changes
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          set -euo pipefail
-          before="${{ github.event.before }}"
-          after="${{ github.sha }}"
-          if [[ "$before" =~ ^0+$ ]]; then
-            before="$(git rev-list --max-parents=0 "$after")"
-          fi
-          if git diff --name-only "$before" "$after" -- \
-            crates/superbank-solparq \
-            crates/superbank-solparq-read \
-            Cargo.toml \
-            Cargo.lock \
-            .goreleaser.solparq.yaml \
-            | grep -q .; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
@@ -84,19 +61,16 @@ jobs:
           version: "~> v2"
           install-only: true
 
-      - name: Build main snapshot artifacts
+      - name: Build snapshot artifacts
         run: goreleaser build --snapshot --clean --config .goreleaser.yaml
 
-      - name: Build superbank-solparq snapshot artifacts
-        if: github.event_name != 'push' || steps.superbank_solparq_changes.outputs.changed == 'true'
-        run: goreleaser build --snapshot --clean --config .goreleaser.solparq.yaml
-
-      - name: Upload superbank-solparq snapshot artifacts
-        if: github.event_name == 'workflow_dispatch' || steps.superbank_solparq_changes.outputs.changed == 'true'
+      - name: Upload snapshot artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: superbank-solparq-${{ github.sha }}
+          name: superbank-${{ github.sha }}
           if-no-files-found: error
           path: |
+            dist/superbank_*/superbank
+            dist/superbank-rpc_*/superbank-rpc
             dist/superbank-solparq_*/superbank-solparq
             dist/superbank-solparq-read_*/superbank-solparq-read

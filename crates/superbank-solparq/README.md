@@ -52,29 +52,30 @@ cargo build -p superbank-solparq-read --release
 
 ## Release
 
-`superbank-solparq` is released independently from the main Superbank binaries. The
-release workflow is triggered by tags named `vX.Y.Z-superbank-solparq` and uses
-`.goreleaser.solparq.yaml`.
+`superbank-solparq` ships through the same release workflow as the main Superbank
+binaries. Releases are triggered by annotated `vX.Y.Z` tags and use
+`.goreleaser.yaml`.
 
-Before tagging, update the package version in `crates/superbank-solparq/Cargo.toml`,
-commit all superbank-solparq release changes, and push the branch:
+Before tagging, update workspace member versions in `Cargo.toml` files,
+including `crates/superbank-solparq/Cargo.toml` and
+`crates/superbank-solparq-read/Cargo.toml`, commit release changes, and push
+the branch:
 
 ```bash
-git add crates/superbank-solparq crates/superbank-solparq-read .goreleaser.solparq.yaml .github/workflows/release-solparq.yml
-git commit -m "Release superbank-solparq v0.1.0"
+git add Cargo.toml crates/superbank-solparq/Cargo.toml crates/superbank-solparq-read/Cargo.toml .goreleaser.yaml .github/workflows/release.yml
+git commit -m "Release v0.3.0"
 git push origin <branch-name>
 ```
 
 Then create and push the annotated release tag:
 
 ```bash
-git tag -a v0.1.0-superbank-solparq -m "Release superbank-solparq v0.1.0"
-git push origin v0.1.0-superbank-solparq
+git tag -a v0.3.0 -m "Release v0.3.0"
+git push origin v0.3.0
 ```
 
-The tag must point at a commit that already contains
-`.github/workflows/release-solparq.yml` and `.goreleaser.solparq.yaml`; Git tags
-do not include uncommitted working-tree changes.
+The tag must point at a commit that already contains release workflow and
+GoReleaser changes; Git tags do not include uncommitted working-tree changes.
 
 The workflow builds Linux binaries for:
 
@@ -84,18 +85,18 @@ The workflow builds Linux binaries for:
 and publishes GitHub Release assets similar to:
 
 ```text
-superbank-solparq-v0.1.0-linux-amd64.tar.gz
-superbank-solparq-v0.1.0-linux-arm64.tar.gz
-superbank-solparq-read-v0.1.0-linux-amd64.tar.gz
-superbank-solparq-read-v0.1.0-linux-arm64.tar.gz
-superbank-solparq-v0.1.0-SHA256SUMS.txt
+superbank-solparq-v0.3.0-linux-amd64.tar.gz
+superbank-solparq-v0.3.0-linux-arm64.tar.gz
+superbank-solparq-read-v0.3.0-linux-amd64.tar.gz
+superbank-solparq-read-v0.3.0-linux-arm64.tar.gz
+SHA256SUMS.txt
 ```
 
 To verify the release packaging locally without publishing:
 
 ```bash
-goreleaser check --config .goreleaser.solparq.yaml
-goreleaser release --snapshot --clean --config .goreleaser.solparq.yaml
+goreleaser check --config .goreleaser.yaml
+goreleaser release --snapshot --clean --config .goreleaser.yaml
 ```
 
 ## One-Shot Local Archive

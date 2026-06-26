@@ -262,23 +262,14 @@ git tag -a v0.4.0 -m "Release v0.4.0"
 git push origin v0.4.0
 ```
 
-The release workflow runs the Tilt E2E profile first, then GoReleaser builds both binaries for
+The release workflow runs the Tilt E2E profile first, then GoReleaser builds all release binaries for
 Linux amd64 and Linux arm64, publishes GitHub release notes, uploads `.tar.gz`
 archives, and generates `SHA256SUMS.txt`.
 
-`superbank-solparq` releases are tagged independently from the main Superbank
-release line. Before cutting a `superbank-solparq` release, update
-`crates/superbank-solparq/Cargo.toml`, then create and push an annotated
-`vX.Y.Z-superbank-solparq` tag:
-
-```bash
-git tag -a v0.1.0-superbank-solparq -m "Release superbank-solparq v0.1.0"
-git push origin v0.1.0-superbank-solparq
-```
-
-The `Release superbank-solparq` workflow uses `.goreleaser.solparq.yaml` and
-publishes the `superbank-solparq` and `superbank-solparq-read` Linux amd64 and
-Linux arm64 archives.
+The same `vX.Y.Z` release tag also publishes `superbank-solparq` and
+`superbank-solparq-read` Linux amd64 and Linux arm64 archives via the main
+release workflow and `.goreleaser.yaml`. Keep `superbank-solparq` and
+`superbank-solparq-read` crate versions in lockstep with the main release tag.
 
 ### Key environment variables
 

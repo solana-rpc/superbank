@@ -8,7 +8,6 @@ on:
   pull_request:
     paths:
       - .goreleaser.yaml
-      - .goreleaser.solparq.yaml
   workflow_dispatch:
 
 permissions:
@@ -31,6 +30,3 @@ jobs:
 
       - name: Check main config
         run: goreleaser check --config .goreleaser.yaml
-
-      - name: Check superbank-solparq config
-        run: goreleaser check --config .goreleaser.solparq.yaml
