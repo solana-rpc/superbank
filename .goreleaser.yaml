@@ -60,7 +60,7 @@ builds:
     flags:
       - --release
       - --locked
-      - --package=superbank-solparq-read
+      - --package=superbank-solparq
       - --bin=superbank-solparq-read
     env:
       - SUPERBANK_GIT_SHA={{ .Commit }}

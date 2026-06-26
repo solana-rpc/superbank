@@ -10,7 +10,7 @@ use parquet::{
 };
 use serde_json::Value;
 use serde_json::json;
-use superbank_solparq_read::{
+use superbank_solparq::read::{
     archive_name::{ParsedArchiveName, parse_archive_name},
     config::{Cli, ScanSelection},
     query::{ArchiveInput, ScanOptions, scan_archive, summarize_archive},

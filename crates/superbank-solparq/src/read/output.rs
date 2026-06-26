@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::{
+use crate::read::{
     config::OutputFormat,
     query::{ArchiveSchema, ArchiveSummary},
     source::ArchiveObject,

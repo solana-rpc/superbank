@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::TryStreamExt;
-use object_store::{ObjectStore, PutPayload, aws::AmazonS3Builder, path::Path as ObjectPath};
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, path::Path as ObjectPath,
+};
 use tokio::fs;
 
 use crate::{

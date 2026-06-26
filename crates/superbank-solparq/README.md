@@ -47,7 +47,7 @@ cargo run -p superbank-solparq -- --version
 The companion archive reader is built separately:
 
 ```bash
-cargo build -p superbank-solparq-read --release
+cargo build -p superbank-solparq --bin superbank-solparq-read --release
 ```
 
 ## Release
@@ -57,12 +57,12 @@ binaries. Releases are triggered by annotated `vX.Y.Z` tags and use
 `.goreleaser.yaml`.
 
 Before tagging, update workspace member versions in `Cargo.toml` files,
-including `crates/superbank-solparq/Cargo.toml` and
-`crates/superbank-solparq-read/Cargo.toml`, commit release changes, and push
-the branch:
+including `crates/superbank-solparq/Cargo.toml` (which builds both the
+`superbank-solparq` and `superbank-solparq-read` binaries), commit release
+changes, and push the branch:
 
 ```bash
-git add Cargo.toml crates/superbank-solparq/Cargo.toml crates/superbank-solparq-read/Cargo.toml .goreleaser.yaml .github/workflows/release.yml
+git add Cargo.toml crates/superbank-solparq/Cargo.toml .goreleaser.yaml .github/workflows/release.yml
 git commit -m "Release v0.3.0"
 git push origin <branch-name>
 ```
@@ -178,13 +178,13 @@ Use `superbank-solparq-read` to inspect local or S3 archives without connecting 
 ClickHouse.
 
 ```bash
-cargo run -p superbank-solparq-read -- list \
+cargo run -p superbank-solparq --bin superbank-solparq-read -- list \
   --archive-dir ./crates/superbank-solparq/archives
 
-cargo run -p superbank-solparq-read -- summary \
+cargo run -p superbank-solparq --bin superbank-solparq-read -- summary \
   --archive ./crates/superbank-solparq/archives/hourly_989_427299625-427308624
 
-cargo run -p superbank-solparq-read -- scan \
+cargo run -p superbank-solparq --bin superbank-solparq-read -- scan \
   --archive ./crates/superbank-solparq/archives/hourly_989_427299625-427308624 \
   --slot-range 427300000-427300500 \
   --columns slot,signature \
@@ -199,7 +199,7 @@ S3 reads use the same endpoint, bucket, path, and credentials model as
 `--archive-s3-bucket-path`:
 
 ```bash
-cargo run -p superbank-solparq-read -- summary \
+cargo run -p superbank-solparq --bin superbank-solparq-read -- summary \
   --archive-location-type s3 \
   --archive-s3-endpoint https://s3.eu-central-003.backblazeb2.com \
   --archive-s3-bucket-name solparq \

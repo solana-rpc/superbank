@@ -6,7 +6,7 @@ pub mod source;
 
 use anyhow::Result;
 
-use crate::{
+use crate::read::{
     config::{Cli, Command},
     output::{format_archive_list, format_rows, format_schema, format_summary},
     query::{ArchiveInput, ScanOptions, scan_archive, schema_archive, summarize_archive},

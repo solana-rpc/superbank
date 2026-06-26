@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use object_store::{ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
 
-use crate::{
+use crate::read::{
     archive_name::{ParsedArchiveName, parse_archive_name},
     config::{ArchiveArgs, ArchiveLocationType, ListArgs, SourceArgs},
     query::ArchiveInput,

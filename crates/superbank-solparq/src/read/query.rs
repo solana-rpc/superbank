@@ -19,7 +19,7 @@ use parquet::arrow::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{
+use crate::read::{
     archive_name::{ParsedArchiveName, parse_archive_name},
     config::{ArchiveTable, ScanSelection},
 };
