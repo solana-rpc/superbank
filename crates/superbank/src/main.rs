@@ -44,8 +44,14 @@ async fn main() -> Result<()> {
         "Ingest metrics server listening on http://{}/metrics",
         metrics_addr
     );
+    let health_stale_secs = args.health_stale_secs;
     let metrics_server = tokio::spawn(async move {
-        let app = Router::new().route("/metrics", get(metrics::metrics_handler));
+        let app = Router::new()
+            .route("/metrics", get(metrics::metrics_handler))
+            .route(
+                "/health",
+                get(move || metrics::health_handler(health_stale_secs)),
+            );
         axum::serve(metrics_listener, app).await
     });
 

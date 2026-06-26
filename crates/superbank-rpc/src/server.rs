@@ -406,7 +406,9 @@ async fn start_disk_cache(
         .as_deref()
         .map(str::trim)
         .filter(|path| !path.is_empty())
-        .expect("validated above");
+        .ok_or_else(|| {
+            RpcError::Config("DISK_CACHE_ENABLED=true requires DISK_CACHE_PATH".to_string())
+        })?;
 
     let disk_cfg = DiskCacheConfig {
         path: path.into(),

@@ -172,10 +172,8 @@ impl DiskCacheInner {
     /// Resolve a signature to its stored status. Bounded by the eviction floor:
     /// index entries of evicted slots may linger until compaction.
     pub(crate) fn get_sig_status_sync(&self, signature: &Signature) -> Option<DiskSigStatus> {
-        let raw = self
-            .db
-            .get_pinned_cf(&self.cf(schema::CF_SIG), signature.as_ref())
-            .ok()??;
+        let cf = self.cf(schema::CF_SIG).ok()?;
+        let raw = self.db.get_pinned_cf(&cf, signature.as_ref()).ok()??;
         let value = codec::decode_sig_value(&raw)?;
         if value.slot < self.min_retained() {
             return None;
@@ -199,12 +197,10 @@ impl DiskCacheInner {
     /// record must list the signature (defense against index/record mismatch).
     pub(crate) fn get_tx_sync(&self, signature: &Signature) -> Option<StoredTransactionRecord> {
         let position = self.signature_position_sync(signature)?;
+        let cf = self.cf(schema::CF_TX).ok()?;
         let raw = self
             .db
-            .get_pinned_cf(
-                &self.cf(schema::CF_TX),
-                schema::tx_key(position.slot, position.slot_idx),
-            )
+            .get_pinned_cf(&cf, schema::tx_key(position.slot, position.slot_idx))
             .ok()??;
         let record = codec::decode_record::<StoredTransactionRecord>(&raw)?;
         let sig_bytes: [u8; 64] = *signature.as_array();
@@ -251,10 +247,11 @@ impl DiskCacheInner {
         };
         let seek = seek_key(&address_bytes, before);
 
+        let addr_cf = self.cf(schema::CF_ADDR_SIG)?;
         let mut read_opts = ReadOptions::default();
         read_opts.set_iterate_upper_bound(upper_bound);
         let iter = self.db.iterator_cf_opt(
-            &self.cf(schema::CF_ADDR_SIG),
+            &addr_cf,
             read_opts,
             IteratorMode::From(&seek, Direction::Forward),
         );
@@ -357,15 +354,17 @@ impl DiskCacheInner {
             key_low.clone(),
             key_high.clone(),
             query.sort_order,
-        );
-        let token_iter = (query.token_accounts != TokenAccountsFilter::None).then(|| {
-            self.window_iterator(
-                schema::CF_TOKEN_OWNER,
-                key_low.clone(),
-                key_high.clone(),
-                query.sort_order,
-            )
-        });
+        )?;
+        let token_iter = (query.token_accounts != TokenAccountsFilter::None)
+            .then(|| {
+                self.window_iterator(
+                    schema::CF_TOKEN_OWNER,
+                    key_low.clone(),
+                    key_high.clone(),
+                    query.sort_order,
+                )
+            })
+            .transpose()?;
 
         let balance_changed_only = query.token_accounts == TokenAccountsFilter::BalanceChanged;
         let mut gsfa = IndexCursor::new(gsfa_iter, &key_high, query.sort_order, false)?;
@@ -446,11 +445,13 @@ impl DiskCacheInner {
         key_low: Vec<u8>,
         key_high: Vec<u8>,
         sort_order: SortOrder,
-    ) -> rocksdb::DBIteratorWithThreadMode<'_, rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>>
-    {
-        let cf = self.cf(cf_name);
+    ) -> Result<
+        rocksdb::DBIteratorWithThreadMode<'_, rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>>,
+        super::DiskCacheError,
+    > {
+        let cf = self.cf(cf_name)?;
         let mut read_opts = ReadOptions::default();
-        match sort_order {
+        Ok(match sort_order {
             SortOrder::Desc => {
                 read_opts.set_iterate_upper_bound(key_high.clone());
                 self.db.iterator_cf_opt(
@@ -469,7 +470,7 @@ impl DiskCacheInner {
                     IteratorMode::From(&key_high, Direction::Reverse),
                 )
             }
-        }
+        })
     }
 
     /// Batch full-record fetch by position; `None` per entry on miss (e.g. the
@@ -478,7 +479,10 @@ impl DiskCacheInner {
         &self,
         positions: &[(u64, u32)],
     ) -> Vec<Option<StoredTransactionRecord>> {
-        let tx_cf = self.cf(schema::CF_TX);
+        let tx_cf = match self.cf(schema::CF_TX) {
+            Ok(cf) => cf,
+            Err(_) => return vec![None; positions.len()],
+        };
         positions
             .iter()
             .map(|&(slot, idx)| {

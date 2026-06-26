@@ -55,3 +55,15 @@ spec:
             secretKeyRef:
               name: superbank-clickhouse
               key: CLICKHOUSE_PASSWORD
+        ports:
+        - name: metrics
+          containerPort: 9901
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9901
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3

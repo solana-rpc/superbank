@@ -60,6 +60,8 @@ grpc-slot-notifications: true
 clickhouse-url: "http://localhost:8123"
 metrics-host: "0.0.0.0"
 metrics-port: 9901
+# Seconds without a successful ClickHouse flush before /health returns 503. Set to 0 to disable.
+# health-stale-secs: 120
 # Optional static label added to all ingestor metrics, e.g. the ClickHouse cluster name.
 # metrics-cluster-label: "mainnet-west"
 clickhouse-database: "default"
