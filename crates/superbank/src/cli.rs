@@ -357,6 +357,10 @@ struct CliArgs {
     #[arg(long, env = "METRICS_PORT", default_value = "9901")]
     metrics_port: u16,
 
+    /// Seconds since the last successful ClickHouse flush before /health returns 503.
+    #[arg(long, env = "HEALTH_STALE_SECS", default_value_t = 120)]
+    health_stale_secs: u64,
+
     /// Optional static cluster label added to all Prometheus metrics.
     #[arg(long, env = "METRICS_CLUSTER_LABEL")]
     metrics_cluster_label: Option<String>,
@@ -468,6 +472,7 @@ pub(crate) struct Args {
     pub(crate) clickhouse_url: String,
     pub(crate) metrics_host: String,
     pub(crate) metrics_port: u16,
+    pub(crate) health_stale_secs: u64,
     pub(crate) metrics_cluster_label: Option<String>,
     pub(crate) clickhouse_database: String,
     pub(crate) clickhouse_user: String,
@@ -580,6 +585,8 @@ struct FileConfig {
     metrics_host: Option<String>,
     #[serde(alias = "metrics_port")]
     metrics_port: Option<u16>,
+    #[serde(alias = "health_stale_secs")]
+    health_stale_secs: Option<u64>,
     #[serde(alias = "metrics_cluster_label")]
     metrics_cluster_label: Option<String>,
     #[serde(alias = "clickhouse_database")]
@@ -885,6 +892,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "metrics_port",
             cli.metrics_port,
             file_config.metrics_port,
+        ),
+        health_stale_secs: merge_value(
+            &matches,
+            "health_stale_secs",
+            cli.health_stale_secs,
+            file_config.health_stale_secs,
         ),
         metrics_cluster_label: merge_option(
             &matches,
@@ -1670,6 +1683,7 @@ rpc-from-slot: 456
             clickhouse_url: "http://localhost:8123".to_string(),
             metrics_host: "0.0.0.0".to_string(),
             metrics_port: 9901,
+            health_stale_secs: 120,
             metrics_cluster_label: None,
             clickhouse_database: "default".to_string(),
             clickhouse_user: "default".to_string(),

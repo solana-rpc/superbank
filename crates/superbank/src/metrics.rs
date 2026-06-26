@@ -343,6 +343,18 @@ pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {
     metrics().export()
 }
 
+pub async fn health_handler(stale_secs: u64) -> impl IntoResponse {
+    let last_flush = metrics().last_successful_flush_timestamp_seconds.get();
+    let stale = stale_secs > 0
+        && last_flush > 0
+        && current_timestamp_seconds().saturating_sub(last_flush) > stale_secs as i64;
+    if stale {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
+}
+
 pub async fn metrics_handler() -> impl IntoResponse {
     match export_metrics() {
         Ok(buffer) => (

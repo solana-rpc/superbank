@@ -91,6 +91,8 @@ pub(crate) enum DiskCacheError {
     BelowFloor { slot: u64, floor: u64 },
     #[error("corrupt address-index entry (slot {slot:?})")]
     CorruptIndexEntry { slot: Option<u64> },
+    #[error("column family '{0}' not found in RocksDB")]
+    MissingColumnFamily(String),
 }
 
 #[derive(Debug, Clone)]
@@ -513,10 +515,10 @@ impl DiskCache {
 }
 
 impl DiskCacheInner {
-    fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
+    fn cf(&self, name: &str) -> Result<Arc<BoundColumnFamily<'_>>, DiskCacheError> {
         self.db
             .cf_handle(name)
-            .unwrap_or_else(|| panic!("column family {name} exists"))
+            .ok_or_else(|| DiskCacheError::MissingColumnFamily(name.to_string()))
     }
 
     pub(crate) fn min_retained(&self) -> u64 {
@@ -540,7 +542,7 @@ impl DiskCacheInner {
     }
 
     fn load_persisted_state(&self) -> Result<(), DiskCacheError> {
-        let meta_cf = self.cf(schema::CF_META);
+        let meta_cf = self.cf(schema::CF_META)?;
         let floor = self
             .db
             .get_cf(&meta_cf, schema::META_MIN_RETAINED)?
@@ -548,7 +550,7 @@ impl DiskCacheInner {
             .unwrap_or(0);
         self.min_retained.store(floor, Ordering::Relaxed);
 
-        let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE);
+        let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE)?;
         let mut read_opts = ReadOptions::default();
         read_opts.set_iterate_lower_bound(schema::slot_key(floor).to_vec());
         let iter = self
@@ -595,12 +597,12 @@ impl DiskCacheInner {
         }
 
         let mut batch = WriteBatch::default();
-        let block_meta_cf = self.cf(schema::CF_BLOCK_META);
-        let tx_cf = self.cf(schema::CF_TX);
-        let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE);
-        let sig_cf = self.cf(schema::CF_SIG);
-        let addr_cf = self.cf(schema::CF_ADDR_SIG);
-        let token_cf = self.cf(schema::CF_TOKEN_OWNER);
+        let block_meta_cf = self.cf(schema::CF_BLOCK_META)?;
+        let tx_cf = self.cf(schema::CF_TX)?;
+        let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE)?;
+        let sig_cf = self.cf(schema::CF_SIG)?;
+        let addr_cf = self.cf(schema::CF_ADDR_SIG)?;
+        let token_cf = self.cf(schema::CF_TOKEN_OWNER)?;
 
         batch.put_cf(
             &block_meta_cf,
@@ -737,18 +739,19 @@ impl DiskCacheInner {
         // observe a partially deleted slot.
         self.min_retained.store(new_floor, Ordering::Relaxed);
 
+        let meta_cf = self.cf(schema::CF_META)?;
+        let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE)?;
+        let block_meta_cf = self.cf(schema::CF_BLOCK_META)?;
+        let tx_cf = self.cf(schema::CF_TX)?;
+
         let mut batch = WriteBatch::default();
-        batch.put_cf(
-            &self.cf(schema::CF_META),
-            schema::META_MIN_RETAINED,
-            new_floor.to_be_bytes(),
-        );
+        batch.put_cf(&meta_cf, schema::META_MIN_RETAINED, new_floor.to_be_bytes());
         let from = schema::slot_key(old_floor);
         let to = schema::slot_key(new_floor);
-        batch.delete_range_cf(&self.cf(schema::CF_SLOT_COVERAGE), from, to);
-        batch.delete_range_cf(&self.cf(schema::CF_BLOCK_META), from, to);
+        batch.delete_range_cf(&coverage_cf, from, to);
+        batch.delete_range_cf(&block_meta_cf, from, to);
         batch.delete_range_cf(
-            &self.cf(schema::CF_TX),
+            &tx_cf,
             schema::tx_key(old_floor, 0),
             schema::tx_key(new_floor, 0),
         );
@@ -781,8 +784,9 @@ impl DiskCacheInner {
         cf_names
             .iter()
             .filter_map(|name| {
+                let cf = self.db.cf_handle(name)?;
                 self.db
-                    .property_int_value_cf(&self.cf(name), "rocksdb.live-sst-files-size")
+                    .property_int_value_cf(&cf, "rocksdb.live-sst-files-size")
                     .ok()
                     .flatten()
             })
@@ -794,11 +798,13 @@ impl DiskCacheInner {
     fn poison_slot(&self, slot: u64) {
         warn!(slot, "disk cache: poisoning slot after inconsistency");
         crate::metrics::disk_cache_poisoned_slot();
-        if let Err(err) = self
-            .db
-            .delete_cf(&self.cf(schema::CF_SLOT_COVERAGE), schema::slot_key(slot))
-        {
-            warn!(slot, "disk cache: failed to delete coverage marker: {err}");
+        match self.cf(schema::CF_SLOT_COVERAGE) {
+            Ok(cf) => {
+                if let Err(err) = self.db.delete_cf(&cf, schema::slot_key(slot)) {
+                    warn!(slot, "disk cache: failed to delete coverage marker: {err}");
+                }
+            }
+            Err(err) => warn!(slot, "disk cache: cannot access coverage CF: {err}"),
         }
         self.coverage.write().expect("coverage lock").remove(slot);
         self.publish_coverage_metrics();
@@ -808,10 +814,10 @@ impl DiskCacheInner {
         if slot < self.min_retained.load(Ordering::Relaxed) {
             return SlotStatus::NotCovered;
         }
-        let Ok(Some(raw)) = self
-            .db
-            .get_cf(&self.cf(schema::CF_SLOT_COVERAGE), schema::slot_key(slot))
-        else {
+        let Ok(cf) = self.cf(schema::CF_SLOT_COVERAGE) else {
+            return SlotStatus::NotCovered;
+        };
+        let Ok(Some(raw)) = self.db.get_cf(&cf, schema::slot_key(slot)) else {
             return SlotStatus::NotCovered;
         };
         match codec::decode_coverage_value(&raw) {
@@ -832,10 +838,10 @@ impl DiskCacheInner {
             SlotStatus::Covered { tx_count } => tx_count,
         };
 
-        let Ok(Some(raw_meta)) = self
-            .db
-            .get_cf(&self.cf(schema::CF_BLOCK_META), schema::slot_key(slot))
-        else {
+        let Ok(cf_block_meta) = self.cf(schema::CF_BLOCK_META) else {
+            return DiskBlockResult::NotCovered;
+        };
+        let Ok(Some(raw_meta)) = self.db.get_cf(&cf_block_meta, schema::slot_key(slot)) else {
             self.poison_slot(slot);
             return DiskBlockResult::NotCovered;
         };
@@ -848,6 +854,13 @@ impl DiskCacheInner {
             return DiskBlockResult::Found(Box::new(StoredBlockPayload::Metadata(metadata)));
         }
 
+        if let Err(err) = self.cf(schema::CF_TX) {
+            warn!(
+                slot,
+                "disk cache: {err}; returning NotCovered without poisoning"
+            );
+            return DiskBlockResult::NotCovered;
+        }
         let transactions = match self.read_slot_transactions(slot, tx_count) {
             Some(transactions) => transactions,
             None => {
@@ -892,7 +905,7 @@ impl DiskCacheInner {
             return Some(transactions);
         }
 
-        let tx_cf = self.cf(schema::CF_TX);
+        let tx_cf = self.cf(schema::CF_TX).ok()?;
         let mut read_opts = ReadOptions::default();
         if let Some(next_slot) = slot.checked_add(1) {
             read_opts.set_iterate_upper_bound(schema::tx_key(next_slot, 0).to_vec());
@@ -923,10 +936,10 @@ impl DiskCacheInner {
             SlotStatus::Skipped => return DiskBlockTime::Skipped,
             SlotStatus::Covered { .. } => {}
         }
-        let Ok(Some(raw)) = self
-            .db
-            .get_cf(&self.cf(schema::CF_BLOCK_META), schema::slot_key(slot))
-        else {
+        let Ok(cf_block_meta) = self.cf(schema::CF_BLOCK_META) else {
+            return DiskBlockTime::NotCovered;
+        };
+        let Ok(Some(raw)) = self.db.get_cf(&cf_block_meta, schema::slot_key(slot)) else {
             self.poison_slot(slot);
             return DiskBlockTime::NotCovered;
         };
@@ -950,7 +963,7 @@ impl DiskCacheInner {
             return Ok(Vec::new());
         }
 
-        let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE);
+        let coverage_cf = self.cf(schema::CF_SLOT_COVERAGE)?;
         let mut read_opts = ReadOptions::default();
         if let Some(after_end) = end.checked_add(1) {
             read_opts.set_iterate_upper_bound(schema::slot_key(after_end).to_vec());
@@ -986,7 +999,10 @@ impl DiskCacheInner {
     #[cfg(test)]
     pub(crate) fn delete_tx_for_tests(&self, slot: u64, idx: u32) {
         self.db
-            .delete_cf(&self.cf(schema::CF_TX), schema::tx_key(slot, idx))
+            .delete_cf(
+                &self.cf(schema::CF_TX).expect("tx CF exists"),
+                schema::tx_key(slot, idx),
+            )
             .expect("delete tx");
     }
 
@@ -994,7 +1010,9 @@ impl DiskCacheInner {
     pub(crate) fn corrupt_block_meta_for_tests(&self, slot: u64) {
         self.db
             .put_cf(
-                &self.cf(schema::CF_BLOCK_META),
+                &self
+                    .cf(schema::CF_BLOCK_META)
+                    .expect("block meta CF exists"),
                 schema::slot_key(slot),
                 [codec::VALUE_VERSION_V1, 0xFF, 0xFF],
             )
@@ -1025,7 +1043,7 @@ enum SchemaCheck {
 fn check_schema_version(db: Db) -> Result<SchemaCheck, DiskCacheError> {
     let meta_cf = db
         .cf_handle(schema::CF_META)
-        .expect("meta column family exists");
+        .ok_or_else(|| DiskCacheError::MissingColumnFamily(schema::CF_META.to_string()))?;
     let stored = db
         .get_cf(&meta_cf, schema::META_SCHEMA_VERSION)?
         .and_then(|raw| raw.try_into().ok().map(u32::from_be_bytes));
@@ -1181,7 +1199,7 @@ pub(crate) mod tests {
             .flush_cfs_opt(
                 &schema::ALL_CFS
                     .iter()
-                    .map(|name| cache.inner_for_tests().cf(name))
+                    .map(|name| cache.inner_for_tests().cf(name).expect("CF exists"))
                     .collect::<Vec<_>>()
                     .iter()
                     .collect::<Vec<_>>(),
@@ -1356,7 +1374,10 @@ pub(crate) mod tests {
                 .inner_for_tests()
                 .db
                 .put_cf(
-                    &cache.inner_for_tests().cf(schema::CF_META),
+                    &cache
+                        .inner_for_tests()
+                        .cf(schema::CF_META)
+                        .expect("meta CF exists"),
                     schema::META_SCHEMA_VERSION,
                     9999u32.to_be_bytes(),
                 )

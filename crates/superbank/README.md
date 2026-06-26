@@ -58,9 +58,12 @@ CLICKHOUSE_ENTRIES_TABLE=default.entries \
 cargo run -p superbank --
 ```
 
-Prometheus metrics are served at `/metrics` on `METRICS_HOST:METRICS_PORT` (defaults:
-`0.0.0.0:9901` for the ingestor).
-Set `METRICS_CLUSTER_LABEL` to attach a static `cluster="..."` label to every ingestor metric.
+Prometheus metrics are served at `/metrics` and a liveness health check at `/health` on
+`METRICS_HOST:METRICS_PORT` (defaults: `0.0.0.0:9901`). `/health` returns `200 OK` while the
+ingestor is flushing normally, and `503 Service Unavailable` when no successful ClickHouse flush
+has occurred within `HEALTH_STALE_SECS` seconds (default: 120). Set `HEALTH_STALE_SECS=0` to
+disable staleness checking. Set `METRICS_CLUSTER_LABEL` to attach a static `cluster="..."` label
+to every ingestor metric.
 
 Minimal example (RPC source):
 

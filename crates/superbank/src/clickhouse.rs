@@ -504,6 +504,7 @@ mod tests {
             clickhouse_url: "http://localhost:8123".to_string(),
             metrics_host: "0.0.0.0".to_string(),
             metrics_port: 9901,
+            health_stale_secs: 120,
             metrics_cluster_label: None,
             clickhouse_database: "default".to_string(),
             clickhouse_user: "default".to_string(),
