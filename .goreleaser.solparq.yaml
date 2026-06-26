@@ -6,54 +6,55 @@ git:
   ignore_tags:
     - "v[0-9]*.[0-9]*.[0-9]"
     - "solparq-v*"
+    - "v*-solparq"
 
 builds:
-  - id: solparq
+  - id: superbank-solparq
     builder: rust
     command: zigbuild
-    binary: solparq
+    binary: superbank-solparq
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
     flags:
       - --release
       - --locked
-      - --package=solparq
-      - --bin=solparq
+      - --package=superbank-solparq
+      - --bin=superbank-solparq
     env:
       - SUPERBANK_GIT_SHA={{ .Commit }}
-  - id: solparq-read
+  - id: superbank-solparq-read
     builder: rust
     command: zigbuild
-    binary: solparq-read
+    binary: superbank-solparq-read
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
     flags:
       - --release
       - --locked
-      - --package=solparq-read
-      - --bin=solparq-read
+      - --package=superbank-solparq-read
+      - --bin=superbank-solparq-read
     env:
       - SUPERBANK_GIT_SHA={{ .Commit }}
 
 archives:
-  - id: solparq
-    ids: [solparq]
-    name_template: solparq-{{ trimsuffix .Tag "-solparq" }}-{{ .Os }}-{{ .Arch }}
+  - id: superbank-solparq
+    ids: [superbank-solparq]
+    name_template: superbank-solparq-{{ trimsuffix .Tag "-superbank-solparq" }}-{{ .Os }}-{{ .Arch }}
     formats: [tar.gz]
     files: []
-  - id: solparq-read
-    ids: [solparq-read]
-    name_template: solparq-read-{{ trimsuffix .Tag "-solparq" }}-{{ .Os }}-{{ .Arch }}
+  - id: superbank-solparq-read
+    ids: [superbank-solparq-read]
+    name_template: superbank-solparq-read-{{ trimsuffix .Tag "-superbank-solparq" }}-{{ .Os }}-{{ .Arch }}
     formats: [tar.gz]
     files: []
 
 checksum:
-  name_template: solparq-{{ trimsuffix .Tag "-solparq" }}-SHA256SUMS.txt
+  name_template: superbank-solparq-{{ trimsuffix .Tag "-superbank-solparq" }}-SHA256SUMS.txt
 
 release:
-  name_template: 'Solparq {{ trimsuffix .Tag "-solparq" }}'
+  name_template: 'superbank-solparq {{ trimsuffix .Tag "-superbank-solparq" }}'
   header: |
     rust {{ .Env.RUST_VERSION }}
 

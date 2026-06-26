@@ -1,6 +1,6 @@
 use std::{fs, process::Command, str::FromStr};
 
-use solparq::{
+use superbank_solparq::{
     archive::{
         ArchiveKind, ArchiveRunReport, ArchiveSlotRange, ClickHouseBounds, plan_archive_slot_range,
         plan_next_archive, safe_delete_archived_data_range,
@@ -136,7 +136,7 @@ fn explicit_slot_range_plan_requires_clickhouse_to_cover_range() {
 #[test]
 fn config_rejects_multiple_archive_types_outside_server_mode() {
     let err = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -160,7 +160,7 @@ fn config_rejects_multiple_archive_types_outside_server_mode() {
 #[test]
 fn config_accepts_one_shot_archive_slot_range() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -183,7 +183,7 @@ fn config_accepts_one_shot_archive_slot_range() {
 #[test]
 fn config_rejects_archive_slot_range_in_server_mode() {
     let err = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -208,7 +208,7 @@ fn config_rejects_archive_slot_range_in_server_mode() {
 #[test]
 fn config_rejects_invalid_archive_slot_range() {
     let err = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -232,7 +232,7 @@ fn config_rejects_invalid_archive_slot_range() {
 #[test]
 fn config_rejects_multiple_custom_archive_sizes() {
     let err = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -257,7 +257,7 @@ fn config_rejects_multiple_custom_archive_sizes() {
 #[test]
 fn config_rejects_duplicate_archive_types() {
     let err = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -281,27 +281,27 @@ fn config_rejects_duplicate_archive_types() {
 
 #[test]
 fn binary_reports_crate_version() {
-    let output = Command::new(env!("CARGO_BIN_EXE_solparq"))
+    let output = Command::new(env!("CARGO_BIN_EXE_superbank-solparq"))
         .arg("--version")
         .output()
-        .expect("run solparq --version");
+        .expect("run superbank-solparq --version");
 
     assert!(
         output.status.success(),
-        "solparq --version failed with status {:?}: {}",
+        "superbank-solparq --version failed with status {:?}: {}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        concat!("solparq ", env!("CARGO_PKG_VERSION"))
+        concat!("superbank-solparq ", env!("CARGO_PKG_VERSION"))
     );
 }
 
 #[test]
 fn config_applies_required_defaults_and_s3_validation() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "192.168.0.184",
         "--db-user",
@@ -345,7 +345,7 @@ fn config_applies_required_defaults_and_s3_validation() {
 #[test]
 fn db_archive_tables_cover_superbank_base_and_index_tables() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -570,7 +570,7 @@ fn validation_report_groups_legit_and_backfill_gap_ranges() {
 #[test]
 fn clickhouse_cleanup_waits_until_all_archive_types_cover_range() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -606,7 +606,7 @@ fn clickhouse_cleanup_waits_until_all_archive_types_cover_range() {
 #[test]
 fn clickhouse_cleanup_allows_smaller_kind_after_larger_kind_covers_range() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -642,7 +642,7 @@ fn clickhouse_cleanup_allows_smaller_kind_after_larger_kind_covers_range() {
 #[test]
 fn clickhouse_cleanup_deletes_only_safe_prefix_when_other_kinds_lag() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -740,7 +740,7 @@ fn archive_kind_from_str_parses_custom_slot_override() {
 #[test]
 fn config_rejects_s3_without_required_fields() {
     let err = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -760,7 +760,7 @@ fn config_rejects_s3_without_required_fields() {
 #[test]
 fn config_accepts_optional_log_file() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -783,7 +783,7 @@ fn config_accepts_optional_log_file() {
 #[test]
 fn config_continues_from_last_archive_by_default_and_can_disable_it() {
     let default_config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -796,7 +796,7 @@ fn config_continues_from_last_archive_by_default_and_can_disable_it() {
     .expect("valid config");
 
     let disabled_config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -864,7 +864,7 @@ fn app_state_tracks_db_slots_and_archive_timeline() {
 #[test]
 fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",
@@ -918,7 +918,7 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
 #[test]
 fn dashboard_renders_skip_reasons_and_known_gap_tables() {
     let config = Config::try_parse_from([
-        "solparq",
+        "superbank-solparq",
         "--db-server",
         "127.0.0.1",
         "--db-user",

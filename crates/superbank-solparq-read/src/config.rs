@@ -5,9 +5,9 @@ use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "solparq-read",
+    name = "superbank-solparq-read",
     version,
-    about = "Inspect and read solparq Parquet archives"
+    about = "Inspect and read superbank-solparq Parquet archives"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -150,7 +150,7 @@ pub struct SourceArgs {
     )]
     pub archive_s3_bucket_name: Option<String>,
 
-    /// S3 key prefix containing solparq archives.
+    /// S3 key prefix containing superbank-solparq archives.
     #[arg(
         long = "archive-s3-bucket-path",
         env = "SOLPARQ_READ_ARCHIVE_S3_BUCKET_PATH",

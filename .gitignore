@@ -59,8 +59,8 @@ superbank.yaml
 .bin
 dist/
 
-crates/solparq/archives/
-crates/solparq/*.log
+crates/superbank-solparq/archives/
+crates/superbank-solparq/*.log
 
 credentials.json
 clickhouse.sh

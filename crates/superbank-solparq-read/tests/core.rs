@@ -10,7 +10,7 @@ use parquet::{
 };
 use serde_json::Value;
 use serde_json::json;
-use solparq_read::{
+use superbank_solparq_read::{
     archive_name::{ParsedArchiveName, parse_archive_name},
     config::{Cli, ScanSelection},
     query::{ArchiveInput, ScanOptions, scan_archive, summarize_archive},
@@ -71,7 +71,7 @@ async fn summary_projects_slot_column_and_ignores_invalid_utf8_columns() {
 async fn summary_reads_db_archive_bundle_manifest_and_table_counts() {
     let (_dir, bundle_path) = write_test_bundle();
     let cli = Cli::try_parse_from([
-        "solparq-read",
+        "superbank-solparq-read",
         "summary",
         "--archive",
         bundle_path.to_str().expect("bundle path"),
@@ -118,7 +118,7 @@ async fn scan_filters_transactions_by_inclusive_slot_range() {
 async fn scan_reads_transactions_from_db_archive_bundle_by_default() {
     let (_dir, bundle_path) = write_test_bundle();
     let cli = Cli::try_parse_from([
-        "solparq-read",
+        "superbank-solparq-read",
         "scan",
         "--archive",
         bundle_path.to_str().expect("bundle path"),
@@ -195,7 +195,7 @@ async fn scan_without_columns_explains_invalid_utf8_projection_failure() {
 #[test]
 fn cli_rejects_scan_without_range_or_all() {
     let err = Cli::try_parse_from([
-        "solparq-read",
+        "superbank-solparq-read",
         "scan",
         "--archive",
         "./archive.parquet",
@@ -214,7 +214,7 @@ fn cli_rejects_scan_without_range_or_all() {
 #[test]
 fn cli_accepts_scan_with_slot_range() {
     let cli = Cli::try_parse_from([
-        "solparq-read",
+        "superbank-solparq-read",
         "scan",
         "--archive",
         "./archive.parquet",

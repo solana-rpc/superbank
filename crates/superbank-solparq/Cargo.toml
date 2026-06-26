@@ -1,5 +1,5 @@
 [package]
-name = "solparq"
+name = "superbank-solparq"
 version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -29,5 +29,5 @@ urlencoding = "2.1"
 tempfile = "3"
 
 [[bin]]
-name = "solparq"
+name = "superbank-solparq"
 path = "src/main.rs"

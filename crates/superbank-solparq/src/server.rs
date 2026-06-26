@@ -117,7 +117,7 @@ pub async fn run(config: Config) -> Result<()> {
     info!(
         ops_port = config.ops_port,
         metrics_port = config.metrics_port,
-        "solparq server mode started"
+        "superbank-solparq server mode started"
     );
 
     let loop_state = state.clone();
@@ -483,7 +483,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="30">
-  <title>Solparq Ops</title>
+  <title>superbank-solparq Ops</title>
   <style>
     :root {{
       color-scheme: light;
@@ -545,7 +545,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
   <main>
     <header>
       <div>
-        <h1>Solparq Ops</h1>
+        <h1>superbank-solparq Ops</h1>
         <p>Auto-refreshes every 30 seconds</p>
       </div>
       <div class="pill {health_class}"><span class="dot"></span>{health_label}</div>
@@ -770,7 +770,7 @@ mod tests {
 
     fn test_server_config() -> Config {
         Config::try_parse_from([
-            "solparq",
+            "superbank-solparq",
             "--db-server",
             "127.0.0.1",
             "--db-user",
@@ -881,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn archive_cycle_does_not_start_duplicate_kind_while_active() {
         let config = Config::try_parse_from([
-            "solparq",
+            "superbank-solparq",
             "--db-server",
             "127.0.0.1",
             "--db-user",

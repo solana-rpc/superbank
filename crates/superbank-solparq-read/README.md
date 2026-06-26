@@ -1,6 +1,6 @@
-# solparq-read
+# superbank-solparq-read
 
-`solparq-read` inspects and reads Parquet archives created by `solparq`.
+`superbank-solparq-read` inspects and reads Parquet archives created by `superbank-solparq`.
 It is read-only and works with local archives or S3-compatible object stores.
 It supports current DB archive bundles and older single-file transaction
 Parquet archives.
@@ -10,7 +10,7 @@ Parquet archives.
 From the repository root:
 
 ```bash
-cargo build -p solparq-read --release
+cargo build -p superbank-solparq-read --release
 ```
 
 ## Local Archives
@@ -18,30 +18,30 @@ cargo build -p solparq-read --release
 List archives:
 
 ```bash
-cargo run -p solparq-read -- list \
-  --archive-dir ./crates/solparq/archives
+cargo run -p superbank-solparq-read -- list \
+  --archive-dir ./crates/superbank-solparq/archives
 ```
 
 Show archive counts and metadata:
 
 ```bash
-cargo run -p solparq-read -- summary \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124
+cargo run -p superbank-solparq-read -- summary \
+  --archive ./crates/superbank-solparq/archives/custom_989_427299625-427300124
 ```
 
 Show the Parquet schema:
 
 ```bash
-cargo run -p solparq-read -- schema \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
+cargo run -p superbank-solparq-read -- schema \
+  --archive ./crates/superbank-solparq/archives/custom_989_427299625-427300124 \
   --table transactions
 ```
 
 Read transactions in an inclusive slot range:
 
 ```bash
-cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
+cargo run -p superbank-solparq-read -- scan \
+  --archive ./crates/superbank-solparq/archives/custom_989_427299625-427300124 \
   --slot-range 427299700-427299800 \
   --columns slot,signature \
   --format jsonl
@@ -50,8 +50,8 @@ cargo run -p solparq-read -- scan \
 Read block metadata from the same bundle:
 
 ```bash
-cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
+cargo run -p superbank-solparq-read -- scan \
+  --archive ./crates/superbank-solparq/archives/custom_989_427299625-427300124 \
   --table blocks_metadata \
   --slot-range 427299700-427299800 \
   --columns slot,block_time,executed_transaction_count \
@@ -61,8 +61,8 @@ cargo run -p solparq-read -- scan \
 Read the full archive explicitly:
 
 ```bash
-cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
+cargo run -p superbank-solparq-read -- scan \
+  --archive ./crates/superbank-solparq/archives/custom_989_427299625-427300124 \
   --all \
   --format csv
 ```
@@ -73,12 +73,12 @@ archives are not dumped accidentally.
 ## S3 Archives
 
 S3 mode uses the same endpoint, bucket, path, and credential model as
-`solparq`.
+`superbank-solparq`.
 
 List archives under a prefix:
 
 ```bash
-cargo run -p solparq-read -- list \
+cargo run -p superbank-solparq-read -- list \
   --archive-location-type s3 \
   --archive-s3-endpoint https://s3.eu-central-003.backblazeb2.com \
   --archive-s3-bucket-name solparq \
@@ -91,7 +91,7 @@ Read one archive. In S3 mode, `--archive` is relative to
 `--archive-s3-bucket-path`:
 
 ```bash
-cargo run -p solparq-read -- summary \
+cargo run -p superbank-solparq-read -- summary \
   --archive-location-type s3 \
   --archive-s3-endpoint https://s3.eu-central-003.backblazeb2.com \
   --archive-s3-bucket-name solparq \
@@ -122,8 +122,8 @@ they can contain raw non-UTF8 bytes. If an unprojected `scan` reports
 you need, for example:
 
 ```bash
-cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/custom_989_427299625-427300124 \
+cargo run -p superbank-solparq-read -- scan \
+  --archive ./crates/superbank-solparq/archives/custom_989_427299625-427300124 \
   --slot-range 427299700-427299800 \
   --columns slot,signature,meta_fee
 ```

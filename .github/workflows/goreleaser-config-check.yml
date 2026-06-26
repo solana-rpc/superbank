@@ -32,5 +32,5 @@ jobs:
       - name: Check main config
         run: goreleaser check --config .goreleaser.yaml
 
-      - name: Check solparq config
+      - name: Check superbank-solparq config
         run: goreleaser check --config .goreleaser.solparq.yaml

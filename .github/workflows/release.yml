@@ -5,6 +5,7 @@ on:
     tags:
       - "v*"
       - "!v*-solparq"
+      - "!v*-superbank-solparq"
 
 concurrency:
   group: release-${{ github.ref }}

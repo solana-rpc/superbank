@@ -6541,50 +6541,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "solparq"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "axum 0.8.8",
- "chrono",
- "clap",
- "futures-util",
- "object_store 0.12.5",
- "prometheus-client",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "urlencoding",
-]
-
-[[package]]
-name = "solparq-read"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "arrow-json",
- "arrow-schema",
- "chrono",
- "clap",
- "futures-util",
- "object_store 0.13.2",
- "parquet",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6930,6 +6886,50 @@ dependencies = [
  "yellowstone-block-machine",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
+]
+
+[[package]]
+name = "superbank-solparq"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "chrono",
+ "clap",
+ "futures-util",
+ "object_store 0.12.5",
+ "prometheus-client",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "urlencoding",
+]
+
+[[package]]
+name = "superbank-solparq-read"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-json",
+ "arrow-schema",
+ "chrono",
+ "clap",
+ "futures-util",
+ "object_store 0.13.2",
+ "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
-# solparq
+# superbank-solparq
 
-`solparq` archives Superbank/Solana ClickHouse tables to Parquet bundles.
+`superbank-solparq` archives Superbank/Solana ClickHouse tables to Parquet bundles.
 It can run once or continuously in server mode.
 
 Archive bundles use:
@@ -35,41 +35,41 @@ entries for later PoH-specific tooling.
 From the repository root:
 
 ```bash
-cargo build -p solparq --release
+cargo build -p superbank-solparq --release
 ```
 
 Check the packaged version with:
 
 ```bash
-cargo run -p solparq -- --version
+cargo run -p superbank-solparq -- --version
 ```
 
 The companion archive reader is built separately:
 
 ```bash
-cargo build -p solparq-read --release
+cargo build -p superbank-solparq-read --release
 ```
 
 ## Release
 
-`solparq` is released independently from the main Superbank binaries. The
-release workflow is triggered by tags named `vX.Y.Z-solparq` and uses
+`superbank-solparq` is released independently from the main Superbank binaries. The
+release workflow is triggered by tags named `vX.Y.Z-superbank-solparq` and uses
 `.goreleaser.solparq.yaml`.
 
-Before tagging, update the package version in `crates/solparq/Cargo.toml`,
-commit all solparq release changes, and push the branch:
+Before tagging, update the package version in `crates/superbank-solparq/Cargo.toml`,
+commit all superbank-solparq release changes, and push the branch:
 
 ```bash
-git add crates/solparq .goreleaser.solparq.yaml .github/workflows/release-solparq.yml
-git commit -m "Release solparq v0.1.0"
+git add crates/superbank-solparq crates/superbank-solparq-read .goreleaser.solparq.yaml .github/workflows/release-solparq.yml
+git commit -m "Release superbank-solparq v0.1.0"
 git push origin <branch-name>
 ```
 
 Then create and push the annotated release tag:
 
 ```bash
-git tag -a v0.1.0-solparq -m "Release solparq v0.1.0"
-git push origin v0.1.0-solparq
+git tag -a v0.1.0-superbank-solparq -m "Release superbank-solparq v0.1.0"
+git push origin v0.1.0-superbank-solparq
 ```
 
 The tag must point at a commit that already contains
@@ -84,11 +84,11 @@ The workflow builds Linux binaries for:
 and publishes GitHub Release assets similar to:
 
 ```text
-solparq-v0.1.0-linux-amd64.tar.gz
-solparq-v0.1.0-linux-arm64.tar.gz
-solparq-read-v0.1.0-linux-amd64.tar.gz
-solparq-read-v0.1.0-linux-arm64.tar.gz
-solparq-v0.1.0-SHA256SUMS.txt
+superbank-solparq-v0.1.0-linux-amd64.tar.gz
+superbank-solparq-v0.1.0-linux-arm64.tar.gz
+superbank-solparq-read-v0.1.0-linux-amd64.tar.gz
+superbank-solparq-read-v0.1.0-linux-arm64.tar.gz
+superbank-solparq-v0.1.0-SHA256SUMS.txt
 ```
 
 To verify the release packaging locally without publishing:
@@ -101,7 +101,7 @@ goreleaser release --snapshot --clean --config .goreleaser.solparq.yaml
 ## One-Shot Local Archive
 
 ```bash
-cargo run -p solparq -- \
+cargo run -p superbank-solparq -- \
   --db-server 192.168.0.184 \
   --db-user admin \
   --db-password 'change-me' \
@@ -113,7 +113,7 @@ To archive an exact inclusive slot range in one-shot mode, pass
 `--archive-slot-range START-END`:
 
 ```bash
-cargo run -p solparq -- \
+cargo run -p superbank-solparq -- \
   --db-server 192.168.0.184 \
   --db-user admin \
   --db-password 'change-me' \
@@ -148,7 +148,7 @@ This works with S3-compatible endpoints, including Backblaze-style custom
 endpoints.
 
 ```bash
-cargo run -p solparq -- \
+cargo run -p superbank-solparq -- \
   --db-server 192.168.0.184 \
   --db-user admin \
   --db-password 'change-me' \
@@ -173,18 +173,18 @@ presence as the data-completion marker.
 
 ## Read Archives
 
-Use `solparq-read` to inspect local or S3 archives without connecting to
+Use `superbank-solparq-read` to inspect local or S3 archives without connecting to
 ClickHouse.
 
 ```bash
-cargo run -p solparq-read -- list \
-  --archive-dir ./crates/solparq/archives
+cargo run -p superbank-solparq-read -- list \
+  --archive-dir ./crates/superbank-solparq/archives
 
-cargo run -p solparq-read -- summary \
-  --archive ./crates/solparq/archives/hourly_989_427299625-427308624
+cargo run -p superbank-solparq-read -- summary \
+  --archive ./crates/superbank-solparq/archives/hourly_989_427299625-427308624
 
-cargo run -p solparq-read -- scan \
-  --archive ./crates/solparq/archives/hourly_989_427299625-427308624 \
+cargo run -p superbank-solparq-read -- scan \
+  --archive ./crates/superbank-solparq/archives/hourly_989_427299625-427308624 \
   --slot-range 427300000-427300500 \
   --columns slot,signature \
   --format jsonl
@@ -194,11 +194,11 @@ Use `--table` to read a non-transaction table from a bundle, for example
 `--table blocks_metadata` or `--table entries`.
 
 S3 reads use the same endpoint, bucket, path, and credentials model as
-`solparq`. In S3 mode, `--archive` is the object key relative to
+`superbank-solparq`. In S3 mode, `--archive` is the object key relative to
 `--archive-s3-bucket-path`:
 
 ```bash
-cargo run -p solparq-read -- summary \
+cargo run -p superbank-solparq-read -- summary \
   --archive-location-type s3 \
   --archive-s3-endpoint https://s3.eu-central-003.backblazeb2.com \
   --archive-s3-bucket-name solparq \
@@ -213,7 +213,7 @@ cargo run -p solparq-read -- summary \
 Server mode runs continuously and can process multiple archive range types.
 
 ```bash
-cargo run -p solparq -- \
+cargo run -p superbank-solparq -- \
   --db-server 192.168.0.184 \
   --db-user admin \
   --db-password 'change-me' \
@@ -233,7 +233,7 @@ Defaults:
 
 Archive range types run independently in server mode. For example, a
 `custom:500` archive check can start while a larger `hourly` or `epoch` archive
-is still being written. `solparq` does not start a second task for the same
+is still being written. `superbank-solparq` does not start a second task for the same
 archive type while that type is already running; it logs that the task is
 already active and checks again on the next interval.
 
@@ -257,7 +257,7 @@ Before creating an archive, validation logs a gap summary even when
   match transaction rows.
 
 By default, each archive type continues from the highest existing archive of
-that same type. If no archive exists for that type, `solparq` starts from the
+that same type. If no archive exists for that type, `superbank-solparq` starts from the
 oldest transaction slot available in ClickHouse. To ignore existing archives and
 plan from the oldest ClickHouse slot at startup, use:
 
@@ -276,7 +276,7 @@ timestamps for last run and last success, the number of transaction slots
 available in ClickHouse, startup settings, skip reasons, known data gaps, and a
 color-coded archive timeline.
 
-On shutdown, `solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
+On shutdown, `superbank-solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
 shutdown signal stops new archive tasks from starting and waits for any archive
 currently being written to finish, including parallel archive tasks, their
 reports, cleanup, and optional ClickHouse delete steps. Press `Ctrl+C` again,
@@ -302,7 +302,7 @@ archives use the shared `custom_*` archive namespace.
 
 ## Validation
 
-Before writing an archive, `solparq` checks:
+Before writing an archive, `superbank-solparq` checks:
 
 - ClickHouse has the required `transactions` and `blocks_metadata` tables.
 - Produced Solana blocks in the range, discovered through `getBlocks`, exist in
@@ -310,7 +310,7 @@ Before writing an archive, `solparq` checks:
 - Each block's `executed_transaction_count` matches transaction rows in the
   `transactions` table.
 
-If warnings are found in regular mode, `solparq` asks for confirmation before
+If warnings are found in regular mode, `superbank-solparq` asks for confirmation before
 creating the archive. Use `--force-archive` to archive despite warnings.
 
 The default Solana RPC endpoint is:
@@ -342,7 +342,7 @@ To delete the archived ClickHouse data range after a successful archive:
 
 When multiple archive types are configured, ClickHouse data deletion is gated by
 the completed archive high-watermark for every configured type. After any
-archive succeeds, `solparq` checks the latest completed archive for each type
+archive succeeds, `superbank-solparq` checks the latest completed archive for each type
 and deletes only the part of the current archive range that all types have
 already covered. For example, if `custom:500` and `hourly` are both configured,
 early `custom:500` archives will defer deletion until an `hourly` archive covers

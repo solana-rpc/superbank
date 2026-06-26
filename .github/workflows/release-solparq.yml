@@ -1,12 +1,12 @@
-name: Release solparq
+name: Release superbank-solparq
 
 on:
   push:
     tags:
-      - "v*-solparq"
+      - "v*-superbank-solparq"
 
 concurrency:
-  group: release-solparq-${{ github.ref }}
+  group: release-superbank-solparq-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -39,7 +39,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
-          shared-key: release-solparq-goreleaser
+          shared-key: release-superbank-solparq-goreleaser
 
       - name: Install cargo-zigbuild
         run: cargo install --locked cargo-zigbuild

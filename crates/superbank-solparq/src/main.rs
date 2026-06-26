@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use solparq::config::Config;
+use superbank_solparq::config::Config;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -10,7 +10,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 async fn main() -> Result<()> {
     let config = Config::try_parse()?;
     let _log_guard = init_tracing(config.verbose, config.log_file.as_deref())?;
-    solparq::run(config).await
+    superbank_solparq::run(config).await
 }
 
 fn init_tracing(verbose: u8, log_file: Option<&Path>) -> Result<Option<WorkerGuard>> {
