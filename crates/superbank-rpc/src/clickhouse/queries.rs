@@ -9,7 +9,7 @@ use ch_cityhash102::cityhash64;
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 use super::constants::SLOT_SHARD_DIVISOR;
 use super::types::{
     NumericFilter, PaginationToken, ResolvedSignatureFilter, SignatureFilter, SignatureSlot,
@@ -21,6 +21,7 @@ pub(crate) const TRANSACTION_SELECT_COLUMNS: &str = "signature,
                 slot,
                 slot_idx,
                 block_time,
+                is_vote,
                 tx_version,
                 tx_signatures,
                 tx_num_required_signatures,
@@ -149,6 +150,7 @@ pub(crate) const BLOCK_TRANSACTION_REWARD_COLUMNS: &[&str] = &[
 
 pub(crate) const BLOCK_FULL_BASE_COLUMNS: &[&str] = &[
     "slot_idx",
+    "is_vote",
     "tx_version",
     "tx_signatures",
     "tx_num_required_signatures",
@@ -894,7 +896,7 @@ pub(crate) fn build_transactions_by_slot_signatures_query(
 /// Range scan for disk-cache backfill: every transaction in
 /// `[start_slot, end_slot]` in `(slot, slot_idx)` order. `LIMIT 1 BY signature`
 /// mirrors the per-slot block query's ReplacingMergeTree dedup.
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 pub(crate) fn build_transactions_by_slot_range_query(
     transaction_table: &str,
     start_slot: u64,
@@ -929,13 +931,13 @@ pub(crate) fn build_transactions_by_slot_range_query(
 mod tests {
     use ch_cityhash102::cityhash64;
 
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use super::build_transactions_by_slot_range_query;
     use super::{
         TransactionsForAddressTables, build_hot_position_pagination_clauses,
         build_transactions_for_address_hot_query, build_transactions_for_address_query,
     };
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use crate::clickhouse::constants::SLOT_SHARD_DIVISOR;
     use crate::clickhouse::types::{
         NumericFilter, ResolvedSignatureFilter, SignatureFilter, SignatureSlot, SlotBoundary,
@@ -997,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     fn transactions_by_slot_range_query_includes_bucket_predicate_for_shard_pruning() {
         let query = build_transactions_by_slot_range_query(
             "default.transactions",
