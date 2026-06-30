@@ -20,6 +20,8 @@ fn default_bigtable_decode_concurrency() -> usize {
         .unwrap_or(4)
 }
 
+pub(crate) const DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FromSlotSpec {
     Slot(u64),
@@ -173,6 +175,14 @@ struct CliArgs {
     #[arg(long, env = "FUMAROLE_DATA_CHANNEL_CAPACITY", default_value_t = 4096)]
     fumarole_data_channel_capacity: usize,
 
+    /// Fumarole memory pressure soft limit in bytes (0 disables)
+    #[arg(
+        long,
+        env = "FUMAROLE_MEMORY_SOFT_LIMIT_BYTES",
+        default_value_t = DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES
+    )]
+    fumarole_memory_soft_limit_bytes: u64,
+
     /// Fumarole offset commit interval (seconds)
     #[arg(long, env = "FUMAROLE_COMMIT_INTERVAL_SECS", default_value_t = 10)]
     fumarole_commit_interval_secs: u64,
@@ -253,7 +263,7 @@ struct CliArgs {
     #[arg(long, env = "RPC_TO_SLOT")]
     rpc_to_slot: Option<u64>,
 
-    /// Slot count for rpc source (exclusive with --to-slot)
+    /// Slot count for rpc source (exclusive with --rpc-to-slot)
     #[arg(long, env = "RPC_SLOT_COUNT")]
     rpc_slot_count: Option<u64>,
 
@@ -420,6 +430,18 @@ struct CliArgs {
     /// Flush after every block update (disables batching)
     #[arg(long, env = "FLUSH_EVERY_BLOCK", default_value_t = false)]
     flush_every_block: bool,
+
+    /// Max ClickHouse insert retry attempts before giving up (stateless sources only)
+    #[arg(long, env = "CLICKHOUSE_INSERT_MAX_RETRIES", default_value_t = 5)]
+    insert_max_retries: u32,
+
+    /// Initial backoff for ClickHouse insert retries (milliseconds)
+    #[arg(long, env = "CLICKHOUSE_INSERT_RETRY_BASE_MS", default_value_t = 1_000)]
+    insert_retry_base_ms: u64,
+
+    /// Maximum backoff cap for ClickHouse insert retries (milliseconds)
+    #[arg(long, env = "CLICKHOUSE_INSERT_RETRY_MAX_MS", default_value_t = 30_000)]
+    insert_retry_max_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +456,7 @@ pub(crate) struct Args {
     pub(crate) fumarole_data_plane_tcp_connections: u8,
     pub(crate) fumarole_concurrent_download_limit_per_tcp: usize,
     pub(crate) fumarole_data_channel_capacity: usize,
+    pub(crate) fumarole_memory_soft_limit_bytes: u64,
     pub(crate) fumarole_commit_interval_secs: u64,
     pub(crate) fumarole_no_commit: bool,
     pub(crate) commitment: String,
@@ -485,6 +508,9 @@ pub(crate) struct Args {
     pub(crate) blocks_flush_rows: usize,
     pub(crate) flush_interval_secs: u64,
     pub(crate) flush_every_block: bool,
+    pub(crate) insert_max_retries: u32,
+    pub(crate) insert_retry_base_ms: u64,
+    pub(crate) insert_retry_max_ms: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -508,6 +534,8 @@ struct FileConfig {
     fumarole_concurrent_download_limit_per_tcp: Option<usize>,
     #[serde(alias = "fumarole_data_channel_capacity")]
     fumarole_data_channel_capacity: Option<usize>,
+    #[serde(alias = "fumarole_memory_soft_limit_bytes")]
+    fumarole_memory_soft_limit_bytes: Option<u64>,
     #[serde(alias = "fumarole_commit_interval_secs")]
     fumarole_commit_interval_secs: Option<u64>,
     #[serde(alias = "fumarole_no_commit")]
@@ -611,6 +639,12 @@ struct FileConfig {
     flush_interval_secs: Option<u64>,
     #[serde(alias = "flush_every_block")]
     flush_every_block: Option<bool>,
+    #[serde(alias = "insert_max_retries")]
+    insert_max_retries: Option<u32>,
+    #[serde(alias = "insert_retry_base_ms")]
+    insert_retry_base_ms: Option<u64>,
+    #[serde(alias = "insert_retry_max_ms")]
+    insert_retry_max_ms: Option<u64>,
 }
 
 pub(crate) fn resolve_args() -> Result<Args> {
@@ -669,6 +703,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "fumarole_data_channel_capacity",
             cli.fumarole_data_channel_capacity,
             file_config.fumarole_data_channel_capacity,
+        ),
+        fumarole_memory_soft_limit_bytes: merge_value(
+            &matches,
+            "fumarole_memory_soft_limit_bytes",
+            cli.fumarole_memory_soft_limit_bytes,
+            file_config.fumarole_memory_soft_limit_bytes,
         ),
         fumarole_commit_interval_secs: merge_value(
             &matches,
@@ -971,6 +1011,24 @@ pub(crate) fn resolve_args() -> Result<Args> {
             cli.flush_every_block,
             file_config.flush_every_block,
         ),
+        insert_max_retries: merge_value(
+            &matches,
+            "insert_max_retries",
+            cli.insert_max_retries,
+            file_config.insert_max_retries,
+        ),
+        insert_retry_base_ms: merge_value(
+            &matches,
+            "insert_retry_base_ms",
+            cli.insert_retry_base_ms,
+            file_config.insert_retry_base_ms,
+        ),
+        insert_retry_max_ms: merge_value(
+            &matches,
+            "insert_retry_max_ms",
+            cli.insert_retry_max_ms,
+            file_config.insert_retry_max_ms,
+        ),
     };
 
     validate_args(&args)?;
@@ -1056,12 +1114,12 @@ fn validate_args(args: &Args) -> Result<()> {
             }
             if args.rpc_to_slot.is_some() && args.rpc_slot_count.is_some() {
                 return Err(anyhow!(
-                    "rpc source requires either --to-slot or --slot-count (not both)"
+                    "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
                 ));
             }
             if args.rpc_to_slot.is_none() && args.rpc_slot_count.is_none() {
                 return Err(anyhow!(
-                    "rpc source requires --to-slot or --slot-count to define a range"
+                    "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
                 ));
             }
             if let Some(count) = args.rpc_slot_count
@@ -1369,6 +1427,8 @@ grpc-health-watch-enabled: false
             "3",
             "--fumarole-data-channel-capacity",
             "1234",
+            "--fumarole-memory-soft-limit-bytes",
+            "987654321",
             "--fumarole-commit-interval-secs",
             "2",
         ]);
@@ -1388,6 +1448,7 @@ grpc-health-watch-enabled: false
         assert_eq!(cli.fumarole_data_plane_tcp_connections, 8);
         assert_eq!(cli.fumarole_concurrent_download_limit_per_tcp, 3);
         assert_eq!(cli.fumarole_data_channel_capacity, 1234);
+        assert_eq!(cli.fumarole_memory_soft_limit_bytes, 987654321);
         assert_eq!(cli.fumarole_commit_interval_secs, 2);
     }
 
@@ -1403,6 +1464,7 @@ fumarole-create-consumer-group: true
 fumarole-data-plane-tcp-connections: 8
 fumarole-concurrent-download-limit-per-tcp: 3
 fumarole-data-channel-capacity: 1234
+fumarole-memory-soft-limit-bytes: 987654321
 fumarole-commit-interval-secs: 2
 fumarole-no-commit: true
 "#,
@@ -1423,8 +1485,34 @@ fumarole-no-commit: true
         assert_eq!(config.fumarole_data_plane_tcp_connections, Some(8));
         assert_eq!(config.fumarole_concurrent_download_limit_per_tcp, Some(3));
         assert_eq!(config.fumarole_data_channel_capacity, Some(1234));
+        assert_eq!(config.fumarole_memory_soft_limit_bytes, Some(987654321));
         assert_eq!(config.fumarole_commit_interval_secs, Some(2));
         assert_eq!(config.fumarole_no_commit, Some(true));
+    }
+
+    #[test]
+    fn fumarole_memory_soft_limit_defaults_to_twenty_four_gib() {
+        let matches = CliArgs::command().get_matches_from(["superbank", "--source", "fumarole"]);
+        let cli = CliArgs::from_arg_matches(&matches).expect("parse cli args");
+
+        assert_eq!(
+            cli.fumarole_memory_soft_limit_bytes,
+            DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn cli_accepts_zero_fumarole_memory_soft_limit() {
+        let matches = CliArgs::command().get_matches_from([
+            "superbank",
+            "--source",
+            "fumarole",
+            "--fumarole-memory-soft-limit-bytes",
+            "0",
+        ]);
+        let cli = CliArgs::from_arg_matches(&matches).expect("parse cli args");
+
+        assert_eq!(cli.fumarole_memory_soft_limit_bytes, 0);
     }
 
     #[test]
@@ -1645,6 +1733,7 @@ rpc-from-slot: 456
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: 2,
             fumarole_data_channel_capacity: 4096,
+            fumarole_memory_soft_limit_bytes: DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES,
             fumarole_commit_interval_secs: 10,
             fumarole_no_commit: false,
             commitment: "finalized".to_string(),
@@ -1696,6 +1785,9 @@ rpc-from-slot: 456
             blocks_flush_rows: 2_000,
             flush_interval_secs: 5,
             flush_every_block: false,
+            insert_max_retries: 5,
+            insert_retry_base_ms: 1_000,
+            insert_retry_max_ms: 30_000,
         }
     }
 }

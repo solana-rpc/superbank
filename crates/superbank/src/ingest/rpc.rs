@@ -40,8 +40,8 @@ use tracing::{info, warn};
 
 use crate::cli::{Args, FromSlotSpec};
 use crate::clickhouse::{
-    BlockMetadataRow, InsertTables, ProgressSnapshot, TransactionRow, build_clickhouse_client,
-    fetch_latest_slot_from_blocks, flush_buffers,
+    BlockMetadataRow, InsertTables, ProgressSnapshot, RetryConfig, TransactionRow,
+    build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers_with_retry,
 };
 use crate::commitment::parse_commitment_config;
 use crate::metrics;
@@ -341,6 +341,7 @@ async fn enqueue_flush(
     clickhouse: Arc<clickhouse::Client>,
     insert_tables: Arc<InsertTables>,
     batch: FlushBatch,
+    retry: Arc<RetryConfig>,
 ) -> Result<()> {
     let max_inflight = insert_concurrency.max(1);
     while insert_tasks.len() >= max_inflight {
@@ -353,13 +354,14 @@ async fn enqueue_flush(
         let mut transaction_rows = batch.transaction_rows;
         let mut block_rows = batch.block_rows;
         let mut entry_rows = Vec::new();
-        flush_buffers(
+        flush_buffers_with_retry(
             clickhouse.as_ref(),
             insert_tables.as_ref(),
             &mut transaction_rows,
             &mut block_rows,
             &mut entry_rows,
             batch.progress,
+            &retry,
         )
         .await
     });
@@ -480,6 +482,11 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
         range,
         start_time,
     } = args;
+    let retry_config = Arc::new(RetryConfig {
+        max_retries: cli_args.insert_max_retries,
+        base_ms: cli_args.insert_retry_base_ms,
+        max_ms: cli_args.insert_retry_max_ms,
+    });
     let mut transaction_rows: Vec<TransactionRow> =
         Vec::with_capacity(cli_args.transactions_flush_rows);
     let mut block_rows: Vec<BlockMetadataRow> = Vec::with_capacity(cli_args.blocks_flush_rows);
@@ -526,6 +533,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                         clickhouse.clone(),
                         insert_tables.clone(),
                         batch,
+                        retry_config.clone(),
                     )
                     .await?;
                     last_progress = None;
@@ -580,6 +588,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                                 clickhouse.clone(),
                                 insert_tables.clone(),
                                 batch,
+                                retry_config.clone(),
                             )
                             .await?;
                         }
@@ -595,6 +604,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                             clickhouse.clone(),
                             insert_tables.clone(),
                             batch,
+                            retry_config.clone(),
                         )
                         .await?;
                     }
@@ -602,6 +612,23 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                 }
             }
         }
+    }
+
+    if let Some(batch) = take_flush_batch(
+        cli_args,
+        &mut transaction_rows,
+        &mut block_rows,
+        last_progress.take(),
+    ) {
+        enqueue_flush(
+            &mut insert_tasks,
+            insert_concurrency,
+            clickhouse.clone(),
+            insert_tables.clone(),
+            batch,
+            retry_config.clone(),
+        )
+        .await?;
     }
 
     if shutdown_requested {
@@ -620,6 +647,9 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
             }
         }
     } else {
+        if let Ok(err) = fatal_rx.try_recv() {
+            return Err(err);
+        }
         drain_insert_tasks(&mut insert_tasks, None).await?;
     }
 
@@ -694,12 +724,12 @@ async fn resolve_rpc_range(
         }
         (Some(_), Some(_)) => {
             return Err(anyhow!(
-                "rpc source requires either --to-slot or --slot-count (not both)"
+                "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
             ));
         }
         (None, None) => {
             return Err(anyhow!(
-                "rpc source requires --to-slot or --slot-count to define a range"
+                "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
             ));
         }
     };
@@ -2156,6 +2186,114 @@ mod tests {
         VersionedTransaction {
             signatures: vec![Default::default()],
             message: VersionedMessage::Legacy(message),
+        }
+    }
+
+    fn sample_args() -> Args {
+        Args {
+            source: crate::cli::IngestSource::Grpc,
+            endpoint: Some("https://example.invalid".to_string()),
+            x_token: None,
+            fumarole_endpoint: None,
+            fumarole_x_token: None,
+            fumarole_consumer_group: None,
+            fumarole_create_consumer_group: false,
+            fumarole_data_plane_tcp_connections: 4,
+            fumarole_concurrent_download_limit_per_tcp: 2,
+            fumarole_data_channel_capacity: 4096,
+            fumarole_memory_soft_limit_bytes: crate::cli::DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES,
+            fumarole_commit_interval_secs: 10,
+            fumarole_no_commit: false,
+            commitment: "finalized".to_string(),
+            dragonsmouth_from_slot: None,
+            fumarole_from_slot: None,
+            rpc_from_slot: None,
+            grpc_max_decoding_bytes: 64 * 1024 * 1024,
+            grpc_http2_adaptive_window: false,
+            grpc_idle_timeout_secs: 30,
+            grpc_health_watch_enabled: true,
+            grpc_slot_notifications: true,
+            rpc_url: None,
+            rpc_to_slot: None,
+            rpc_slot_count: None,
+            rpc_timeout_secs: 30,
+            rpc_retry_backoff_ms: 500,
+            rpc_max_inflight: 64,
+            rpc_max_supported_tx_version: 0,
+            rpc_flush_every_slots: 500,
+            rpc_progress_every_slots: 100,
+            rpc_discovery_chunk_slots: 10_000,
+            bigtable_range: None,
+            bigtable_slot_file: None,
+            bigtable_instance: "solana-ledger".to_string(),
+            bigtable_app_profile: "default".to_string(),
+            bigtable_timeout_secs: None,
+            bigtable_max_message_bytes: 64 * 1024 * 1024,
+            bigtable_credential_path: None,
+            bigtable_credential_json: None,
+            bigtable_discovery_limit: 10_000,
+            bigtable_fetch_batch_size: 500,
+            bigtable_fetch_concurrency: 4,
+            bigtable_insert_concurrency: 1,
+            bigtable_decode_concurrency: 4,
+            bigtable_progress_every_slots: 10_000,
+            clickhouse_url: "http://localhost:8123".to_string(),
+            metrics_host: "0.0.0.0".to_string(),
+            metrics_port: 9901,
+            health_stale_secs: 120,
+            metrics_cluster_label: None,
+            clickhouse_database: "default".to_string(),
+            clickhouse_user: "default".to_string(),
+            clickhouse_password: String::new(),
+            clickhouse_async_insert: false,
+            transactions_table: "default.transactions".to_string(),
+            blocks_table: "default.blocks_metadata".to_string(),
+            entries_table: None,
+            transactions_flush_rows: 25_000,
+            blocks_flush_rows: 2_000,
+            flush_interval_secs: 5,
+            flush_every_block: false,
+            insert_max_retries: 5,
+            insert_retry_base_ms: 1_000,
+            insert_retry_max_ms: 30_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn inserter_surfaces_pending_fatal_error_when_results_close() {
+        for _ in 0..64 {
+            let args = sample_args();
+
+            let (result_tx, result_rx) = mpsc::channel::<RpcSlotResult>(1);
+            let (_progress_tx, progress_rx) = watch::channel(0u64);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(0u64);
+            let (fatal_tx, fatal_rx) = mpsc::channel::<anyhow::Error>(1);
+
+            fatal_tx
+                .try_send(anyhow!("simulated fatal getBlock error"))
+                .expect("queue fatal error");
+            drop(result_tx);
+            drop(fatal_tx);
+
+            let outcome = run_rpc_inserter(RpcInserterArgs {
+                clickhouse: Arc::new(build_clickhouse_client(&args)),
+                insert_tables: Arc::new(InsertTables::from_args(&args)),
+                insert_concurrency: 2,
+                args: &args,
+                rpc_clients: Arc::new(Vec::new()),
+                result_rx,
+                progress_rx,
+                shutdown_rx,
+                fatal_rx,
+                range: RpcRange { start: 0, end: 0 },
+                start_time: std::time::Instant::now(),
+            })
+            .await;
+
+            assert!(
+                outcome.is_err(),
+                "run_rpc_inserter returned Ok despite a pending fatal worker error",
+            );
         }
     }
 

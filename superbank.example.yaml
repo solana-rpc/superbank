@@ -24,14 +24,15 @@ grpc-slot-notifications: true
 # fumarole-data-plane-tcp-connections: 4
 # fumarole-concurrent-download-limit-per-tcp: 2
 # fumarole-data-channel-capacity: 4096
+# fumarole-memory-soft-limit-bytes: 25769803776 # 24 GiB; set 0 to disable
 # fumarole-commit-interval-secs: 10
 # fumarole-no-commit: false
 
 # RPC source options (required when source is "rpc")
 # rpc-url: "https://api.mainnet-beta.solana.com"
 # rpc-from-slot: 0
-# to-slot: 0
-# slot-count: 1000
+# rpc-to-slot: 0
+# rpc-slot-count: 1000
 # rpc-timeout-secs: 30
 # rpc-retry-backoff-ms: 500
 # rpc-max-inflight: 64
@@ -77,3 +78,8 @@ transactions-flush-rows: 25000
 blocks-flush-rows: 2000
 flush-interval-secs: 5
 flush-every-block: false
+
+# ClickHouse insert retry (stateless sources: grpc, rpc, bigtable only — fumarole is excluded)
+# insert-max-retries: 5
+# insert-retry-base-ms: 1000
+# insert-retry-max-ms: 30000

@@ -27,7 +27,8 @@ use tracing::{info, warn};
 
 use crate::cli::Args;
 use crate::clickhouse::{
-    BlockMetadataRow, InsertTables, TransactionRow, build_clickhouse_client, flush_buffers,
+    BlockMetadataRow, InsertTables, RetryConfig, TransactionRow, build_clickhouse_client,
+    flush_buffers_with_retry,
 };
 use crate::commitment::parse_commitment_config;
 use crate::ingest::rpc::{map_bigtable_block_metadata, map_bigtable_transactions};
@@ -75,6 +76,7 @@ struct BigtableInserterArgs {
     result_rx: mpsc::Receiver<Result<BigtableBatch>>,
     shutdown_rx: watch::Receiver<u64>,
     fatal: Arc<AtomicBool>,
+    retry_config: Arc<RetryConfig>,
 }
 
 async fn load_slot_list(path: &Path) -> Result<Vec<u64>> {
@@ -145,6 +147,11 @@ pub(crate) async fn run_bigtable_ingest(args: &Args) -> Result<()> {
     let storage = Arc::new(build_bigtable_storage(args).await?);
     let clickhouse = build_clickhouse_client(args);
     let insert_tables = InsertTables::from_args(args);
+    let retry_config = Arc::new(RetryConfig {
+        max_retries: args.insert_max_retries,
+        base_ms: args.insert_retry_base_ms,
+        max_ms: args.insert_retry_max_ms,
+    });
     let flush_config = BigtableFlushConfig {
         transactions_flush_rows: args.transactions_flush_rows,
         blocks_flush_rows: args.blocks_flush_rows,
@@ -204,6 +211,7 @@ pub(crate) async fn run_bigtable_ingest(args: &Args) -> Result<()> {
         result_rx,
         shutdown_rx: shutdown_rx.clone(),
         fatal: fatal.clone(),
+        retry_config: retry_config.clone(),
     }));
 
     let semaphore = Arc::new(Semaphore::new(fetch_concurrency));
@@ -507,6 +515,7 @@ async fn run_bigtable_inserter(args: BigtableInserterArgs) -> Result<BigtableIns
         mut result_rx,
         mut shutdown_rx,
         fatal,
+        retry_config,
     } = args;
     let clickhouse = Arc::new(clickhouse);
     let insert_tables = Arc::new(insert_tables);
@@ -568,6 +577,7 @@ async fn run_bigtable_inserter(args: BigtableInserterArgs) -> Result<BigtableIns
                 batch,
                 &mut shutdown_rx,
                 shutdown_requested,
+                retry_config.clone(),
             )
             .await
             .inspect_err(|_| {
@@ -593,6 +603,7 @@ async fn run_bigtable_inserter(args: BigtableInserterArgs) -> Result<BigtableIns
             batch,
             &mut shutdown_rx,
             shutdown_requested,
+            retry_config.clone(),
         )
         .await
         .inspect_err(|_| {
@@ -660,20 +671,23 @@ async fn flush_bigtable_batch(
     clickhouse: &clickhouse::Client,
     insert_tables: &InsertTables,
     mut batch: BigtableFlushBatch,
+    retry: &RetryConfig,
 ) -> Result<()> {
     sort_bigtable_rows(&mut batch.transaction_rows, &mut batch.block_rows);
     let mut entry_rows = Vec::new();
-    flush_buffers(
+    flush_buffers_with_retry(
         clickhouse,
         insert_tables,
         &mut batch.transaction_rows,
         &mut batch.block_rows,
         &mut entry_rows,
         None,
+        retry,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_bigtable_flush(
     insert_tasks: &mut JoinSet<Result<()>>,
     insert_concurrency: usize,
@@ -682,6 +696,7 @@ async fn enqueue_bigtable_flush(
     batch: BigtableFlushBatch,
     shutdown_rx: &mut watch::Receiver<u64>,
     allow_abort: bool,
+    retry: Arc<RetryConfig>,
 ) -> Result<bool> {
     let max_inflight = insert_concurrency.max(1);
     while insert_tasks.len() >= max_inflight {
@@ -714,7 +729,7 @@ async fn enqueue_bigtable_flush(
     }
 
     insert_tasks.spawn(async move {
-        flush_bigtable_batch(clickhouse.as_ref(), insert_tables.as_ref(), batch).await
+        flush_bigtable_batch(clickhouse.as_ref(), insert_tables.as_ref(), batch, &retry).await
     });
 
     Ok(false)

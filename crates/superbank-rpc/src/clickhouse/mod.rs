@@ -29,7 +29,10 @@ pub use types::{
 pub(crate) use types::{ResolvedSignatureFilter, SignatureSlot, SlotBoundary};
 
 pub(crate) use sharding::{RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig};
-pub(crate) use util::{QueryCacheConfig, QueryFreshnessClass, transient_shard_local_error_reason};
+pub(crate) use util::{QueryCacheConfig, QueryFreshnessClass};
+
+#[cfg(feature = "grpc-streaming")]
+pub(crate) use util::transient_shard_local_error_reason;
 
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) use util::extract_memo;
