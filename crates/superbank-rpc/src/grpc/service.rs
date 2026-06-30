@@ -15,7 +15,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status};
 
-use crate::clickhouse::{BlockMetadataRecord, StoredTransactionRecord};
+use crate::clickhouse::{
+    BlockMetadataRecord, StoredTransactionRecord, transient_shard_local_error_reason,
+};
 use crate::grpc::generated::superbank::{
     BlockRequest, BlockResponse, BlockTimeRequest, BlockTimeResponse, GetRequest, GetResponse,
     StreamBlocksRequest, StreamTransactionsRequest, TransactionRequest, TransactionResponse,
@@ -151,9 +153,11 @@ impl Superbank for SuperbankGrpcService {
                 for metadata in metadata {
                     let txs = tx_by_slot.remove(&metadata.slot).unwrap_or_default();
                     if block_matches_account_filter(&txs, &account_filter) {
-                        let response = encode_block_response(metadata, txs).inspect_err(|_| {
-                            metrics::superbank_grpc_stream_error(STREAM_BLOCKS_METHOD, "encode");
-                        })?;
+                        let response = encode_block_response_blocking(&state, metadata, txs)
+                            .await
+                            .inspect_err(|_| {
+                                metrics::superbank_grpc_stream_error(STREAM_BLOCKS_METHOD, "encode");
+                            })?;
                         metrics::superbank_grpc_stream_message(STREAM_BLOCKS_METHOD);
                         yield response;
                     }
@@ -203,9 +207,14 @@ impl Superbank for SuperbankGrpcService {
 
                 for record in transactions {
                     if transaction_matches_stream_filter(&record, filter.as_ref(), &account_filters) {
-                        let response = encode_transaction_response(record).inspect_err(|_| {
-                            metrics::superbank_grpc_stream_error(STREAM_TRANSACTIONS_METHOD, "encode");
-                        })?;
+                        let response = encode_transaction_response_blocking(&state, record)
+                            .await
+                            .inspect_err(|_| {
+                                metrics::superbank_grpc_stream_error(
+                                    STREAM_TRANSACTIONS_METHOD,
+                                    "encode",
+                                );
+                            })?;
                         metrics::superbank_grpc_stream_message(STREAM_TRANSACTIONS_METHOD);
                         yield response;
                     }
@@ -297,8 +306,67 @@ fn transactions_by_slot(
     by_slot
 }
 
+async fn encode_block_response_blocking(
+    state: &Arc<AppState>,
+    metadata: BlockMetadataRecord,
+    transactions: Vec<StoredTransactionRecord>,
+) -> Result<BlockResponse, Status> {
+    let permit = state
+        .hydration_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Status::new(Code::Internal, "hydration semaphore closed"))?;
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        encode_block_response(metadata, transactions)
+    })
+    .await
+    .map_err(|err| {
+        Status::new(
+            Code::Internal,
+            format!("failed to join gRPC block encoding task: {err}"),
+        )
+    })?
+}
+
+async fn encode_transaction_response_blocking(
+    state: &Arc<AppState>,
+    record: StoredTransactionRecord,
+) -> Result<TransactionResponse, Status> {
+    let permit = state
+        .hydration_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Status::new(Code::Internal, "hydration semaphore closed"))?;
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        encode_transaction_response(record)
+    })
+    .await
+    .map_err(|err| {
+        Status::new(
+            Code::Internal,
+            format!("failed to join gRPC transaction encoding task: {err}"),
+        )
+    })?
+}
+
 fn status_from_processing_error(err: ProcessingError) -> Status {
-    Status::new(Code::Internal, err.to_string())
+    let code = match &err {
+        ProcessingError::Timeout { .. } => Code::DeadlineExceeded,
+        ProcessingError::Database { .. } if transient_shard_local_error_reason(&err).is_some() => {
+            Code::Unavailable
+        }
+        ProcessingError::Database { .. } | ProcessingError::Deserialization { .. } => {
+            Code::Internal
+        }
+    };
+
+    Status::new(code, err.to_string())
 }
 
 fn unimplemented_status() -> Status {
@@ -310,7 +378,8 @@ fn unimplemented_status() -> Status {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_chunk_end, resolve_slot_range};
+    use super::{bounded_chunk_end, resolve_slot_range, status_from_processing_error};
+    use crate::processing::ProcessingError;
     use tonic::Code;
 
     #[test]
@@ -333,5 +402,18 @@ mod tests {
     #[test]
     fn bounded_chunk_end_caps_to_requested_end() {
         assert_eq!(bounded_chunk_end(10, 12, 8), 12);
+    }
+
+    #[test]
+    fn status_from_processing_error_maps_timeouts_to_deadline_exceeded() {
+        let status = status_from_processing_error(ProcessingError::timeout_msg("chunk timed out"));
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+    }
+
+    #[test]
+    fn status_from_processing_error_maps_transient_database_errors_to_unavailable() {
+        let status =
+            status_from_processing_error(ProcessingError::database_msg("Shard 1 tcp handle error"));
+        assert_eq!(status.code(), Code::Unavailable);
     }
 }
