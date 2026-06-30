@@ -45,7 +45,7 @@ use crate::handlers::signatures::{
     handle_get_signature_statuses, handle_get_signatures_for_address,
 };
 use crate::handlers::transactions::handle_get_transactions_for_address;
-use crate::handlers::types::MAX_GET_BLOCKS_RANGE;
+use crate::handlers::types::{EpochInfo, MAX_GET_BLOCKS_RANGE};
 use crate::hydration::BlockHydrationError;
 use crate::hydration::build_transaction_status_meta;
 use crate::hydration::{
@@ -3510,6 +3510,115 @@ async fn emit_http_errors_keeps_success_http_200() {
     let parsed = parse_json_rpc_response(response).await;
     assert_eq!(parsed.result, Some(json!(1)));
     assert!(parsed.error.is_none());
+}
+
+#[tokio::test]
+async fn get_epoch_info_rejects_non_object_config() {
+    let state = test_state();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getEpochInfo",
+        "params": ["finalized"]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    // -32602 rather than -32601 also confirms the method is wired to the handler.
+    assert_eq!(parsed.error.expect("invalid params").code, -32602);
+    assert!(parsed.result.is_none());
+}
+
+#[tokio::test]
+async fn get_epoch_info_rejects_unknown_config_field() {
+    let state = test_state();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getEpochInfo",
+        "params": [{ "notARealField": true }]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.error.expect("invalid params").code, -32602);
+}
+
+#[tokio::test]
+async fn get_epoch_info_rejects_more_than_one_param() {
+    let state = test_state();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getEpochInfo",
+        "params": [{}, {}]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.error.expect("invalid params").code, -32602);
+}
+
+#[tokio::test]
+async fn get_epoch_info_rejects_processed_commitment() {
+    // test_state has no head cache, so processed commitment is unsupported.
+    let state = test_state();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getEpochInfo",
+        "params": [{ "commitment": "processed" }]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    let err = parsed.error.expect("commitment rejected");
+    assert_eq!(err.code, -32602);
+    assert_eq!(
+        err.message,
+        "Only confirmed or finalized commitments are supported"
+    );
+}
+
+#[test]
+fn epoch_info_serializes_with_solana_field_names() {
+    let value = serde_json::to_value(EpochInfo {
+        absolute_slot: 500,
+        block_height: 480,
+        epoch: 1,
+        slot_index: 68,
+        slots_in_epoch: 432_000,
+        transaction_count: Some(1_234),
+    })
+    .expect("serialize");
+
+    assert_eq!(
+        value,
+        json!({
+            "absoluteSlot": 500,
+            "blockHeight": 480,
+            "epoch": 1,
+            "slotIndex": 68,
+            "slotsInEpoch": 432_000,
+            "transactionCount": 1_234
+        })
+    );
+
+    // transactionCount is nullable, matching the Solana spec.
+    let null_count = serde_json::to_value(EpochInfo {
+        absolute_slot: 1,
+        block_height: 1,
+        epoch: 0,
+        slot_index: 1,
+        slots_in_epoch: 432_000,
+        transaction_count: None,
+    })
+    .expect("serialize");
+    assert_eq!(null_count.get("transactionCount"), Some(&Value::Null));
 }
 
 #[tokio::test]

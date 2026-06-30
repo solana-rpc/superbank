@@ -11,6 +11,7 @@ writer that matches the same schemas).
 - `getBlock`
 - `getBlockHeight`
 - `getSlot`
+- `getEpochInfo`
 - `getTransactionCount`
 - `getLatestBlockhash`
 - `getBlockTime`
@@ -31,7 +32,7 @@ Notes:
 - `processed` commitment is supported for a subset of methods when compiled with
   `--features grpc-head-cache` and enabled at runtime with `HEAD_CACHE_ENABLED=true`
   (see "Optional gRPC head cache" below).
-- `getBlockHeight`, `getSlot`, and `getTransactionCount` accept an optional single config object as the sole param:
+- `getBlockHeight`, `getSlot`, `getEpochInfo`, and `getTransactionCount` accept an optional single config object as the sole param:
   - `commitment`: `processed|confirmed|finalized` (defaults to `finalized`; `processed` requires the head cache)
   - `minContextSlot`: optional `u64`; if the server's current context slot is below this value, the
     call fails with JSON-RPC error `-32016` ("Minimum context slot has not been reached") and

@@ -23,9 +23,9 @@ use crate::clickhouse::{QueryTimings, StoredBlockPayload, StoredBlockRecord};
 use crate::handlers::{
     RouteMetric,
     types::{
-        GetBlockHeightConfig, GetBlocksConfig, GetInflationRewardConfig, GetLatestBlockhashConfig,
-        GetLatestBlockhashResult, GetLatestBlockhashValue, GetSlotConfig, InflationRewardInfo,
-        MAX_GET_BLOCKS_RANGE, RpcContextSlot, reject_unknown_fields,
+        EpochInfo, GetBlockHeightConfig, GetBlocksConfig, GetInflationRewardConfig,
+        GetLatestBlockhashConfig, GetLatestBlockhashResult, GetLatestBlockhashValue, GetSlotConfig,
+        InflationRewardInfo, MAX_GET_BLOCKS_RANGE, RpcContextSlot, reject_unknown_fields,
     },
 };
 use crate::hydration::{BlockHydrationError, hydrate_block_payload};
@@ -624,6 +624,162 @@ pub(crate) async fn handle_get_slot(
 
     route.success();
     Ok(json_rpc_success_response(id, json!(slot)))
+}
+
+pub(crate) async fn handle_get_epoch_info(
+    state: Arc<AppState>,
+    id: Value,
+    params: Option<Vec<Value>>,
+) -> Result<Response, StatusCode> {
+    let mut route = RouteMetric::for_state("getEpochInfo", state.as_ref());
+
+    // getEpochInfo accepts the same optional config as getSlot: an object with
+    // an optional commitment and minContextSlot.
+    let config = match params.filter(|v| !v.is_empty()) {
+        None => GetSlotConfig::default(),
+        Some(mut params) => {
+            if params.len() != 1 {
+                route.invalid_params();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32602,
+                    "Invalid params: expected a single config object",
+                    None,
+                ));
+            }
+
+            let value = params.remove(0);
+            if value.is_null() {
+                GetSlotConfig::default()
+            } else if value.is_object() {
+                match serde_json::from_value::<GetSlotConfig>(value) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        route.invalid_params();
+                        return Ok(json_rpc_error_response(
+                            id,
+                            -32602,
+                            format!("Invalid params: failed to parse config ({e})"),
+                            None,
+                        ));
+                    }
+                }
+            } else {
+                route.invalid_params();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32602,
+                    "Invalid params: config must be an object",
+                    None,
+                ));
+            }
+        }
+    };
+
+    let commitment = config.commitment.unwrap_or_default();
+
+    if commitment.is_processed() {
+        #[cfg(feature = "grpc-head-cache")]
+        {
+            if state.head_cache.is_none() {
+                route.invalid_params();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32602,
+                    "Only confirmed or finalized commitments are supported",
+                    Some(json!({ "requestedCommitment": commitment.commitment })),
+                ));
+            }
+        }
+        #[cfg(not(feature = "grpc-head-cache"))]
+        {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(
+                id,
+                -32602,
+                "Only confirmed or finalized commitments are supported",
+                Some(json!({ "requestedCommitment": commitment.commitment })),
+            ));
+        }
+    }
+
+    // Resolve a single ClickHouse-resident context slot and derive every field
+    // from it, so absoluteSlot, blockHeight and transactionCount form a
+    // consistent snapshot. Epoch math assumes the default schedule with no
+    // warmup, matching the rest of the codebase (see getInflationReward).
+    let slot = match state
+        .latest_slot_cache
+        .get_or_refresh(&state.clickhouse)
+        .await
+    {
+        Ok(slot) => slot,
+        Err(e) => {
+            metrics::backend_error("get_latest_finalized_slot");
+            error!("Failed to fetch latest slot for getEpochInfo: {}", e);
+            return Ok(json_rpc_internal_error_response(id));
+        }
+    };
+    route.source_clickhouse();
+
+    if let Some(min_context_slot) = config.min_context_slot
+        && slot < min_context_slot
+    {
+        route.rpc_error();
+        return Ok(json_rpc_error_response(
+            id,
+            JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32,
+            "Minimum context slot has not been reached",
+            Some(json!({ "contextSlot": slot })),
+        ));
+    }
+
+    let block_height = match state
+        .latest_block_height_cache
+        .get_or_refresh(slot, &state.clickhouse)
+        .await
+    {
+        Ok(Some(height)) => height,
+        Ok(None) => {
+            route.source_none();
+            error!(slot, "Block height unavailable for getEpochInfo");
+            return Ok(json_rpc_internal_error_response(id));
+        }
+        Err(e) => {
+            metrics::backend_error("get_block_height_by_slot");
+            error!(
+                "Failed to query ClickHouse block height at slot {} for getEpochInfo: {}",
+                slot, e
+            );
+            return Ok(json_rpc_internal_error_response(id));
+        }
+    };
+
+    let (transaction_count, timings) =
+        match state.clickhouse.get_transaction_count_by_slot(slot).await {
+            Ok(result) => result,
+            Err(e) => {
+                metrics::backend_error("get_transaction_count_by_slot");
+                error!(
+                    "Failed to query ClickHouse transaction count at slot {} for getEpochInfo: {}",
+                    slot, e
+                );
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        };
+
+    let epoch_info = EpochInfo {
+        absolute_slot: slot,
+        block_height,
+        epoch: slot / DEFAULT_SLOTS_PER_EPOCH,
+        slot_index: slot % DEFAULT_SLOTS_PER_EPOCH,
+        slots_in_epoch: DEFAULT_SLOTS_PER_EPOCH,
+        transaction_count: Some(transaction_count),
+    };
+
+    route.success();
+    let mut resp = json_rpc_success_response(id, json!(epoch_info));
+    add_downstream_header(&mut resp, &timings);
+    Ok(resp)
 }
 
 enum TransactionCountPlan {

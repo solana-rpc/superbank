@@ -535,6 +535,7 @@ fn metrics_method_label(method: &str) -> &'static str {
         "getBlock" => "getBlock",
         "getBlockHeight" => "getBlockHeight",
         "getSlot" => "getSlot",
+        "getEpochInfo" => "getEpochInfo",
         "getTransactionCount" => "getTransactionCount",
         "getLatestBlockhash" => "getLatestBlockhash",
         "getBlockTime" => "getBlockTime",
@@ -861,6 +862,7 @@ async fn dispatch_json_rpc_request(
                 blocks::handle_get_block_height(state, id_for_dispatch, params).await
             }
             "getSlot" => blocks::handle_get_slot(state, id_for_dispatch, params).await,
+            "getEpochInfo" => blocks::handle_get_epoch_info(state, id_for_dispatch, params).await,
             "getTransactionCount" => {
                 blocks::handle_get_transaction_count(state, id_for_dispatch, params).await
             }
