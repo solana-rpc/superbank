@@ -7,6 +7,8 @@ use crate::{
 
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
 pub const REPORT_FILE_NAME: &str = "report.txt";
+pub const SHA256SUMS_FILE_NAME: &str = "SHA256SUMS.txt";
+pub const DONE_FILE_PREFIX: &str = ".done";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveManifest {

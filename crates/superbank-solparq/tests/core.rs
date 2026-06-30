@@ -12,7 +12,7 @@ use superbank_solparq::{
     config::{ArchiveLocation, Config},
     metrics::AppState,
     server::{format_utc_timestamp, render_dashboard},
-    storage::local_archives_to_delete,
+    storage::{archive_has_done_marker, local_archives_to_delete, write_local_sha256sums},
 };
 
 #[test]
@@ -724,6 +724,61 @@ fn local_retention_deletes_oldest_bundle_directories_for_each_kind() {
     assert_eq!(names, vec!["custom_0_10-19"]);
 }
 
+#[tokio::test]
+async fn local_archive_done_marker_is_detected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_id = "custom_0_10-19";
+    let bundle_dir = dir.path().join(archive_id);
+    fs::create_dir(&bundle_dir).expect("create bundle");
+    fs::write(bundle_dir.join(".done.test-node"), b"done").expect("write done marker");
+    let output_location = dir.path().to_string_lossy().into_owned();
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom:10",
+        "--archive-file-output-location",
+        &output_location,
+    ])
+    .expect("valid config");
+
+    assert!(
+        archive_has_done_marker(&config, ArchiveKind::Custom { slots: 10 }, archive_id)
+            .await
+            .expect("done marker check")
+    );
+}
+
+#[tokio::test]
+async fn local_sha256sums_include_all_parquet_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(dir.path().join("transactions.parquet"), b"abc").expect("write parquet");
+    fs::write(dir.path().join("blocks_metadata.parquet"), b"").expect("write parquet");
+
+    write_local_sha256sums(
+        dir.path(),
+        &[
+            "transactions.parquet".to_string(),
+            "blocks_metadata.parquet".to_string(),
+        ],
+    )
+    .await
+    .expect("write checksums");
+
+    let contents = fs::read_to_string(dir.path().join("SHA256SUMS.txt")).expect("read checksums");
+    assert!(contents.contains(
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  transactions.parquet"
+    ));
+    assert!(contents.contains(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  blocks_metadata.parquet"
+    ));
+}
+
 #[test]
 fn archive_kind_from_str_parses_custom_slot_override() {
     assert_eq!(
@@ -911,8 +966,33 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
     assert!(html.contains("2023-11-14 22:13:20 UTC"));
     assert!(html.contains("Archive timeline"));
     assert!(html.contains("Continue from last archive"));
+    assert!(html.contains("main { max-width: 1534px"));
+    assert!(html.contains(".gaps table { min-width: 988px; }"));
     assert!(html.contains("<svg"));
     assert!(html.contains("custom_0_10-1009.parquet"));
+}
+
+#[test]
+fn archive_report_includes_human_timestamp_and_hostname() {
+    let report = ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: true,
+        archive_skipped_reason: None,
+        archive_name: Some("custom_0_10-1009.parquet".to_string()),
+        archive_kind: ArchiveKind::Custom { slots: 1_000 },
+        archive_epoch: Some(0),
+        archive_slot_start: Some(10),
+        archive_slot_end: Some(1_009),
+        db_bounds: None,
+        destination: "./".to_string(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+    };
+
+    let text = report.to_text();
+    assert!(text.contains("timestamp_utc: 2023-11-14 22:13:20 UTC"));
+    assert!(text.contains("hostname: "));
 }
 
 #[test]

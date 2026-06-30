@@ -9,12 +9,17 @@ use futures_util::TryStreamExt;
 use object_store::{
     ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, path::Path as ObjectPath,
 };
+use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 
 use crate::{
     archive::{ArchiveKind, parse_archive_name, report_path_for_local_archive},
     config::{ArchiveLocation, Config, S3Config},
-    manifest::{ArchiveManifest, MANIFEST_FILE_NAME, REPORT_FILE_NAME},
+    manifest::{
+        ArchiveManifest, DONE_FILE_PREFIX, MANIFEST_FILE_NAME, REPORT_FILE_NAME,
+        SHA256SUMS_FILE_NAME,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -103,6 +108,140 @@ pub async fn cleanup_archives(config: &Config, kind: ArchiveKind) -> Result<Vec<
         }
         ArchiveLocation::S3 => cleanup_s3_archives(config, kind).await,
     }
+}
+
+pub async fn archive_has_done_marker(
+    config: &Config,
+    kind: ArchiveKind,
+    archive_id: &str,
+) -> Result<bool> {
+    match config.archive_location {
+        ArchiveLocation::Local => {
+            let bundle_dir = local_bundle_dir(&config.output_location, archive_id);
+            if !bundle_dir.exists() {
+                return Ok(false);
+            }
+            let mut entries = fs::read_dir(&bundle_dir)
+                .await
+                .with_context(|| format!("scan archive bundle {}", bundle_dir.display()))?;
+            while let Some(entry) = entries.next_entry().await? {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .map(is_done_file_name)
+                    .unwrap_or(false)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ArchiveLocation::S3 => {
+            let s3 = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| anyhow!("archive-location-type=s3 requires S3 config"))?;
+            let store = build_s3_store(s3)?;
+            let bundle_prefix =
+                ObjectPath::from(format!("{}/{}/", s3_prefix_for_kind(s3, kind), archive_id));
+            let objects = store
+                .list(Some(&bundle_prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .with_context(|| format!("list S3 archive bundle {}", bundle_prefix.as_ref()))?;
+            Ok(objects.iter().any(|object| {
+                object
+                    .location
+                    .filename()
+                    .map(is_done_file_name)
+                    .unwrap_or(false)
+            }))
+        }
+    }
+}
+
+pub async fn write_done_marker(
+    config: &Config,
+    kind: ArchiveKind,
+    archive_id: &str,
+    hostname: &str,
+    timestamp_utc: &str,
+) -> Result<()> {
+    let file_name = done_file_name(hostname);
+    let contents = format!("hostname: {hostname}\ntimestamp_utc: {timestamp_utc}\n");
+    match config.archive_location {
+        ArchiveLocation::Local => {
+            let bundle_dir = local_bundle_dir(&config.output_location, archive_id);
+            fs::create_dir_all(&bundle_dir).await?;
+            let path = bundle_dir.join(file_name);
+            fs::write(&path, contents)
+                .await
+                .with_context(|| format!("write archive done marker {}", path.display()))?;
+        }
+        ArchiveLocation::S3 => {
+            let s3 = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| anyhow!("archive-location-type=s3 requires S3 config"))?;
+            let store = build_s3_store(s3)?;
+            let key = object_path_for_bundle_file(s3, kind, archive_id, &file_name);
+            store
+                .put(&key, PutPayload::from(contents.into_bytes()))
+                .await
+                .with_context(|| format!("write S3 done marker {}", key.as_ref()))?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn write_local_sha256sums(bundle_dir: &Path, file_names: &[String]) -> Result<()> {
+    let mut lines = Vec::with_capacity(file_names.len());
+    for file_name in file_names {
+        let path = bundle_dir.join(file_name);
+        let sha256 = sha256_local_file(&path).await?;
+        lines.push(format!("{sha256}  {file_name}"));
+    }
+    let mut contents = lines.join("\n");
+    contents.push('\n');
+    let path = bundle_dir.join(SHA256SUMS_FILE_NAME);
+    fs::write(&path, contents)
+        .await
+        .with_context(|| format!("write archive checksums {}", path.display()))?;
+    Ok(())
+}
+
+pub async fn write_s3_sha256sums(
+    config: &Config,
+    kind: ArchiveKind,
+    archive_id: &str,
+    file_names: &[String],
+) -> Result<()> {
+    let s3 = config
+        .s3
+        .as_ref()
+        .ok_or_else(|| anyhow!("archive-location-type=s3 requires S3 config"))?;
+    let store = build_s3_store(s3)?;
+    let mut lines = Vec::with_capacity(file_names.len());
+    for file_name in file_names {
+        let key = object_path_for_bundle_file(s3, kind, archive_id, file_name);
+        let bytes = store
+            .get(&key)
+            .await
+            .with_context(|| format!("read S3 archive object {}", key.as_ref()))?
+            .bytes()
+            .await
+            .with_context(|| format!("read S3 archive object bytes {}", key.as_ref()))?;
+        let sha256 = sha256_bytes(&bytes);
+        lines.push(format!("{sha256}  {file_name}"));
+    }
+    let mut contents = lines.join("\n");
+    contents.push('\n');
+    let key = object_path_for_bundle_file(s3, kind, archive_id, SHA256SUMS_FILE_NAME);
+    store
+        .put(&key, PutPayload::from(contents.into_bytes()))
+        .await
+        .with_context(|| format!("write S3 checksums {}", key.as_ref()))?;
+    Ok(())
 }
 
 pub async fn write_report(
@@ -372,6 +511,46 @@ pub fn local_bundle_dir(directory: &Path, archive_id: &str) -> PathBuf {
 
 pub fn local_staging_bundle_dir(directory: &Path, archive_id: &str) -> PathBuf {
     directory.join(format!(".{archive_id}.tmp"))
+}
+
+fn done_file_name(hostname: &str) -> String {
+    let sanitized = hostname
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' => '_',
+            _ => ch,
+        })
+        .collect::<String>();
+    format!("{DONE_FILE_PREFIX}.{sanitized}")
+}
+
+fn is_done_file_name(file_name: &str) -> bool {
+    file_name.starts_with(DONE_FILE_PREFIX)
+}
+
+async fn sha256_local_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("open parquet file for checksum {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("read parquet file for checksum {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn object_path_for_bundle_file(

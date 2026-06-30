@@ -9,6 +9,8 @@ Archive bundles use:
 type_epoch_from-slot_to-slot/
   manifest.json
   report.txt
+  SHA256SUMS.txt
+  .done.<hostname>
   transactions.parquet
   blocks_metadata.parquet
   entries.parquet
@@ -29,6 +31,13 @@ included when they exist on the ClickHouse server and are recorded as skipped in
 `manifest.json` when absent. This lets RPC/Bigtable deployments archive cleanly
 without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
 entries for later PoH-specific tooling.
+
+`SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
+bundle. `report.txt` records the run timestamp in Unix and UTC forms plus the
+node `$HOSTNAME`. A `.done.<hostname>` marker is written after the archive data
+and manifest exist; if a later run sees an archive with any `.done*` marker, it
+treats that archive as already successful and still performs any safe
+ClickHouse cleanup that is due.
 
 ## Build
 
@@ -140,7 +149,7 @@ FORMAT Parquet
 ```
 
 Local bundles are written to a staging directory and moved into place after the
-table Parquet files and `manifest.json` are written.
+table Parquet files, `SHA256SUMS.txt`, and `manifest.json` are written.
 
 ## One-Shot S3 Archive
 
@@ -166,11 +175,13 @@ The object paths are:
 
 ```text
 s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/<table>.parquet
+s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/SHA256SUMS.txt
 s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/manifest.json
+s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/.done.<hostname>
 ```
 
-`manifest.json` is written after the table objects so readers can treat its
-presence as the data-completion marker.
+`manifest.json` is written after the table objects and checksum file. The final
+success marker is `.done.<hostname>`.
 
 ## Read Archives
 

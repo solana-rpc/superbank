@@ -499,7 +499,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; background: var(--bg); color: var(--ink); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    main {{ max-width: 1180px; margin: 0 auto; padding: 28px; }}
+    main {{ max-width: 1534px; margin: 0 auto; padding: 28px; }}
     header {{ display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 24px; }}
     h1 {{ margin: 0 0 6px; font-size: 28px; font-weight: 720; }}
     h2 {{ margin: 0 0 14px; font-size: 17px; font-weight: 680; }}
@@ -515,10 +515,10 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     .label {{ color: var(--muted); font-size: 13px; margin-bottom: 7px; }}
     .value {{ font-size: 23px; font-weight: 720; overflow-wrap: anywhere; }}
     section {{ padding: 18px; margin-bottom: 18px; }}
-    .two {{ display: grid; gap: 18px; grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr); }}
+    .two {{ display: grid; gap: 18px; grid-template-columns: minmax(0, 1.35fr) minmax(416px, .65fr); }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
-    th {{ width: 210px; color: var(--muted); font-weight: 620; }}
+    th {{ width: 273px; color: var(--muted); font-weight: 620; }}
     tr:last-child th, tr:last-child td {{ border-bottom: 0; }}
     .timeline svg {{ width: 100%; height: auto; display: block; }}
     .events {{ margin-top: 12px; max-height: 260px; overflow: auto; border-top: 1px solid var(--line); }}
@@ -526,7 +526,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     .event:last-child {{ border-bottom: 0; }}
     .badge {{ display: inline-flex; justify-content: center; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; color: #fff; }}
     .gaps {{ overflow: auto; }}
-    .gaps table {{ min-width: 760px; }}
+    .gaps table {{ min-width: 988px; }}
     .created {{ background: var(--green); }}
     .skipped {{ background: var(--amber); }}
     .error {{ background: var(--red); }}

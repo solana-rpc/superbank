@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::fs;
 use tracing::{debug, info};
@@ -352,6 +353,11 @@ impl ArchiveRunReport {
     pub fn to_text(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!("timestamp_unix: {}", self.timestamp_unix));
+        lines.push(format!(
+            "timestamp_utc: {}",
+            format_unix_timestamp_utc(self.timestamp_unix)
+        ));
+        lines.push(format!("hostname: {}", node_hostname()));
         lines.push(format!("archive_created: {}", self.archive_created));
         if let Some(reason) = &self.archive_skipped_reason {
             lines.push(format!("archive_skipped_reason: {reason}"));
@@ -498,6 +504,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         report.db_bounds = Some(bounds);
         return Ok(report);
     };
+    let archive_name = plan.archive_id();
     info!(
         archive_kind = kind.to_string(),
         archive_name = plan.file_name(),
@@ -505,6 +512,39 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         end_slot = plan.end_slot,
         "archive task is ready to run"
     );
+
+    if storage::archive_has_done_marker(config, kind, &archive_name).await? {
+        info!(
+            archive_kind = kind.to_string(),
+            archive_name, "archive already has done marker; treating as successful"
+        );
+        let deleted_clickhouse_range = maybe_delete_archived_data_range(
+            config,
+            kind,
+            &client,
+            &available_archive_tables,
+            &plan,
+        )
+        .await?;
+        let cleaned_archives = storage::cleanup_archives(config, kind).await?;
+        let report = ArchiveRunReport {
+            timestamp_unix: unix_timestamp(),
+            archive_created: true,
+            archive_skipped_reason: Some("archive already has done marker".to_string()),
+            archive_name: Some(archive_name.clone()),
+            archive_kind: kind,
+            archive_epoch: Some(plan.epoch),
+            archive_slot_start: Some(plan.start_slot),
+            archive_slot_end: Some(plan.end_slot),
+            db_bounds: Some(bounds),
+            destination: destination.describe(),
+            validation: None,
+            deleted_clickhouse_range,
+            cleaned_archives,
+        };
+        storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
+        return Ok(report);
+    }
 
     let validation = client
         .validate_archive_range(
@@ -545,7 +585,6 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         }
     }
 
-    let archive_name = plan.archive_id();
     info!(
         archive_kind = kind.to_string(),
         archive_name,
@@ -559,6 +598,20 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             let staging_dir = storage::local_staging_bundle_dir(directory, &archive_name);
             if staging_dir.exists() {
                 fs::remove_dir_all(&staging_dir).await?;
+            }
+            let bundle_dir = storage::local_bundle_dir(directory, &archive_name);
+            if bundle_dir.exists() {
+                info!(
+                    archive_kind = kind.to_string(),
+                    archive_name,
+                    path = bundle_dir.display().to_string(),
+                    "removing archive bundle without done marker before recreating"
+                );
+                if bundle_dir.is_dir() {
+                    fs::remove_dir_all(&bundle_dir).await?;
+                } else {
+                    fs::remove_file(&bundle_dir).await?;
+                }
             }
             fs::create_dir_all(&staging_dir).await?;
             for table in &available_archive_tables {
@@ -579,6 +632,11 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
                     .await?;
                 manifest_tables.push(ArchiveManifestTable::from_table(table, row_count));
             }
+            let checksum_file_names = manifest_tables
+                .iter()
+                .map(|table| table.file_name.clone())
+                .collect::<Vec<_>>();
+            storage::write_local_sha256sums(&staging_dir, &checksum_file_names).await?;
             let manifest = ArchiveManifest::new(
                 archive_name.clone(),
                 kind,
@@ -627,6 +685,11 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
                     .await?;
                 manifest_tables.push(ArchiveManifestTable::from_table(table, row_count));
             }
+            let checksum_file_names = manifest_tables
+                .iter()
+                .map(|table| table.file_name.clone())
+                .collect::<Vec<_>>();
+            storage::write_s3_sha256sums(config, kind, &archive_name, &checksum_file_names).await?;
             let manifest = ArchiveManifest::new(
                 archive_name.clone(),
                 kind,
@@ -640,45 +703,23 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         }
     }
 
-    let mut deleted_clickhouse_range = false;
-    if config.delete_archived_data_range {
-        let latest_archive_names = storage::latest_archive_names(config).await?;
-        let safe_delete_range = safe_delete_archived_data_range(
-            config,
-            plan.start_slot,
-            plan.end_slot,
-            &latest_archive_names,
-        )?;
-        if let Some(range) = safe_delete_range {
-            info!(
-                archive_kind = kind.to_string(),
-                start_slot = range.start_slot,
-                end_slot = range.end_slot,
-                current_archive_start_slot = plan.start_slot,
-                current_archive_end_slot = plan.end_slot,
-                "deleting archived ClickHouse data range covered by all configured archive types"
-            );
-            client
-                .delete_archived_range_for_tables(
-                    &available_archive_tables,
-                    range.start_slot,
-                    range.end_slot,
-                )
-                .await?;
-            deleted_clickhouse_range = true;
-        } else {
-            info!(
-                archive_kind = kind.to_string(),
-                start_slot = plan.start_slot,
-                end_slot = plan.end_slot,
-                "deferring ClickHouse data cleanup until all configured archive types cover this range"
-            );
-        }
-    }
+    let report_timestamp = unix_timestamp();
+    storage::write_done_marker(
+        config,
+        kind,
+        &archive_name,
+        &node_hostname(),
+        &format_unix_timestamp_utc(report_timestamp),
+    )
+    .await?;
+
+    let deleted_clickhouse_range =
+        maybe_delete_archived_data_range(config, kind, &client, &available_archive_tables, &plan)
+            .await?;
 
     let cleaned_archives = storage::cleanup_archives(config, kind).await?;
     let report = ArchiveRunReport {
-        timestamp_unix: unix_timestamp(),
+        timestamp_unix: report_timestamp,
         archive_created: true,
         archive_skipped_reason: None,
         archive_name: Some(archive_name.clone()),
@@ -700,6 +741,52 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         "archive task completed"
     );
     Ok(report)
+}
+
+async fn maybe_delete_archived_data_range(
+    config: &Config,
+    kind: ArchiveKind,
+    client: &ClickHouseClient,
+    available_archive_tables: &[ArchiveDbTable],
+    plan: &ArchivePlan,
+) -> Result<bool> {
+    if !config.delete_archived_data_range {
+        return Ok(false);
+    }
+
+    let latest_archive_names = storage::latest_archive_names(config).await?;
+    let safe_delete_range = safe_delete_archived_data_range(
+        config,
+        plan.start_slot,
+        plan.end_slot,
+        &latest_archive_names,
+    )?;
+    if let Some(range) = safe_delete_range {
+        info!(
+            archive_kind = kind.to_string(),
+            start_slot = range.start_slot,
+            end_slot = range.end_slot,
+            current_archive_start_slot = plan.start_slot,
+            current_archive_end_slot = plan.end_slot,
+            "deleting archived ClickHouse data range covered by all configured archive types"
+        );
+        client
+            .delete_archived_range_for_tables(
+                available_archive_tables,
+                range.start_slot,
+                range.end_slot,
+            )
+            .await?;
+        Ok(true)
+    } else {
+        info!(
+            archive_kind = kind.to_string(),
+            start_slot = plan.start_slot,
+            end_slot = plan.end_slot,
+            "deferring ClickHouse data cleanup until all configured archive types cover this range"
+        );
+        Ok(false)
+    }
 }
 
 fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {
@@ -768,6 +855,19 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()
+}
+
+fn format_unix_timestamp_utc(timestamp_unix: u64) -> String {
+    DateTime::<Utc>::from_timestamp(timestamp_unix as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "invalid timestamp".to_string())
+}
+
+fn node_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|hostname| !hostname.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn report_path_for_local_archive(directory: PathBuf, archive_name: &str) -> PathBuf {
