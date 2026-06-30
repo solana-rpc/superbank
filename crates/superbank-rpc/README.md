@@ -89,6 +89,20 @@ CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
 cargo run -p superbank-rpc --
 ```
 
+## HTTP status behavior
+
+By default, JSON-RPC responses use HTTP `200 OK`, including JSON-RPC error bodies. To make
+infrastructure/server-side failures visible to HTTP-aware load balancers and clients, enable:
+
+| Option | Environment | Default | Notes |
+| --- | --- | --- | --- |
+| `--emit-http-errors` | `SUPERBANK_RPC_EMIT_HTTP_ERRORS` | `false` | Returns HTTP `503 Service Unavailable` when the JSON-RPC response contains a server-side failure; JSON-RPC response bodies are unchanged. |
+
+Only internal error (`-32603`), server-generated request timeout (`-32000`), node unhealthy
+(`-32005`), and long-term storage unreachable (`-32019`) are promoted to HTTP `503`.
+Client, malformed-request, and data-condition errors remain HTTP `200 OK`. For batches, any
+eligible item promotes the whole HTTP response to `503`.
+
 ## Optional gRPC head cache (`grpc-head-cache`)
 
 When compiled with `--features grpc-head-cache` and enabled at runtime, superbank-rpc subscribes to

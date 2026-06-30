@@ -280,6 +280,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         latest_slot_cache: LatestSlotCache::new(Duration::from_millis(1000)),
         latest_block_height_cache: LatestBlockHeightCache::new(Duration::from_millis(1000)),
         rpc_request_timeout: Duration::from_millis(args.rpc_request_timeout_ms),
+        emit_http_errors: args.emit_http_errors,
         metrics_header_capture: MetricsHeaderCaptureConfig {
             capture_x_endpoint: args.metrics_capture_x_endpoint(),
             capture_x_rpc_node: args.metrics_capture_x_rpc_node(),
