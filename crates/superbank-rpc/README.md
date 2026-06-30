@@ -54,6 +54,7 @@ Notes:
   - Missing `before` or `until` signatures return JSON-RPC error `-32020` (`Transaction <signature> not found`).
 - `getTransactionsForAddress` supports `transactionDetails=signatures|full`, `sortOrder=asc|desc`,
   `paginationToken`, and filters (`slot`, `blockTime`, `signature`, `status`, `tokenAccounts`).
+  With `transactionDetails=full`, each item carries the transaction's `version`when `maxSupportedTransactionVersion` is set.
   It also accepts `beforeSlot`/`untilSlot` as aliases for `filters.slot.lt`/`filters.slot.gt`;
   these aliases cannot be combined with same-side slot filters (`lt`/`lte` for `beforeSlot`,
   `gt`/`gte` for `untilSlot`).

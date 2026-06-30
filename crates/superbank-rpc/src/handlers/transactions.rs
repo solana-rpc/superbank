@@ -1198,6 +1198,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                             block_time: input.block_time,
                             transaction: encoded.transaction.transaction,
                             meta: encoded.transaction.meta,
+                            version: encoded.transaction.version,
                         });
 
                         pagination_token = Some(format!("{}:{}", input.slot, input.slot_idx));
@@ -1764,6 +1765,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                 block_time: input.block_time,
                 transaction: encoded.transaction.transaction,
                 meta: encoded.transaction.meta,
+                version: encoded.transaction.version,
             });
 
             #[cfg(feature = "grpc-head-cache")]
