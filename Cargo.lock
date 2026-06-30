@@ -6353,6 +6353,7 @@ dependencies = [
 name = "superbank-rpc"
 version = "0.3.0"
 dependencies = [
+ "async-stream",
  "axum 0.8.8",
  "base64 0.22.1",
  "bincode",
@@ -6371,6 +6372,7 @@ dependencies = [
  "once_cell",
  "prometheus-client",
  "prometheus-client-derive-encode",
+ "prost 0.14.3",
  "pyroscope",
  "pyroscope_pprofrs",
  "reqwest 0.13.2",
@@ -6391,6 +6393,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
+ "tonic 0.14.5",
+ "tonic-prost",
+ "tonic-prost-build",
  "tower 0.5.3",
  "tower-http",
  "tracing",

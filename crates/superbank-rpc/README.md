@@ -90,6 +90,41 @@ CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
 cargo run -p superbank-rpc --
 ```
 
+## Optional Superbank gRPC streaming (`grpc-streaming`)
+
+When compiled with `--features grpc-streaming` and enabled at runtime, superbank-rpc serves a
+tonic gRPC endpoint alongside JSON-RPC. The v1 implementation supports historical
+`StreamBlocks` and `StreamTransactions` over bounded inclusive slot ranges from ClickHouse.
+Unary methods and bidirectional `Get` are present in the proto for compatibility but return
+`UNIMPLEMENTED`.
+
+`StreamBlocks` returns one message per matching block with block metadata, rewards, and
+transaction payloads. `StreamTransactions` returns one message per matching transaction. Filters
+support account include/exclude/required matching, transaction vote filtering, and failed/success
+filtering where present in the request.
+
+Run example:
+
+```bash
+RPC_HOST=0.0.0.0 RPC_PORT=8899 \
+CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
+SUPERBANK_GRPC_ENABLED=true SUPERBANK_GRPC_PORT=10000 \
+cargo run -p superbank-rpc --features grpc-streaming --
+```
+
+Configuration:
+
+| Option | Environment | Default | Notes |
+| --- | --- | --- | --- |
+| `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Enables the gRPC endpoint at runtime. |
+| `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Bind host. |
+| `--superbank-grpc-port` | `SUPERBANK_GRPC_PORT` | `10000` | Bind port. |
+| `--superbank-grpc-max-slot-range` | `SUPERBANK_GRPC_MAX_SLOT_RANGE` | `100` | Maximum inclusive slots per stream request. |
+| `--superbank-grpc-query-timeout-ms` | `SUPERBANK_GRPC_QUERY_TIMEOUT_MS` | `30000` | Per-chunk ClickHouse range-query timeout. |
+| `--superbank-grpc-chunk-slots` | `SUPERBANK_GRPC_CHUNK_SLOTS` | `8` | Slots fetched from ClickHouse per chunk. |
+| `--superbank-grpc-max-send-bytes` | `SUPERBANK_GRPC_MAX_SEND_BYTES` | `104857600` | Max encoded gRPC response message size. |
+| `--superbank-grpc-max-concurrent-streams` | `SUPERBANK_GRPC_MAX_CONCURRENT_STREAMS` | `20` | HTTP/2 concurrent stream limit. |
+
 ## HTTP status behavior
 
 By default, JSON-RPC responses use HTTP `200 OK`, including JSON-RPC error bodies. To make
@@ -301,6 +336,14 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |
+| `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Only available with `--features grpc-streaming`; enables the gRPC endpoint at runtime. |
+| `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Only available with `--features grpc-streaming`. |
+| `--superbank-grpc-port` | `SUPERBANK_GRPC_PORT` | `10000` | Only available with `--features grpc-streaming`. |
+| `--superbank-grpc-max-slot-range` | `SUPERBANK_GRPC_MAX_SLOT_RANGE` | `100` | Only available with `--features grpc-streaming`. |
+| `--superbank-grpc-query-timeout-ms` | `SUPERBANK_GRPC_QUERY_TIMEOUT_MS` | `30000` | Only available with `--features grpc-streaming`. |
+| `--superbank-grpc-chunk-slots` | `SUPERBANK_GRPC_CHUNK_SLOTS` | `8` | Only available with `--features grpc-streaming`. |
+| `--superbank-grpc-max-send-bytes` | `SUPERBANK_GRPC_MAX_SEND_BYTES` | `104857600` | Only available with `--features grpc-streaming`. |
+| `--superbank-grpc-max-concurrent-streams` | `SUPERBANK_GRPC_MAX_CONCURRENT_STREAMS` | `20` | Only available with `--features grpc-streaming`. |
 | `--clickhouse-url` | `CLICKHOUSE_URL` | `http://localhost:8123` | — |
 | `--clickhouse-database` | `CLICKHOUSE_DATABASE` | `default` | — |
 | `--clickhouse-user` | `CLICKHOUSE_USER` | `default` | — |
@@ -473,6 +516,13 @@ Request-scoped metric families:
 
 - `rpc_requests`, `rpc_response_time_seconds`, `rpc_inflight_requests`, `rpc_timeouts`, `rpc_response_overhead_seconds`, `rpc_blocks_slots_returned`, `rpc_batch_requests`, `rpc_batch_items`, `rpc_batch_size`, `rpc_batch_rejected_total`, `rpc_backend_errors`, `rpc_clickhouse_duration_seconds`, `rpc_clickhouse_received_bytes`, `rpc_clickhouse_decoded_bytes`, `rpc_clickhouse_timeouts`, `rpc_clickhouse_query_cache_total`, `rpc_clickhouse_query_cache_settings_total` can include `x_endpoint`, `x_rpc_node`, `x_subscription_id`, and `x_account_id` when each capture option is enabled.
 - For those labels, values are `missing|<raw-value>` for enabled capture; disabled capture omits the label.
+
+Superbank gRPC streaming metrics, emitted only with `--features grpc-streaming`:
+
+- `superbank_grpc_stream_requests_total{method}`
+- `superbank_grpc_stream_chunks_total{method}`
+- `superbank_grpc_stream_messages_total{method}`
+- `superbank_grpc_stream_errors_total{method,stage}`
 
 Response metric headers:
 

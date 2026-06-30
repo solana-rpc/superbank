@@ -505,6 +505,7 @@ fn base_transaction_record() -> StoredTransactionRecord {
         slot: 1,
         slot_idx: 0,
         block_time: Some(123),
+        is_vote: false,
         tx_version: None,
         tx_signatures: vec![[0u8; 64]],
         tx_num_required_signatures: 1,
@@ -695,6 +696,7 @@ fn hydrate_transaction_record_base64_round_trip() {
         slot: 99,
         slot_idx: 7,
         block_time: Some(123),
+        is_vote: false,
         tx_version: None,
         tx_signatures: versioned
             .signatures
@@ -3049,6 +3051,7 @@ fn build_v0_transaction_allows_missing_lookup_flag_when_empty() {
         slot: 0,
         slot_idx: 0,
         block_time: None,
+        is_vote: false,
         tx_version: Some(0),
         tx_signatures: vec![[0u8; 64]],
         tx_num_required_signatures: 1,

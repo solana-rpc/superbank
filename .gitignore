@@ -52,6 +52,8 @@ copy-transactions-logs-*/
 # Test scripts
 test.sh
 test-ingest.sh
+test-grpc.sh
+topology.yaml
 
 # Superbank local development files
 superbank.yaml

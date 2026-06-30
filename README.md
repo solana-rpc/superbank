@@ -28,6 +28,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Ingest from Yellowstone Fumarole, Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable
 - Store blocks + transactions in ClickHouse (`ddl/`)
 - Serve Solana-compatible JSON-RPC backed by ClickHouse (`crates/superbank-rpc`)
+- Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
 ## Architecture
@@ -251,7 +252,7 @@ cargo build -p superbank -p superbank-rpc
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
+cargo test -p superbank-rpc --all-features --locked
 ```
 
 Local RPC helper:

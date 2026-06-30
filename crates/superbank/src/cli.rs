@@ -430,6 +430,18 @@ struct CliArgs {
     /// Flush after every block update (disables batching)
     #[arg(long, env = "FLUSH_EVERY_BLOCK", default_value_t = false)]
     flush_every_block: bool,
+
+    /// Max ClickHouse insert retry attempts before giving up (stateless sources only)
+    #[arg(long, env = "CLICKHOUSE_INSERT_MAX_RETRIES", default_value_t = 5)]
+    insert_max_retries: u32,
+
+    /// Initial backoff for ClickHouse insert retries (milliseconds)
+    #[arg(long, env = "CLICKHOUSE_INSERT_RETRY_BASE_MS", default_value_t = 1_000)]
+    insert_retry_base_ms: u64,
+
+    /// Maximum backoff cap for ClickHouse insert retries (milliseconds)
+    #[arg(long, env = "CLICKHOUSE_INSERT_RETRY_MAX_MS", default_value_t = 30_000)]
+    insert_retry_max_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +508,9 @@ pub(crate) struct Args {
     pub(crate) blocks_flush_rows: usize,
     pub(crate) flush_interval_secs: u64,
     pub(crate) flush_every_block: bool,
+    pub(crate) insert_max_retries: u32,
+    pub(crate) insert_retry_base_ms: u64,
+    pub(crate) insert_retry_max_ms: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -624,6 +639,12 @@ struct FileConfig {
     flush_interval_secs: Option<u64>,
     #[serde(alias = "flush_every_block")]
     flush_every_block: Option<bool>,
+    #[serde(alias = "insert_max_retries")]
+    insert_max_retries: Option<u32>,
+    #[serde(alias = "insert_retry_base_ms")]
+    insert_retry_base_ms: Option<u64>,
+    #[serde(alias = "insert_retry_max_ms")]
+    insert_retry_max_ms: Option<u64>,
 }
 
 pub(crate) fn resolve_args() -> Result<Args> {
@@ -989,6 +1010,24 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "flush_every_block",
             cli.flush_every_block,
             file_config.flush_every_block,
+        ),
+        insert_max_retries: merge_value(
+            &matches,
+            "insert_max_retries",
+            cli.insert_max_retries,
+            file_config.insert_max_retries,
+        ),
+        insert_retry_base_ms: merge_value(
+            &matches,
+            "insert_retry_base_ms",
+            cli.insert_retry_base_ms,
+            file_config.insert_retry_base_ms,
+        ),
+        insert_retry_max_ms: merge_value(
+            &matches,
+            "insert_retry_max_ms",
+            cli.insert_retry_max_ms,
+            file_config.insert_retry_max_ms,
         ),
     };
 
@@ -1746,6 +1785,9 @@ rpc-from-slot: 456
             blocks_flush_rows: 2_000,
             flush_interval_secs: 5,
             flush_every_block: false,
+            insert_max_retries: 5,
+            insert_retry_base_ms: 1_000,
+            insert_retry_max_ms: 30_000,
         }
     }
 }

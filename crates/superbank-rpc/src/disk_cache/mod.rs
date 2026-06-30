@@ -1121,6 +1121,7 @@ pub(crate) mod tests {
             slot,
             slot_idx: idx,
             block_time: Some(1_700_000_000 + slot as i64),
+            is_vote: false,
             tx_version: None,
             tx_signatures: vec![signature],
             tx_num_required_signatures: 1,

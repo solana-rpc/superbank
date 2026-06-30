@@ -29,6 +29,9 @@ use crate::metrics::metrics_handler;
 use crate::processing::ProcessingError;
 use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHeaderCaptureConfig};
 
+#[cfg(feature = "grpc-streaming")]
+use crate::grpc::service::{self as superbank_grpc, SuperbankGrpcConfig};
+
 #[cfg(feature = "disk-cache")]
 use crate::disk_cache::{
     DiskCache, DiskCacheConfig, filler, ingest::DiskIngestSink, ingest::RepairQueue,
@@ -97,6 +100,9 @@ pub enum RpcError {
     Bind(#[from] std::io::Error),
     #[error("Server error: {0}")]
     Server(#[from] HyperError),
+    #[cfg(feature = "grpc-streaming")]
+    #[error("gRPC server error: {0}")]
+    Grpc(#[from] tonic::transport::Error),
     #[error("Invalid configuration: {0}")]
     Config(String),
 }
@@ -310,7 +316,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         .route("/", post(handle_json_rpc_with_headers))
         .route("/health", get(|| async { "OK" }))
         .layer(rpc_layers)
-        .with_state(state);
+        .with_state(state.clone());
 
     // Metrics server on a dedicated listener
     let metrics_app = Router::new().route("/metrics", get(metrics_handler));
@@ -326,6 +332,28 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         "Metrics server listening on http://{}/metrics",
         metrics_addr
     );
+
+    #[cfg(feature = "grpc-streaming")]
+    let grpc_server = if args.superbank_grpc_enabled {
+        let grpc_addr = format!("{}:{}", args.superbank_grpc_host, args.superbank_grpc_port);
+        let grpc_listener = TcpListener::bind(&grpc_addr).await?;
+        let grpc_config = SuperbankGrpcConfig {
+            max_slot_range: args.superbank_grpc_max_slot_range,
+            query_timeout: Duration::from_millis(args.superbank_grpc_query_timeout_ms),
+            chunk_slots: args.superbank_grpc_chunk_slots,
+            max_send_bytes: args.superbank_grpc_max_send_bytes,
+            max_concurrent_streams: args.superbank_grpc_max_concurrent_streams,
+        };
+        info!("gRPC server listening on http://{}", grpc_addr);
+        Some(superbank_grpc::serve(
+            state.clone(),
+            grpc_config,
+            grpc_listener,
+            shutdown_tx.subscribe(),
+        ))
+    } else {
+        None
+    };
 
     let shutdown_signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -360,6 +388,20 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             let _ = metrics_shutdown_rx.recv().await;
         });
 
+    #[cfg(feature = "grpc-streaming")]
+    if let Some(grpc_server) = grpc_server {
+        tokio::try_join!(
+            async { rpc_server.await.map_err(RpcError::from) },
+            async { metrics_server.await.map_err(RpcError::from) },
+            async { grpc_server.await.map_err(RpcError::from) },
+        )?;
+    } else {
+        tokio::try_join!(async { rpc_server.await.map_err(RpcError::from) }, async {
+            metrics_server.await.map_err(RpcError::from)
+        },)?;
+    }
+
+    #[cfg(not(feature = "grpc-streaming"))]
     tokio::try_join!(rpc_server, metrics_server)?;
 
     // The filler heard the shutdown broadcast; stop the writer thread last so

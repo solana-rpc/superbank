@@ -78,3 +78,8 @@ transactions-flush-rows: 25000
 blocks-flush-rows: 2000
 flush-interval-secs: 5
 flush-every-block: false
+
+# ClickHouse insert retry (stateless sources: grpc, rpc, bigtable only — fumarole is excluded)
+# insert-max-retries: 5
+# insert-retry-base-ms: 1000
+# insert-retry-max-ms: 30000
