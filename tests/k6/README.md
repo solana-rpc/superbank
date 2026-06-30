@@ -1,7 +1,7 @@
 # superbank-rpc k6 Load Tests
 
 Comprehensive load testing suite for superbank-rpc methods, including stress tests for many supported RPCs.
-Includes basic tests plus validation tests for `getSignaturesForAddress`, `getTransaction`, `getBlock`, `getTransactionCount`, `getInflationReward`, and a dedicated endpoint-comparison scenario for `getTransactionsForAddress`.
+Includes basic tests plus validation tests for `getSignaturesForAddress`, `getTransaction`, `getBlock`, `getTransactionCount`, `getInflationReward`, a dedicated endpoint-comparison scenario for `getTransactionsForAddress`, a disk-cache parity scenario (`superbank-rpc-disk-cache-parity.js`) that diffs a disk-cache-enabled target against a reference across every method the disk tier serves, and a disk-cache performance comparison scenario (`superbank-rpc-disk-cache-compare.js`) that reports latency deltas and speedup ratios versus a non-disk reference.
 
 ## Quick Start
 
@@ -74,6 +74,14 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for
 
 # Validation test for JSON-RPC batch semantics (no reference RPC required)
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-batch.js -e RPC_URL=http://localhost:8899
+
+# Disk-cache performance comparison against a non-disk reference
+k6 run tests/k6/scenarios/performance/superbank-rpc-disk-cache-compare.js \
+  -e RPC_URL=http://disk-enabled:8899 \
+  -e REFERENCE_RPC_URL=http://disk-disabled:8899 \
+  -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt \
+  -e VUS=10 \
+  -e DURATION=60s
 
 # Stress test for getBlock
 k6 run tests/k6/scenarios/stress/stress-test-get-block.js -e RPC_URL=http://localhost:8899 -e SLOT_FILE=./tests/k6/data/pools/slots.txt
@@ -225,6 +233,34 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-batch.js \
   -e RPC_URL=http://localhost:8899
 ```
+
+### Disk-Cache Performance Comparison (`superbank-rpc-disk-cache-compare.js`)
+
+Compare a disk-cache-enabled target (`RPC_URL`) with the same server build running without disk
+cache (`REFERENCE_RPC_URL`). The setup phase probes recent finalized slots, derives stable
+`getSignaturesForAddress` signature cursors from the target coverage span, and keeps only requests
+whose target response reports `X-Superbank-Sources: disk-cache`. The measured
+`getSignaturesForAddress` workload uses standard Solana `before`/`until` cursors. The load phase
+alternates call order between the two endpoints and reports per-method target/reference latency,
+latency delta, and speedup ratio.
+
+```bash
+k6 run tests/k6/scenarios/performance/superbank-rpc-disk-cache-compare.js \
+  -e RPC_URL=http://disk-enabled:8899 \
+  -e REFERENCE_RPC_URL=http://disk-disabled:8899 \
+  -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt \
+  -e VUS=10 \
+  -e DURATION=60s
+```
+
+Useful knobs:
+- `PERF_SLOT_SPAN` / `PERF_BLOCK_SAMPLES`: recent finalized slot window and sampled block count.
+- `PERF_ADDRESS_SAMPLES` / `PERF_PAGE_SIZE`: address workload size for gSFA/gTFA.
+- `PERF_METHODS`: comma-separated labels such as `get_block_full,get_transaction`.
+- `PERF_ALLOW_MIXED_SOURCES=1`: accepts `disk-cache,clickhouse` responses when intentionally testing tier-boundary paths. `head-cache,disk-cache` is accepted by default because the source header reports every tier touched.
+- `PERF_NORMALIZE_PROVIDER_DIFFS=0`: disables default normalization for live-reference differences. By default the comparator ignores `getSignatureStatuses.context.slot` drift and token-balance `uiTokenAmount.uiAmount` null-vs-number differences when canonical token fields are present.
+- `PERF_DEBUG_MISMATCHES=1`: logs mismatched request params, source headers, first differing JSON path, and trimmed target/reference result snippets.
+- `PERF_DEBUG_MISMATCHES_MAX` / `PERF_DEBUG_BODY_CHARS`: cap mismatch log count and result snippet size.
 
 ### Stress Test (`stress-test.js`)
 

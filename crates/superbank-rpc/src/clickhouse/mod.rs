@@ -30,3 +30,8 @@ pub(crate) use types::{ResolvedSignatureFilter, SignatureSlot, SlotBoundary};
 
 pub(crate) use sharding::{RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig};
 pub(crate) use util::{QueryCacheConfig, QueryFreshnessClass};
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) use util::extract_memo;
+#[cfg(feature = "disk-cache")]
+pub(crate) use util::parse_err_json;

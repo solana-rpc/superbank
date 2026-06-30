@@ -186,7 +186,7 @@ impl ClickHouseClient {
                 )));
             }
 
-            if self.is_gsfa_hot_address(&pubkey)
+            if self.should_use_gsfa_hot_fanout(&pubkey)
                 && query.token_accounts == TokenAccountsFilter::None
             {
                 return self

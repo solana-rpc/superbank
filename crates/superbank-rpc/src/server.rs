@@ -29,6 +29,11 @@ use crate::metrics::metrics_handler;
 use crate::processing::ProcessingError;
 use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHeaderCaptureConfig};
 
+#[cfg(feature = "disk-cache")]
+use crate::disk_cache::{
+    DiskCache, DiskCacheConfig, filler, ingest::DiskIngestSink, ingest::RepairQueue,
+    writer::DiskWriterHandle,
+};
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::dragonsmouth::DragonsmouthHeadCacheConfig;
 #[cfg(feature = "grpc-head-cache")]
@@ -92,6 +97,8 @@ pub enum RpcError {
     Bind(#[from] std::io::Error),
     #[error("Server error: {0}")]
     Server(#[from] HyperError),
+    #[error("Invalid configuration: {0}")]
+    Config(String),
 }
 
 pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
@@ -173,6 +180,37 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     #[cfg(feature = "pyroscope")]
     let pyroscope_agent = crate::profiling::start_pyroscope(&args);
 
+    #[cfg(feature = "disk-cache")]
+    if args.disk_cache_enabled {
+        let endpoint_usable = args
+            .dragonsmouth_endpoint
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|endpoint| !endpoint.is_empty());
+        if !args.head_cache_enabled || !endpoint_usable {
+            return Err(RpcError::Config(
+                "DISK_CACHE_ENABLED=true requires HEAD_CACHE_ENABLED=true and a usable \
+                 DRAGONSMOUTH_ENDPOINT (the DragonsMouth stream is the live ingestion source)"
+                    .to_string(),
+            ));
+        }
+        if args
+            .disk_cache_path
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Err(RpcError::Config(
+                "DISK_CACHE_ENABLED=true requires DISK_CACHE_PATH".to_string(),
+            ));
+        }
+    }
+
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
+    #[cfg(feature = "disk-cache")]
+    let mut disk_runtime: Option<DiskCacheRuntime> = None;
+
     #[cfg(feature = "grpc-head-cache")]
     let (head_cache, head_cache_task): (Option<Arc<HeadCache>>, Option<JoinHandle<()>>) = if args
         .head_cache_enabled
@@ -184,15 +222,39 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             .filter(|v| !v.is_empty())
         {
             let min_commitment = parse_commitment_level(&args.head_cache_min_commitment);
-            let retain_slots = args.head_cache_retain_slots.max(1);
+            #[allow(unused_mut)]
+            let mut retain_slots = args.head_cache_retain_slots.max(1);
+            #[cfg(feature = "disk-cache")]
+            if args.disk_cache_enabled && retain_slots < DISK_CACHE_MIN_HEAD_RETAIN_SLOTS {
+                warn!(
+                    configured = retain_slots,
+                    clamped = DISK_CACHE_MIN_HEAD_RETAIN_SLOTS,
+                    "HEAD_CACHE_RETAIN_SLOTS is below the mainnet finalization lag; raising it \
+                     so finalized slots are still resident when the disk cache snapshots them"
+                );
+                retain_slots = DISK_CACHE_MIN_HEAD_RETAIN_SLOTS;
+            }
             let max_per_address = args.max_signatures_limit as usize;
 
             let cache = Arc::new(HeadCache::new(retain_slots, max_per_address));
+
+            #[cfg(feature = "disk-cache")]
+            let disk_sink = if args.disk_cache_enabled {
+                let runtime = start_disk_cache(&args, &clickhouse, &cache, &shutdown_tx).await?;
+                let sink = runtime.sink.clone();
+                disk_runtime = Some(runtime);
+                Some(sink)
+            } else {
+                None
+            };
+
             let cfg = DragonsmouthHeadCacheConfig {
                 endpoint: endpoint.to_string(),
                 x_token: args.dragonsmouth_x_token.clone(),
                 max_decoding_bytes: args.grpc_max_decoding_bytes,
                 min_commitment,
+                #[cfg(feature = "disk-cache")]
+                disk_sink,
             };
 
             let task = tokio::spawn(dragonsmouth::run(cache.clone(), cfg));
@@ -229,6 +291,8 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         )),
         #[cfg(feature = "grpc-head-cache")]
         head_cache,
+        #[cfg(feature = "disk-cache")]
+        disk_cache: disk_runtime.as_ref().map(|runtime| runtime.cache.clone()),
     });
 
     // Build the router
@@ -262,7 +326,6 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         metrics_addr
     );
 
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let shutdown_signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -298,7 +361,112 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 
     tokio::try_join!(rpc_server, metrics_server)?;
 
+    // The filler heard the shutdown broadcast; stop the writer thread last so
+    // every queued slot drains and the WAL is flushed. A timeout only costs a
+    // hole that the next start repairs from ClickHouse.
+    #[cfg(feature = "disk-cache")]
+    if let Some(runtime) = disk_runtime {
+        let writer = runtime.writer;
+        let shutdown = tokio::task::spawn_blocking(move || writer.shutdown());
+        if tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .is_err()
+        {
+            warn!("disk cache: writer shutdown timed out; holes will be repaired at next start");
+        }
+        metrics::disk_cache_set_active(false);
+    }
+
     Ok(())
+}
+
+#[cfg(feature = "disk-cache")]
+const DISK_CACHE_MIN_HEAD_RETAIN_SLOTS: u64 = 64;
+
+#[cfg(feature = "disk-cache")]
+struct DiskCacheRuntime {
+    cache: Arc<DiskCache>,
+    writer: DiskWriterHandle,
+    sink: Arc<DiskIngestSink>,
+}
+
+/// Open the disk cache and start its writer thread and backfill/repair filler.
+/// Corruption and schema mismatches are handled inside `DiskCache::open`
+/// (wipe-and-rebuild); any other open failure is an operator error that fails
+/// startup loudly.
+#[cfg(feature = "disk-cache")]
+async fn start_disk_cache(
+    args: &RpcConfig,
+    clickhouse: &ClickHouseClient,
+    head_cache: &Arc<HeadCache>,
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+) -> Result<DiskCacheRuntime, RpcError> {
+    let path = args
+        .disk_cache_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            RpcError::Config("DISK_CACHE_ENABLED=true requires DISK_CACHE_PATH".to_string())
+        })?;
+
+    let disk_cfg = DiskCacheConfig {
+        path: path.into(),
+        retain_slots: args.disk_cache_retain_slots.max(1),
+        max_bytes: args.disk_cache_max_bytes,
+        block_cache_bytes: args.disk_cache_block_cache_bytes,
+        read_concurrency: args.disk_cache_read_concurrency.max(1),
+    };
+    info!(
+        path,
+        retain_slots = disk_cfg.retain_slots,
+        max_bytes = disk_cfg.max_bytes,
+        backfill_enabled = args.disk_cache_backfill_enabled,
+        "disk cache: starting"
+    );
+
+    let cache = tokio::task::spawn_blocking(move || DiskCache::open(disk_cfg))
+        .await
+        .map_err(|err| RpcError::Config(format!("disk cache open task panicked: {err}")))?
+        .map_err(|err| RpcError::Config(format!("disk cache open failed: {err}")))?;
+    let cache = Arc::new(cache);
+
+    let repair = Arc::new(RepairQueue::new(100_000));
+    let writer = cache.spawn_writer(repair.clone(), args.disk_cache_write_queue_slots.max(1));
+
+    if args.disk_cache_backfill_enabled {
+        let filler_cfg = filler::FillerConfig {
+            retain_slots: args.disk_cache_retain_slots.max(1),
+            slots_per_query: args.disk_cache_backfill_slots_per_query,
+            max_slots_per_sec: args.disk_cache_backfill_max_slots_per_sec,
+            query_timeout: Duration::from_millis(args.disk_cache_backfill_query_timeout_ms),
+            repair_interval: Duration::from_millis(args.disk_cache_repair_interval_ms),
+            repair_min_lag_slots: args.disk_cache_repair_min_lag_slots,
+            ..Default::default()
+        };
+        tokio::spawn(filler::run(
+            cache.clone(),
+            clickhouse.clone(),
+            writer.bulk.clone(),
+            repair.clone(),
+            Some(head_cache.clone()),
+            filler_cfg,
+            shutdown_tx.subscribe(),
+        ));
+    }
+
+    let sink = Arc::new(DiskIngestSink::new(
+        cache.clone(),
+        writer.sender.clone(),
+        repair,
+    ));
+    metrics::disk_cache_set_active(true);
+
+    Ok(DiskCacheRuntime {
+        cache,
+        writer,
+        sink,
+    })
 }
 
 async fn shutdown_signal() {

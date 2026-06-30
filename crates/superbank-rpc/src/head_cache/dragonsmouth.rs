@@ -12,8 +12,9 @@ use solana_commitment_config::CommitmentLevel;
 use solana_sdk::{hash::Hash, pubkey::Pubkey};
 use tokio::time::sleep;
 use tracing::{info, warn};
-use yellowstone_block_machine::dragonsmouth::client_ext::{
-    BlockMachineOutput, BlockMachineResult, GeyserGrpcExt,
+use yellowstone_block_machine::dragonsmouth::{
+    client_ext::{GeyserBlockStream, GeyserGrpcExt},
+    stream::BlockMachineOutput,
 };
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
@@ -21,6 +22,8 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::clickhouse::BlockMetadataRecord;
+#[cfg(feature = "disk-cache")]
+use crate::disk_cache::ingest::DiskIngestSink;
 use crate::head_cache::HeadCache;
 use crate::metrics;
 
@@ -30,6 +33,9 @@ pub(crate) struct DragonsmouthHeadCacheConfig {
     pub(crate) x_token: Option<String>,
     pub(crate) max_decoding_bytes: usize,
     pub(crate) min_commitment: CommitmentLevel,
+    /// Receives finalized slots for the disk cache; never blocks the stream.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) disk_sink: Option<Arc<DiskIngestSink>>,
 }
 
 const TRANSACTIONS_FILTER_NAME: &str = "_superbank_rpc";
@@ -48,7 +54,7 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
 
     loop {
         match connect_and_subscribe(&cfg).await {
-            Ok(mut rx) => {
+            Ok(mut stream) => {
                 info!(
                     endpoint = cfg.endpoint.as_str(),
                     min_commitment = ?cfg.min_commitment,
@@ -56,9 +62,9 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
                 );
                 backoff = Duration::from_millis(250);
 
-                while let Some(result) = rx.recv().await {
+                while let Some(result) = stream.next().await {
                     match result {
-                        Ok(output) => handle_output(&cache, output),
+                        Ok(output) => handle_output(&cache, output, &cfg),
                         Err(err) => {
                             warn!("head cache: block-machine error: {err:?}");
                             break;
@@ -182,7 +188,8 @@ async fn run_block_meta_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCache
     }
 }
 
-fn handle_output(cache: &HeadCache, output: BlockMachineOutput) {
+#[cfg_attr(not(feature = "disk-cache"), allow(unused_variables))]
+fn handle_output(cache: &HeadCache, output: BlockMachineOutput, cfg: &DragonsmouthHeadCacheConfig) {
     match output {
         BlockMachineOutput::FrozenBlock(block) => {
             let slot = block.slot;
@@ -220,6 +227,12 @@ fn handle_output(cache: &HeadCache, output: BlockMachineOutput) {
         }
         BlockMachineOutput::SlotCommitmentUpdate(update) => {
             cache.note_slot_commitment(update.slot, update.commitment);
+            #[cfg(feature = "disk-cache")]
+            if update.commitment == CommitmentLevel::Finalized
+                && let Some(sink) = cfg.disk_sink.as_ref()
+            {
+                sink.on_slot_finalized(update.slot, cache);
+            }
         }
         BlockMachineOutput::ForkDetected(fork) => {
             warn!(slot = fork.slot, "head cache: fork detected; dropping slot");
@@ -438,7 +451,7 @@ fn parse_block_rewards(
 
 async fn connect_and_subscribe(
     cfg: &DragonsmouthHeadCacheConfig,
-) -> Result<tokio::sync::mpsc::Receiver<BlockMachineResult>, String> {
+) -> Result<GeyserBlockStream, String> {
     let mut client = GeyserGrpcClient::build_from_shared(cfg.endpoint.clone().into_bytes())
         .map_err(|e| format!("invalid endpoint: {e}"))?
         .x_token(cfg.x_token.clone())
@@ -536,6 +549,7 @@ mod tests {
                         post_balance: 99,
                         reward_type: yellowstone_grpc_proto::prelude::RewardType::Fee as i32,
                         commission: "7".to_string(),
+                        commission_bps: String::new(),
                     }],
                     num_partitions: Some(yellowstone_grpc_proto::prelude::NumPartitions {
                         num_partitions: 4,

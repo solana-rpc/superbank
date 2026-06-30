@@ -350,6 +350,7 @@ struct RouteLabels {
     scope: String,
     source: String,
     head_cache_read: String,
+    disk_cache_read: String,
     outcome: String,
     x_endpoint: Option<String>,
     x_rpc_node: Option<String>,
@@ -368,6 +369,11 @@ impl EncodeLabelSetTrait for RouteLabels {
             "head_cache_read",
             self.head_cache_read.as_str(),
         )?;
+        encode_required_label(
+            &mut encoder,
+            "disk_cache_read",
+            self.disk_cache_read.as_str(),
+        )?;
         encode_required_label(&mut encoder, "outcome", self.outcome.as_str())?;
         encode_request_header_labels(
             &mut encoder,
@@ -385,6 +391,7 @@ pub(crate) struct RouteMetricLabels<'a> {
     pub(crate) scope: &'a str,
     pub(crate) source: &'a str,
     pub(crate) head_cache_read: bool,
+    pub(crate) disk_cache_read: bool,
     pub(crate) outcome: &'a str,
     pub(crate) x_endpoint: Option<&'a str>,
     pub(crate) x_rpc_node: Option<&'a str>,
@@ -397,6 +404,25 @@ struct SlotSourceLabels {
     operation: String,
     source: String,
     commitment: String,
+}
+
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DiskCacheReadLabels {
+    operation: String,
+    outcome: String,
+}
+
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DiskCacheReasonLabels {
+    reason: String,
+}
+
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DiskCacheSourceLabels {
+    source: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -504,6 +530,39 @@ pub struct Metrics {
     head_cache_address_entries: Gauge,
     #[cfg(feature = "grpc-head-cache")]
     head_cache_slot_entries: Gauge,
+
+    #[cfg(feature = "disk-cache")]
+    disk_cache_active: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_reads_total: Family<DiskCacheReadLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_covered_min_slot: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_covered_max_slot: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_contiguous_floor_slot: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_size_bytes: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_writes_total: Family<DiskCacheSourceLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_written_transactions_total: Counter,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_write_latency_seconds: Histogram,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_write_errors_total: Counter,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_dropped_to_repair_total: Family<DiskCacheReasonLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_evicted_slots_total: Family<DiskCacheReasonLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_backfill_slots_remaining: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_fill_errors_total: Counter,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_poisoned_slots_total: Counter,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_wipes_total: Counter,
 }
 
 impl Metrics {
@@ -560,6 +619,39 @@ impl Metrics {
         let head_cache_address_entries = Gauge::default();
         #[cfg(feature = "grpc-head-cache")]
         let head_cache_slot_entries = Gauge::default();
+
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_active = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_reads_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_covered_min_slot = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_covered_max_slot = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_contiguous_floor_slot = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_size_bytes = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_writes_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_written_transactions_total = Counter::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_write_latency_seconds = latency_histogram();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_write_errors_total = Counter::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_dropped_to_repair_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_evicted_slots_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_backfill_slots_remaining = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_fill_errors_total = Counter::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_poisoned_slots_total = Counter::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_wipes_total = Counter::default();
 
         let mut registry = Registry::with_prefix("superbank");
 
@@ -723,6 +815,90 @@ impl Metrics {
             );
         }
 
+        #[cfg(feature = "disk-cache")]
+        {
+            registry.register(
+                "disk_cache_active",
+                "Whether the disk cache is open and serving (1) or disabled (0)",
+                disk_cache_active.clone(),
+            );
+            registry.register(
+                "disk_cache_reads",
+                "Disk-cache read outcomes per operation",
+                disk_cache_reads_total.clone(),
+            );
+            registry.register(
+                "disk_cache_covered_min_slot",
+                "Oldest slot covered by the disk cache",
+                disk_cache_covered_min_slot.clone(),
+            );
+            registry.register(
+                "disk_cache_covered_max_slot",
+                "Newest slot covered by the disk cache",
+                disk_cache_covered_max_slot.clone(),
+            );
+            registry.register(
+                "disk_cache_contiguous_floor_slot",
+                "Floor of the contiguous tip span (the gSFA-safe boundary)",
+                disk_cache_contiguous_floor_slot.clone(),
+            );
+            registry.register(
+                "disk_cache_size_bytes",
+                "Live SST bytes across all disk-cache column families",
+                disk_cache_size_bytes.clone(),
+            );
+            registry.register(
+                "disk_cache_writes",
+                "Slots committed to the disk cache by source",
+                disk_cache_writes_total.clone(),
+            );
+            registry.register(
+                "disk_cache_written_transactions",
+                "Transactions written to the disk cache",
+                disk_cache_written_transactions_total.clone(),
+            );
+            registry.register(
+                "disk_cache_write_latency_seconds",
+                "Per slot-batch commit latency",
+                disk_cache_write_latency_seconds.clone(),
+            );
+            registry.register(
+                "disk_cache_write_errors",
+                "RocksDB write failures",
+                disk_cache_write_errors_total.clone(),
+            );
+            registry.register(
+                "disk_cache_dropped_to_repair",
+                "Live slots deferred to the repair queue by reason",
+                disk_cache_dropped_to_repair_total.clone(),
+            );
+            registry.register(
+                "disk_cache_evicted_slots",
+                "Slots evicted below the retention floor by reason",
+                disk_cache_evicted_slots_total.clone(),
+            );
+            registry.register(
+                "disk_cache_backfill_slots_remaining",
+                "Holes remaining inside the retention window",
+                disk_cache_backfill_slots_remaining.clone(),
+            );
+            registry.register(
+                "disk_cache_fill_errors",
+                "ClickHouse fetch failures in the backfill/repair filler",
+                disk_cache_fill_errors_total.clone(),
+            );
+            registry.register(
+                "disk_cache_poisoned_slots",
+                "Slots dropped from coverage after decode/consistency failures",
+                disk_cache_poisoned_slots_total.clone(),
+            );
+            registry.register(
+                "disk_cache_wipes",
+                "Times the disk cache database was destroyed and rebuilt",
+                disk_cache_wipes_total.clone(),
+            );
+        }
+
         // Register process metrics to expose basic runtime health info (CPU, memory).
         if let Err(err) =
             kubert_prometheus_process::register(registry.sub_registry_with_prefix("process"))
@@ -774,6 +950,38 @@ impl Metrics {
             head_cache_address_entries,
             #[cfg(feature = "grpc-head-cache")]
             head_cache_slot_entries,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_active,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_reads_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_covered_min_slot,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_covered_max_slot,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_contiguous_floor_slot,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_size_bytes,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_writes_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_written_transactions_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_write_latency_seconds,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_write_errors_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_dropped_to_repair_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_evicted_slots_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_backfill_slots_remaining,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_fill_errors_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_poisoned_slots_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_wipes_total,
         })
     }
 
@@ -1084,6 +1292,11 @@ impl Metrics {
                 scope: labels.scope.to_string(),
                 source: labels.source.to_string(),
                 head_cache_read: if labels.head_cache_read {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                },
+                disk_cache_read: if labels.disk_cache_read {
                     "true".to_string()
                 } else {
                     "false".to_string()
@@ -1402,6 +1615,127 @@ pub(crate) fn head_cache_drop_slot(
         metrics
             .head_cache_slot_entries
             .set(clamp_i64_usize(slot_entries));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_set_active(active: bool) {
+    if let Some(metrics) = metrics() {
+        metrics.disk_cache_active.set(i64::from(active));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_read(operation: &'static str, outcome: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_reads_total
+            .get_or_create(&DiskCacheReadLabels {
+                operation: operation.to_string(),
+                outcome: outcome.to_string(),
+            })
+            .inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_coverage(min_covered: u64, max_covered: u64, contiguous_floor: u64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_covered_min_slot
+            .set(clamp_i64(min_covered));
+        metrics
+            .disk_cache_covered_max_slot
+            .set(clamp_i64(max_covered));
+        metrics
+            .disk_cache_contiguous_floor_slot
+            .set(clamp_i64(contiguous_floor));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_size_bytes(bytes: u64) {
+    if let Some(metrics) = metrics() {
+        metrics.disk_cache_size_bytes.set(clamp_i64(bytes));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_write(source: &'static str, transactions: u64, latency_seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_writes_total
+            .get_or_create(&DiskCacheSourceLabels {
+                source: source.to_string(),
+            })
+            .inc();
+        metrics
+            .disk_cache_written_transactions_total
+            .inc_by(transactions);
+        metrics
+            .disk_cache_write_latency_seconds
+            .observe(latency_seconds);
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_write_error() {
+    if let Some(metrics) = metrics() {
+        metrics.disk_cache_write_errors_total.inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_dropped_to_repair(reason: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_dropped_to_repair_total
+            .get_or_create(&DiskCacheReasonLabels {
+                reason: reason.to_string(),
+            })
+            .inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_evicted(reason: &'static str, slots: u64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_evicted_slots_total
+            .get_or_create(&DiskCacheReasonLabels {
+                reason: reason.to_string(),
+            })
+            .inc_by(slots);
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_backfill_remaining(slots: u64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_backfill_slots_remaining
+            .set(clamp_i64(slots));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_fill_error() {
+    if let Some(metrics) = metrics() {
+        metrics.disk_cache_fill_errors_total.inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_poisoned_slot() {
+    if let Some(metrics) = metrics() {
+        metrics.disk_cache_poisoned_slots_total.inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_wipe() {
+    if let Some(metrics) = metrics() {
+        metrics.disk_cache_wipes_total.inc();
     }
 }
 

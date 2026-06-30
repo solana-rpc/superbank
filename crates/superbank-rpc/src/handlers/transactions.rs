@@ -22,8 +22,8 @@ use tracing::error;
 
 use crate::clickhouse::{
     NumericFilter, PaginationToken, QueryTimings, ResolvedSignatureFilter, SignatureFilter,
-    SignatureSlot, SortOrder, TokenAccountsFilter, TransactionStatusFilter,
-    TransactionsForAddressQuery,
+    SignatureSlot, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
+    TransactionStatusFilter, TransactionsForAddressQuery,
 };
 use crate::handlers::{
     RouteMetric,
@@ -130,7 +130,7 @@ fn apply_get_transactions_for_address_slot_aliases(
     Ok(())
 }
 
-async fn resolve_signature_slot_for_hot_bounds(
+async fn resolve_signature_slot_for_bounds(
     state: &AppState,
     signature: &str,
 ) -> crate::processing::ProcessingResult<(Option<SignatureSlot>, QueryTimings)> {
@@ -148,6 +148,14 @@ async fn resolve_signature_slot_for_hot_bounds(
         ));
     }
 
+    #[cfg(feature = "disk-cache")]
+    if let Some(disk) = state.disk_cache.as_ref()
+        && let Ok(parsed) = Signature::from_str(signature)
+        && let Some(position) = disk.signature_position(parsed).await
+    {
+        return Ok((Some(position), QueryTimings::zero()));
+    }
+
     state.clickhouse.get_signature_slot(signature).await
 }
 
@@ -155,6 +163,83 @@ fn unsupported_transaction_version_message(version: u8) -> String {
     format!(
         "Transaction version ({version}) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": {version}"
     )
+}
+
+/// Hydrate a stored record and build the JSON-RPC response; shared by the
+/// head-cache, disk-cache, and ClickHouse branches of getTransaction.
+#[allow(clippy::too_many_arguments)]
+async fn respond_with_hydrated_transaction(
+    state: &AppState,
+    id: Value,
+    route: &mut RouteMetric,
+    signature_str: &str,
+    record: Arc<StoredTransactionRecord>,
+    encoding: UiTransactionEncoding,
+    max_version: Option<u8>,
+    timings: Option<QueryTimings>,
+) -> Result<Response, StatusCode> {
+    let attach_timings = |resp: &mut Response| {
+        if let Some(timings) = timings.as_ref() {
+            add_downstream_header(resp, timings);
+        }
+    };
+
+    let permit = match state.hydration_sem.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            error!(signature = signature_str, "Hydration semaphore closed");
+            let mut resp = json_rpc_internal_error_response(id);
+            attach_timings(&mut resp);
+            return Ok(resp);
+        }
+    };
+
+    let record_slot = record.slot;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hydrate_transaction_record(record.as_ref(), encoding, max_version)
+    })
+    .await
+    {
+        Ok(Ok(encoded_tx)) => {
+            route.success();
+            let mut resp = json_rpc_success_response(id, encoded_tx);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Ok(Err(TransactionHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
+            version,
+        )))) => {
+            route.rpc_error();
+            let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
+            let mut resp = json_rpc_error_response(
+                id,
+                code,
+                unsupported_transaction_version_message(version),
+                None,
+            );
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Ok(Err(e)) => {
+            error!(
+                "Failed to hydrate transaction {} in slot {}: {}",
+                signature_str, record_slot, e
+            );
+            let mut resp = json_rpc_internal_error_response(id);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Err(join_err) => {
+            error!(
+                "Failed to join hydration task for transaction {} in slot {}: {}",
+                signature_str, record_slot, join_err
+            );
+            let mut resp = json_rpc_internal_error_response(id);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+    }
 }
 
 pub(crate) async fn handle_get_transaction(
@@ -278,57 +363,61 @@ pub(crate) async fn handle_get_transaction(
         }
 
         route.source_head_cache();
-        let max_version = config.max_supported_transaction_version;
-        let permit = match state.hydration_sem.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                error!(signature = signature_str, "Hydration semaphore closed");
-                return Ok(json_rpc_internal_error_response(id));
-            }
-        };
-        let record = record.clone();
-
-        match tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            hydrate_transaction_record(record.as_ref(), encoding, max_version)
-        })
-        .await
-        {
-            Ok(Ok(encoded_tx)) => {
-                route.success();
-                return Ok(json_rpc_success_response(id, encoded_tx));
-            }
-            Ok(Err(TransactionHydrationError::Encode(
-                EncodeError::UnsupportedTransactionVersion(version),
-            ))) => {
-                route.rpc_error();
-                let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-                return Ok(json_rpc_error_response(
-                    id,
-                    code,
-                    unsupported_transaction_version_message(version),
-                    None,
-                ));
-            }
-            Ok(Err(e)) => {
-                error!(
-                    "Failed to hydrate head-cache transaction {}: {}",
-                    signature_str, e
-                );
-                return Ok(json_rpc_internal_error_response(id));
-            }
-            Err(join_err) => {
-                error!(
-                    "Failed to join hydration task for head-cache transaction {}: {}",
-                    signature_str, join_err
-                );
-                return Ok(json_rpc_internal_error_response(id));
-            }
-        }
+        return respond_with_hydrated_transaction(
+            state.as_ref(),
+            id,
+            &mut route,
+            signature_str,
+            record,
+            encoding,
+            config.max_supported_transaction_version,
+            None,
+        )
+        .await;
     }
     #[cfg(feature = "grpc-head-cache")]
     if state.head_cache.is_some() {
         route.head_cache_read();
+    }
+
+    // Disk tier: everything stored is finalized, which satisfies any commitment
+    // accepted above. A hit answers without ClickHouse. A miss proves nothing by
+    // itself (the signature may be older than the window or in a coverage hole) —
+    // EXCEPT when the request pinned a slot that the disk fully covers: then the
+    // transaction conclusively does not exist there.
+    #[cfg(feature = "disk-cache")]
+    if let Some(disk) = state.disk_cache.as_ref() {
+        route.disk_cache_read();
+        if let Some(record) = disk.get_tx(signature).await {
+            if requested_slot.is_some_and(|slot| record.slot != slot) {
+                route.source_disk_cache();
+                route.not_found();
+                return Ok(json_rpc_null_response(id));
+            }
+            route.source_disk_cache();
+            return respond_with_hydrated_transaction(
+                state.as_ref(),
+                id,
+                &mut route,
+                signature_str,
+                Arc::new(record),
+                encoding,
+                config.max_supported_transaction_version,
+                None,
+            )
+            .await;
+        }
+        if let Some(slot) = requested_slot
+            && matches!(
+                disk.slot_status(slot).await,
+                crate::disk_cache::SlotStatus::Covered { .. }
+                    | crate::disk_cache::SlotStatus::Skipped
+            )
+        {
+            route.source_disk_cache();
+            route.not_found();
+            return Ok(json_rpc_null_response(id));
+        }
     }
 
     route.source_clickhouse();
@@ -367,63 +456,17 @@ pub(crate) async fn handle_get_transaction(
         return Ok(resp);
     };
 
-    let max_version = config.max_supported_transaction_version;
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            error!(signature = signature_str, "Hydration semaphore closed");
-            let mut resp = json_rpc_internal_error_response(id);
-            add_downstream_header(&mut resp, &timings);
-            return Ok(resp);
-        }
-    };
-
-    let record_slot = record.slot;
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        hydrate_transaction_record(&record, encoding, max_version)
-    })
+    respond_with_hydrated_transaction(
+        state.as_ref(),
+        id,
+        &mut route,
+        signature_str,
+        Arc::new(record),
+        encoding,
+        config.max_supported_transaction_version,
+        Some(timings),
+    )
     .await
-    {
-        Ok(Ok(encoded_tx)) => {
-            route.success();
-            let mut resp = json_rpc_success_response(id, encoded_tx);
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-        Ok(Err(TransactionHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
-            version,
-        )))) => {
-            route.rpc_error();
-            let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-            let mut resp = json_rpc_error_response(
-                id,
-                code,
-                unsupported_transaction_version_message(version),
-                None,
-            );
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-        Ok(Err(e)) => {
-            error!(
-                "Failed to hydrate transaction {} in slot {}: {}",
-                signature_str, record_slot, e
-            );
-            let mut resp = json_rpc_internal_error_response(id);
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-        Err(join_err) => {
-            error!(
-                "Failed to join hydration task for transaction {} in slot {}: {}",
-                signature_str, record_slot, join_err
-            );
-            let mut resp = json_rpc_internal_error_response(id);
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
-        }
-    }
 }
 
 pub(crate) async fn handle_get_transactions_for_address(
@@ -712,6 +755,30 @@ pub(crate) async fn handle_get_transactions_for_address(
         }
     };
 
+    #[cfg(feature = "disk-cache")]
+    let pagination = {
+        if let Some(disk) = state.disk_cache.as_ref() {
+            match pagination {
+                Some(PaginationToken::Signature(sig_str)) => {
+                    route.disk_cache_read();
+                    if let Ok(sig) = Signature::from_str(&sig_str)
+                        && let Some(position) = disk.signature_position(sig).await
+                    {
+                        Some(PaginationToken::SlotIndex {
+                            slot: position.slot,
+                            idx: position.slot_idx,
+                        })
+                    } else {
+                        Some(PaginationToken::Signature(sig_str))
+                    }
+                }
+                other => other,
+            }
+        } else {
+            pagination
+        }
+    };
+
     let mut filters = options.filters.unwrap_or_default();
 
     if let Err(message) = apply_get_transactions_for_address_slot_aliases(
@@ -862,8 +929,13 @@ pub(crate) async fn handle_get_transactions_for_address(
         token_accounts,
     };
 
+    #[cfg(feature = "disk-cache")]
+    let disk_candidate = state.disk_cache.is_some();
+    #[cfg(not(feature = "disk-cache"))]
+    let disk_candidate = false;
+
     let mut prequery_timings = QueryTimings::zero();
-    if hot_fanout_eligible {
+    if hot_fanout_eligible || disk_candidate {
         match query.pagination.as_ref() {
             Some(PaginationToken::SlotIndex { slot, idx }) => {
                 query.resolved_pagination = Some(SignatureSlot {
@@ -873,7 +945,7 @@ pub(crate) async fn handle_get_transactions_for_address(
             }
             Some(PaginationToken::Signature(signature)) => {
                 let (position, timings) =
-                    match resolve_signature_slot_for_hot_bounds(state.as_ref(), signature).await {
+                    match resolve_signature_slot_for_bounds(state.as_ref(), signature).await {
                         Ok(result) => result,
                         Err(e) => {
                             metrics::backend_error("get_signature_slot");
@@ -902,7 +974,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                     continue;
                 };
                 let (position, timings) =
-                    match resolve_signature_slot_for_hot_bounds(state.as_ref(), signature).await {
+                    match resolve_signature_slot_for_bounds(state.as_ref(), signature).await {
                         Ok(result) => result,
                         Err(e) => {
                             metrics::backend_error("get_signature_slot");
@@ -925,6 +997,8 @@ pub(crate) async fn handle_get_transactions_for_address(
         ClickHouse,
         #[cfg(feature = "grpc-head-cache")]
         Head,
+        #[cfg(feature = "disk-cache")]
+        Disk,
     }
 
     #[derive(Debug)]
@@ -1124,6 +1198,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                             block_time: input.block_time,
                             transaction: encoded.transaction.transaction,
                             meta: encoded.transaction.meta,
+                            version: encoded.transaction.version,
                         });
 
                         pagination_token = Some(format!("{}:{}", input.slot, input.slot_idx));
@@ -1157,17 +1232,122 @@ pub(crate) async fn handle_get_transactions_for_address(
         }
     }
 
-    route.source_clickhouse();
-    let (signature_records, mut timings) = match state
-        .clickhouse
-        .get_transactions_for_address_signatures(&query)
+    // Disk tier: eligible only when every signature-shaped bound resolved to a
+    // position (otherwise ClickHouse's NULL-tolerant SQL semantics must apply),
+    // and — for ascending pages, which start from the oldest row — when the
+    // whole eligible range lies inside the contiguous covered span.
+    #[cfg(feature = "disk-cache")]
+    let disk_page = 'disk: {
+        let Some(disk) = state.disk_cache.as_ref() else {
+            break 'disk None;
+        };
+
+        let pagination_position = match query.pagination.as_ref() {
+            None => None,
+            Some(PaginationToken::SlotIndex { slot, idx }) => Some(SignatureSlot {
+                slot: *slot,
+                slot_idx: *idx,
+            }),
+            Some(PaginationToken::Signature(_)) => match query.resolved_pagination {
+                Some(position) => Some(position),
+                None => break 'disk None,
+            },
+        };
+
+        let resolved_filter = match query.signature_filter.as_ref() {
+            None => None,
+            Some(filter) => {
+                let resolved = query.resolved_signature_filter.clone().unwrap_or_default();
+                let fully_resolved = [
+                    (filter.gte.is_some(), resolved.gte.is_some()),
+                    (filter.gt.is_some(), resolved.gt.is_some()),
+                    (filter.lte.is_some(), resolved.lte.is_some()),
+                    (filter.lt.is_some(), resolved.lt.is_some()),
+                ]
+                .iter()
+                .all(|(requested, resolved)| !requested || *resolved);
+                if !fully_resolved {
+                    break 'disk None;
+                }
+                Some(resolved)
+            }
+        };
+
+        if query.sort_order == SortOrder::Asc {
+            let Some((floor, _)) = disk.tip_span() else {
+                break 'disk None;
+            };
+            let mut lower_bound: Option<u64> = pagination_position.map(|position| position.slot);
+            if let Some(filter) = query.slot_filter.as_ref() {
+                for bound in [filter.gt.map(|v| v.saturating_add(1)), filter.gte]
+                    .into_iter()
+                    .flatten()
+                {
+                    lower_bound = Some(lower_bound.map_or(bound, |low| low.max(bound)));
+                }
+            }
+            if let Some(resolved) = resolved_filter.as_ref() {
+                for position in [resolved.gt, resolved.gte].into_iter().flatten() {
+                    lower_bound =
+                        Some(lower_bound.map_or(position.slot, |low| low.max(position.slot)));
+                }
+            }
+            // An ascending page that starts below the floor must come from
+            // ClickHouse in full: its oldest rows lead the page.
+            if lower_bound.is_none_or(|low| low < floor) {
+                break 'disk None;
+            }
+        }
+
+        route.disk_cache_read();
+        disk.transactions_for_address(
+            address_pubkey,
+            crate::disk_cache::index::DiskTfaQuery {
+                limit: limit as usize,
+                sort_order: query.sort_order,
+                pagination: pagination_position,
+                slot_filter: query.slot_filter.clone(),
+                block_time_filter: query.block_time_filter.clone(),
+                signature_filter: resolved_filter,
+                status: query.status,
+                token_accounts: query.token_accounts,
+            },
+        )
         .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            metrics::backend_error("get_transactions_for_address_signatures");
-            error!("Failed to query ClickHouse: {}", e);
-            return Ok(json_rpc_internal_error_response(id));
+    };
+
+    #[cfg(feature = "disk-cache")]
+    let (skip_clickhouse, clickhouse_query) = match disk_page.as_ref() {
+        Some(page) if !page.reached_floor => (true, None),
+        Some(page) => {
+            // ClickHouse owes only the remainder strictly below the floor.
+            let mut remainder = query.clone();
+            let slot_filter = remainder.slot_filter.get_or_insert_with(Default::default);
+            slot_filter.lt = Some(slot_filter.lt.map_or(page.floor, |lt| lt.min(page.floor)));
+            remainder.limit = limit - page.records.len() as u64;
+            (false, Some(remainder))
+        }
+        None => (false, None),
+    };
+    #[cfg(not(feature = "disk-cache"))]
+    let (skip_clickhouse, clickhouse_query): (bool, Option<TransactionsForAddressQuery>) =
+        (false, None);
+
+    let (signature_records, mut timings) = if skip_clickhouse {
+        (Vec::new(), QueryTimings::zero())
+    } else {
+        route.source_clickhouse();
+        match state
+            .clickhouse
+            .get_transactions_for_address_signatures(clickhouse_query.as_ref().unwrap_or(&query))
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                metrics::backend_error("get_transactions_for_address_signatures");
+                error!("Failed to query ClickHouse: {}", e);
+                return Ok(json_rpc_internal_error_response(id));
+            }
         }
     };
     timings.add(prequery_timings);
@@ -1192,6 +1372,49 @@ pub(crate) async fn handle_get_transactions_for_address(
     let mut merged_records = merged_records;
     #[cfg(feature = "grpc-head-cache")]
     let mut merged_has_head = false;
+
+    #[cfg(feature = "disk-cache")]
+    let mut merged_has_disk = false;
+    #[cfg(feature = "disk-cache")]
+    if let Some(page) = disk_page {
+        let mut seen = HashSet::with_capacity(merged_records.len() + page.records.len());
+        for record in merged_records.iter() {
+            seen.insert(record.signature.clone());
+        }
+        for record in page.records {
+            if !seen.insert(record.signature.clone()) {
+                continue;
+            }
+            merged_has_disk = true;
+            merged_records.push(MergedRecord {
+                source: RecordSource::Disk,
+                signature: record.signature,
+                slot: record.slot,
+                slot_idx: record.slot_idx,
+                err: record.err,
+                memo: record.memo,
+                block_time: record.block_time,
+                confirmation_status: "finalized".to_string(),
+            });
+        }
+        if merged_has_disk {
+            merged_records.sort_unstable_by(|a, b| match query.sort_order {
+                SortOrder::Desc => b
+                    .slot
+                    .cmp(&a.slot)
+                    .then_with(|| b.slot_idx.cmp(&a.slot_idx))
+                    .then_with(|| b.signature.cmp(&a.signature)),
+                SortOrder::Asc => a
+                    .slot
+                    .cmp(&b.slot)
+                    .then_with(|| a.slot_idx.cmp(&b.slot_idx))
+                    .then_with(|| a.signature.cmp(&b.signature)),
+            });
+            merged_records.truncate(limit as usize);
+        }
+    }
+    #[cfg(all(feature = "grpc-head-cache", not(feature = "disk-cache")))]
+    let merged_has_disk = false;
 
     #[cfg(feature = "grpc-head-cache")]
     if let Some(cache) = head_cache {
@@ -1295,12 +1518,11 @@ pub(crate) async fn handle_get_transactions_for_address(
 
     if transaction_details == TransactionsForAddressDetails::Signatures {
         #[cfg(feature = "grpc-head-cache")]
-        let pagination_token = merged_records.last().map(|record| {
-            if record.source == RecordSource::Head {
-                format!("{}:{}", record.slot, record.slot_idx)
-            } else {
-                record.signature.clone()
-            }
+        let pagination_token = merged_records.last().map(|record| match record.source {
+            RecordSource::ClickHouse => record.signature.clone(),
+            RecordSource::Head => format!("{}:{}", record.slot, record.slot_idx),
+            #[cfg(feature = "disk-cache")]
+            RecordSource::Disk => format!("{}:{}", record.slot, record.slot_idx),
         });
 
         #[cfg(not(feature = "grpc-head-cache"))]
@@ -1325,7 +1547,10 @@ pub(crate) async fn handle_get_transactions_for_address(
         };
 
         #[cfg(feature = "grpc-head-cache")]
-        if clickhouse_records_count == 0 && merged_has_head {
+        if clickhouse_records_count == 0 && merged_has_disk {
+            #[cfg(feature = "disk-cache")]
+            route.source_disk_cache();
+        } else if clickhouse_records_count == 0 && merged_has_head {
             route.source_head_cache();
         } else {
             route.source_clickhouse();
@@ -1362,9 +1587,49 @@ pub(crate) async fn handle_get_transactions_for_address(
 
     let max_supported_transaction_version = options.max_supported_transaction_version;
 
+    #[cfg(feature = "disk-cache")]
+    let mut disk_transaction_map: HashMap<
+        String,
+        Arc<crate::clickhouse::StoredTransactionRecord>,
+    > = {
+        let disk_records: Vec<(u64, u32, String)> = merged_records
+            .iter()
+            .filter(|record| record.source == RecordSource::Disk)
+            .map(|record| (record.slot, record.slot_idx, record.signature.clone()))
+            .collect();
+        if disk_records.is_empty() {
+            HashMap::new()
+        } else {
+            let disk = state
+                .disk_cache
+                .as_ref()
+                .expect("disk records imply disk cache");
+            let positions: Vec<(u64, u32)> = disk_records
+                .iter()
+                .map(|(slot, idx, _)| (*slot, *idx))
+                .collect();
+            let fetched = disk.get_txs_by_position(positions).await;
+            disk_records
+                .into_iter()
+                .zip(fetched)
+                .filter_map(|((_, _, signature), record)| {
+                    record.map(|record| (signature, Arc::new(record)))
+                })
+                .collect()
+        }
+    };
+
+    // Disk-sourced rows whose full record vanished (eviction race) are fetched
+    // from ClickHouse with the rest, so the page never silently drops entries.
     let signature_pairs = merged_records
         .iter()
-        .filter(|record| record.source == RecordSource::ClickHouse)
+        .filter(|record| match record.source {
+            RecordSource::ClickHouse => true,
+            #[cfg(feature = "grpc-head-cache")]
+            RecordSource::Head => false,
+            #[cfg(feature = "disk-cache")]
+            RecordSource::Disk => !disk_transaction_map.contains_key(&record.signature),
+        })
         .map(|record| (record.slot, record.signature.clone()))
         .collect::<Vec<_>>();
 
@@ -1402,13 +1667,17 @@ pub(crate) async fn handle_get_transactions_for_address(
         slot_idx: u32,
         block_time: Option<i64>,
         signature: String,
+        /// Position-shaped pagination token (cache-sourced records have no
+        /// ClickHouse signature cursor).
         #[cfg(feature = "grpc-head-cache")]
-        is_head: bool,
+        position_token: bool,
         stored: Arc<crate::clickhouse::StoredTransactionRecord>,
     }
 
     let mut inputs = Vec::with_capacity(merged_records.len());
     for record in merged_records {
+        #[cfg(feature = "grpc-head-cache")]
+        let position_token = record.source != RecordSource::ClickHouse;
         let stored = match record.source {
             RecordSource::ClickHouse => {
                 let Some(stored) = transaction_map.remove(&record.signature) else {
@@ -1430,6 +1699,16 @@ pub(crate) async fn handle_get_transactions_for_address(
                 };
                 stored
             }
+            #[cfg(feature = "disk-cache")]
+            RecordSource::Disk => {
+                match disk_transaction_map
+                    .remove(&record.signature)
+                    .or_else(|| transaction_map.remove(&record.signature))
+                {
+                    Some(stored) => stored,
+                    None => continue,
+                }
+            }
         };
 
         inputs.push(HydrationInput {
@@ -1438,7 +1717,7 @@ pub(crate) async fn handle_get_transactions_for_address(
             block_time: record.block_time,
             signature: record.signature,
             #[cfg(feature = "grpc-head-cache")]
-            is_head: record.source == RecordSource::Head,
+            position_token,
             stored,
         });
     }
@@ -1486,11 +1765,12 @@ pub(crate) async fn handle_get_transactions_for_address(
                 block_time: input.block_time,
                 transaction: encoded.transaction.transaction,
                 meta: encoded.transaction.meta,
+                version: encoded.transaction.version,
             });
 
             #[cfg(feature = "grpc-head-cache")]
             {
-                if input.is_head {
+                if input.position_token {
                     pagination_token = Some(format!("{}:{}", input.slot, input.slot_idx));
                 } else {
                     pagination_token = Some(input.signature);
@@ -1532,7 +1812,10 @@ pub(crate) async fn handle_get_transactions_for_address(
     };
 
     #[cfg(feature = "grpc-head-cache")]
-    if signature_pairs.is_empty() && merged_has_head {
+    if signature_pairs.is_empty() && merged_has_disk {
+        #[cfg(feature = "disk-cache")]
+        route.source_disk_cache();
+    } else if signature_pairs.is_empty() && merged_has_head {
         route.source_head_cache();
     } else {
         route.source_clickhouse();

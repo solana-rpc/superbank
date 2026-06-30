@@ -1,0 +1,8 @@
+# librocksdb-sys (disk-cache feature) compiled against the Nix dev shell's hardened
+# libc++ trips a false-positive unique_ptr<T[]> bounds assertion on RocksDB's
+# cache-line-aligned striped mutexes (first SST load aborts with SIGTRAP). The
+# index is provably in range (FastRangeGeneric maps into [0, stripe_count)); the
+# checker mishandles over-aligned array allocations. Harmless on libstdc++ (Linux
+# CI), where the macro is ignored. `force` is off, so an explicit CXXFLAGS wins.
+[env]
+CXXFLAGS = "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE"

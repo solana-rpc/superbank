@@ -15,6 +15,8 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::client::ClickHouseClient;
 use super::constants::SLOT_SHARD_DIVISOR;
+#[cfg(feature = "disk-cache")]
+use super::queries::build_transactions_by_slot_range_query;
 use super::queries::{
     BLOCK_ACCOUNTS_BASE_COLUMNS, BLOCK_FULL_BASE_COLUMNS, BLOCK_METADATA_BASE_COLUMNS,
     BLOCK_METADATA_REWARD_COLUMNS, BLOCK_SIGNATURE_COLUMNS, BLOCK_TRANSACTION_REWARD_COLUMNS,
@@ -26,6 +28,8 @@ use super::rows::{
     map_block_full_transaction_row, map_block_metadata_base_row, map_block_metadata_row,
     map_block_signature_row,
 };
+#[cfg(feature = "disk-cache")]
+use super::rows::{TransactionRow, map_transaction_row};
 use super::types::{
     BlockMetadataRecord, InflationRewardRecord, QueryTimings, StoredAccountsTransactionRecord,
     StoredTransactionRecord,
@@ -68,6 +72,51 @@ where
         }
     }
     shard_indices
+}
+
+#[cfg(feature = "disk-cache")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShardSlotRange {
+    shard_index: usize,
+    start_slot: u64,
+    end_slot: u64,
+}
+
+#[cfg(feature = "disk-cache")]
+fn shard_slot_ranges_for_slot_range<F>(
+    start_slot: u64,
+    end_slot: u64,
+    mut shard_index_for_bucket: F,
+) -> Vec<ShardSlotRange>
+where
+    F: FnMut(u64) -> usize,
+{
+    if end_slot < start_slot {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut segment_start = start_slot;
+    loop {
+        let bucket = segment_start / SLOT_SHARD_DIVISOR;
+        let next_bucket_start = bucket
+            .checked_add(1)
+            .and_then(|next_bucket| next_bucket.checked_mul(SLOT_SHARD_DIVISOR))
+            .unwrap_or(u64::MAX);
+        let segment_end = next_bucket_start.saturating_sub(1).min(end_slot);
+        ranges.push(ShardSlotRange {
+            shard_index: shard_index_for_bucket(bucket),
+            start_slot: segment_start,
+            end_slot: segment_end,
+        });
+
+        if segment_end == end_slot {
+            break;
+        }
+        segment_start = segment_end + 1;
+    }
+
+    ranges
 }
 
 fn normalize_slots(mut slots: Vec<u64>) -> Vec<u64> {
@@ -176,6 +225,42 @@ fn build_block_transactions_query(
     )
 }
 
+/// Range variant for disk-cache backfill: every block in `[start, end]`,
+/// rewards included, ascending. Always routed via the distributed table because
+/// slot ranges can straddle shard buckets.
+#[cfg(feature = "disk-cache")]
+fn build_block_metadata_range_query(
+    table: &str,
+    start_slot: u64,
+    end_slot: u64,
+    settings_clause: &str,
+) -> String {
+    let mut columns = BLOCK_METADATA_BASE_COLUMNS.to_vec();
+    columns.extend_from_slice(BLOCK_METADATA_REWARD_COLUMNS);
+    let start_bucket = start_slot / SLOT_SHARD_DIVISOR;
+    let end_bucket = end_slot / SLOT_SHARD_DIVISOR;
+
+    format!(
+        "SELECT
+                {columns}
+             FROM {blocks_metadata_table}
+             PREWHERE
+                intDiv(slot, {slot_shard_divisor}) BETWEEN {start_bucket} AND {end_bucket}
+                AND slot BETWEEN {start_slot} AND {end_slot}
+             ORDER BY slot ASC
+             LIMIT 1 BY slot
+             {settings_clause}",
+        columns = format_select_columns(&columns),
+        blocks_metadata_table = table,
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+        start_bucket = start_bucket,
+        end_bucket = end_bucket,
+        start_slot = start_slot,
+        end_slot = end_slot,
+        settings_clause = settings_clause
+    )
+}
+
 fn build_transaction_count_query(
     table: &str,
     slot: u64,
@@ -240,6 +325,64 @@ async fn fetch_block_metadata_projection(
         };
         Ok((row_opt.map(map_block_metadata_base_row), timings))
     }
+}
+
+#[cfg(feature = "disk-cache")]
+async fn fetch_block_metadata_range(
+    client: &clickhouse::Client,
+    query: &str,
+) -> ProcessingResult<(Vec<BlockMetadataRecord>, QueryTimings)> {
+    let start = Instant::now();
+    let mut cursor = client
+        .query(query)
+        .fetch::<BlockMetadataRow>()
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+    let mut records = Vec::new();
+    while let Some(row) = cursor
+        .next()
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?
+    {
+        records.push(map_block_metadata_row(row));
+    }
+    let timings = QueryTimings {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        received_bytes: cursor.received_bytes(),
+        decoded_bytes: cursor.decoded_bytes(),
+        rows_read: Some(0),
+        rows_read_unknown: true,
+        rows_returned: records.len() as u64,
+    };
+    Ok((records, timings))
+}
+
+#[cfg(feature = "disk-cache")]
+async fn fetch_transaction_range(
+    client: &clickhouse::Client,
+    query: &str,
+) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
+    let start = Instant::now();
+    let mut cursor = client
+        .query(query)
+        .fetch::<TransactionRow>()
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+    let mut records = Vec::new();
+    while let Some(row) = cursor
+        .next()
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?
+    {
+        records.push(map_transaction_row(row));
+    }
+    let timings = QueryTimings {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        received_bytes: cursor.received_bytes(),
+        decoded_bytes: cursor.decoded_bytes(),
+        rows_read: Some(0),
+        rows_read_unknown: true,
+        rows_returned: records.len() as u64,
+    };
+    Ok((records, timings))
 }
 
 async fn fetch_block_signatures_projection(
@@ -1347,6 +1490,170 @@ impl ClickHouseClient {
         })
         .await
     }
+
+    /// All block metadata in `[start_slot, end_slot]`, ascending, rewards
+    /// included. Disk-cache backfill only: shard-direct deployments use the
+    /// shard-local table for each covered slot bucket; distributed deployments
+    /// use the distributed table. The caller-provided timeout is sized for
+    /// range scans rather than interactive reads.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn get_block_metadata_by_slot_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        timeout: std::time::Duration,
+    ) -> ProcessingResult<(Vec<BlockMetadataRecord>, QueryTimings)> {
+        self.with_timeout_duration("get_block_metadata_by_slot_range", timeout, async {
+            if self.scope_shard_direct()
+                && let (Some(topology), Some(local_table)) =
+                    (&self.shard_topology, &self.blocks_metadata_local_table)
+            {
+                let settings_clause = self.select_settings_clause_with_timeout(
+                    "get_block_metadata_by_slot_range_local_http",
+                    QueryFreshnessClass::Historical,
+                    timeout,
+                );
+                let ranges = shard_slot_ranges_for_slot_range(start_slot, end_slot, |bucket| {
+                    topology.shard_index_for_hash(bucket)
+                });
+                let mut records = Vec::new();
+                let mut timings = QueryTimings::zero();
+                let mut local_failed = false;
+                for range in ranges {
+                    let Some(shard) = topology.shards.get(range.shard_index) else {
+                        local_failed = true;
+                        continue;
+                    };
+                    let query = build_block_metadata_range_query(
+                        local_table,
+                        range.start_slot,
+                        range.end_slot,
+                        &settings_clause,
+                    );
+                    match fetch_block_metadata_range(&shard.http_client, &query).await {
+                        Ok((mut local_records, local_timings)) => {
+                            timings.add(local_timings);
+                            records.append(&mut local_records);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Shard {}:{} HTTP range query failed; falling back to distributed table: {}",
+                                shard.host,
+                                shard.tcp_port,
+                                err
+                            );
+                            records.clear();
+                            timings = QueryTimings::zero();
+                            local_failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !local_failed {
+                    return Ok((records, timings));
+                }
+            }
+
+            let settings_clause = self.select_settings_clause_with_timeout(
+                "get_block_metadata_by_slot_range",
+                QueryFreshnessClass::Historical,
+                timeout,
+            );
+            let query = build_block_metadata_range_query(
+                &self.blocks_metadata_table,
+                start_slot,
+                end_slot,
+                &settings_clause,
+            );
+
+            fetch_block_metadata_range(&self.client, &query).await
+        })
+        .await
+    }
+
+    /// All transactions in `[start_slot, end_slot]`, ordered by
+    /// `(slot, slot_idx)` ascending. Disk-cache backfill only; see
+    /// [`Self::get_block_metadata_by_slot_range`] for the routing rationale.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn get_block_full_transactions_by_slot_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        timeout: std::time::Duration,
+    ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
+        self.with_timeout_duration(
+            "get_block_full_transactions_by_slot_range",
+            timeout,
+            async {
+                if self.scope_shard_direct()
+                    && let (Some(topology), Some(local_table)) =
+                        (&self.shard_topology, &self.transactions_local_table)
+                {
+                    let settings_clause = self.select_settings_clause_with_timeout(
+                        "get_block_full_transactions_by_slot_range_local_http",
+                        QueryFreshnessClass::Historical,
+                        timeout,
+                    );
+                    let ranges = shard_slot_ranges_for_slot_range(start_slot, end_slot, |bucket| {
+                        topology.shard_index_for_hash(bucket)
+                    });
+                    let mut records = Vec::new();
+                    let mut timings = QueryTimings::zero();
+                    let mut local_failed = false;
+                    for range in ranges {
+                        let Some(shard) = topology.shards.get(range.shard_index) else {
+                            local_failed = true;
+                            continue;
+                        };
+                        let query = build_transactions_by_slot_range_query(
+                            local_table,
+                            range.start_slot,
+                            range.end_slot,
+                            &settings_clause,
+                        );
+                        match fetch_transaction_range(&shard.http_client, &query).await {
+                            Ok((mut local_records, local_timings)) => {
+                                timings.add(local_timings);
+                                records.append(&mut local_records);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Shard {}:{} HTTP transaction range query failed; falling back to distributed table: {}",
+                                    shard.host,
+                                    shard.tcp_port,
+                                    err
+                                );
+                                records.clear();
+                                timings = QueryTimings::zero();
+                                local_failed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !local_failed {
+                        return Ok((records, timings));
+                    }
+                }
+
+                let settings_clause = self.select_settings_clause_with_timeout(
+                    "get_block_full_transactions_by_slot_range",
+                    QueryFreshnessClass::Historical,
+                    timeout,
+                );
+                let query = build_transactions_by_slot_range_query(
+                    &self.transaction_table,
+                    start_slot,
+                    end_slot,
+                    &settings_clause,
+                );
+
+                fetch_transaction_range(&self.client, &query).await
+            },
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1355,6 +1662,10 @@ mod tests {
         BlockTransactionProjection, SLOT_SHARD_DIVISOR, build_block_metadata_query,
         build_block_transactions_query, build_transaction_count_query, normalize_slots,
         shard_indices_for_slot_range,
+    };
+    #[cfg(feature = "disk-cache")]
+    use super::{
+        ShardSlotRange, build_block_metadata_range_query, shard_slot_ranges_for_slot_range,
     };
 
     #[test]
@@ -1385,6 +1696,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "disk-cache")]
+    fn shard_slot_ranges_for_slot_range_keeps_single_bucket_together() {
+        let ranges = shard_slot_ranges_for_slot_range(10, 100, |bucket| (bucket % 3) as usize);
+        assert_eq!(
+            ranges,
+            vec![ShardSlotRange {
+                shard_index: 0,
+                start_slot: 10,
+                end_slot: 100,
+            }]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "disk-cache")]
+    fn shard_slot_ranges_for_slot_range_splits_at_bucket_boundaries() {
+        let start_slot = SLOT_SHARD_DIVISOR - 2;
+        let end_slot = SLOT_SHARD_DIVISOR + 2;
+        let ranges =
+            shard_slot_ranges_for_slot_range(start_slot, end_slot, |bucket| bucket as usize);
+        assert_eq!(
+            ranges,
+            vec![
+                ShardSlotRange {
+                    shard_index: 0,
+                    start_slot,
+                    end_slot: SLOT_SHARD_DIVISOR - 1,
+                },
+                ShardSlotRange {
+                    shard_index: 1,
+                    start_slot: SLOT_SHARD_DIVISOR,
+                    end_slot,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn normalize_slots_handles_empty_and_singleton() {
         assert_eq!(normalize_slots(Vec::new()), Vec::<u64>::new());
         assert_eq!(normalize_slots(vec![42]), vec![42]);
@@ -1403,6 +1752,20 @@ mod tests {
         assert!(query.contains("executed_transaction_count"));
         assert!(!query.contains("rewards_present"));
         assert!(!query.contains("rewards_pubkey"));
+    }
+
+    #[test]
+    #[cfg(feature = "disk-cache")]
+    fn block_metadata_range_query_includes_bucket_predicate_for_shard_pruning() {
+        let query = build_block_metadata_range_query(
+            "default.blocks_metadata",
+            SLOT_SHARD_DIVISOR + 1,
+            SLOT_SHARD_DIVISOR + 10,
+            "",
+        );
+
+        assert!(query.contains("intDiv(slot, 432000) BETWEEN 1 AND 1"));
+        assert!(query.contains("AND slot BETWEEN 432001 AND 432010"));
     }
 
     #[test]

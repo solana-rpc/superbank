@@ -19,8 +19,9 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 > [!NOTE]
 > Superbank is licensed under **AGPL-3.0-only** (see `LICENSE`).
 > `superbank-rpc` supports an optional in-memory gRPC "head cache" (`--features grpc-head-cache`) to reduce
-> perceived ingestion lag and (optionally) expose `processed` commitment for a subset of methods.
-> See `crates/superbank-rpc/README.md` for details.
+> perceived ingestion lag and (optionally) expose `processed` commitment for a subset of methods,
+> and an optional RocksDB "disk cache" (`--features disk-cache`) that serves recent finalized slots
+> in place of ClickHouse. See `crates/superbank-rpc/README.md` for details.
 
 ## Features
 
@@ -168,6 +169,8 @@ curl -sS http://localhost:8899 \
 - `superbank` supports YAML config, CLI flags, and environment variables.
   Precedence is: flags > env > config file > defaults.
   See `crates/superbank/README.md` and `superbank.example.yaml`.
+  Fumarole ingest includes a default memory soft-limit backpressure guard; set
+  `fumarole-memory-soft-limit-bytes: 0` only if you want to disable it.
 - `superbank-rpc` is configured via CLI flags and environment variables.
   See `crates/superbank-rpc/README.md`.
 
@@ -248,7 +251,7 @@ cargo build -p superbank -p superbank-rpc
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope --locked
+cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
 ```
 
 Local RPC helper:

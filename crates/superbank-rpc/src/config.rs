@@ -320,6 +320,104 @@ pub struct RpcConfig {
     #[arg(long, env = "GRPC_MAX_DECODING_BYTES", default_value_t = 67_108_864)]
     pub(crate) grpc_max_decoding_bytes: usize,
 
+    // --- Optional RocksDB disk cache of recent finalized slots ---
+    #[cfg(feature = "disk-cache")]
+    /// Enable the RocksDB-backed disk cache of recent finalized slots, served in
+    /// place of ClickHouse. Requires the gRPC head cache (its DragonsMouth
+    /// stream is the live ingestion source) and DISK_CACHE_PATH.
+    #[arg(long, env = "DISK_CACHE_ENABLED", default_value_t = false)]
+    pub(crate) disk_cache_enabled: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// Filesystem path for the disk cache database (required when enabled).
+    #[arg(long, env = "DISK_CACHE_PATH")]
+    pub(crate) disk_cache_path: Option<String>,
+
+    #[cfg(feature = "disk-cache")]
+    /// How many finalized slots to retain on disk (default ~10 epochs). At
+    /// mainnet volume the full window needs tens of TB; the tighter of this
+    /// window and DISK_CACHE_MAX_BYTES wins.
+    #[arg(long, env = "DISK_CACHE_RETAIN_SLOTS", default_value_t = 4_320_000)]
+    pub(crate) disk_cache_retain_slots: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Disk byte budget; 0 = unlimited. When live data exceeds it, the slot
+    /// window shrinks until usage fits.
+    #[arg(long, env = "DISK_CACHE_MAX_BYTES", default_value_t = 0)]
+    pub(crate) disk_cache_max_bytes: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// RocksDB block-cache size (bytes) shared across column families.
+    #[arg(
+        long,
+        env = "DISK_CACHE_BLOCK_CACHE_BYTES",
+        default_value_t = 4_294_967_296
+    )]
+    pub(crate) disk_cache_block_cache_bytes: usize,
+
+    #[cfg(feature = "disk-cache")]
+    /// Live write queue capacity in slots (overflow defers slots to repair).
+    #[arg(long, env = "DISK_CACHE_WRITE_QUEUE_SLOTS", default_value_t = 64)]
+    pub(crate) disk_cache_write_queue_slots: usize,
+
+    #[cfg(feature = "disk-cache")]
+    /// Max concurrent blocking disk-cache reads.
+    #[arg(long, env = "DISK_CACHE_READ_CONCURRENCY", default_value_t = 64)]
+    pub(crate) disk_cache_read_concurrency: usize,
+
+    #[cfg(feature = "disk-cache")]
+    /// Enable the ClickHouse->disk backfill/repair task (disable for debugging only).
+    #[arg(long, env = "DISK_CACHE_BACKFILL_ENABLED", default_value_t = true)]
+    pub(crate) disk_cache_backfill_enabled: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// Slots fetched per ClickHouse backfill range query.
+    #[arg(
+        long,
+        env = "DISK_CACHE_BACKFILL_SLOTS_PER_QUERY",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) disk_cache_backfill_slots_per_query: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Backfill rate limit (slots per second). The default fills the full
+    /// 10-epoch window in roughly a day.
+    #[arg(
+        long,
+        env = "DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC",
+        default_value_t = 50,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) disk_cache_backfill_max_slots_per_sec: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Timeout for backfill range queries (milliseconds); range scans need more
+    /// than the interactive CLICKHOUSE_QUERY_TIMEOUT_MS.
+    #[arg(
+        long,
+        env = "DISK_CACHE_BACKFILL_QUERY_TIMEOUT_MS",
+        default_value_t = 30_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) disk_cache_backfill_query_timeout_ms: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Idle wait between repair/backfill planning rounds (milliseconds).
+    #[arg(
+        long,
+        env = "DISK_CACHE_REPAIR_INTERVAL_MS",
+        default_value_t = 5_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) disk_cache_repair_interval_ms: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Never backfill slots within this distance of the finalized tip, so
+    /// ClickHouse ingestion has had time to land them.
+    #[arg(long, env = "DISK_CACHE_REPAIR_MIN_LAG_SLOTS", default_value_t = 75)]
+    pub(crate) disk_cache_repair_min_lag_slots: u64,
+
     // --- Optional Pyroscope continuous profiling ---
     #[cfg(feature = "pyroscope")]
     /// Enable Pyroscope continuous profiling (requires `PYROSCOPE_URL` / `--pyroscope-url`).
@@ -635,6 +733,77 @@ mod config_tests {
         assert!(!cfg.metrics_capture_x_rpc_node());
         assert!(!cfg.metrics_capture_x_subscription_id());
         assert!(!cfg.metrics_capture_x_account_id());
+    }
+}
+
+#[cfg(all(test, feature = "disk-cache"))]
+mod disk_cache_config_tests {
+    use clap::Parser;
+
+    use super::RpcConfig;
+
+    #[test]
+    fn disk_cache_defaults() {
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+
+        assert!(!cfg.disk_cache_enabled);
+        assert_eq!(cfg.disk_cache_path, None);
+        assert_eq!(cfg.disk_cache_retain_slots, 4_320_000);
+        assert_eq!(cfg.disk_cache_max_bytes, 0);
+        assert_eq!(cfg.disk_cache_block_cache_bytes, 4_294_967_296);
+        assert_eq!(cfg.disk_cache_write_queue_slots, 64);
+        assert_eq!(cfg.disk_cache_read_concurrency, 64);
+        assert!(cfg.disk_cache_backfill_enabled);
+        assert_eq!(cfg.disk_cache_backfill_slots_per_query, 8);
+        assert_eq!(cfg.disk_cache_backfill_max_slots_per_sec, 50);
+        assert_eq!(cfg.disk_cache_backfill_query_timeout_ms, 30_000);
+        assert_eq!(cfg.disk_cache_repair_interval_ms, 5_000);
+        assert_eq!(cfg.disk_cache_repair_min_lag_slots, 75);
+    }
+
+    #[test]
+    fn disk_cache_flags_parse() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--disk-cache-enabled",
+            "--disk-cache-path",
+            "/var/lib/superbank/disk-cache",
+            "--disk-cache-retain-slots",
+            "432000",
+            "--disk-cache-max-bytes",
+            "2199023255552",
+            "--disk-cache-backfill-max-slots-per-sec",
+            "200",
+        ]);
+
+        assert!(cfg.disk_cache_enabled);
+        assert_eq!(
+            cfg.disk_cache_path.as_deref(),
+            Some("/var/lib/superbank/disk-cache")
+        );
+        assert_eq!(cfg.disk_cache_retain_slots, 432_000);
+        assert_eq!(cfg.disk_cache_max_bytes, 2_199_023_255_552);
+        assert_eq!(cfg.disk_cache_backfill_max_slots_per_sec, 200);
+    }
+
+    #[test]
+    fn disk_cache_rejects_zero_rate_limits() {
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--disk-cache-backfill-slots-per-query",
+                "0",
+            ])
+            .is_err()
+        );
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--disk-cache-backfill-max-slots-per-sec",
+                "0",
+            ])
+            .is_err()
+        );
     }
 }
 

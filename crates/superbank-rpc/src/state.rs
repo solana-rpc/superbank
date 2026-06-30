@@ -16,6 +16,8 @@ use crate::metrics;
 use crate::processing::ProcessingError;
 use crate::util::{current_time_millis, ttl_millis};
 
+#[cfg(feature = "disk-cache")]
+use crate::disk_cache::DiskCache;
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::HeadCache;
 
@@ -39,6 +41,11 @@ pub(crate) struct AppState {
     pub(crate) hydration_sem: Arc<Semaphore>,
     #[cfg(feature = "grpc-head-cache")]
     pub(crate) head_cache: Option<Arc<HeadCache>>,
+    /// Finalized recent-slot cache on local disk; consulted between the head
+    /// cache and ClickHouse. Intentionally not part of latest-slot resolution:
+    /// its tip never leads the head cache, so it adds nothing there.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) disk_cache: Option<Arc<DiskCache>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

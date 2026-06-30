@@ -9,6 +9,8 @@ use ch_cityhash102::cityhash64;
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
+#[cfg(feature = "disk-cache")]
+use super::constants::SLOT_SHARD_DIVISOR;
 use super::types::{
     NumericFilter, PaginationToken, ResolvedSignatureFilter, SignatureFilter, SignatureSlot,
     SlotBoundary, SortOrder, TokenAccountsFilter, TransactionStatusFilter,
@@ -404,6 +406,28 @@ fn slot_idx_condition(expr: &SignaturePositionExpr, comparison: SlotIdxCompariso
     }
 }
 
+fn slot_idx_condition_for_position(
+    position: SignatureSlot,
+    comparison: SlotIdxComparison,
+) -> String {
+    let slot = position.slot;
+    let idx = position.slot_idx;
+    match comparison {
+        SlotIdxComparison::Lt => {
+            format!("(slot < {slot} OR (slot = {slot} AND slot_idx < {idx}))")
+        }
+        SlotIdxComparison::Lte => {
+            format!("(slot < {slot} OR (slot = {slot} AND slot_idx <= {idx}))")
+        }
+        SlotIdxComparison::Gt => {
+            format!("(slot > {slot} OR (slot = {slot} AND slot_idx > {idx}))")
+        }
+        SlotIdxComparison::Gte => {
+            format!("(slot > {slot} OR (slot = {slot} AND slot_idx >= {idx}))")
+        }
+    }
+}
+
 fn apply_signature_filter(
     signatures_table: &str,
     signature_bucket_modulus: u64,
@@ -488,34 +512,37 @@ fn apply_pagination_token(
     Ok(())
 }
 
-fn apply_resolved_signature_filter(filter: &ResolvedSignatureFilter, conditions: &mut Vec<String>) {
+fn apply_hot_resolved_signature_filter(
+    filter: &ResolvedSignatureFilter,
+    conditions: &mut Vec<String>,
+) {
     if let Some(position) = filter.gte {
-        conditions.push(slot_idx_condition(
-            &signature_position_for_token(position.slot, position.slot_idx),
+        conditions.push(slot_idx_condition_for_position(
+            position,
             SlotIdxComparison::Gte,
         ));
     }
     if let Some(position) = filter.gt {
-        conditions.push(slot_idx_condition(
-            &signature_position_for_token(position.slot, position.slot_idx),
+        conditions.push(slot_idx_condition_for_position(
+            position,
             SlotIdxComparison::Gt,
         ));
     }
     if let Some(position) = filter.lte {
-        conditions.push(slot_idx_condition(
-            &signature_position_for_token(position.slot, position.slot_idx),
+        conditions.push(slot_idx_condition_for_position(
+            position,
             SlotIdxComparison::Lte,
         ));
     }
     if let Some(position) = filter.lt {
-        conditions.push(slot_idx_condition(
-            &signature_position_for_token(position.slot, position.slot_idx),
+        conditions.push(slot_idx_condition_for_position(
+            position,
             SlotIdxComparison::Lt,
         ));
     }
 }
 
-fn apply_resolved_pagination_token(
+fn apply_hot_resolved_pagination_token(
     pagination: SignatureSlot,
     sort_order: SortOrder,
     conditions: &mut Vec<String>,
@@ -524,10 +551,7 @@ fn apply_resolved_pagination_token(
         SortOrder::Desc => SlotIdxComparison::Lt,
         SortOrder::Asc => SlotIdxComparison::Gt,
     };
-    conditions.push(slot_idx_condition(
-        &signature_position_for_token(pagination.slot, pagination.slot_idx),
-        comparison,
-    ));
+    conditions.push(slot_idx_condition_for_position(pagination, comparison));
 }
 
 pub(crate) fn build_pagination_clauses(
@@ -563,6 +587,41 @@ pub(crate) fn build_pagination_clauses(
                     slot = until_pos.slot,
                     idx = until_pos.slot_idx
                 )
+            }
+            SlotBoundary::Slot(slot) => format!("slot > {slot}"),
+        };
+        conditions.push(condition);
+    }
+
+    let where_clause = if conditions.is_empty() {
+        "1".to_string()
+    } else {
+        conditions.join(" AND ")
+    };
+
+    (String::new(), where_clause)
+}
+
+pub(crate) fn build_hot_position_pagination_clauses(
+    before: Option<SlotBoundary>,
+    until: Option<SlotBoundary>,
+) -> (String, String) {
+    let mut conditions = Vec::new();
+
+    if let Some(before) = before {
+        let condition = match before {
+            SlotBoundary::Position(position) => {
+                slot_idx_condition_for_position(position, SlotIdxComparison::Lt)
+            }
+            SlotBoundary::Slot(slot) => format!("slot < {slot}"),
+        };
+        conditions.push(condition);
+    }
+
+    if let Some(until) = until {
+        let condition = match until {
+            SlotBoundary::Position(position) => {
+                slot_idx_condition_for_position(position, SlotIdxComparison::Gt)
             }
             SlotBoundary::Slot(slot) => format!("slot > {slot}"),
         };
@@ -740,7 +799,7 @@ pub(crate) fn build_transactions_for_address_hot_query(
     }
 
     if let Some(slot_filter) = &query.slot_filter {
-        append_transactions_for_address_slot_filter_conditions(slot_filter, &mut conditions);
+        append_numeric_filter_conditions("slot", slot_filter, &mut conditions);
     }
 
     if let Some(block_time_filter) = &query.block_time_filter {
@@ -748,11 +807,11 @@ pub(crate) fn build_transactions_for_address_hot_query(
     }
 
     if let Some(signature_filter) = query.resolved_signature_filter.as_ref() {
-        apply_resolved_signature_filter(signature_filter, &mut conditions);
+        apply_hot_resolved_signature_filter(signature_filter, &mut conditions);
     }
 
     if let Some(pagination) = query.resolved_pagination {
-        apply_resolved_pagination_token(pagination, query.sort_order, &mut conditions);
+        apply_hot_resolved_pagination_token(pagination, query.sort_order, &mut conditions);
     }
 
     let where_clause = if conditions.is_empty() {
@@ -832,17 +891,55 @@ pub(crate) fn build_transactions_by_slot_signatures_query(
     )
 }
 
+/// Range scan for disk-cache backfill: every transaction in
+/// `[start_slot, end_slot]` in `(slot, slot_idx)` order. `LIMIT 1 BY signature`
+/// mirrors the per-slot block query's ReplacingMergeTree dedup.
+#[cfg(feature = "disk-cache")]
+pub(crate) fn build_transactions_by_slot_range_query(
+    transaction_table: &str,
+    start_slot: u64,
+    end_slot: u64,
+    settings_clause: &str,
+) -> String {
+    let start_bucket = start_slot / SLOT_SHARD_DIVISOR;
+    let end_bucket = end_slot / SLOT_SHARD_DIVISOR;
+
+    format!(
+        "SELECT
+            {columns}
+         FROM {transaction_table}
+         PREWHERE
+            intDiv(slot, {slot_shard_divisor}) BETWEEN {start_bucket} AND {end_bucket}
+            AND slot BETWEEN {start_slot} AND {end_slot}
+         ORDER BY slot ASC, slot_idx ASC, signature ASC
+         LIMIT 1 BY signature
+         {settings_clause}",
+        columns = TRANSACTION_SELECT_COLUMNS,
+        transaction_table = transaction_table,
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+        start_bucket = start_bucket,
+        end_bucket = end_bucket,
+        start_slot = start_slot,
+        end_slot = end_slot,
+        settings_clause = settings_clause
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use ch_cityhash102::cityhash64;
 
+    #[cfg(feature = "disk-cache")]
+    use super::build_transactions_by_slot_range_query;
     use super::{
-        TransactionsForAddressTables, build_transactions_for_address_hot_query,
-        build_transactions_for_address_query,
+        TransactionsForAddressTables, build_hot_position_pagination_clauses,
+        build_transactions_for_address_hot_query, build_transactions_for_address_query,
     };
+    #[cfg(feature = "disk-cache")]
+    use crate::clickhouse::constants::SLOT_SHARD_DIVISOR;
     use crate::clickhouse::types::{
-        NumericFilter, ResolvedSignatureFilter, SignatureFilter, SignatureSlot, SortOrder,
-        TokenAccountsFilter, TransactionStatusFilter, TransactionsForAddressQuery,
+        NumericFilter, ResolvedSignatureFilter, SignatureFilter, SignatureSlot, SlotBoundary,
+        SortOrder, TokenAccountsFilter, TransactionStatusFilter, TransactionsForAddressQuery,
     };
 
     fn normalize_sql(sql: &str) -> String {
@@ -897,6 +994,21 @@ mod tests {
         assert!(sql.contains(
             "slot + toUInt64(0) > sig_gte_slot OR (slot + toUInt64(0) = sig_gte_slot AND slot_idx + toUInt32(0) >= sig_gte_idx)"
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "disk-cache")]
+    fn transactions_by_slot_range_query_includes_bucket_predicate_for_shard_pruning() {
+        let query = build_transactions_by_slot_range_query(
+            "default.transactions",
+            SLOT_SHARD_DIVISOR + 1,
+            SLOT_SHARD_DIVISOR + 10,
+            "",
+        );
+        let sql = normalize_sql(&query);
+
+        assert!(sql.contains("intDiv(slot, 432000) BETWEEN 1 AND 1"));
+        assert!(sql.contains("AND slot BETWEEN 432001 AND 432010"));
     }
 
     #[test]
@@ -982,18 +1094,35 @@ mod tests {
         let sql = normalize_sql(&sql);
 
         assert!(sql.contains("FROM default.gsfa_hot_local"));
-        assert!(sql.contains(
-            "(slot + toUInt64(0) > 400179100 OR (slot + toUInt64(0) = 400179100 AND slot_idx + toUInt32(0) >= 42))"
-        ));
-        assert!(sql.contains(
-            "(slot + toUInt64(0) < 400179920 OR (slot + toUInt64(0) = 400179920 AND slot_idx + toUInt32(0) < 678))"
-        ));
+        assert!(sql.contains("(slot > 400179100 OR (slot = 400179100 AND slot_idx >= 42))"));
+        assert!(sql.contains("(slot < 400179920 OR (slot = 400179920 AND slot_idx < 678))"));
+        assert!(!sql.contains("slot + toUInt64(0) > 400179100"));
+        assert!(!sql.contains("slot_idx + toUInt32(0) < 678"));
         assert!(!sql.contains("FROM default.signatures"));
         assert!(!sql.contains("ignored"));
     }
 
     #[test]
-    fn hot_transactions_for_address_query_uses_computed_slot_filter_bounds() {
+    fn hot_position_pagination_clauses_use_raw_reverse_key_predicates() {
+        let (_, where_clause) = build_hot_position_pagination_clauses(
+            Some(SlotBoundary::Position(SignatureSlot {
+                slot: 400_179_920,
+                slot_idx: 678,
+            })),
+            Some(SlotBoundary::Position(SignatureSlot {
+                slot: 400_179_100,
+                slot_idx: 42,
+            })),
+        );
+
+        assert_eq!(
+            where_clause,
+            "(slot < 400179920 OR (slot = 400179920 AND slot_idx < 678)) AND (slot > 400179100 OR (slot = 400179100 AND slot_idx > 42))"
+        );
+    }
+
+    #[test]
+    fn hot_transactions_for_address_query_uses_raw_slot_filter_bounds() {
         let query = TransactionsForAddressQuery {
             address: bs58::encode([9_u8; 32]).into_string(),
             limit: 100,
@@ -1016,7 +1145,7 @@ mod tests {
                 .expect("query");
         let sql = normalize_sql(&sql);
 
-        assert!(sql.contains("WHERE slot + toUInt64(0) <= 420051754"));
-        assert!(!sql.contains("WHERE slot <= 420051754"));
+        assert!(sql.contains("WHERE slot <= 420051754"));
+        assert!(!sql.contains("slot + toUInt64(0) <= 420051754"));
     }
 }

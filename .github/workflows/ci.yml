@@ -86,4 +86,4 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Test optional features (superbank-rpc)
-        run: cargo test -p superbank-rpc --features grpc-head-cache,pyroscope --locked
+        run: cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked

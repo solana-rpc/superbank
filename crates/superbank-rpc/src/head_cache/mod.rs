@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::clickhouse::{
     BlockMetadataRecord, SlotBoundary, StoredAccountsTransactionRecord, StoredBlockPayload,
-    StoredBlockRecord, StoredTransactionRecord,
+    StoredBlockRecord, StoredTransactionRecord, extract_memo,
 };
 
 mod convert;
@@ -415,6 +415,64 @@ impl HeadCache {
         }
     }
 
+    /// Snapshot a complete block for the disk cache without deep-cloning records.
+    ///
+    /// Same completeness rules as [`Self::get_block`] with full details: block
+    /// metadata present, exactly `executed_transaction_count` transactions, all
+    /// positioned in this slot. Returns records ordered by execution index.
+    /// `None` means the head cache holds an incomplete view (or the slot was
+    /// already evicted) and the caller must repair from ClickHouse instead.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn finalized_block_snapshot(
+        &self,
+        slot: u64,
+    ) -> Option<(BlockMetadataRecord, Vec<Arc<StoredTransactionRecord>>)> {
+        let mut metadata = self.slot_block_metadata.get(&slot)?.clone();
+        // The block-meta stream can race individual note_* updates; prefer the
+        // per-slot maps where present so the snapshot matches what reads serve.
+        if metadata.block_time.is_none() {
+            metadata.block_time = self.block_time_for_slot(slot);
+        }
+
+        let expected = metadata.executed_transaction_count as usize;
+        let slot_signatures = if expected == 0 {
+            Vec::new()
+        } else {
+            self.sigs_by_slot.get(&slot).map(|entry| entry.clone())?
+        };
+        if slot_signatures.len() != expected {
+            return None;
+        }
+
+        let mut ordered = Vec::with_capacity(expected);
+        for signature in slot_signatures {
+            let meta = self.meta_by_signature.get(&signature)?;
+            if meta.pos.slot != slot {
+                return None;
+            }
+            let record = self.tx_by_signature.get(&signature)?.clone();
+            ordered.push((meta.pos.idx, record));
+        }
+        ordered.sort_unstable_by_key(|(idx, _)| *idx);
+
+        let records = ordered
+            .into_iter()
+            .map(|(_, record)| {
+                // Normalize block_time so disk contents match what ClickHouse
+                // stores for the same transaction.
+                if record.block_time.is_none() && metadata.block_time.is_some() {
+                    let mut fixed = record.as_ref().clone();
+                    fixed.block_time = metadata.block_time;
+                    Arc::new(fixed)
+                } else {
+                    record
+                }
+            })
+            .collect();
+
+        Some((metadata, records))
+    }
+
     pub(crate) fn signatures_for_address(
         &self,
         address: &Pubkey,
@@ -805,64 +863,6 @@ fn commitment_to_str(c: CommitmentLevel) -> &'static str {
         CommitmentLevel::Confirmed => "confirmed",
         CommitmentLevel::Finalized => "finalized",
     }
-}
-
-fn extract_memo(record: &StoredTransactionRecord) -> Option<String> {
-    static MEMO_PROGRAM_IDS: once_cell::sync::Lazy<[Pubkey; 2]> =
-        once_cell::sync::Lazy::new(|| {
-            use std::str::FromStr;
-            [
-                Pubkey::from_str("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo")
-                    .expect("memo program id"),
-                Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
-                    .expect("memo program id"),
-            ]
-        });
-
-    let mut memos = Vec::new();
-    for (program_id_index, data) in record
-        .tx_instructions_program_id_index
-        .iter()
-        .zip(record.tx_instructions_data.iter())
-    {
-        let idx = usize::from(*program_id_index);
-        let Some(program_id) = account_key_at(record, idx) else {
-            continue;
-        };
-        if !MEMO_PROGRAM_IDS.contains(&program_id) {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(data) else {
-            continue;
-        };
-        if text.is_empty() {
-            continue;
-        }
-        memos.push(format!("[{}] {}", text.len(), text));
-    }
-
-    if memos.is_empty() {
-        None
-    } else {
-        Some(memos.join("; "))
-    }
-}
-
-fn account_key_at(record: &StoredTransactionRecord, idx: usize) -> Option<Pubkey> {
-    let static_len = record.tx_account_keys.len();
-    if idx < static_len {
-        return Some(Pubkey::from(record.tx_account_keys[idx]));
-    }
-    let idx = idx - static_len;
-    let w_len = record.meta_loaded_addresses_writable.len();
-    if idx < w_len {
-        return Some(Pubkey::from(record.meta_loaded_addresses_writable[idx]));
-    }
-    let idx = idx - w_len;
-    if idx < record.meta_loaded_addresses_readonly.len() {
-        return Some(Pubkey::from(record.meta_loaded_addresses_readonly[idx]));
-    }
-    None
 }
 
 #[cfg(test)]

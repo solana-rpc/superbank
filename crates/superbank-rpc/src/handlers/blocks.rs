@@ -224,23 +224,64 @@ async fn get_block_slots_response_for_range(
     #[cfg(not(feature = "grpc-head-cache"))]
     let _ = commitment;
 
+    // Disk tier: the contiguous covered span answers its part of the range, so
+    // ClickHouse is only consulted below the coverage floor and above the
+    // covered head (the latter matters when disk writes lag the chain tip).
+    #[cfg(feature = "disk-cache")]
+    let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) =
+        if let Some(disk) = state.disk_cache.as_ref() {
+            route.disk_cache_read();
+            match disk.tip_span() {
+                Some((floor, head)) if end_slot >= floor && start_slot <= head => {
+                    match disk
+                        .covered_slots_in_range(start_slot.max(floor), end_slot.min(head))
+                        .await
+                    {
+                        Some(slots) => (slots, Some((floor, head))),
+                        None => (Vec::new(), None),
+                    }
+                }
+                _ => (Vec::new(), None),
+            }
+        } else {
+            (Vec::new(), None)
+        };
+    #[cfg(not(feature = "disk-cache"))]
+    let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) = (Vec::new(), None);
+
+    let disk_contributed = disk_span.is_some();
+    let mut clickhouse_ranges: Vec<(u64, u64)> = Vec::new();
+    match disk_span {
+        Some((floor, head)) => {
+            if start_slot < floor {
+                clickhouse_ranges.push((start_slot, end_slot.min(floor.saturating_sub(1))));
+            }
+            if end_slot > head {
+                clickhouse_ranges.push((start_slot.max(head + 1), end_slot));
+            }
+        }
+        None => clickhouse_ranges.push((start_slot, end_slot)),
+    }
+
     let mut clickhouse_slots = Vec::new();
     let mut clickhouse_read = false;
     let mut clickhouse_error: Option<String> = None;
 
-    match state
-        .clickhouse
-        .get_block_slots_by_range(start_slot, end_slot)
-        .await
-    {
-        Ok((slots, query_timings)) => {
-            clickhouse_slots = slots;
-            clickhouse_read = true;
-            timings.add(query_timings);
-        }
-        Err(e) => {
-            metrics::backend_error("get_block_slots_by_range");
-            clickhouse_error = Some(e.to_string());
+    for (range_start, range_end) in clickhouse_ranges {
+        match state
+            .clickhouse
+            .get_block_slots_by_range(range_start, range_end)
+            .await
+        {
+            Ok((slots, query_timings)) => {
+                clickhouse_slots = merge_sorted_block_slots(clickhouse_slots, slots);
+                clickhouse_read = true;
+                timings.add(query_timings);
+            }
+            Err(e) => {
+                metrics::backend_error("get_block_slots_by_range");
+                clickhouse_error = Some(e.to_string());
+            }
         }
     }
 
@@ -258,7 +299,7 @@ async fn get_block_slots_response_for_range(
     let head_contributed = !head_slots.is_empty();
 
     if let Some(err) = clickhouse_error {
-        if !head_contributed {
+        if !head_contributed && !disk_contributed {
             error!(
                 "Failed to query ClickHouse for block slots {}..={}: {}",
                 start_slot, end_slot, err
@@ -267,13 +308,16 @@ async fn get_block_slots_response_for_range(
         }
 
         warn!(
-            "Falling back to head-cache-only slots for range {}..={} after ClickHouse error: {}",
+            "Serving cache-only slots for range {}..={} after ClickHouse error: {}",
             start_slot, end_slot, err
         );
     }
 
     if clickhouse_read {
         route.source_clickhouse();
+    } else if disk_contributed {
+        #[cfg(feature = "disk-cache")]
+        route.source_disk_cache();
     } else if head_contributed {
         #[cfg(feature = "grpc-head-cache")]
         route.source_head_cache();
@@ -281,7 +325,10 @@ async fn get_block_slots_response_for_range(
         route.source_none();
     }
 
-    let slots = merge_sorted_block_slots(clickhouse_slots, head_slots);
+    let slots = merge_sorted_block_slots(
+        merge_sorted_block_slots(clickhouse_slots, disk_slots),
+        head_slots,
+    );
     metrics::blocks_slots_returned(route.method(), slots.len());
     route.success();
     let mut resp = json_rpc_success_response(id, slots);
@@ -976,6 +1023,113 @@ pub(crate) async fn handle_get_latest_blockhash(
     Ok(resp)
 }
 
+/// Hydrate a block payload and build the JSON-RPC response; shared by the
+/// head-cache, disk-cache, and ClickHouse branches of getBlock.
+async fn respond_with_hydrated_block(
+    state: &AppState,
+    id: Value,
+    route: &mut RouteMetric,
+    slot: u64,
+    payload: StoredBlockPayload,
+    fetch_plan: GetBlockFetchPlan,
+    timings: Option<QueryTimings>,
+) -> Result<Response, StatusCode> {
+    if payload.metadata().slot != slot {
+        warn!(
+            requested = slot,
+            observed = payload.metadata().slot,
+            "Block metadata slot mismatch"
+        );
+    }
+    if let Some(observed) = block_payload_transaction_count(&payload)
+        && payload.metadata().executed_transaction_count != observed as u64
+    {
+        warn!(
+            slot,
+            expected = payload.metadata().executed_transaction_count,
+            observed = observed,
+            entry_count = payload.metadata().entry_count,
+            "Block transaction count mismatch"
+        );
+    }
+
+    let attach_timings = |resp: &mut Response| {
+        if let Some(timings) = timings.as_ref() {
+            add_downstream_header(resp, timings);
+        }
+    };
+
+    let hydrated = if fetch_plan.needs_blocking_hydration() {
+        let permit = match state.hydration_sem.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!(slot, "Hydration semaphore closed");
+                let mut resp = json_rpc_internal_error_response(id);
+                attach_timings(&mut resp);
+                return Ok(resp);
+            }
+        };
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            hydrate_block_payload(
+                payload,
+                fetch_plan.encoding,
+                fetch_plan.transaction_details,
+                fetch_plan.show_rewards,
+                fetch_plan.max_supported_transaction_version,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) => {
+                error!(
+                    "Failed to join hydration task for block {}: {}",
+                    slot, join_err
+                );
+                let mut resp = json_rpc_internal_error_response(id);
+                attach_timings(&mut resp);
+                return Ok(resp);
+            }
+        }
+    } else {
+        hydrate_block_payload(
+            payload,
+            fetch_plan.encoding,
+            fetch_plan.transaction_details,
+            fetch_plan.show_rewards,
+            fetch_plan.max_supported_transaction_version,
+        )
+    };
+
+    match hydrated {
+        Ok(encoded_block) => {
+            route.success();
+            let mut resp = json_rpc_success_response(id, encoded_block);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Err(BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(version))) => {
+            route.rpc_error();
+            let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
+            let mut resp = json_rpc_error_response(
+                id,
+                code,
+                unsupported_transaction_version_message(version),
+                None,
+            );
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+        Err(e) => {
+            error!("Failed to hydrate block {}: {}", slot, e);
+            let mut resp = json_rpc_internal_error_response(id);
+            attach_timings(&mut resp);
+            Ok(resp)
+        }
+    }
+}
+
 pub(crate) async fn handle_get_block(
     state: Arc<AppState>,
     id: Value,
@@ -1076,85 +1230,51 @@ pub(crate) async fn handle_get_block(
             }
 
             route.source_head_cache();
-            if fetch_plan.needs_blocking_hydration() {
-                let permit = match state.hydration_sem.clone().acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        error!(slot, "Hydration semaphore closed");
-                        return Ok(json_rpc_internal_error_response(id));
-                    }
-                };
-
-                match tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    hydrate_block_payload(
-                        payload,
-                        fetch_plan.encoding,
-                        fetch_plan.transaction_details,
-                        fetch_plan.show_rewards,
-                        fetch_plan.max_supported_transaction_version,
-                    )
-                })
-                .await
-                {
-                    Ok(Ok(encoded_block)) => {
-                        route.success();
-                        return Ok(json_rpc_success_response(id, encoded_block));
-                    }
-                    Ok(Err(BlockHydrationError::Encode(
-                        EncodeError::UnsupportedTransactionVersion(version),
-                    ))) => {
-                        route.rpc_error();
-                        let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-                        return Ok(json_rpc_error_response(
-                            id,
-                            code,
-                            unsupported_transaction_version_message(version),
-                            None,
-                        ));
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to hydrate head-cache block {}: {}", slot, e);
-                        return Ok(json_rpc_internal_error_response(id));
-                    }
-                    Err(join_err) => {
-                        error!(
-                            "Failed to join hydration task for head-cache block {}: {}",
-                            slot, join_err
-                        );
-                        return Ok(json_rpc_internal_error_response(id));
-                    }
-                }
-            }
-
-            match hydrate_block_payload(
+            return respond_with_hydrated_block(
+                state.as_ref(),
+                id,
+                &mut route,
+                slot,
                 payload,
-                fetch_plan.encoding,
-                fetch_plan.transaction_details,
-                fetch_plan.show_rewards,
-                fetch_plan.max_supported_transaction_version,
-            ) {
-                Ok(encoded_block) => {
-                    route.success();
-                    return Ok(json_rpc_success_response(id, encoded_block));
-                }
-                Err(BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
-                    version,
-                ))) => {
-                    route.rpc_error();
-                    let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-                    return Ok(json_rpc_error_response(
-                        id,
-                        code,
-                        unsupported_transaction_version_message(version),
-                        None,
-                    ));
-                }
-                Err(e) => {
-                    error!("Failed to hydrate head-cache block {}: {}", slot, e);
-                    return Ok(json_rpc_internal_error_response(id));
-                }
+                fetch_plan,
+                None,
+            )
+            .await;
+        }
+    }
+
+    // Disk tier: serves any individually covered slot (all stored data is
+    // finalized, satisfying the confirmed/finalized commitments accepted
+    // above). A Skipped marker is proof the slot has no block on the finalized
+    // chain, so the miss is answered without ClickHouse.
+    #[cfg(feature = "disk-cache")]
+    if let Some(disk) = state.disk_cache.as_ref() {
+        route.disk_cache_read();
+        match disk.get_block(slot, fetch_plan.transaction_details).await {
+            crate::disk_cache::DiskBlockResult::Found(payload) => {
+                route.source_disk_cache();
+                return respond_with_hydrated_block(
+                    state.as_ref(),
+                    id,
+                    &mut route,
+                    slot,
+                    *payload,
+                    fetch_plan,
+                    None,
+                )
+                .await;
             }
+            crate::disk_cache::DiskBlockResult::Skipped => {
+                route.source_disk_cache();
+                route.not_found();
+                return Ok(json_rpc_error_response(
+                    id,
+                    JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
+                    format!("Slot {slot} was skipped, or missing in long-term storage"),
+                    None,
+                ));
+            }
+            crate::disk_cache::DiskBlockResult::NotCovered => {}
         }
     }
 
@@ -1273,121 +1393,16 @@ pub(crate) async fn handle_get_block(
         return Ok(resp);
     };
 
-    if block_payload.metadata().slot != slot {
-        warn!(
-            requested = slot,
-            observed = block_payload.metadata().slot,
-            "Block metadata slot mismatch"
-        );
-    }
-
-    if let Some(observed) = block_payload_transaction_count(&block_payload)
-        && block_payload.metadata().executed_transaction_count != observed as u64
-    {
-        warn!(
-            slot,
-            expected = block_payload.metadata().executed_transaction_count,
-            observed = observed,
-            entry_count = block_payload.metadata().entry_count,
-            "Block transaction count mismatch"
-        );
-    }
-
-    if fetch_plan.needs_blocking_hydration() {
-        let permit = match state.hydration_sem.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                error!(slot, "Hydration semaphore closed");
-                let mut resp = json_rpc_internal_error_response(id);
-                add_downstream_header(&mut resp, &timings);
-                return Ok(resp);
-            }
-        };
-
-        match tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            hydrate_block_payload(
-                block_payload,
-                fetch_plan.encoding,
-                fetch_plan.transaction_details,
-                fetch_plan.show_rewards,
-                fetch_plan.max_supported_transaction_version,
-            )
-        })
-        .await
-        {
-            Ok(Ok(encoded_block)) => {
-                route.success();
-                let mut resp = json_rpc_success_response(id, encoded_block);
-                add_downstream_header(&mut resp, &timings);
-                Ok(resp)
-            }
-            Ok(Err(BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
-                version,
-            )))) => {
-                route.rpc_error();
-                let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-                let mut resp = json_rpc_error_response(
-                    id,
-                    code,
-                    unsupported_transaction_version_message(version),
-                    None,
-                );
-                add_downstream_header(&mut resp, &timings);
-                Ok(resp)
-            }
-            Ok(Err(e)) => {
-                error!("Failed to hydrate block {}: {}", slot, e);
-                let mut resp = json_rpc_internal_error_response(id);
-                add_downstream_header(&mut resp, &timings);
-                Ok(resp)
-            }
-            Err(join_err) => {
-                error!(
-                    "Failed to join hydration task for block {}: {}",
-                    slot, join_err
-                );
-                let mut resp = json_rpc_internal_error_response(id);
-                add_downstream_header(&mut resp, &timings);
-                Ok(resp)
-            }
-        }
-    } else {
-        match hydrate_block_payload(
-            block_payload,
-            fetch_plan.encoding,
-            fetch_plan.transaction_details,
-            fetch_plan.show_rewards,
-            fetch_plan.max_supported_transaction_version,
-        ) {
-            Ok(encoded_block) => {
-                route.success();
-                let mut resp = json_rpc_success_response(id, encoded_block);
-                add_downstream_header(&mut resp, &timings);
-                Ok(resp)
-            }
-            Err(BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
-                version,
-            ))) => {
-                route.rpc_error();
-                let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
-                let mut resp = json_rpc_error_response(
-                    id,
-                    code,
-                    unsupported_transaction_version_message(version),
-                    None,
-                );
-                add_downstream_header(&mut resp, &timings);
-                Ok(resp)
-            }
-            Err(e) => {
-                error!("Failed to hydrate block {}: {}", slot, e);
-                let mut resp = json_rpc_internal_error_response(id);
-                add_downstream_header(&mut resp, &timings);
-                Ok(resp)
-            }
-        }
-    }
+    respond_with_hydrated_block(
+        state.as_ref(),
+        id,
+        &mut route,
+        slot,
+        block_payload,
+        fetch_plan,
+        Some(timings),
+    )
+    .await
 }
 
 pub(crate) async fn handle_get_block_time(
@@ -1450,6 +1465,34 @@ pub(crate) async fn handle_get_block_time(
             route.source_head_cache();
             route.success();
             return Ok(json_rpc_success_response(id, json!(block_time)));
+        }
+    }
+
+    // Disk tier: a covered slot answers conclusively (including a stored NULL
+    // block time); a Skipped marker proves the slot has no block.
+    #[cfg(feature = "disk-cache")]
+    if let Some(disk) = state.disk_cache.as_ref() {
+        route.disk_cache_read();
+        match disk.block_time_for_slot(slot).await {
+            crate::disk_cache::DiskBlockTime::Found(block_time) => {
+                route.source_disk_cache();
+                route.success();
+                return Ok(match block_time {
+                    Some(value) => json_rpc_success_response(id, json!(value)),
+                    None => json_rpc_null_response(id),
+                });
+            }
+            crate::disk_cache::DiskBlockTime::Skipped => {
+                route.source_disk_cache();
+                route.not_found();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32009,
+                    format!("Slot {slot} was skipped, or missing in long-term storage"),
+                    None,
+                ));
+            }
+            crate::disk_cache::DiskBlockTime::NotCovered => {}
         }
     }
 

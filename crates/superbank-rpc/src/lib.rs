@@ -10,6 +10,8 @@ mod metrics;
 mod processing;
 
 mod config;
+#[cfg(feature = "disk-cache")]
+mod disk_cache;
 mod handlers;
 #[cfg(feature = "grpc-head-cache")]
 mod head_cache;

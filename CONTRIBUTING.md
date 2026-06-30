@@ -251,7 +251,7 @@ cargo test --workspace --locked
 CI also exercises optional features for `superbank-rpc`:
 
 ```bash
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope --locked
+cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
 ```
 
 If you change RPC behavior, ClickHouse queries, or response formats:

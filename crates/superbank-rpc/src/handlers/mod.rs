@@ -41,6 +41,8 @@ pub(crate) const ROUTE_SOURCE_NONE: &str = "none";
 pub(crate) const ROUTE_SOURCE_CLICKHOUSE: &str = "clickhouse";
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) const ROUTE_SOURCE_HEAD_CACHE: &str = "head_cache";
+#[cfg(feature = "disk-cache")]
+pub(crate) const ROUTE_SOURCE_DISK_CACHE: &str = "disk_cache";
 pub(crate) const ROUTE_OUTCOME_SUCCESS: &str = "success";
 pub(crate) const ROUTE_OUTCOME_NOT_FOUND: &str = "not_found";
 pub(crate) const ROUTE_OUTCOME_INVALID_PARAMS: &str = "invalid_params";
@@ -54,6 +56,8 @@ const HEADER_X_SUBSCRIPTION_ID: &str = "X-Subscription-ID";
 const HEADER_X_ACCOUNT_ID: &str = "X-Account-ID";
 const SOURCE_TOUCHED_CLICKHOUSE_BIT: u8 = 0b0000_0001;
 const SOURCE_TOUCHED_HEAD_CACHE_BIT: u8 = 0b0000_0010;
+#[cfg(feature = "disk-cache")]
+const SOURCE_TOUCHED_DISK_CACHE_BIT: u8 = 0b0000_0100;
 
 #[derive(Debug, Default)]
 struct ResponseHeaderMetricsContext {
@@ -83,6 +87,12 @@ impl ResponseHeaderMetricsContext {
     fn mark_head_cache_source_touched(&self) {
         self.source_touched_bits
             .fetch_or(SOURCE_TOUCHED_HEAD_CACHE_BIT, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "disk-cache")]
+    fn mark_disk_cache_source_touched(&self) {
+        self.source_touched_bits
+            .fetch_or(SOURCE_TOUCHED_DISK_CACHE_BIT, Ordering::Relaxed);
     }
 
     fn observe_clickhouse_timings(&self, timings: &QueryTimings) {
@@ -165,6 +175,13 @@ fn mark_head_cache_source_touched() {
     }
 }
 
+#[cfg(feature = "disk-cache")]
+fn mark_disk_cache_source_touched() {
+    if let Some(context) = current_response_header_metrics_context() {
+        context.mark_disk_cache_source_touched();
+    }
+}
+
 fn observe_clickhouse_timings(timings: &QueryTimings) {
     if let Some(context) = current_response_header_metrics_context() {
         let has_clickhouse_signal = timings.elapsed_ms > 0
@@ -184,11 +201,20 @@ fn observe_clickhouse_timings(timings: &QueryTimings) {
 fn sources_touched_header_value(source_touched_bits: u8) -> &'static str {
     let clickhouse = (source_touched_bits & SOURCE_TOUCHED_CLICKHOUSE_BIT) != 0;
     let head_cache = (source_touched_bits & SOURCE_TOUCHED_HEAD_CACHE_BIT) != 0;
-    match (head_cache, clickhouse) {
-        (false, false) => "none",
-        (true, false) => "head-cache",
-        (false, true) => "clickhouse",
-        (true, true) => "both",
+    #[cfg(feature = "disk-cache")]
+    let disk_cache = (source_touched_bits & SOURCE_TOUCHED_DISK_CACHE_BIT) != 0;
+    #[cfg(not(feature = "disk-cache"))]
+    let disk_cache = false;
+    match (head_cache, disk_cache, clickhouse) {
+        (false, false, false) => "none",
+        (true, false, false) => "head-cache",
+        (false, false, true) => "clickhouse",
+        // Legacy value, kept for header consumers that predate the disk cache.
+        (true, false, true) => "both",
+        (false, true, false) => "disk-cache",
+        (false, true, true) => "disk-cache,clickhouse",
+        (true, true, false) => "head-cache,disk-cache",
+        (true, true, true) => "all",
     }
 }
 
@@ -272,6 +298,7 @@ pub(crate) struct RouteMetric {
     scope: &'static str,
     source: &'static str,
     head_cache_read: bool,
+    disk_cache_read: bool,
     outcome: &'static str,
     started: Instant,
     timeout: std::time::Duration,
@@ -291,6 +318,7 @@ impl RouteMetric {
             scope,
             source: ROUTE_SOURCE_NONE,
             head_cache_read: false,
+            disk_cache_read: false,
             outcome: ROUTE_OUTCOME_BACKEND_ERROR,
             started: Instant::now(),
             timeout: state.rpc_request_timeout,
@@ -335,6 +363,19 @@ impl RouteMetric {
         self.head_cache_read = true;
     }
 
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn source_disk_cache(&mut self) {
+        mark_disk_cache_source_touched();
+        self.source = ROUTE_SOURCE_DISK_CACHE;
+        self.disk_cache_read = true;
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn disk_cache_read(&mut self) {
+        mark_disk_cache_source_touched();
+        self.disk_cache_read = true;
+    }
+
     pub(crate) fn success(&mut self) {
         self.outcome = ROUTE_OUTCOME_SUCCESS;
     }
@@ -371,6 +412,7 @@ impl Drop for RouteMetric {
             scope: self.scope,
             source: self.source,
             head_cache_read: self.head_cache_read,
+            disk_cache_read: self.disk_cache_read,
             outcome,
             x_endpoint: self.x_endpoint.as_deref(),
             x_rpc_node: self.x_rpc_node.as_deref(),
@@ -735,7 +777,7 @@ async fn dispatch_json_rpc_request(
     let id_for_dispatch = id.clone();
     let params = req.params;
     let method_str = method.as_str();
-    let dispatch = async {
+    let dispatch = Box::pin(async {
         match method_str {
             "getSignaturesForAddress" => {
                 signatures::handle_get_signatures_for_address(state, id_for_dispatch, params).await
@@ -783,7 +825,7 @@ async fn dispatch_json_rpc_request(
                 None,
             )),
         }
-    };
+    });
     let result = if let Some(timeout) = timeout {
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(result) => result,
@@ -946,7 +988,11 @@ async fn handle_single_request(
     let dispatch_request = request.into_dispatch_request();
     let response = metrics::with_request_metric_labels(
         request_metric_labels,
-        dispatch_json_rpc_request(state, dispatch_request, Some(timeout)),
+        Box::pin(dispatch_json_rpc_request(
+            state,
+            dispatch_request,
+            Some(timeout),
+        )),
     )
     .await?;
     Ok(response)
@@ -986,7 +1032,7 @@ async fn execute_batch_requests(
                         response_header_metrics_context,
                         metrics::with_request_metric_labels(
                             request_metric_labels,
-                            dispatch_json_rpc_request(state, dispatch_request, None),
+                            Box::pin(dispatch_json_rpc_request(state, dispatch_request, None)),
                         ),
                     )
                     .await
