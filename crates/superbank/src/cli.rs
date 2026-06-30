@@ -1125,7 +1125,7 @@ fn validate_args(args: &Args) -> Result<()> {
             if let Some(count) = args.rpc_slot_count
                 && count == 0
             {
-                return Err(anyhow!("rpc slot-count must be greater than 0"));
+                return Err(anyhow!("rpc-slot-count must be greater than 0"));
             }
             if args.rpc_max_inflight == 0 {
                 return Err(anyhow!("rpc max-inflight must be greater than 0"));

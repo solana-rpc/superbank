@@ -124,7 +124,7 @@ Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
-- RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `to-slot` or `slot-count`
+- RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
 - Bigtable: `source: bigtable` plus range/slot file and GCP credentials
 - Prometheus metrics: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`, exposed at `/metrics`)
 - Optional static metrics label: `metrics-cluster-label`
