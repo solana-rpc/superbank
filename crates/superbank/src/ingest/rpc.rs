@@ -604,6 +604,22 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
         }
     }
 
+    if let Some(batch) = take_flush_batch(
+        cli_args,
+        &mut transaction_rows,
+        &mut block_rows,
+        last_progress.take(),
+    ) {
+        enqueue_flush(
+            &mut insert_tasks,
+            insert_concurrency,
+            clickhouse.clone(),
+            insert_tables.clone(),
+            batch,
+        )
+        .await?;
+    }
+
     if shutdown_requested {
         let shutdown_count = *shutdown_rx.borrow();
         tokio::select! {
