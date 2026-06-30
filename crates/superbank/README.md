@@ -141,6 +141,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--fumarole-data-plane-tcp-connections` / `FUMAROLE_DATA_PLANE_TCP_CONNECTIONS` (default: 4; maximum: 20)
 - `--fumarole-concurrent-download-limit-per-tcp` / `FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP` (default: 2)
 - `--fumarole-data-channel-capacity` / `FUMAROLE_DATA_CHANNEL_CAPACITY` (default: 4096; Fumarole client data channel capacity)
+- `--fumarole-memory-soft-limit-bytes` / `FUMAROLE_MEMORY_SOFT_LIMIT_BYTES` (default: 25769803776; Fumarole backpressure guard soft limit, set 0 to disable)
 - `--fumarole-commit-interval-secs` / `FUMAROLE_COMMIT_INTERVAL_SECS` (default: 10)
 - `--fumarole-no-commit[=true|false]` / `FUMAROLE_NO_COMMIT` (default: false)
 - `--endpoint` / `DRAGONSMOUTH_ENDPOINT` (required for grpc source)
@@ -203,6 +204,10 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
 - The ingestor writes **distributed** tables by default. Set table names if you want shard-local writes.
 - Fumarole ingest commits consumer-group progress only after pending ClickHouse rows have been flushed. Set `fumarole-no-commit: true` only for diagnostics.
+- Fumarole ingest applies a memory soft limit guard by default. When sampled RSS or Superbank's
+  estimated Fumarole assembler bytes reach `fumarole-memory-soft-limit-bytes`, Superbank stops
+  polling new Fumarole events while it flushes completed rows to ClickHouse, which backpressures
+  upstream downloads instead of letting memory grow unbounded.
 - `fumarole-from-slot` only initializes a Fumarole consumer group when
   `fumarole-create-consumer-group: true`; existing groups resume from the Fumarole-managed offset.
 - `dragonsmouth-from-slot: 0` attempts slot 0; if unavailable, superbank parses the gRPC error to
