@@ -6845,7 +6845,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-solparq"
-version = "0.3.0"
+version = "0.4.1-rc1-sp1"
 dependencies = [
  "anyhow",
  "arrow-array",
