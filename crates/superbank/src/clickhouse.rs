@@ -4,7 +4,7 @@
  */
 
 use anyhow::{Context, Result};
-use clickhouse::{Client as ClickHouseClient, Row};
+use clickhouse::{Client as ClickHouseClient, Row, RowOwned, RowWrite};
 use serde::{Deserialize, Serialize};
 use serde_big_array::Array;
 use serde_bytes::ByteBuf;
@@ -289,26 +289,7 @@ async fn flush_transaction_rows(
     let slot_range = transaction_slot_range(rows);
     let started = Instant::now();
 
-    let result: Result<()> = async {
-        let (insert_client, insert_table) = match split_qualified_table(table) {
-            // clickhouse::Client always sets the "current database" separately; if callers pass a
-            // qualified table (e.g. `default.transactions`), normalize it for the insert API.
-            Some((db, table_name)) => (client.clone().with_database(db), table_name),
-            None => (client.clone(), table),
-        };
-        let mut insert = insert_client
-            .insert::<TransactionRow>(insert_table)
-            .await
-            .with_context(|| format!("prepare insert into {table}"))?;
-
-        for row in rows.iter() {
-            insert.write(row).await.context("write row")?;
-        }
-
-        insert.end().await.context("finish insert")?;
-        Ok(())
-    }
-    .await;
+    let result = insert_rows(client, table, rows).await;
 
     match result {
         Ok(()) => {
@@ -335,24 +316,7 @@ async fn flush_block_rows(
     let slot_range = block_slot_range(rows);
     let started = Instant::now();
 
-    let result: Result<()> = async {
-        let (insert_client, insert_table) = match split_qualified_table(table) {
-            Some((db, table_name)) => (client.clone().with_database(db), table_name),
-            None => (client.clone(), table),
-        };
-        let mut insert = insert_client
-            .insert::<BlockMetadataRow>(insert_table)
-            .await
-            .with_context(|| format!("prepare insert into {table}"))?;
-
-        for row in rows.iter() {
-            insert.write(row).await.context("write row")?;
-        }
-
-        insert.end().await.context("finish insert")?;
-        Ok(())
-    }
-    .await;
+    let result = insert_rows(client, table, rows).await;
 
     match result {
         Ok(()) => {
@@ -381,22 +345,33 @@ async fn flush_entry_rows(
 ) -> Result<()> {
     let row_count = rows.len();
     let slot_range = entry_slot_range(rows);
+    insert_rows(client, table, rows).await?;
+    log_insert_commit(table, row_count, slot_range, progress);
+    rows.clear();
+    Ok(())
+}
+
+async fn insert_rows<T: RowOwned + RowWrite>(
+    client: &ClickHouseClient,
+    table: &str,
+    rows: &[T],
+) -> Result<()> {
     let (insert_client, insert_table) = match split_qualified_table(table) {
+        // clickhouse::Client always sets the "current database" separately; if callers pass a
+        // qualified table (e.g. `default.transactions`), normalize it for the insert API.
         Some((db, table_name)) => (client.clone().with_database(db), table_name),
         None => (client.clone(), table),
     };
     let mut insert = insert_client
-        .insert::<EntryRow>(insert_table)
+        .insert::<T>(insert_table)
         .await
         .with_context(|| format!("prepare insert into {table}"))?;
 
-    for row in rows.iter() {
+    for row in rows {
         insert.write(row).await.context("write row")?;
     }
 
     insert.end().await.context("finish insert")?;
-    log_insert_commit(table, row_count, slot_range, progress);
-    rows.clear();
     Ok(())
 }
 
@@ -523,6 +498,7 @@ mod tests {
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: 2,
             fumarole_data_channel_capacity: 4096,
+            fumarole_memory_soft_limit_bytes: crate::cli::DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES,
             fumarole_commit_interval_secs: 10,
             fumarole_no_commit: false,
             commitment: "finalized".to_string(),
@@ -561,6 +537,7 @@ mod tests {
             clickhouse_url: "http://localhost:8123".to_string(),
             metrics_host: "0.0.0.0".to_string(),
             metrics_port: 9901,
+            health_stale_secs: 120,
             metrics_cluster_label: None,
             clickhouse_database: "default".to_string(),
             clickhouse_user: "default".to_string(),
@@ -594,5 +571,22 @@ mod tests {
         let client = build_clickhouse_client(&args);
 
         assert_eq!(client.get_option("async_insert"), Some("1"));
+    }
+
+    #[test]
+    fn split_qualified_table_accepts_single_database_prefix() {
+        assert_eq!(
+            split_qualified_table("default.transactions"),
+            Some(("default", "transactions"))
+        );
+    }
+
+    #[test]
+    fn split_qualified_table_rejects_ambiguous_names() {
+        assert_eq!(split_qualified_table("transactions"), None);
+        assert_eq!(split_qualified_table(".transactions"), None);
+        assert_eq!(split_qualified_table("default."), None);
+        assert_eq!(split_qualified_table("a.b.c"), None);
+        assert_eq!(split_qualified_table(""), None);
     }
 }

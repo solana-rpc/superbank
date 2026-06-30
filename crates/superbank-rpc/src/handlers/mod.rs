@@ -10,12 +10,15 @@ pub(crate) mod types;
 
 use axum::{
     Json,
-    body::{Bytes, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
+use solana_rpc_client_api::custom_error::{
+    JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE, JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY,
+};
 use std::future::Future;
 use std::io::{self, Write};
 use std::sync::{
@@ -50,6 +53,9 @@ pub(crate) const ROUTE_OUTCOME_RPC_ERROR: &str = "rpc_error";
 pub(crate) const ROUTE_OUTCOME_BACKEND_ERROR: &str = "backend_error";
 pub(crate) const ROUTE_OUTCOME_TIMEOUT: &str = "timeout";
 const ROUTE_HEADER_LABEL_MISSING: &str = "missing";
+const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
+const JSON_RPC_REQUEST_TIMEOUT_CODE: i64 = -32000;
+const JSON_RPC_REQUEST_TIMEOUT_MESSAGE: &str = "Request timeout";
 const HEADER_X_ENDPOINT: &str = "X-Endpoint";
 const HEADER_X_RPC_NODE: &str = "X-RPC-Node";
 const HEADER_X_SUBSCRIPTION_ID: &str = "X-Subscription-ID";
@@ -631,6 +637,67 @@ fn json_rpc_error_value(
     Value::Object(response)
 }
 
+fn is_http_503_eligible_json_rpc_error(code: i64, message: Option<&str>) -> bool {
+    if code == JSON_RPC_INTERNAL_ERROR_CODE {
+        return true;
+    }
+    if code == JSON_RPC_REQUEST_TIMEOUT_CODE {
+        return message == Some(JSON_RPC_REQUEST_TIMEOUT_MESSAGE);
+    }
+    if code == JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY {
+        return true;
+    }
+    if code == JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE {
+        return true;
+    }
+    false
+}
+
+fn json_rpc_response_value_has_http_503_error(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(json_rpc_response_item_has_http_503_error),
+        _ => json_rpc_response_item_has_http_503_error(value),
+    }
+}
+
+fn json_rpc_response_item_has_http_503_error(value: &Value) -> bool {
+    let Some(error) = value.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(code) = error.get("code").and_then(Value::as_i64) else {
+        return false;
+    };
+    let message = error.get("message").and_then(Value::as_str);
+    is_http_503_eligible_json_rpc_error(code, message)
+}
+
+async fn promote_http_status_for_json_rpc_errors(response: Response, enabled: bool) -> Response {
+    if !enabled {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            error!("Failed to read JSON-RPC response body for HTTP status promotion: {err}");
+            return Response::from_parts(parts, Body::empty());
+        }
+    };
+
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) if json_rpc_response_value_has_http_503_error(&value) => {
+            parts.status = StatusCode::SERVICE_UNAVAILABLE;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            error!("Failed to deserialize JSON-RPC response body for HTTP status promotion: {err}");
+        }
+    }
+
+    Response::from_parts(parts, Body::from(bytes))
+}
+
 fn validate_json_rpc_response_value(value: &Value) -> Result<(), &'static str> {
     let response = value
         .as_object()
@@ -833,8 +900,8 @@ async fn dispatch_json_rpc_request(
                 metrics::rpc_timeout(method_label);
                 Ok(json_rpc_error_response(
                     id,
-                    -32000,
-                    "Request timeout",
+                    JSON_RPC_REQUEST_TIMEOUT_CODE as i32,
+                    JSON_RPC_REQUEST_TIMEOUT_MESSAGE,
                     Some(serde_json::json!({
                         "timeoutMs": timeout.as_millis().min(u128::from(u64::MAX)) as u64,
                     })),
@@ -1130,8 +1197,8 @@ async fn handle_batch_request(
                 metrics::batch_rejected("timeout");
                 Ok(json_rpc_error_response(
                     Value::Null,
-                    -32000,
-                    "Request timeout",
+                    JSON_RPC_REQUEST_TIMEOUT_CODE as i32,
+                    JSON_RPC_REQUEST_TIMEOUT_MESSAGE,
                     Some(serde_json::json!({
                         "timeoutMs": timeout.as_millis().min(u128::from(u64::MAX)) as u64,
                     })),
@@ -1147,6 +1214,7 @@ pub(crate) async fn handle_json_rpc_with_headers(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
+    let emit_http_errors = state.emit_http_errors;
     let response_header_metrics_context = Arc::new(ResponseHeaderMetricsContext::default());
     let mut response =
         with_response_header_metrics_context(response_header_metrics_context.clone(), async move {
@@ -1181,6 +1249,7 @@ pub(crate) async fn handle_json_rpc_with_headers(
         })
         .await?;
 
+    response = promote_http_status_for_json_rpc_errors(response, emit_http_errors).await;
     add_response_metrics_headers(&mut response, response_header_metrics_context.snapshot());
     Ok(response)
 }
@@ -1188,7 +1257,10 @@ pub(crate) async fn handle_json_rpc_with_headers(
 #[cfg(test)]
 mod tests {
     use super::{
-        request_header_metric_labels, response_to_json_value, validate_json_rpc_response_value,
+        JSON_RPC_INTERNAL_ERROR_CODE, JSON_RPC_REQUEST_TIMEOUT_CODE,
+        JSON_RPC_REQUEST_TIMEOUT_MESSAGE, is_http_503_eligible_json_rpc_error,
+        json_rpc_response_value_has_http_503_error, request_header_metric_labels,
+        response_to_json_value, validate_json_rpc_response_value,
     };
     use axum::{
         Json,
@@ -1196,8 +1268,97 @@ mod tests {
         response::IntoResponse,
     };
     use serde_json::json;
+    use solana_rpc_client_api::custom_error::{
+        JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+        JSON_RPC_SERVER_ERROR_FILTER_TRANSACTION_NOT_FOUND,
+        JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
+        JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE,
+        JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED, JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY,
+        JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
+    };
 
     use crate::state::MetricsHeaderCaptureConfig;
+
+    #[test]
+    fn http_503_classifier_includes_server_side_codes() {
+        assert!(is_http_503_eligible_json_rpc_error(
+            JSON_RPC_INTERNAL_ERROR_CODE,
+            Some("Internal error"),
+        ));
+        assert!(is_http_503_eligible_json_rpc_error(
+            JSON_RPC_REQUEST_TIMEOUT_CODE,
+            Some(JSON_RPC_REQUEST_TIMEOUT_MESSAGE),
+        ));
+        assert!(is_http_503_eligible_json_rpc_error(
+            JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY,
+            Some("Node is unhealthy"),
+        ));
+        assert!(is_http_503_eligible_json_rpc_error(
+            JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE,
+            Some("Failed to query long-term storage; please try again"),
+        ));
+    }
+
+    #[test]
+    fn http_503_classifier_excludes_client_and_data_condition_codes() {
+        for code in [
+            -32700,
+            -32600,
+            -32601,
+            -32602,
+            JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
+            JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
+            JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+            JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
+            JSON_RPC_SERVER_ERROR_FILTER_TRANSACTION_NOT_FOUND,
+        ] {
+            assert!(
+                !is_http_503_eligible_json_rpc_error(code, Some("not server infrastructure")),
+                "code {code} should not be HTTP-503 eligible"
+            );
+        }
+
+        assert!(!is_http_503_eligible_json_rpc_error(
+            JSON_RPC_REQUEST_TIMEOUT_CODE,
+            Some("Upstream returned -32000"),
+        ));
+    }
+
+    #[test]
+    fn http_503_classifier_checks_batch_items() {
+        let value = json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32602, "message": "Invalid params" }
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": { "code": -32603, "message": "Internal error" }
+            }
+        ]);
+
+        assert!(json_rpc_response_value_has_http_503_error(&value));
+    }
+
+    #[test]
+    fn http_503_classifier_ignores_batch_without_server_side_errors() {
+        let value = json!([
+            {
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32600, "message": "Invalid Request" }
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": { "code": -32601, "message": "Method not found" }
+            }
+        ]);
+
+        assert!(!json_rpc_response_value_has_http_503_error(&value));
+    }
 
     #[test]
     fn request_metric_labels_disabled_when_capture_off() {

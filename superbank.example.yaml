@@ -24,14 +24,15 @@ grpc-slot-notifications: true
 # fumarole-data-plane-tcp-connections: 4
 # fumarole-concurrent-download-limit-per-tcp: 2
 # fumarole-data-channel-capacity: 4096
+# fumarole-memory-soft-limit-bytes: 25769803776 # 24 GiB; set 0 to disable
 # fumarole-commit-interval-secs: 10
 # fumarole-no-commit: false
 
 # RPC source options (required when source is "rpc")
 # rpc-url: "https://api.mainnet-beta.solana.com"
 # rpc-from-slot: 0
-# to-slot: 0
-# slot-count: 1000
+# rpc-to-slot: 0
+# rpc-slot-count: 1000
 # rpc-timeout-secs: 30
 # rpc-retry-backoff-ms: 500
 # rpc-max-inflight: 64
@@ -60,6 +61,8 @@ grpc-slot-notifications: true
 clickhouse-url: "http://localhost:8123"
 metrics-host: "0.0.0.0"
 metrics-port: 9901
+# Seconds without a successful ClickHouse flush before /health returns 503. Set to 0 to disable.
+# health-stale-secs: 120
 # Optional static label added to all ingestor metrics, e.g. the ClickHouse cluster name.
 # metrics-cluster-label: "mainnet-west"
 clickhouse-database: "default"

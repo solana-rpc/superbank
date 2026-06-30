@@ -614,6 +614,23 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
         }
     }
 
+    if let Some(batch) = take_flush_batch(
+        cli_args,
+        &mut transaction_rows,
+        &mut block_rows,
+        last_progress.take(),
+    ) {
+        enqueue_flush(
+            &mut insert_tasks,
+            insert_concurrency,
+            clickhouse.clone(),
+            insert_tables.clone(),
+            batch,
+            retry_config.clone(),
+        )
+        .await?;
+    }
+
     if shutdown_requested {
         let shutdown_count = *shutdown_rx.borrow();
         tokio::select! {
@@ -704,12 +721,12 @@ async fn resolve_rpc_range(
         }
         (Some(_), Some(_)) => {
             return Err(anyhow!(
-                "rpc source requires either --to-slot or --slot-count (not both)"
+                "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
             ));
         }
         (None, None) => {
             return Err(anyhow!(
-                "rpc source requires --to-slot or --slot-count to define a range"
+                "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
             ));
         }
     };
