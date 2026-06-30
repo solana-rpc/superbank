@@ -407,7 +407,7 @@ struct CliArgs {
     )]
     blocks_table: String,
 
-    /// Optional ClickHouse PoH entries table (gRPC live ingest only)
+    /// Optional ClickHouse PoH entries table (Fumarole/gRPC live ingest only)
     #[arg(
         long,
         env = "CLICKHOUSE_ENTRIES_TABLE",

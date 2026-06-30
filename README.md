@@ -126,7 +126,8 @@ Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
 - Bigtable: `source: bigtable` plus range/slot file and GCP credentials
-- Prometheus metrics: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`, exposed at `/metrics`)
+- Prometheus metrics and health: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`,
+  exposed at `/metrics` and `/health`) plus `health-stale-secs`
 - Optional static metrics label: `metrics-cluster-label`
 
 Full option reference: `crates/superbank/README.md`
@@ -251,6 +252,7 @@ cargo build -p superbank -p superbank-rpc
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 cargo test -p superbank-rpc --all-features --locked
 ```

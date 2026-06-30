@@ -85,9 +85,13 @@ Start a local ClickHouse container:
 ```bash
 docker run -d --name clickhouse \
   --ulimit nofile=262144:262144 \
+  -e CLICKHOUSE_SKIP_USER_SETUP=1 \
   -p 8123:8123 -p 9000:9000 \
   clickhouse/clickhouse-server:26.1.2.11
 ```
+
+`CLICKHOUSE_SKIP_USER_SETUP=1` is for local development only. It makes the image's `default` user
+reachable from host-side clients through the mapped ports.
 
 Create the dev tables (single-node) using the schemas under `ddl/local/`:
 
@@ -101,8 +105,9 @@ cat ddl/local/token_owner_activity.sql | docker exec -i clickhouse clickhouse-cl
 ```
 
 Optional:
-- If you configure hot address routing (`CLICKHOUSE_GSFA_HOT_ADDRESSES`), also apply:
-  `cat ddl/local/gsfa_hot.sql | docker exec -i clickhouse clickhouse-client --multiquery`
+- If you configure hot address routing (`CLICKHOUSE_GSFA_HOT_ADDRESSES`), apply
+  `ddl/local/gsfa_nohot.sql` instead of `ddl/local/gsfa.sql`, then apply `ddl/local/gsfa_hot.sql`.
+  Do not apply both `gsfa.sql` and `gsfa_nohot.sql` for the same schema set.
 
 ### Ingestor (`superbank`)
 
@@ -205,19 +210,20 @@ CI enforces PR titles via the `Lint PR title` GitHub Actions check.
 
 Releases are tag-driven and published by GoReleaser:
 
-1. Update the workspace and member versions in the `Cargo.toml` files.
+1. Update the shared package version under `[workspace.package]` in the root `Cargo.toml`.
 2. Create and push an annotated `vX.Y.Z` tag.
-3. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL,
+3. The release workflow verifies that the tag version matches the Cargo package versions.
+4. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL,
    runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite before assets are
    published.
-4. After E2E passes, GoReleaser builds both binaries for Linux amd64 and Linux arm64,
+5. After E2E passes, GoReleaser builds both binaries for Linux amd64 and Linux arm64,
    then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`.
 
 Example:
 
 ```bash
-git tag -a v0.4.0 -m "Release v0.4.0"
-git push origin v0.4.0
+git tag -a v0.5.0 -m "Release v0.5.0"
+git push origin v0.5.0
 ```
 
 Repository settings required (GitHub UI):
@@ -230,6 +236,7 @@ Formatting and linting:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings
 ```
 
 Local optional stricter checks (used by the repo's pre-commit hooks):
@@ -251,7 +258,7 @@ cargo test --workspace --locked
 CI also exercises optional features for `superbank-rpc`:
 
 ```bash
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
+cargo test -p superbank-rpc --all-features --locked
 ```
 
 If you change RPC behavior, ClickHouse queries, or response formats:

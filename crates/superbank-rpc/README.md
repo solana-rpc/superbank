@@ -43,6 +43,9 @@ Notes:
   finalized slot from ClickHouse. ClickHouse query failures or empty block metadata return
   JSON-RPC error `-32005` (`Node is unhealthy`) with `numSlotsBehind: null`; this is not Agave's
   validator-local cluster-tip distance check.
+- Methods that need a latest finalized context return a backend/internal JSON-RPC error when
+  ClickHouse has no finalized slot available. This includes `getSlot`, `getBlockHeight`,
+  `getTransactionCount`, `getLatestBlockhash`, `getSignatureStatuses`, and min-context checks.
 - `getTransaction` accepts the standard Solana config fields plus an optional Superbank extension:
   - `slot`: optional `u64`; when supplied, ClickHouse is queried directly for that exact slot and
     the response is `null` if the signature is not present in that slot.
@@ -330,6 +333,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--rpc-concurrency-limit` | `RPC_CONCURRENCY_LIMIT` | `512` | Maximum number of in-flight HTTP JSON-RPC envelopes. |
 | `--rpc-max-batch-size` | `RPC_MAX_BATCH_SIZE` | `64` | Maximum number of JSON-RPC calls in a single batch envelope. |
 | `--rpc-batch-concurrency-limit` | `RPC_BATCH_CONCURRENCY_LIMIT` | `8` | Max concurrent item execution within one batch envelope. |
+| `--emit-http-errors` | `SUPERBANK_RPC_EMIT_HTTP_ERRORS` | `false` | Return HTTP `503 Service Unavailable` for selected server-side JSON-RPC failures; response bodies are unchanged. |
 | `--host` | `RPC_HOST` | `0.0.0.0` | — |
 | `--port` | `RPC_PORT` | `8899` | — |
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
@@ -499,12 +503,13 @@ Prometheus metrics are served at `/metrics` on `METRICS_HOST:METRICS_PORT`.
 
 Route normalization metric:
 
-- `superbank_rpc_route_total{method,transport,scope,source,head_cache_read,outcome,x_endpoint,x_rpc_node,x_subscription_id,x_account_id}`
+- `superbank_rpc_route_total{method,transport,scope,source,head_cache_read,disk_cache_read,outcome,x_endpoint,x_rpc_node,x_subscription_id,x_account_id}`
   - `method`: supported JSON-RPC method name.
   - `transport`: `tcp|http` (active ClickHouse routing transport policy).
   - `scope`: `distributed|shard_direct` (active ClickHouse routing scope policy).
-  - `source`: `clickhouse|head_cache|none` (source used for the returned response).
+  - `source`: `clickhouse|head_cache|disk_cache|none` (primary source used for the returned response).
   - `head_cache_read`: `true|false` (whether handler read from head cache on that request).
+  - `disk_cache_read`: `true|false` (whether handler read from the RocksDB disk cache on that request).
   - `outcome`: `success|not_found|invalid_params|rpc_error|backend_error|timeout`.
   - `x_endpoint`: omitted when capture is disabled; otherwise `missing|<value>` (`<value>` is the raw `X-Endpoint` header value).
   - `x_rpc_node`: omitted when capture is disabled; otherwise `missing|<value>`.
@@ -525,7 +530,10 @@ Superbank gRPC streaming metrics, emitted only with `--features grpc-streaming`:
 
 Response metric headers:
 
-- `X-Superbank-Sources`: downstream sources consulted while serving the JSON-RPC response (`none`, `clickhouse`, `head-cache`, or `both`). For batch responses, this is the aggregate source footprint across batch items.
+- `X-Superbank-Sources`: downstream sources consulted while serving the JSON-RPC response. Values
+  are `none`, `clickhouse`, `head-cache`, `both` (legacy head-cache + ClickHouse), `disk-cache`,
+  `disk-cache,clickhouse`, `head-cache,disk-cache`, or `all`. For batch responses, this is the
+  aggregate source footprint across batch items.
 - `X-Superbank-Metrics`: aggregate ClickHouse timing/volume counters for the response envelope. Format:
   - `rows_read=<u64>|unknown;rows_returned=<u64>;data_read_bytes=<u64>`
   - For batch responses, counters are aggregated across batch items.

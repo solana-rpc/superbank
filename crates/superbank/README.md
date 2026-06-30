@@ -185,6 +185,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--clickhouse-url` / `CLICKHOUSE_URL` (default: `http://localhost:8123`)
 - `--metrics-host` / `METRICS_HOST` (default: `0.0.0.0`)
 - `--metrics-port` / `METRICS_PORT` (default: `9901`)
+- `--health-stale-secs` / `HEALTH_STALE_SECS` (default: 120; `/health` returns 503 when no successful ClickHouse flush has occurred within this many seconds; set 0 to disable)
 - `--metrics-cluster-label` / `METRICS_CLUSTER_LABEL` (optional static `cluster` label on all metrics)
 - `--clickhouse-database` / `CLICKHOUSE_DATABASE` (default: `default`)
 - `--clickhouse-user` / `CLICKHOUSE_USER` (default: `default`)
@@ -197,11 +198,19 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--blocks-flush-rows` / `BLOCKS_FLUSH_ROWS` (default: 2000)
 - `--flush-interval-secs` / `FLUSH_INTERVAL_SECS` (default: 5)
 - `--flush-every-block` / `FLUSH_EVERY_BLOCK` (default: false; Fumarole/gRPC/Bigtable only)
+- `--insert-max-retries` / `CLICKHOUSE_INSERT_MAX_RETRIES` (default: 5; stateless sources only: gRPC, RPC, Bigtable)
+- `--insert-retry-base-ms` / `CLICKHOUSE_INSERT_RETRY_BASE_MS` (default: 1000; initial ClickHouse insert retry backoff)
+- `--insert-retry-max-ms` / `CLICKHOUSE_INSERT_RETRY_MAX_MS` (default: 30000; maximum ClickHouse insert retry backoff)
 
 ## Notes
 
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
+- `/metrics` includes Fumarole backpressure gauges/counters such as
+  `superbank_ingest_fumarole_memory_soft_limit_bytes`,
+  `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
+  `superbank_ingest_fumarole_rss_bytes`, and
+  `superbank_ingest_fumarole_pressure_flushes_total`.
 - The ingestor writes **distributed** tables by default. Set table names if you want shard-local writes.
 - Fumarole ingest commits consumer-group progress only after pending ClickHouse rows have been flushed. Set `fumarole-no-commit: true` only for diagnostics.
 - Fumarole ingest applies a memory soft limit guard by default. When sampled RSS or Superbank's

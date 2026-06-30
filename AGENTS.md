@@ -22,8 +22,9 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
 - Checks (CI-style; see `.github/workflows/ci.yml`):
   `cargo fmt --all -- --check`
   `cargo clippy --workspace --all-targets --locked -- -D warnings`
+  `cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings`
   `cargo test --workspace --locked`
-  `cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked`
+  `cargo test -p superbank-rpc --all-features --locked`
 - Load tests:
   `scripts/test/run-k6.sh` (or run a single scenario under `tests/k6/scenarios/`)
 
