@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     archive,
-    config::Config,
+    config::{ArchiveLocation, Config},
     metrics::{AppState, ArchiveEvent, KnownDataGap, PublicStatus},
 };
 
@@ -476,6 +476,8 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     let timeline = render_timeline(&status.recent_events);
     let event_rows = render_event_rows(&status.recent_events);
     let gap_rows = render_gap_rows(&status.known_gaps);
+    let archive_tables = render_archive_table_list(status);
+    let output = dashboard_output(config);
     format!(
         r#"<!doctype html>
 <html>
@@ -505,6 +507,9 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     h2 {{ margin: 0 0 14px; font-size: 17px; font-weight: 680; }}
     p {{ margin: 0; color: var(--muted); }}
     code {{ background: #eef3f8; border: 1px solid var(--line); padding: 2px 6px; border-radius: 5px; }}
+    ul {{ margin: 0; padding-left: 18px; }}
+    li {{ margin: 0 0 6px; }}
+    li:last-child {{ margin-bottom: 0; }}
     .pill {{ display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; font-weight: 650; background: var(--panel); border: 1px solid var(--line); }}
     .pill.ok {{ color: var(--green); }}
     .pill.bad {{ color: var(--red); }}
@@ -570,8 +575,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
           <tr><th>Archive types</th><td>{archive_types}</td></tr>
           <tr><th>Location</th><td>{location}</td></tr>
           <tr><th>Output</th><td><code>{output}</code></td></tr>
-          <tr><th>Transactions table</th><td><code>{transactions_table}</code></td></tr>
-          <tr><th>Blocks table</th><td><code>{blocks_table}</code></td></tr>
+          <tr><th>Archive tables</th><td>{archive_tables}</td></tr>
           <tr><th>Archives to keep</th><td>{archives_to_keep}</td></tr>
           <tr><th>Continue from last archive</th><td>{continue_from_last_archive}</td></tr>
           <tr><th>Check interval</th><td>{check_interval} seconds</td></tr>
@@ -599,9 +603,8 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         gap_rows = gap_rows,
         archive_types = html_escape(&archive_types),
         location = html_escape(&format!("{:?}", config.archive_location)),
-        output = html_escape(&config.output_location.display().to_string()),
-        transactions_table = html_escape(&config.transactions_table),
-        blocks_table = html_escape(&config.blocks_table),
+        output = html_escape(&output),
+        archive_tables = archive_tables,
         archives_to_keep = format_u64(config.archives_to_keep as u64),
         continue_from_last_archive = config.continue_from_last_archive,
         check_interval = format_u64(config.archive_check_interval_secs),
@@ -609,6 +612,39 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         archive_errors = format_u64(status.archive_errors),
         last_error = html_escape(status.last_error.as_deref().unwrap_or("none")),
     )
+}
+
+fn render_archive_table_list(status: &PublicStatus) -> String {
+    let Some(report) = &status.last_report else {
+        return "<p>No detected archive tables yet.</p>".to_string();
+    };
+    if report.archive_tables.is_empty() {
+        return "<p>No detected archive tables yet.</p>".to_string();
+    }
+    let items = report
+        .archive_tables
+        .iter()
+        .map(|table| format!("<li><code>{}</code></li>", html_escape(&table.table_name)))
+        .collect::<String>();
+    format!("<ul>{items}</ul>")
+}
+
+fn dashboard_output(config: &Config) -> String {
+    match config.archive_location {
+        ArchiveLocation::Local => config.output_location.display().to_string(),
+        ArchiveLocation::S3 => config
+            .s3
+            .as_ref()
+            .map(|s3| {
+                let bucket_path = s3.bucket_path.trim_matches('/');
+                if bucket_path.is_empty() {
+                    format!("s3://{}", s3.bucket_name)
+                } else {
+                    format!("s3://{}/{}", s3.bucket_name, bucket_path)
+                }
+            })
+            .unwrap_or_else(|| "s3://<missing-config>".to_string()),
+    }
 }
 
 fn render_timeline(events: &[ArchiveEvent]) -> String {

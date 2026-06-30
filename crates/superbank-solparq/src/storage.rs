@@ -160,6 +160,55 @@ pub async fn archive_has_done_marker(
     }
 }
 
+pub async fn remove_archive_bundle(
+    config: &Config,
+    kind: ArchiveKind,
+    archive_id: &str,
+) -> Result<bool> {
+    match config.archive_location {
+        ArchiveLocation::Local => {
+            let bundle_dir = local_bundle_dir(&config.output_location, archive_id);
+            if !bundle_dir.exists() {
+                return Ok(false);
+            }
+            if bundle_dir.is_dir() {
+                fs::remove_dir_all(&bundle_dir)
+                    .await
+                    .with_context(|| format!("remove archive bundle {}", bundle_dir.display()))?;
+            } else {
+                fs::remove_file(&bundle_dir)
+                    .await
+                    .with_context(|| format!("remove archive bundle {}", bundle_dir.display()))?;
+            }
+            Ok(true)
+        }
+        ArchiveLocation::S3 => {
+            let s3 = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| anyhow!("archive-location-type=s3 requires S3 config"))?;
+            let store = build_s3_store(s3)?;
+            let bundle_prefix =
+                ObjectPath::from(format!("{}/{}/", s3_prefix_for_kind(s3, kind), archive_id));
+            let objects = store
+                .list(Some(&bundle_prefix))
+                .try_collect::<Vec<_>>()
+                .await
+                .with_context(|| format!("list S3 archive bundle {}", bundle_prefix.as_ref()))?;
+            let removed = !objects.is_empty();
+            for object in objects {
+                store.delete(&object.location).await.with_context(|| {
+                    format!(
+                        "remove S3 archive bundle object {}",
+                        object.location.as_ref()
+                    )
+                })?;
+            }
+            Ok(removed)
+        }
+    }
+}
+
 pub async fn write_done_marker(
     config: &Config,
     kind: ArchiveKind,
@@ -521,7 +570,7 @@ fn done_file_name(hostname: &str) -> String {
             _ => ch,
         })
         .collect::<String>();
-    format!("{DONE_FILE_PREFIX}.{sanitized}")
+    format!("{DONE_FILE_PREFIX}.{sanitized}.txt")
 }
 
 fn is_done_file_name(file_name: &str) -> bool {

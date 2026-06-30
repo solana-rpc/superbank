@@ -10,7 +10,7 @@ type_epoch_from-slot_to-slot/
   manifest.json
   report.txt
   SHA256SUMS.txt
-  .done.<hostname>
+  .done.<hostname>.txt
   transactions.parquet
   blocks_metadata.parquet
   entries.parquet
@@ -34,10 +34,12 @@ entries for later PoH-specific tooling.
 
 `SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
 bundle. `report.txt` records the run timestamp in Unix and UTC forms plus the
-node `$HOSTNAME`. A `.done.<hostname>` marker is written after the archive data
+node `$HOSTNAME`. A `.done.<hostname>.txt` marker is written after the archive data
 and manifest exist; if a later run sees an archive with any `.done*` marker, it
 treats that archive as already successful and still performs any safe
-ClickHouse cleanup that is due.
+ClickHouse cleanup that is due. If the target archive bundle already exists
+without a `.done*` marker, the incomplete bundle is removed before the archive
+is recreated.
 
 ## Build
 
@@ -177,11 +179,11 @@ The object paths are:
 s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/<table>.parquet
 s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/SHA256SUMS.txt
 s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/manifest.json
-s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/.done.<hostname>
+s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/.done.<hostname>.txt
 ```
 
 `manifest.json` is written after the table objects and checksum file. The final
-success marker is `.done.<hostname>`.
+success marker is `.done.<hostname>.txt`.
 
 ## Read Archives
 

@@ -2,17 +2,21 @@ use std::{fs, process::Command, str::FromStr};
 
 use superbank_solparq::{
     archive::{
-        ArchiveKind, ArchiveRunReport, ArchiveSlotRange, ClickHouseBounds, plan_archive_slot_range,
-        plan_next_archive, safe_delete_archived_data_range,
+        ArchiveKind, ArchiveRunReport, ArchiveRunTable, ArchiveSlotRange, ClickHouseBounds,
+        plan_archive_slot_range, plan_next_archive, safe_delete_archived_data_range,
     },
     clickhouse::{
-        DbTables, S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport, build_delete_sql,
-        build_local_parquet_query, build_s3_archive_sql, build_s3_table_archive_sql,
+        ArchiveTableKind, DbTables, S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport,
+        build_delete_sql, build_local_parquet_query, build_s3_archive_sql,
+        build_s3_table_archive_sql,
     },
     config::{ArchiveLocation, Config},
     metrics::AppState,
     server::{format_utc_timestamp, render_dashboard},
-    storage::{archive_has_done_marker, local_archives_to_delete, write_local_sha256sums},
+    storage::{
+        archive_has_done_marker, local_archives_to_delete, remove_archive_bundle,
+        write_local_sha256sums,
+    },
 };
 
 #[test]
@@ -730,7 +734,7 @@ async fn local_archive_done_marker_is_detected() {
     let archive_id = "custom_0_10-19";
     let bundle_dir = dir.path().join(archive_id);
     fs::create_dir(&bundle_dir).expect("create bundle");
-    fs::write(bundle_dir.join(".done.test-node"), b"done").expect("write done marker");
+    fs::write(bundle_dir.join(".done.test-node.txt"), b"done").expect("write done marker");
     let output_location = dir.path().to_string_lossy().into_owned();
     let config = Config::try_parse_from([
         "superbank-solparq",
@@ -752,6 +756,37 @@ async fn local_archive_done_marker_is_detected() {
             .await
             .expect("done marker check")
     );
+}
+
+#[tokio::test]
+async fn local_archive_bundle_without_done_marker_is_removed_for_overwrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_id = "custom_0_10-19";
+    let bundle_dir = dir.path().join(archive_id);
+    fs::create_dir(&bundle_dir).expect("create bundle");
+    fs::write(bundle_dir.join("manifest.json"), b"partial").expect("write partial archive");
+    let output_location = dir.path().to_string_lossy().into_owned();
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom:10",
+        "--archive-file-output-location",
+        &output_location,
+    ])
+    .expect("valid config");
+
+    let removed = remove_archive_bundle(&config, ArchiveKind::Custom { slots: 10 }, archive_id)
+        .await
+        .expect("remove bundle");
+
+    assert!(removed);
+    assert!(!bundle_dir.exists());
 }
 
 #[tokio::test]
@@ -898,6 +933,7 @@ fn app_state_tracks_db_slots_and_archive_timeline() {
             latest_slot: 427_271_661,
         }),
         destination: "./archives".to_string(),
+        archive_tables: Vec::new(),
         validation: None,
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),
@@ -953,6 +989,18 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
             latest_slot: 1_009,
         }),
         destination: "./".to_string(),
+        archive_tables: vec![
+            ArchiveRunTable {
+                kind: ArchiveTableKind::Transactions,
+                table_name: "transactions".to_string(),
+                required: true,
+            },
+            ArchiveRunTable {
+                kind: ArchiveTableKind::BlocksMetadata,
+                table_name: "blocks_metadata".to_string(),
+                required: true,
+            },
+        ],
         validation: None,
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),
@@ -966,10 +1014,47 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
     assert!(html.contains("2023-11-14 22:13:20 UTC"));
     assert!(html.contains("Archive timeline"));
     assert!(html.contains("Continue from last archive"));
+    assert!(html.contains("Archive tables"));
+    assert!(html.contains("<code>transactions</code>"));
+    assert!(html.contains("<code>blocks_metadata</code>"));
+    assert!(!html.contains("<code>entries</code>"));
     assert!(html.contains("main { max-width: 1534px"));
     assert!(html.contains(".gaps table { min-width: 988px; }"));
     assert!(html.contains("<svg"));
     assert!(html.contains("custom_0_10-1009.parquet"));
+}
+
+#[test]
+fn dashboard_renders_s3_output_location() {
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+        "--archive-location-type",
+        "s3",
+        "--archive-s3-endpoint",
+        "https://s3.example.test",
+        "--archive-s3-bucket-name",
+        "superbank-archives",
+        "--archive-s3-bucket-path",
+        "archives/prod",
+        "--archive-s3-auth-key",
+        "key",
+        "--archive-s3-auth-secret-key",
+        "secret-key",
+    ])
+    .expect("valid config");
+
+    let html = render_dashboard(&config, &AppState::new().public_status());
+
+    assert!(html.contains("<code>s3://superbank-archives/archives/prod</code>"));
 }
 
 #[test]
@@ -985,6 +1070,7 @@ fn archive_report_includes_human_timestamp_and_hostname() {
         archive_slot_end: Some(1_009),
         db_bounds: None,
         destination: "./".to_string(),
+        archive_tables: Vec::new(),
         validation: None,
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),
@@ -1035,6 +1121,7 @@ fn dashboard_renders_skip_reasons_and_known_gap_tables() {
             latest_slot: 110,
         }),
         destination: "./".to_string(),
+        archive_tables: Vec::new(),
         validation: Some(validation),
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),

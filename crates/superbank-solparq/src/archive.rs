@@ -14,7 +14,7 @@ use tokio::fs;
 use tracing::{debug, info};
 
 use crate::{
-    clickhouse::{ArchiveDbTable, ClickHouseClient, DbTables, ValidationReport},
+    clickhouse::{ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, ValidationReport},
     config::Config,
     manifest::{ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, SkippedArchiveTable},
     storage::{self, ArchiveDestination},
@@ -326,9 +326,27 @@ pub struct ArchiveRunReport {
     pub archive_slot_end: Option<u64>,
     pub db_bounds: Option<ClickHouseBounds>,
     pub destination: String,
+    pub archive_tables: Vec<ArchiveRunTable>,
     pub validation: Option<ValidationReport>,
     pub deleted_clickhouse_range: bool,
     pub cleaned_archives: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveRunTable {
+    pub kind: ArchiveTableKind,
+    pub table_name: String,
+    pub required: bool,
+}
+
+impl ArchiveRunTable {
+    fn from_db_table(table: &ArchiveDbTable) -> Self {
+        Self {
+            kind: table.kind,
+            table_name: table.table_name.clone(),
+            required: table.required,
+        }
+    }
 }
 
 impl ArchiveRunReport {
@@ -344,6 +362,7 @@ impl ArchiveRunReport {
             archive_slot_end: None,
             db_bounds: None,
             destination,
+            archive_tables: Vec::new(),
             validation: None,
             deleted_clickhouse_range: false,
             cleaned_archives: Vec::new(),
@@ -381,6 +400,25 @@ impl ArchiveRunReport {
             lines.push(format!("db_slots_available: {}", bounds.slots_available()));
         }
         lines.push(format!("destination: {}", self.destination));
+        if !self.archive_tables.is_empty() {
+            lines.push(format!(
+                "archive_tables: {}",
+                self.archive_tables
+                    .iter()
+                    .map(|table| format!(
+                        "{}:{}:{}",
+                        table.kind.as_str(),
+                        table.table_name,
+                        if table.required {
+                            "required"
+                        } else {
+                            "optional"
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
         lines.push(format!(
             "deleted_clickhouse_range: {}",
             self.deleted_clickhouse_range
@@ -440,6 +478,10 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         "checking ClickHouse archive source"
     );
     let available_archive_tables = client.check_tables(&tables).await?;
+    let archive_tables = available_archive_tables
+        .iter()
+        .map(ArchiveRunTable::from_db_table)
+        .collect::<Vec<_>>();
     let skipped_archive_tables = skipped_archive_tables(&tables, &available_archive_tables);
     info!(
         archive_kind = kind.to_string(),
@@ -449,11 +491,13 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
     );
 
     let Some(bounds) = client.fetch_bounds(&tables.transactions_table).await? else {
-        return Ok(ArchiveRunReport::skipped(
+        let mut report = ArchiveRunReport::skipped(
             kind,
             destination.describe(),
             "no transactions found in ClickHouse",
-        ));
+        );
+        report.archive_tables = archive_tables;
+        return Ok(report);
     };
     info!(
         archive_kind = kind.to_string(),
@@ -502,6 +546,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
     let Some(plan) = plan else {
         let mut report = ArchiveRunReport::skipped(kind, destination.describe(), skipped_reason);
         report.db_bounds = Some(bounds);
+        report.archive_tables = archive_tables;
         return Ok(report);
     };
     let archive_name = plan.archive_id();
@@ -538,6 +583,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             archive_slot_end: Some(plan.end_slot),
             db_bounds: Some(bounds),
             destination: destination.describe(),
+            archive_tables,
             validation: None,
             deleted_clickhouse_range,
             cleaned_archives,
@@ -545,7 +591,6 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
         return Ok(report);
     }
-
     let validation = client
         .validate_archive_range(
             &tables,
@@ -570,6 +615,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
                 "validation warnings require --force-archive in server mode",
             );
             report.db_bounds = Some(bounds);
+            report.archive_tables = archive_tables;
             report.validation = Some(validation);
             return Ok(report);
         }
@@ -580,9 +626,17 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
                 "user declined archive after validation warnings",
             );
             report.db_bounds = Some(bounds);
+            report.archive_tables = archive_tables;
             report.validation = Some(validation);
             return Ok(report);
         }
+    }
+
+    if storage::remove_archive_bundle(config, kind, &archive_name).await? {
+        info!(
+            archive_kind = kind.to_string(),
+            archive_name, "removed existing archive bundle without done marker before recreating"
+        );
     }
 
     info!(
@@ -598,20 +652,6 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             let staging_dir = storage::local_staging_bundle_dir(directory, &archive_name);
             if staging_dir.exists() {
                 fs::remove_dir_all(&staging_dir).await?;
-            }
-            let bundle_dir = storage::local_bundle_dir(directory, &archive_name);
-            if bundle_dir.exists() {
-                info!(
-                    archive_kind = kind.to_string(),
-                    archive_name,
-                    path = bundle_dir.display().to_string(),
-                    "removing archive bundle without done marker before recreating"
-                );
-                if bundle_dir.is_dir() {
-                    fs::remove_dir_all(&bundle_dir).await?;
-                } else {
-                    fs::remove_file(&bundle_dir).await?;
-                }
             }
             fs::create_dir_all(&staging_dir).await?;
             for table in &available_archive_tables {
@@ -729,6 +769,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         archive_slot_end: Some(plan.end_slot),
         db_bounds: Some(bounds),
         destination: destination.describe(),
+        archive_tables,
         validation: Some(validation),
         deleted_clickhouse_range,
         cleaned_archives,
@@ -867,7 +908,22 @@ fn node_hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|hostname| !hostname.trim().is_empty())
+        .or_else(system_hostname)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn system_hostname() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let hostname = String::from_utf8(output.stdout).ok()?;
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        None
+    } else {
+        Some(hostname.to_string())
+    }
 }
 
 pub fn report_path_for_local_archive(directory: PathBuf, archive_name: &str) -> PathBuf {
