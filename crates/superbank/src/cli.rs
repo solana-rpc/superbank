@@ -20,6 +20,8 @@ fn default_bigtable_decode_concurrency() -> usize {
         .unwrap_or(4)
 }
 
+pub(crate) const DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FromSlotSpec {
     Slot(u64),
@@ -172,6 +174,14 @@ struct CliArgs {
     /// Fumarole stream output channel capacity
     #[arg(long, env = "FUMAROLE_DATA_CHANNEL_CAPACITY", default_value_t = 4096)]
     fumarole_data_channel_capacity: usize,
+
+    /// Fumarole memory pressure soft limit in bytes (0 disables)
+    #[arg(
+        long,
+        env = "FUMAROLE_MEMORY_SOFT_LIMIT_BYTES",
+        default_value_t = DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES
+    )]
+    fumarole_memory_soft_limit_bytes: u64,
 
     /// Fumarole offset commit interval (seconds)
     #[arg(long, env = "FUMAROLE_COMMIT_INTERVAL_SECS", default_value_t = 10)]
@@ -434,6 +444,7 @@ pub(crate) struct Args {
     pub(crate) fumarole_data_plane_tcp_connections: u8,
     pub(crate) fumarole_concurrent_download_limit_per_tcp: usize,
     pub(crate) fumarole_data_channel_capacity: usize,
+    pub(crate) fumarole_memory_soft_limit_bytes: u64,
     pub(crate) fumarole_commit_interval_secs: u64,
     pub(crate) fumarole_no_commit: bool,
     pub(crate) commitment: String,
@@ -508,6 +519,8 @@ struct FileConfig {
     fumarole_concurrent_download_limit_per_tcp: Option<usize>,
     #[serde(alias = "fumarole_data_channel_capacity")]
     fumarole_data_channel_capacity: Option<usize>,
+    #[serde(alias = "fumarole_memory_soft_limit_bytes")]
+    fumarole_memory_soft_limit_bytes: Option<u64>,
     #[serde(alias = "fumarole_commit_interval_secs")]
     fumarole_commit_interval_secs: Option<u64>,
     #[serde(alias = "fumarole_no_commit")]
@@ -669,6 +682,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "fumarole_data_channel_capacity",
             cli.fumarole_data_channel_capacity,
             file_config.fumarole_data_channel_capacity,
+        ),
+        fumarole_memory_soft_limit_bytes: merge_value(
+            &matches,
+            "fumarole_memory_soft_limit_bytes",
+            cli.fumarole_memory_soft_limit_bytes,
+            file_config.fumarole_memory_soft_limit_bytes,
         ),
         fumarole_commit_interval_secs: merge_value(
             &matches,
@@ -1369,6 +1388,8 @@ grpc-health-watch-enabled: false
             "3",
             "--fumarole-data-channel-capacity",
             "1234",
+            "--fumarole-memory-soft-limit-bytes",
+            "987654321",
             "--fumarole-commit-interval-secs",
             "2",
         ]);
@@ -1388,6 +1409,7 @@ grpc-health-watch-enabled: false
         assert_eq!(cli.fumarole_data_plane_tcp_connections, 8);
         assert_eq!(cli.fumarole_concurrent_download_limit_per_tcp, 3);
         assert_eq!(cli.fumarole_data_channel_capacity, 1234);
+        assert_eq!(cli.fumarole_memory_soft_limit_bytes, 987654321);
         assert_eq!(cli.fumarole_commit_interval_secs, 2);
     }
 
@@ -1403,6 +1425,7 @@ fumarole-create-consumer-group: true
 fumarole-data-plane-tcp-connections: 8
 fumarole-concurrent-download-limit-per-tcp: 3
 fumarole-data-channel-capacity: 1234
+fumarole-memory-soft-limit-bytes: 987654321
 fumarole-commit-interval-secs: 2
 fumarole-no-commit: true
 "#,
@@ -1423,8 +1446,34 @@ fumarole-no-commit: true
         assert_eq!(config.fumarole_data_plane_tcp_connections, Some(8));
         assert_eq!(config.fumarole_concurrent_download_limit_per_tcp, Some(3));
         assert_eq!(config.fumarole_data_channel_capacity, Some(1234));
+        assert_eq!(config.fumarole_memory_soft_limit_bytes, Some(987654321));
         assert_eq!(config.fumarole_commit_interval_secs, Some(2));
         assert_eq!(config.fumarole_no_commit, Some(true));
+    }
+
+    #[test]
+    fn fumarole_memory_soft_limit_defaults_to_twenty_four_gib() {
+        let matches = CliArgs::command().get_matches_from(["superbank", "--source", "fumarole"]);
+        let cli = CliArgs::from_arg_matches(&matches).expect("parse cli args");
+
+        assert_eq!(
+            cli.fumarole_memory_soft_limit_bytes,
+            DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn cli_accepts_zero_fumarole_memory_soft_limit() {
+        let matches = CliArgs::command().get_matches_from([
+            "superbank",
+            "--source",
+            "fumarole",
+            "--fumarole-memory-soft-limit-bytes",
+            "0",
+        ]);
+        let cli = CliArgs::from_arg_matches(&matches).expect("parse cli args");
+
+        assert_eq!(cli.fumarole_memory_soft_limit_bytes, 0);
     }
 
     #[test]
@@ -1645,6 +1694,7 @@ rpc-from-slot: 456
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: 2,
             fumarole_data_channel_capacity: 4096,
+            fumarole_memory_soft_limit_bytes: DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES,
             fumarole_commit_interval_secs: 10,
             fumarole_no_commit: false,
             commitment: "finalized".to_string(),

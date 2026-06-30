@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solana_commitment_config::CommitmentConfig;
+use solana_sdk::transaction::TransactionVersion;
 use solana_transaction_status::{EncodedTransaction, UiTransactionStatusMeta};
 
 #[derive(Debug, Deserialize, Default)]
@@ -192,6 +193,8 @@ pub(crate) struct TransactionsForAddressFullInfo {
     pub(crate) block_time: Option<i64>,
     pub(crate) transaction: EncodedTransaction,
     pub(crate) meta: Option<UiTransactionStatusMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<TransactionVersion>,
 }
 
 #[derive(Debug, Serialize)]
