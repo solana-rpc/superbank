@@ -4,7 +4,7 @@
  */
 
 use anyhow::{Context, Result};
-use clickhouse::{Client as ClickHouseClient, Row};
+use clickhouse::{Client as ClickHouseClient, Row, RowOwned, RowWrite};
 use serde::{Deserialize, Serialize};
 use serde_big_array::Array;
 use serde_bytes::ByteBuf;
@@ -232,26 +232,7 @@ async fn flush_transaction_rows(
     let slot_range = transaction_slot_range(rows);
     let started = Instant::now();
 
-    let result: Result<()> = async {
-        let (insert_client, insert_table) = match split_qualified_table(table) {
-            // clickhouse::Client always sets the "current database" separately; if callers pass a
-            // qualified table (e.g. `default.transactions`), normalize it for the insert API.
-            Some((db, table_name)) => (client.clone().with_database(db), table_name),
-            None => (client.clone(), table),
-        };
-        let mut insert = insert_client
-            .insert::<TransactionRow>(insert_table)
-            .await
-            .with_context(|| format!("prepare insert into {table}"))?;
-
-        for row in rows.iter() {
-            insert.write(row).await.context("write row")?;
-        }
-
-        insert.end().await.context("finish insert")?;
-        Ok(())
-    }
-    .await;
+    let result = insert_rows(client, table, rows).await;
 
     match result {
         Ok(()) => {
@@ -278,24 +259,7 @@ async fn flush_block_rows(
     let slot_range = block_slot_range(rows);
     let started = Instant::now();
 
-    let result: Result<()> = async {
-        let (insert_client, insert_table) = match split_qualified_table(table) {
-            Some((db, table_name)) => (client.clone().with_database(db), table_name),
-            None => (client.clone(), table),
-        };
-        let mut insert = insert_client
-            .insert::<BlockMetadataRow>(insert_table)
-            .await
-            .with_context(|| format!("prepare insert into {table}"))?;
-
-        for row in rows.iter() {
-            insert.write(row).await.context("write row")?;
-        }
-
-        insert.end().await.context("finish insert")?;
-        Ok(())
-    }
-    .await;
+    let result = insert_rows(client, table, rows).await;
 
     match result {
         Ok(()) => {
@@ -324,22 +288,33 @@ async fn flush_entry_rows(
 ) -> Result<()> {
     let row_count = rows.len();
     let slot_range = entry_slot_range(rows);
+    insert_rows(client, table, rows).await?;
+    log_insert_commit(table, row_count, slot_range, progress);
+    rows.clear();
+    Ok(())
+}
+
+async fn insert_rows<T: RowOwned + RowWrite>(
+    client: &ClickHouseClient,
+    table: &str,
+    rows: &[T],
+) -> Result<()> {
     let (insert_client, insert_table) = match split_qualified_table(table) {
+        // clickhouse::Client always sets the "current database" separately; if callers pass a
+        // qualified table (e.g. `default.transactions`), normalize it for the insert API.
         Some((db, table_name)) => (client.clone().with_database(db), table_name),
         None => (client.clone(), table),
     };
     let mut insert = insert_client
-        .insert::<EntryRow>(insert_table)
+        .insert::<T>(insert_table)
         .await
         .with_context(|| format!("prepare insert into {table}"))?;
 
-    for row in rows.iter() {
+    for row in rows {
         insert.write(row).await.context("write row")?;
     }
 
     insert.end().await.context("finish insert")?;
-    log_insert_commit(table, row_count, slot_range, progress);
-    rows.clear();
     Ok(())
 }
 
@@ -536,5 +511,22 @@ mod tests {
         let client = build_clickhouse_client(&args);
 
         assert_eq!(client.get_option("async_insert"), Some("1"));
+    }
+
+    #[test]
+    fn split_qualified_table_accepts_single_database_prefix() {
+        assert_eq!(
+            split_qualified_table("default.transactions"),
+            Some(("default", "transactions"))
+        );
+    }
+
+    #[test]
+    fn split_qualified_table_rejects_ambiguous_names() {
+        assert_eq!(split_qualified_table("transactions"), None);
+        assert_eq!(split_qualified_table(".transactions"), None);
+        assert_eq!(split_qualified_table("default."), None);
+        assert_eq!(split_qualified_table("a.b.c"), None);
+        assert_eq!(split_qualified_table(""), None);
     }
 }
