@@ -263,7 +263,7 @@ struct CliArgs {
     #[arg(long, env = "RPC_TO_SLOT")]
     rpc_to_slot: Option<u64>,
 
-    /// Slot count for rpc source (exclusive with --to-slot)
+    /// Slot count for rpc source (exclusive with --rpc-to-slot)
     #[arg(long, env = "RPC_SLOT_COUNT")]
     rpc_slot_count: Option<u64>,
 
@@ -1075,12 +1075,12 @@ fn validate_args(args: &Args) -> Result<()> {
             }
             if args.rpc_to_slot.is_some() && args.rpc_slot_count.is_some() {
                 return Err(anyhow!(
-                    "rpc source requires either --to-slot or --slot-count (not both)"
+                    "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
                 ));
             }
             if args.rpc_to_slot.is_none() && args.rpc_slot_count.is_none() {
                 return Err(anyhow!(
-                    "rpc source requires --to-slot or --slot-count to define a range"
+                    "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
                 ));
             }
             if let Some(count) = args.rpc_slot_count

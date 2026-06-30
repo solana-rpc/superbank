@@ -159,8 +159,8 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-url` / `RPC_URL` (required for rpc source)
 - `--rpc-from-slot` / `RPC_FROM_SLOT` (required for rpc source; use `*` for latest slot in
   `blocks_metadata`, `0` to start from earliest available slot)
-- `--to-slot` / `RPC_TO_SLOT` (required for rpc source if `--slot-count` not set)
-- `--slot-count` / `RPC_SLOT_COUNT` (required for rpc source if `--to-slot` not set)
+- `--rpc-to-slot` / `RPC_TO_SLOT` (required for rpc source if `--rpc-slot-count` not set)
+- `--rpc-slot-count` / `RPC_SLOT_COUNT` (required for rpc source if `--rpc-to-slot` not set)
 - `--rpc-timeout-secs` / `RPC_TIMEOUT_SECS` (default: 30)
 - `--rpc-retry-backoff-ms` / `RPC_RETRY_BACKOFF_MS` (default: 500)
 - `--rpc-max-inflight` / `RPC_MAX_INFLIGHT` (default: 64)

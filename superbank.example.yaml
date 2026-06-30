@@ -31,8 +31,8 @@ grpc-slot-notifications: true
 # RPC source options (required when source is "rpc")
 # rpc-url: "https://api.mainnet-beta.solana.com"
 # rpc-from-slot: 0
-# to-slot: 0
-# slot-count: 1000
+# rpc-to-slot: 0
+# rpc-slot-count: 1000
 # rpc-timeout-secs: 30
 # rpc-retry-backoff-ms: 500
 # rpc-max-inflight: 64

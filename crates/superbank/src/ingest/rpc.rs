@@ -710,12 +710,12 @@ async fn resolve_rpc_range(
         }
         (Some(_), Some(_)) => {
             return Err(anyhow!(
-                "rpc source requires either --to-slot or --slot-count (not both)"
+                "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
             ));
         }
         (None, None) => {
             return Err(anyhow!(
-                "rpc source requires --to-slot or --slot-count to define a range"
+                "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
             ));
         }
     };
