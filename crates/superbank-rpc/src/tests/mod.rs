@@ -36,8 +36,8 @@ use crate::clickhouse::{
 };
 use crate::handlers::blocks::{
     handle_get_block, handle_get_block_height, handle_get_block_time, handle_get_blocks,
-    handle_get_blocks_with_limit, handle_get_first_available_block, handle_get_health,
-    handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
+    handle_get_blocks_with_limit, handle_get_epoch_info, handle_get_first_available_block,
+    handle_get_health, handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
     handle_get_transaction_count, handle_minimum_ledger_slot,
 };
 use crate::handlers::handle_json_rpc_with_headers;
@@ -3552,14 +3552,9 @@ async fn get_epoch_info_rejects_unknown_config_field() {
 #[tokio::test]
 async fn get_epoch_info_rejects_more_than_one_param() {
     let state = test_state();
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getEpochInfo",
-        "params": [{}, {}]
-    });
-
-    let response = handle_json_rpc_value(state, &request).await;
+    let response = handle_get_epoch_info(state, json!(1), Some(vec![json!({}), json!({})]))
+        .await
+        .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
     let parsed = parse_json_rpc_response(response).await;
     assert_eq!(parsed.error.expect("invalid params").code, -32602);
@@ -3622,6 +3617,47 @@ fn epoch_info_serializes_with_solana_field_names() {
     })
     .expect("serialize");
     assert_eq!(null_count.get("transactionCount"), Some(&Value::Null));
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_epoch_info_confirmed_uses_head_overlay_context() {
+    // ClickHouse is at slot 95; the head cache has a newer confirmed slot 105.
+    // A confirmed getEpochInfo must resolve the context slot to 105 (head), not
+    // 95 (ClickHouse) — proven here via the minContextSlot boundary. Mirrors
+    // get_transaction_count_min_context_uses_head_overlay_context.
+    let cache = Arc::new(HeadCache::new(32, 1024));
+    cache.note_block_metadata(head_cache_metadata(100, 95, 3));
+    cache.note_block_metadata(head_cache_metadata(105, 100, 5));
+    cache.note_slot_commitment(105, CommitmentLevel::Confirmed);
+
+    let state = test_state_with_head_cache_and_clickhouse_url(cache, "http://127.0.0.1:1");
+    state.latest_slot_cache.value.store(95, Ordering::Relaxed);
+    state
+        .latest_slot_cache
+        .last_updated_ms
+        .store(current_time_millis(), Ordering::Relaxed);
+
+    let response = handle_get_epoch_info(
+        state,
+        json!(1),
+        Some(vec![
+            json!({ "commitment": "confirmed", "minContextSlot": 106 }),
+        ]),
+    )
+    .await
+    .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    let err = parsed.error.expect("error present");
+    assert_eq!(
+        err.code,
+        JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32
+    );
+    assert_eq!(
+        err.data.and_then(|d| d.get("contextSlot").cloned()),
+        Some(json!(105u64))
+    );
 }
 
 #[tokio::test]

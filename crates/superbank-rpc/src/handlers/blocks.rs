@@ -703,11 +703,16 @@ pub(crate) async fn handle_get_epoch_info(
         }
     }
 
-    // Resolve a single ClickHouse-resident context slot and derive every field
-    // from it, so absoluteSlot, blockHeight and transactionCount form a
-    // consistent snapshot. Epoch math assumes the default schedule with no
-    // warmup, matching the rest of the codebase (see getInflationReward).
-    let slot = match state
+    // Resolve the context slot honoring the requested commitment. Start from the
+    // latest ClickHouse-ingested slot, then, when the head cache holds a newer
+    // slot that meets the commitment (e.g. a confirmed slot not yet in
+    // ClickHouse), derive the snapshot from it instead. This keeps getEpochInfo
+    // consistent with getSlot/getBlockHeight/getTransactionCount, which all use
+    // the head cache for confirmed reads. With the head cache off, every field
+    // resolves to the finalized ClickHouse slot. Reuses TransactionCountPlan
+    // since the slot/count resolution is identical. Epoch math assumes the
+    // default schedule with no warmup, matching getInflationReward.
+    let clickhouse_slot = match state
         .latest_slot_cache
         .get_or_refresh(&state.clickhouse)
         .await
@@ -719,59 +724,143 @@ pub(crate) async fn handle_get_epoch_info(
             return Ok(json_rpc_internal_error_response(id));
         }
     };
-    route.source_clickhouse();
+
+    #[cfg(feature = "grpc-head-cache")]
+    let plan = {
+        let mut plan = TransactionCountPlan::ClickHouseThroughSlot {
+            context_slot: clickhouse_slot,
+        };
+        if let Some(cache) = state.head_cache.as_ref()
+            && let Some(overlay) =
+                cache.transaction_count_overlay_at_least(commitment.commitment, clickhouse_slot)
+            && overlay.context_slot > clickhouse_slot
+        {
+            plan = TransactionCountPlan::ClickHouseBeforeSlotPlusHead {
+                context_slot: overlay.context_slot,
+                clickhouse_before_slot: overlay.start_slot,
+                head_transaction_count: overlay.transaction_count,
+            };
+        }
+        plan
+    };
+    #[cfg(not(feature = "grpc-head-cache"))]
+    let plan = TransactionCountPlan::ClickHouseThroughSlot {
+        context_slot: clickhouse_slot,
+    };
+
+    let context_slot = plan.context_slot();
+    match &plan {
+        TransactionCountPlan::ClickHouseThroughSlot { .. } => route.source_clickhouse(),
+        #[cfg(feature = "grpc-head-cache")]
+        TransactionCountPlan::ClickHouseBeforeSlotPlusHead { .. } => route.source_head_cache(),
+    }
 
     if let Some(min_context_slot) = config.min_context_slot
-        && slot < min_context_slot
+        && context_slot < min_context_slot
     {
         route.rpc_error();
         return Ok(json_rpc_error_response(
             id,
             JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32,
             "Minimum context slot has not been reached",
-            Some(json!({ "contextSlot": slot })),
+            Some(json!({ "contextSlot": context_slot })),
         ));
     }
 
-    let block_height = match state
-        .latest_block_height_cache
-        .get_or_refresh(slot, &state.clickhouse)
-        .await
-    {
-        Ok(Some(height)) => height,
-        Ok(None) => {
-            route.source_none();
-            error!(slot, "Block height unavailable for getEpochInfo");
-            return Ok(json_rpc_internal_error_response(id));
-        }
-        Err(e) => {
-            metrics::backend_error("get_block_height_by_slot");
-            error!(
-                "Failed to query ClickHouse block height at slot {} for getEpochInfo: {}",
-                slot, e
-            );
-            return Ok(json_rpc_internal_error_response(id));
-        }
-    };
-
-    let (transaction_count, timings) =
-        match state.clickhouse.get_transaction_count_by_slot(slot).await {
-            Ok(result) => result,
-            Err(e) => {
-                metrics::backend_error("get_transaction_count_by_slot");
+    // Block height for the resolved slot: the ClickHouse path reads it from the
+    // block-height cache; the head path reads it from the head cache, since a
+    // confirmed slot isn't ingested into ClickHouse yet (getBlockHeight pattern).
+    let block_height = match &plan {
+        TransactionCountPlan::ClickHouseThroughSlot { .. } => match state
+            .latest_block_height_cache
+            .get_or_refresh(context_slot, &state.clickhouse)
+            .await
+        {
+            Ok(Some(height)) => height,
+            Ok(None) => {
+                route.source_none();
                 error!(
-                    "Failed to query ClickHouse transaction count at slot {} for getEpochInfo: {}",
-                    slot, e
+                    slot = context_slot,
+                    "Block height unavailable for getEpochInfo"
                 );
                 return Ok(json_rpc_internal_error_response(id));
             }
-        };
+            Err(e) => {
+                metrics::backend_error("get_block_height_by_slot");
+                error!(
+                    "Failed to query ClickHouse block height at slot {} for getEpochInfo: {}",
+                    context_slot, e
+                );
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        },
+        #[cfg(feature = "grpc-head-cache")]
+        TransactionCountPlan::ClickHouseBeforeSlotPlusHead { .. } => match state
+            .head_cache
+            .as_ref()
+            .and_then(|cache| cache.latest_block_height_at_least(commitment.commitment))
+        {
+            Some(height) => height,
+            None => {
+                route.source_none();
+                error!(
+                    slot = context_slot,
+                    "Head block height unavailable for getEpochInfo"
+                );
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        },
+    };
+
+    // Transaction count through the resolved slot, following getTransactionCount.
+    let (transaction_count, timings) = match plan {
+        TransactionCountPlan::ClickHouseThroughSlot { context_slot } => {
+            match state
+                .clickhouse
+                .get_transaction_count_by_slot(context_slot)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    metrics::backend_error("get_transaction_count_by_slot");
+                    error!(
+                        "Failed to query ClickHouse transaction count at slot {} for getEpochInfo: {}",
+                        context_slot, e
+                    );
+                    return Ok(json_rpc_internal_error_response(id));
+                }
+            }
+        }
+        #[cfg(feature = "grpc-head-cache")]
+        TransactionCountPlan::ClickHouseBeforeSlotPlusHead {
+            context_slot,
+            clickhouse_before_slot,
+            head_transaction_count,
+        } => match state
+            .clickhouse
+            .get_transaction_count_before_slot(clickhouse_before_slot)
+            .await
+        {
+            Ok((base_transaction_count, timings)) => (
+                base_transaction_count.saturating_add(head_transaction_count),
+                timings,
+            ),
+            Err(e) => {
+                metrics::backend_error("get_transaction_count_before_slot");
+                error!(
+                    "Failed to query ClickHouse transaction count before slot {} for context slot {} (getEpochInfo): {}",
+                    clickhouse_before_slot, context_slot, e
+                );
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        },
+    };
 
     let epoch_info = EpochInfo {
-        absolute_slot: slot,
+        absolute_slot: context_slot,
         block_height,
-        epoch: slot / DEFAULT_SLOTS_PER_EPOCH,
-        slot_index: slot % DEFAULT_SLOTS_PER_EPOCH,
+        epoch: context_slot / DEFAULT_SLOTS_PER_EPOCH,
+        slot_index: context_slot % DEFAULT_SLOTS_PER_EPOCH,
         slots_in_epoch: DEFAULT_SLOTS_PER_EPOCH,
         transaction_count: Some(transaction_count),
     };
