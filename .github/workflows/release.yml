@@ -63,6 +63,33 @@ jobs:
       - name: Export Rust version
         run: echo "RUST_VERSION=$(rustc --version)" >> "${GITHUB_ENV}"
 
+      - name: Verify tag matches Cargo package versions
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          metadata_file="${RUNNER_TEMP}/cargo-metadata.json"
+          cargo metadata --format-version=1 --locked --no-deps > "${metadata_file}"
+          python3 - "$tag_version" "${metadata_file}" <<'PY'
+          import json
+          import sys
+
+          expected = sys.argv[1]
+          metadata_path = sys.argv[2]
+          packages = {"superbank-workspace", "superbank", "superbank-rpc"}
+          with open(metadata_path, encoding="utf-8") as f:
+              metadata = json.load(f)
+
+          mismatches = [
+              (package["name"], package["version"])
+              for package in metadata["packages"]
+              if package["name"] in packages and package["version"] != expected
+          ]
+          if mismatches:
+              for name, version in mismatches:
+                  print(f"{name} version {version} does not match release tag v{expected}", file=sys.stderr)
+              sys.exit(1)
+          PY
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
         with:

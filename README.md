@@ -30,6 +30,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Serve Solana-compatible JSON-RPC backed by ClickHouse (`crates/superbank-rpc`)
 - Archive Superbank ClickHouse table bundles to Parquet (`crates/superbank-solparq`)
 - Inspect and read superbank-solparq Parquet archives from local files or S3 (`superbank-solparq-read` binary in `crates/superbank-solparq`)
+- Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
 ## Architecture
@@ -126,9 +127,10 @@ Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
-- RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `to-slot` or `slot-count`
+- RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
 - Bigtable: `source: bigtable` plus range/slot file and GCP credentials
-- Prometheus metrics: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`, exposed at `/metrics`)
+- Prometheus metrics and health: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`,
+  exposed at `/metrics` and `/health`) plus `health-stale-secs`
 - Optional static metrics label: `metrics-cluster-label`
 
 Full option reference: `crates/superbank/README.md`
@@ -254,8 +256,9 @@ cargo build -p superbank -p superbank-rpc -p superbank-solparq
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
+cargo test -p superbank-rpc --all-features --locked
 ```
 
 Local RPC helper:

@@ -37,6 +37,7 @@ pub(crate) struct AppState {
     pub(crate) latest_slot_cache: LatestSlotCache,
     pub(crate) latest_block_height_cache: LatestBlockHeightCache,
     pub(crate) rpc_request_timeout: Duration,
+    pub(crate) emit_http_errors: bool,
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
     #[cfg(feature = "grpc-head-cache")]
@@ -87,6 +88,11 @@ fn commitment_label(commitment: CommitmentLevel) -> &'static str {
     }
 }
 
+enum CacheRefreshRole {
+    Leader(Arc<Notify>),
+    Waiter(OwnedNotified),
+}
+
 pub(crate) struct LatestSlotCache {
     ttl: Duration,
     pub(crate) value: AtomicU64,
@@ -116,11 +122,7 @@ impl LatestSlotCache {
                 return Ok(cached);
             }
 
-            let (is_leader, leader_notify, wait_notified): (
-                bool,
-                Option<Arc<Notify>>,
-                Option<OwnedNotified>,
-            ) = {
+            let role = {
                 let mut guard = self.refresh_lock.lock().await;
                 let now_ms = current_time_millis();
                 let last_ms = self.last_updated_ms.load(Ordering::Relaxed);
@@ -130,46 +132,49 @@ impl LatestSlotCache {
                 }
 
                 if let Some(inflight) = guard.as_ref() {
-                    (
-                        false,
-                        None,
-                        // Create the wait future while holding the lock so we can't miss a notify.
-                        Some(inflight.clone().notified_owned()),
-                    )
+                    // Create the wait future while holding the lock so we can't miss a notify.
+                    CacheRefreshRole::Waiter(inflight.clone().notified_owned())
                 } else {
                     let inflight = Arc::new(Notify::new());
                     *guard = Some(inflight.clone());
-                    (true, Some(inflight), None)
+                    CacheRefreshRole::Leader(inflight)
                 }
             };
 
-            if is_leader {
-                let notify = leader_notify.expect("leader must have notify");
-                let result = clickhouse.get_latest_finalized_slot().await;
-                match result {
-                    Ok(slot_opt) => {
-                        let latest = slot_opt.unwrap_or(0);
-                        self.value.store(latest, Ordering::Relaxed);
-                        self.last_updated_ms
-                            .store(current_time_millis(), Ordering::Relaxed);
+            match role {
+                CacheRefreshRole::Leader(notify) => {
+                    let fetch_result = async {
+                        let slot_opt = clickhouse.get_latest_finalized_slot().await?;
+                        slot_opt.ok_or_else(|| {
+                            ProcessingError::database_msg(
+                                "no finalized slot in ClickHouse — node may not be synced yet",
+                            )
+                        })
                     }
-                    Err(err) => {
-                        let mut guard = self.refresh_lock.lock().await;
-                        *guard = None;
-                        notify.notify_waiters();
-                        return Err(err);
+                    .await;
+
+                    match fetch_result {
+                        Ok(latest) => {
+                            self.value.store(latest, Ordering::Relaxed);
+                            self.last_updated_ms
+                                .store(current_time_millis(), Ordering::Relaxed);
+                            let mut guard = self.refresh_lock.lock().await;
+                            *guard = None;
+                            notify.notify_waiters();
+                            return Ok(latest);
+                        }
+                        Err(err) => {
+                            let mut guard = self.refresh_lock.lock().await;
+                            *guard = None;
+                            notify.notify_waiters();
+                            return Err(err);
+                        }
                     }
                 }
-
-                let mut guard = self.refresh_lock.lock().await;
-                *guard = None;
-                notify.notify_waiters();
-                let cached = self.value.load(Ordering::Relaxed);
-                return Ok(cached);
+                CacheRefreshRole::Waiter(notified) => {
+                    notified.await;
+                }
             }
-
-            let notified = wait_notified.expect("waiters must have notified future");
-            notified.await;
         }
     }
 }
@@ -215,11 +220,7 @@ impl LatestBlockHeightCache {
                 return Ok((cached != Self::NONE_SENTINEL).then_some(cached));
             }
 
-            let (is_leader, leader_notify, wait_notified): (
-                bool,
-                Option<Arc<Notify>>,
-                Option<OwnedNotified>,
-            ) = {
+            let role = {
                 let mut guard = self.refresh_lock.lock().await;
                 let now_ms = current_time_millis();
                 let last_ms = self.last_updated_ms.load(Ordering::Acquire);
@@ -233,49 +234,48 @@ impl LatestBlockHeightCache {
                 }
 
                 if let Some(inflight) = guard.as_ref() {
-                    (
-                        false,
-                        None,
-                        // Create the wait future while holding the lock so we can't miss a notify.
-                        Some(inflight.clone().notified_owned()),
-                    )
+                    // Create the wait future while holding the lock so we can't miss a notify.
+                    CacheRefreshRole::Waiter(inflight.clone().notified_owned())
                 } else {
                     let inflight = Arc::new(Notify::new());
                     *guard = Some(inflight.clone());
-                    (true, Some(inflight), None)
+                    CacheRefreshRole::Leader(inflight)
                 }
             };
 
-            if is_leader {
-                let notify = leader_notify.expect("leader must have notify");
-                let result = clickhouse.get_blockhash_height_by_slot(slot).await.map(
-                    |(row_opt, timings)| (row_opt.and_then(|(_blockhash, height)| height), timings),
-                );
-                match result {
-                    Ok((height_opt, _timings)) => {
-                        let stored = height_opt.unwrap_or(Self::NONE_SENTINEL);
-                        self.value.store(stored, Ordering::Relaxed);
-                        self.slot.store(slot, Ordering::Relaxed);
-                        self.last_updated_ms
-                            .store(current_time_millis(), Ordering::Release);
+            match role {
+                CacheRefreshRole::Leader(notify) => {
+                    let result = clickhouse.get_blockhash_height_by_slot(slot).await.map(
+                        |(row_opt, timings)| {
+                            (row_opt.and_then(|(_blockhash, height)| height), timings)
+                        },
+                    );
+                    match result {
+                        Ok((height_opt, _timings)) => {
+                            let stored = height_opt.unwrap_or(Self::NONE_SENTINEL);
+                            self.value.store(stored, Ordering::Relaxed);
+                            self.slot.store(slot, Ordering::Relaxed);
+                            self.last_updated_ms
+                                .store(current_time_millis(), Ordering::Release);
+                        }
+                        Err(err) => {
+                            let mut guard = self.refresh_lock.lock().await;
+                            *guard = None;
+                            notify.notify_waiters();
+                            return Err(err);
+                        }
                     }
-                    Err(err) => {
-                        let mut guard = self.refresh_lock.lock().await;
-                        *guard = None;
-                        notify.notify_waiters();
-                        return Err(err);
-                    }
+
+                    let mut guard = self.refresh_lock.lock().await;
+                    *guard = None;
+                    notify.notify_waiters();
+                    let cached = self.value.load(Ordering::Relaxed);
+                    return Ok((cached != Self::NONE_SENTINEL).then_some(cached));
                 }
-
-                let mut guard = self.refresh_lock.lock().await;
-                *guard = None;
-                notify.notify_waiters();
-                let cached = self.value.load(Ordering::Relaxed);
-                return Ok((cached != Self::NONE_SENTINEL).then_some(cached));
+                CacheRefreshRole::Waiter(notified) => {
+                    notified.await;
+                }
             }
-
-            let notified = wait_notified.expect("waiters must have notified future");
-            notified.await;
         }
     }
 }

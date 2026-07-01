@@ -12,6 +12,8 @@ mod processing;
 mod config;
 #[cfg(feature = "disk-cache")]
 mod disk_cache;
+#[cfg(feature = "grpc-streaming")]
+mod grpc;
 mod handlers;
 #[cfg(feature = "grpc-head-cache")]
 mod head_cache;

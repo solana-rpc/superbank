@@ -4,12 +4,13 @@
  */
 
 use anyhow::{Context, Result};
-use clickhouse::{Client as ClickHouseClient, Row};
+use clickhouse::{Client as ClickHouseClient, Row, RowOwned, RowWrite};
 use serde::{Deserialize, Serialize};
 use serde_big_array::Array;
 use serde_bytes::ByteBuf;
-use std::time::Instant;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 use crate::cli::Args;
 use crate::metrics;
@@ -214,6 +215,62 @@ pub(crate) async fn flush_buffers(
     Ok(())
 }
 
+pub(crate) struct RetryConfig {
+    pub(crate) max_retries: u32,
+    pub(crate) base_ms: u64,
+    pub(crate) max_ms: u64,
+}
+
+pub(crate) async fn flush_buffers_with_retry(
+    client: &ClickHouseClient,
+    tables: &InsertTables,
+    transaction_rows: &mut Vec<TransactionRow>,
+    block_rows: &mut Vec<BlockMetadataRow>,
+    entry_rows: &mut Vec<EntryRow>,
+    progress: Option<ProgressSnapshot>,
+    retry: &RetryConfig,
+) -> Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match flush_buffers(
+            client,
+            tables,
+            transaction_rows,
+            block_rows,
+            entry_rows,
+            progress,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < retry.max_retries => {
+                attempt += 1;
+                let delay_ms = retry
+                    .base_ms
+                    .saturating_mul(1u64 << (attempt - 1).min(62))
+                    .min(retry.max_ms);
+                warn!(
+                    attempt,
+                    max_retries = retry.max_retries,
+                    delay_ms,
+                    error = %err,
+                    "ClickHouse insert failed, retrying"
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(err) => {
+                warn!(
+                    attempt,
+                    max_retries = retry.max_retries,
+                    error = %err,
+                    "ClickHouse insert failed, giving up"
+                );
+                return Err(err);
+            }
+        }
+    }
+}
+
 fn split_qualified_table(name: &str) -> Option<(&str, &str)> {
     let (db, table) = name.split_once('.')?;
     if db.is_empty() || table.is_empty() || table.contains('.') {
@@ -232,26 +289,7 @@ async fn flush_transaction_rows(
     let slot_range = transaction_slot_range(rows);
     let started = Instant::now();
 
-    let result: Result<()> = async {
-        let (insert_client, insert_table) = match split_qualified_table(table) {
-            // clickhouse::Client always sets the "current database" separately; if callers pass a
-            // qualified table (e.g. `default.transactions`), normalize it for the insert API.
-            Some((db, table_name)) => (client.clone().with_database(db), table_name),
-            None => (client.clone(), table),
-        };
-        let mut insert = insert_client
-            .insert::<TransactionRow>(insert_table)
-            .await
-            .with_context(|| format!("prepare insert into {table}"))?;
-
-        for row in rows.iter() {
-            insert.write(row).await.context("write row")?;
-        }
-
-        insert.end().await.context("finish insert")?;
-        Ok(())
-    }
-    .await;
+    let result = insert_rows(client, table, rows).await;
 
     match result {
         Ok(()) => {
@@ -278,24 +316,7 @@ async fn flush_block_rows(
     let slot_range = block_slot_range(rows);
     let started = Instant::now();
 
-    let result: Result<()> = async {
-        let (insert_client, insert_table) = match split_qualified_table(table) {
-            Some((db, table_name)) => (client.clone().with_database(db), table_name),
-            None => (client.clone(), table),
-        };
-        let mut insert = insert_client
-            .insert::<BlockMetadataRow>(insert_table)
-            .await
-            .with_context(|| format!("prepare insert into {table}"))?;
-
-        for row in rows.iter() {
-            insert.write(row).await.context("write row")?;
-        }
-
-        insert.end().await.context("finish insert")?;
-        Ok(())
-    }
-    .await;
+    let result = insert_rows(client, table, rows).await;
 
     match result {
         Ok(()) => {
@@ -324,22 +345,33 @@ async fn flush_entry_rows(
 ) -> Result<()> {
     let row_count = rows.len();
     let slot_range = entry_slot_range(rows);
+    insert_rows(client, table, rows).await?;
+    log_insert_commit(table, row_count, slot_range, progress);
+    rows.clear();
+    Ok(())
+}
+
+async fn insert_rows<T: RowOwned + RowWrite>(
+    client: &ClickHouseClient,
+    table: &str,
+    rows: &[T],
+) -> Result<()> {
     let (insert_client, insert_table) = match split_qualified_table(table) {
+        // clickhouse::Client always sets the "current database" separately; if callers pass a
+        // qualified table (e.g. `default.transactions`), normalize it for the insert API.
         Some((db, table_name)) => (client.clone().with_database(db), table_name),
         None => (client.clone(), table),
     };
     let mut insert = insert_client
-        .insert::<EntryRow>(insert_table)
+        .insert::<T>(insert_table)
         .await
         .with_context(|| format!("prepare insert into {table}"))?;
 
-    for row in rows.iter() {
+    for row in rows {
         insert.write(row).await.context("write row")?;
     }
 
     insert.end().await.context("finish insert")?;
-    log_insert_commit(table, row_count, slot_range, progress);
-    rows.clear();
     Ok(())
 }
 
@@ -518,6 +550,9 @@ mod tests {
             blocks_flush_rows: 2_000,
             flush_interval_secs: 5,
             flush_every_block: false,
+            insert_max_retries: 5,
+            insert_retry_base_ms: 1_000,
+            insert_retry_max_ms: 30_000,
         }
     }
 
@@ -536,5 +571,22 @@ mod tests {
         let client = build_clickhouse_client(&args);
 
         assert_eq!(client.get_option("async_insert"), Some("1"));
+    }
+
+    #[test]
+    fn split_qualified_table_accepts_single_database_prefix() {
+        assert_eq!(
+            split_qualified_table("default.transactions"),
+            Some(("default", "transactions"))
+        );
+    }
+
+    #[test]
+    fn split_qualified_table_rejects_ambiguous_names() {
+        assert_eq!(split_qualified_table("transactions"), None);
+        assert_eq!(split_qualified_table(".transactions"), None);
+        assert_eq!(split_qualified_table("default."), None);
+        assert_eq!(split_qualified_table("a.b.c"), None);
+        assert_eq!(split_qualified_table(""), None);
     }
 }

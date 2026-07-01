@@ -244,15 +244,11 @@ impl HeadCache {
             let mut current_slot = tip;
             let mut transaction_count = 0u64;
 
-            loop {
-                let Some(metadata) = self
-                    .slot_block_metadata
-                    .get(&current_slot)
-                    .map(|metadata| metadata.clone())
-                else {
-                    break;
-                };
-
+            while let Some(metadata) = self
+                .slot_block_metadata
+                .get(&current_slot)
+                .map(|metadata| metadata.clone())
+            {
                 transaction_count =
                     transaction_count.saturating_add(metadata.executed_transaction_count);
 
@@ -876,6 +872,7 @@ mod tests {
             slot,
             slot_idx: 0,
             block_time: None,
+            is_vote: false,
             tx_version: None,
             tx_signatures: vec![[0u8; 64]],
             tx_num_required_signatures: 1,

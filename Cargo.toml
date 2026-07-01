@@ -1,10 +1,25 @@
 [package]
 name = "superbank-workspace"
-version = "0.3.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[workspace.package]
+version = "0.5.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-authors = ["Triton One Limited", "Miles Smith <52319902+notwedtm@users.noreply.github.com>", "Daniel Camargo <67828229+dancamarg0@users.noreply.github.com>", "Augustin Cheron <1165445+augustin-cheron@users.noreply.github.com>"]
-publish = false
+authors = [
+    "Triton One Limited",
+    "Miles 'wedtm' Smith <52319902+notwedtm@users.noreply.github.com>",
+    "Daniel Camargo <67828229+dancamarg0@users.noreply.github.com>",
+    "Augustin Cheron <1165445+augustin-cheron@users.noreply.github.com>",
+    "Henry Adenuga <39364502+Mctursh@users.noreply.github.com>",
+    "Rishav <68805388+rishavmehra@users.noreply.github.com>",
+    "TechieGhost <116256043+gamandeepsingh@users.noreply.github.com>",
+    "aspnxdd <43625217+aspnxdd@users.noreply.github.com>",
+]
 
 [workspace]
 members = [

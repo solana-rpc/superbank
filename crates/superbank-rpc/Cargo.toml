@@ -1,9 +1,9 @@
 [package]
 name = "superbank-rpc"
-version = "0.3.0"
-edition = "2024"
-license = "AGPL-3.0-only"
-authors = ["Triton One Limited", "Miles Smith <52319902+notwedtm@users.noreply.github.com>", "Daniel Camargo <67828229+dancamarg0@users.noreply.github.com>", "Augustin Cheron <1165445+augustin-cheron@users.noreply.github.com>"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [features]
 default = []
@@ -20,6 +20,14 @@ grpc-head-cache = [
 # Requires `grpc-head-cache`: the DragonsMouth stream is the live ingestion source.
 disk-cache = ["grpc-head-cache", "dep:rocksdb"]
 pyroscope = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
+grpc-streaming = [
+    "dep:async-stream",
+    "dep:prost",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:tokio-stream",
+]
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
@@ -56,9 +64,14 @@ clickhouse = { version = "0.14", features = ["inserter"] }
 clickhouse-rs = "1.1.0-alpha.1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 futures-util = "0.3"
+async-stream = { version = "0.3", optional = true }
 bs58 = "0.5"
 hex = "0.4"
 ch_cityhash102 = "0.1"
+prost = { version = "0.14.3", optional = true }
+tonic = { version = "0.14.5", optional = true }
+tonic-prost = { version = "0.14.5", optional = true }
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
 dashmap = { version = "6.1.0", optional = true }
 rocksdb = { version = "0.24", optional = true, default-features = false, features = [
     "lz4",
@@ -75,6 +88,12 @@ yellowstone-grpc-proto = { version = "12.3.0", optional = true }
 [dev-dependencies]
 base64 = "0.22"
 tempfile = "3"
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14.5", optional = true }
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]
 
 [[bin]]
 name = "superbank-rpc"

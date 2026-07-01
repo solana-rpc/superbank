@@ -459,6 +459,7 @@ pub(crate) fn stored_record_from_transaction_info(
         slot,
         slot_idx: tx_info.index.min(u64::from(u32::MAX)) as u32,
         block_time: None,
+        is_vote: tx_info.is_vote,
         tx_version: if message.versioned { Some(0) } else { None },
         tx_signatures,
         tx_num_required_signatures: header
