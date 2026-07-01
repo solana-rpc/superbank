@@ -1,6 +1,6 @@
 [package]
 name = "superbank-solparq"
-version = "0.4.1-rc1-sp1"
+version = "0.5.1-rc1-sp1"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
@@ -17,6 +17,8 @@ futures-util = "0.3"
 object_store = { version = "0.13", features = ["aws"] }
 parquet = { version = "59.0.0", features = ["arrow", "async", "object_store"] }
 prometheus-client = "0.23"
+prometheus-client-derive-encode = "0.4.2"
+kubert-prometheus-process = "0.2.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

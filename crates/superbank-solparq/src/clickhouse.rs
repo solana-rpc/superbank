@@ -727,6 +727,49 @@ async fn fetch_solana_produced_slots(
     Ok(slots)
 }
 
+/// Query the current Solana network tip via `getSlot` at the given commitment.
+///
+/// Used to expose the end-to-end chain-tip lag metric (how far the archived
+/// ClickHouse data trails the live chain). Errors are the caller's to handle;
+/// solparq treats a missing tip as "unknown" rather than failing the run.
+pub async fn fetch_solana_tip_slot(rpc_url: &str) -> Result<u64> {
+    #[derive(Serialize)]
+    struct RpcRequest<'a> {
+        jsonrpc: &'a str,
+        id: u64,
+        method: &'a str,
+        params: [serde_json::Value; 1],
+    }
+    #[derive(Deserialize)]
+    struct RpcResponse {
+        result: Option<u64>,
+        error: Option<serde_json::Value>,
+    }
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(rpc_url)
+        .json(&RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getSlot",
+            params: [serde_json::json!({ "commitment": "finalized" })],
+        })
+        .send()
+        .await
+        .context("query Solana RPC getSlot")?;
+    let parsed = response
+        .json::<RpcResponse>()
+        .await
+        .context("parse Solana RPC getSlot response")?;
+    if let Some(error) = parsed.error {
+        return Err(anyhow!("Solana RPC getSlot error: {error}"));
+    }
+    parsed
+        .result
+        .ok_or_else(|| anyhow!("Solana RPC getSlot returned no result"))
+}
+
 fn join_s3_url(endpoint: &str, bucket: &str, bucket_path: &str, archive_name: &str) -> String {
     let endpoint = endpoint.trim_end_matches('/');
     let bucket = bucket.trim_matches('/');

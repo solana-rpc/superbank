@@ -245,6 +245,97 @@ Defaults:
 - Prometheus metrics: `http://0.0.0.0:31313/metrics`
 - Archive check interval: `60` seconds
 
+### Prometheus metrics
+
+The metrics endpoint (default `SOLPARQ_METRICS_PORT`, `31313`) exposes
+OpenMetrics-formatted series under the `solparq_` prefix, plus standard
+`process_*` collectors. Per-archive series carry an `archive_kind` label
+(`hourly`, `epoch`, or `custom`). These are the building blocks for an
+operational Grafana dashboard.
+
+Liveness and configuration:
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `solparq_health` | gauge | — | `1` when the last loop had no error, else `0` |
+| `solparq_started_at_unix` | gauge | — | Process start time (Unix seconds) |
+| `solparq_check_interval_seconds` | gauge | — | Configured archive check interval |
+| `solparq_last_run_at_unix` | gauge | `archive_kind` | Last archive check time |
+| `solparq_last_success_at_unix` | gauge | `archive_kind` | Last successful archive time |
+| `solparq_archive_in_flight` | gauge | `archive_kind` | `1` while an archive task is running |
+
+Currency (how up to date the data is):
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `solparq_db_earliest_slot` | gauge | — | Earliest transaction slot in ClickHouse |
+| `solparq_db_latest_slot` | gauge | — | Latest transaction slot in ClickHouse |
+| `solparq_db_slots_available` | gauge | — | Transaction slots visible in ClickHouse |
+| `solparq_chain_tip_slot` | gauge | — | Latest Solana network slot (finalized) via `getSlot` |
+| `solparq_chain_tip_lag_slots` | gauge | — | Network tip minus latest ClickHouse slot |
+| `solparq_db_lag_slots` | gauge | `archive_kind` | Latest ClickHouse slot minus latest archived slot |
+| `solparq_last_archived_start_slot` | gauge | `archive_kind` | Start slot of the most recent archive |
+| `solparq_last_archived_end_slot` | gauge | `archive_kind` | End slot of the most recent archive |
+| `solparq_last_archived_epoch` | gauge | `archive_kind` | Epoch of the most recent archive |
+
+Throughput and outcomes:
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `solparq_archives_created_total` | counter | `archive_kind` | Archives created successfully |
+| `solparq_archives_skipped_total` | counter | `archive_kind`, `reason` | Planning runs skipped, by skip reason (`not-enough-slots`, `no-data`, `user-declined`, `data-gap`, `validation-warning`, `skipped`) |
+| `solparq_archive_errors_total` | counter | `archive_kind` | Archive loop errors |
+| `solparq_archives_cleaned_total` | counter | `archive_kind` | Old archive bundles pruned by retention |
+| `solparq_clickhouse_range_deleted_total` | counter | `archive_kind` | Archived ClickHouse ranges deleted |
+| `solparq_archive_rows_total` | counter | `archive_kind`, `table` | Rows archived per source table |
+| `solparq_last_archive_rows` | gauge | `archive_kind` | Rows written in the most recent archive |
+| `solparq_last_archive_bytes` | gauge | `archive_kind` | Bytes written in the most recent archive (local destinations only) |
+
+Latency (histograms, seconds):
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `solparq_phase_duration_seconds` | histogram | `archive_kind`, `phase` | Per-phase archive latency. Phases: `validate`, `write`, `delete_range`, `cleanup`, `total` |
+
+Data quality — validation issues are split by `category` so a dashboard can
+separate actionable gaps from expected leader gaps and other problems:
+
+- `missing_block` — Solana produced the block but it is missing from ClickHouse
+  (**actual gap, needs backfill**).
+- `not_produced` — the slot was never produced on-chain (**expected leader gap**,
+  informational).
+- `transaction_mismatch` — block transaction count does not match the archived
+  transaction rows (**other data issue**).
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `solparq_validation_slots` | gauge | `archive_kind`, `category` | Slots flagged in the last validated range, by category |
+| `solparq_validation_ranges` | gauge | `archive_kind`, `category` | Contiguous slot ranges flagged in the last validated range, by category |
+| `solparq_validation_flagged_slots_total` | counter | `archive_kind`, `category` | Cumulative flagged slots across runs, by category (use `rate()`/`increase()` to alert on new gaps) |
+| `solparq_validation_range_start_slot` | gauge | `archive_kind` | Start slot of the last validated range |
+| `solparq_validation_range_end_slot` | gauge | `archive_kind` | End slot of the last validated range |
+| `solparq_validation_db_block_slots` | gauge | `archive_kind` | Block slots present in ClickHouse for the last validated range |
+| `solparq_validation_rpc_produced_slots` | gauge | `archive_kind` | Slots the RPC reports as produced for the last validated range |
+| `solparq_validation_rpc_errors_total` | counter | `archive_kind` | Validation runs where the Solana RPC cross-check failed |
+| `solparq_known_gaps` | gauge | `archive_kind`, `classification` | Currently tracked known data gaps, by classification (`Needs backfill`, `Legit not-produced`, `Transaction mismatch`) |
+
+> `solparq_last_archive_bytes` is only populated for local destinations.
+> ClickHouse-driven S3 exports do not report bytes written, so the byte gauge is
+> left unset for S3 archives.
+
+#### Grafana dashboard
+
+An importable dashboard covering all of the above lives at
+[`grafana/solparq-ops-dashboard.json`](grafana/solparq-ops-dashboard.json). It is
+organised into rows — Overview, Currency, Throughput & outcomes, Latency, Data
+quality, and Resources — and includes an `archive_kind` template variable for
+filtering.
+
+To import: in Grafana, **Dashboards → New → Import**, upload the JSON (or paste
+its contents), and select your Prometheus datasource when prompted for
+`DS_PROMETHEUS`. The `solparq_process_*` panels (CPU, memory, file descriptors)
+are populated on Linux; on macOS only uptime/start-time are exported.
+
 Archive range types run independently in server mode. For example, a
 `custom:500` archive check can start while a larger `hourly` or `epoch` archive
 is still being written. `superbank-solparq` does not start a second task for the same

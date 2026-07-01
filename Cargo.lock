@@ -6851,7 +6851,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-solparq"
-version = "0.4.1-rc1-sp1"
+version = "0.5.1-rc1-sp1"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -6861,9 +6861,11 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "kubert-prometheus-process",
  "object_store",
  "parquet",
  "prometheus-client",
+ "prometheus-client-derive-encode",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

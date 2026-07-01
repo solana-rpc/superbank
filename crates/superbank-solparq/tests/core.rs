@@ -2,8 +2,9 @@ use std::{fs, process::Command, str::FromStr};
 
 use superbank_solparq::{
     archive::{
-        ArchiveKind, ArchiveRunReport, ArchiveRunTable, ArchiveSlotRange, ClickHouseBounds,
-        plan_archive_slot_range, plan_next_archive, safe_delete_archived_data_range,
+        ArchiveKind, ArchiveRunMetrics, ArchiveRunReport, ArchiveRunTable, ArchiveSlotRange,
+        ArchivedTableRows, ClickHouseBounds, PhaseDuration, plan_archive_slot_range,
+        plan_next_archive, safe_delete_archived_data_range,
     },
     clickhouse::{
         ArchiveTableKind, DbTables, S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport,
@@ -937,6 +938,7 @@ fn app_state_tracks_db_slots_and_archive_timeline() {
         validation: None,
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),
+        run_metrics: Default::default(),
     });
 
     let status = state.public_status();
@@ -1004,6 +1006,7 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
         validation: None,
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),
+        run_metrics: Default::default(),
     });
 
     let html = render_dashboard(&config, &state.public_status());
@@ -1074,6 +1077,7 @@ fn archive_report_includes_human_timestamp_and_hostname() {
         validation: None,
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),
+        run_metrics: Default::default(),
     };
 
     let text = report.to_text();
@@ -1125,6 +1129,7 @@ fn dashboard_renders_skip_reasons_and_known_gap_tables() {
         validation: Some(validation),
         deleted_clickhouse_range: false,
         cleaned_archives: Vec::new(),
+        run_metrics: Default::default(),
     });
 
     let status = state.public_status();
@@ -1145,4 +1150,162 @@ fn dashboard_renders_skip_reasons_and_known_gap_tables() {
     assert!(html.contains("101"));
     assert!(html.contains("102-104"));
     assert!(html.contains("skipped: data-gap"));
+}
+
+#[test]
+fn metrics_endpoint_exposes_labeled_series() {
+    let state = AppState::new();
+    state.set_check_interval_secs(60);
+    state.set_archive_in_flight(ArchiveKind::Epoch, true);
+    // Produced 1000,1001,1002,1005,1006 but ClickHouse only has 1000,1002,1005,1006:
+    // slot 1001 is an actual gap (missing block). Slots the RPC did not produce in
+    // 1000-1010 are legit not-produced. Slot 1002 has a transaction-count mismatch.
+    let validation = ValidationReport::from_observed_slots(
+        1_000,
+        1_010,
+        vec![1_000, 1_002, 1_005, 1_006],
+        vec![1_000, 1_001, 1_002, 1_005, 1_006],
+        vec![TransactionMismatch {
+            slot: 1_002,
+            expected: 5,
+            actual: 4,
+        }],
+        None,
+    );
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: true,
+        archive_skipped_reason: None,
+        archive_name: Some("epoch_1000_432000000-432431999.parquet".to_string()),
+        archive_kind: ArchiveKind::Epoch,
+        archive_epoch: Some(1_000),
+        archive_slot_start: Some(432_000_000),
+        archive_slot_end: Some(432_431_999),
+        db_bounds: Some(ClickHouseBounds {
+            earliest_slot: 432_000_000,
+            latest_slot: 432_432_049,
+        }),
+        destination: "./archives".to_string(),
+        archive_tables: Vec::new(),
+        validation: Some(validation),
+        deleted_clickhouse_range: true,
+        cleaned_archives: vec!["epoch_999_431568000-431999999.parquet".to_string()],
+        run_metrics: ArchiveRunMetrics {
+            phase_durations: vec![
+                PhaseDuration {
+                    phase: "validate".to_string(),
+                    seconds: 1.0,
+                },
+                PhaseDuration {
+                    phase: "write".to_string(),
+                    seconds: 2.0,
+                },
+            ],
+            archived_table_rows: vec![ArchivedTableRows {
+                table: "transactions".to_string(),
+                rows: 12_345,
+            }],
+            archived_bytes_total: Some(4_096),
+            chain_tip_slot: Some(432_432_099),
+        },
+    });
+
+    let text = state.prometheus_text();
+
+    // Global gauges.
+    assert!(text.contains("solparq_check_interval_seconds 60"));
+    assert!(text.contains("solparq_db_latest_slot 432432049"));
+    assert!(text.contains("solparq_chain_tip_slot 432432099"));
+    // chain_tip_lag = tip (432432099) - db_latest (432432049) = 50.
+    assert!(text.contains("solparq_chain_tip_lag_slots 50"));
+    // Per-kind labelled series.
+    assert!(text.contains("solparq_archive_in_flight{archive_kind=\"epoch\"} 1"));
+    assert!(text.contains("solparq_last_archive_bytes{archive_kind=\"epoch\"} 4096"));
+    assert!(text.contains("solparq_last_archived_end_slot{archive_kind=\"epoch\"} 432431999"));
+    // db_lag = db_latest (432432049) - last archived end (432431999) = 50.
+    assert!(text.contains("solparq_db_lag_slots{archive_kind=\"epoch\"} 50"));
+    // Counters (suffix handling left to the encoder; assert base name + labels).
+    assert!(text.contains("solparq_archives_created") && text.contains("archive_kind=\"epoch\""));
+    assert!(text.contains("solparq_clickhouse_range_deleted"));
+    assert!(text.contains("solparq_archives_cleaned"));
+    assert!(text.contains("solparq_archive_rows") && text.contains("table=\"transactions\""));
+    // Phase-duration histogram.
+    assert!(text.contains("solparq_phase_duration_seconds_bucket"));
+    assert!(text.contains("phase=\"validate\""));
+    // Categorized validation metrics: actual gap vs legit not-produced vs mismatch.
+    assert!(
+        text.contains(
+            "solparq_validation_slots{archive_kind=\"epoch\",category=\"missing_block\"} 1"
+        )
+    );
+    assert!(text.contains(
+        "solparq_validation_slots{archive_kind=\"epoch\",category=\"transaction_mismatch\"} 1"
+    ));
+    assert!(text.contains("category=\"not_produced\""));
+    assert!(text.contains(
+        "solparq_validation_ranges{archive_kind=\"epoch\",category=\"missing_block\"} 1"
+    ));
+    assert!(text.contains("solparq_validation_range_start_slot{archive_kind=\"epoch\"} 1000"));
+    assert!(text.contains("solparq_validation_range_end_slot{archive_kind=\"epoch\"} 1010"));
+    assert!(text.contains("solparq_validation_db_block_slots{archive_kind=\"epoch\"} 4"));
+    assert!(text.contains("solparq_validation_rpc_produced_slots{archive_kind=\"epoch\"} 5"));
+    // Cumulative counter across runs, split by category. The encoder appends the
+    // single `_total` suffix (no `_total_total` double suffix).
+    assert!(text.contains("solparq_validation_flagged_slots_total"));
+    assert!(text.contains(
+        "solparq_validation_flagged_slots_total{archive_kind=\"epoch\",category=\"transaction_mismatch\"} 1"
+    ));
+    assert!(!text.contains("_total_total"));
+    // Existing counters keep the single-suffix idiomatic name.
+    assert!(text.contains("solparq_archives_created_total{archive_kind=\"epoch\"} 1"));
+}
+
+#[test]
+fn last_error_persists_across_skips_until_archive_created() {
+    let report = |archive_created: bool, reason: Option<&str>| ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created,
+        archive_skipped_reason: reason.map(ToString::to_string),
+        archive_name: archive_created.then(|| "epoch_1_0-431999.parquet".to_string()),
+        archive_kind: ArchiveKind::Epoch,
+        archive_epoch: Some(1),
+        archive_slot_start: Some(0),
+        archive_slot_end: Some(431_999),
+        db_bounds: None,
+        destination: "./archives".to_string(),
+        archive_tables: Vec::new(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: Default::default(),
+    };
+
+    let state = AppState::new();
+    // A hard error marks the service unhealthy and records the error.
+    state.record_task_error(ArchiveKind::Epoch, "clickhouse unavailable".to_string());
+    let status = state.public_status();
+    assert!(!status.healthy);
+    assert_eq!(status.last_error.as_deref(), Some("clickhouse unavailable"));
+    assert!(status.last_error_at_unix.is_some());
+
+    // A routine skipped check restores health but must NOT wipe the last error.
+    state.record_report(report(
+        false,
+        Some("not enough ClickHouse slots available for the next archive"),
+    ));
+    let status = state.public_status();
+    assert!(status.healthy, "a successful check should restore health");
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("clickhouse unavailable"),
+        "a skipped check must not clear the last error"
+    );
+    assert!(status.last_error_at_unix.is_some());
+
+    // A genuine archive creation clears the last error.
+    state.record_report(report(true, None));
+    let status = state.public_status();
+    assert!(status.healthy);
+    assert_eq!(status.last_error, None);
+    assert!(status.last_error_at_unix.is_none());
 }

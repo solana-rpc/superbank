@@ -108,6 +108,7 @@ impl ShutdownToken {
 
 pub async fn run(config: Config) -> Result<()> {
     let state = AppState::new();
+    state.set_check_interval_secs(config.archive_check_interval_secs);
     let mut servers = JoinSet::new();
     let shutdown = ShutdownToken::new();
 
@@ -246,6 +247,7 @@ fn schedule_archive_cycle(
         state.record_check_started(kind, None);
         info!(archive_kind = kind.to_string(), "checking archive task");
         active_kinds.insert(kind);
+        state.set_archive_in_flight(kind, true);
         spawn_archive_task(archive_tasks, run_once.clone(), kind);
     }
     Ok(true)
@@ -273,6 +275,7 @@ async fn handle_archive_task_join(
     };
     let (kind, result) = result.map_err(|err| anyhow!("archive task join failed: {err}"))?;
     active_kinds.remove(&kind);
+    state.set_archive_in_flight(kind, false);
     record_archive_task_result(state, kind, result);
     Ok(())
 }
@@ -394,15 +397,24 @@ async fn dashboard(State(ops): State<OpsState>) -> Html<String> {
 
 async fn health(State(ops): State<OpsState>) -> impl IntoResponse {
     let status = ops.state.public_status();
-    if status.last_error.is_none() {
+    if status.healthy {
         (
             StatusCode::OK,
-            Json(json!({"status":"ok","last_success_at_unix":status.last_success_at_unix})),
+            Json(json!({
+                "status": "ok",
+                "last_success_at_unix": status.last_success_at_unix,
+                "last_error": status.last_error,
+                "last_error_at_unix": status.last_error_at_unix,
+            })),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status":"error","last_error":status.last_error})),
+            Json(json!({
+                "status": "error",
+                "last_error": status.last_error,
+                "last_error_at_unix": status.last_error_at_unix,
+            })),
         )
     }
 }
@@ -436,7 +448,10 @@ async fn status(State(ops): State<OpsState>) -> Json<serde_json::Value> {
 
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
         state.prometheus_text(),
     )
 }
@@ -457,10 +472,17 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    let (health_label, health_class) = if status.last_error.is_none() {
+    let (health_label, health_class) = if status.healthy {
         ("Healthy", "ok")
     } else {
         ("Needs attention", "bad")
+    };
+    let last_error_display = match (&status.last_error, status.last_error_at_unix) {
+        (Some(err), Some(at)) => {
+            format!("{err} (at {})", format_utc_timestamp(Some(at)))
+        }
+        (Some(err), None) => err.clone(),
+        (None, _) => "none".to_string(),
     };
     let db_slots = status
         .db_slots
@@ -610,7 +632,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         check_interval = format_u64(config.archive_check_interval_secs),
         archives_skipped = format_u64(status.archives_skipped),
         archive_errors = format_u64(status.archive_errors),
-        last_error = html_escape(status.last_error.as_deref().unwrap_or("none")),
+        last_error = html_escape(&last_error_display),
     )
 }
 

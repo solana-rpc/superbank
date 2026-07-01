@@ -2,9 +2,9 @@ use std::{
     collections::HashSet,
     fmt,
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow};
@@ -330,6 +330,46 @@ pub struct ArchiveRunReport {
     pub validation: Option<ValidationReport>,
     pub deleted_clickhouse_range: bool,
     pub cleaned_archives: Vec<String>,
+    /// Operational measurements captured during the run, surfaced as Prometheus
+    /// metrics by [`crate::metrics::AppState::record_report`]. Empty/`None` for
+    /// runs that skip archive creation.
+    pub run_metrics: ArchiveRunMetrics,
+}
+
+/// Per-run operational measurements consumed by the metrics layer.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ArchiveRunMetrics {
+    /// Wall-clock duration of individual archive phases (validate, write, …).
+    pub phase_durations: Vec<PhaseDuration>,
+    /// Row counts written per archive table.
+    pub archived_table_rows: Vec<ArchivedTableRows>,
+    /// Total bytes written for the archive bundle. Only populated for local
+    /// destinations; ClickHouse-driven S3 exports do not report bytes written.
+    pub archived_bytes_total: Option<u64>,
+    /// Current Solana network tip (finalized) observed for this run, if the RPC
+    /// probe succeeded. Enables the chain-tip lag metric.
+    pub chain_tip_slot: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PhaseDuration {
+    pub phase: String,
+    pub seconds: f64,
+}
+
+impl PhaseDuration {
+    fn new(phase: impl Into<String>, elapsed: Duration) -> Self {
+        Self {
+            phase: phase.into(),
+            seconds: elapsed.as_secs_f64(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchivedTableRows {
+    pub table: String,
+    pub rows: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -366,6 +406,7 @@ impl ArchiveRunReport {
             validation: None,
             deleted_clickhouse_range: false,
             cleaned_archives: Vec::new(),
+            run_metrics: ArchiveRunMetrics::default(),
         }
     }
 
@@ -429,6 +470,34 @@ impl ArchiveRunReport {
                 self.cleaned_archives.join(",")
             ));
         }
+        if !self.run_metrics.archived_table_rows.is_empty() {
+            lines.push(format!(
+                "archived_rows: {}",
+                self.run_metrics
+                    .archived_table_rows
+                    .iter()
+                    .map(|entry| format!("{}:{}", entry.table, entry.rows))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if let Some(bytes) = self.run_metrics.archived_bytes_total {
+            lines.push(format!("archived_bytes_total: {bytes}"));
+        }
+        if !self.run_metrics.phase_durations.is_empty() {
+            lines.push(format!(
+                "phase_durations_seconds: {}",
+                self.run_metrics
+                    .phase_durations
+                    .iter()
+                    .map(|entry| format!("{}:{:.3}", entry.phase, entry.seconds))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if let Some(chain_tip_slot) = self.run_metrics.chain_tip_slot {
+            lines.push(format!("chain_tip_slot: {chain_tip_slot}"));
+        }
         if let Some(validation) = &self.validation {
             lines.push(format!(
                 "validation_missing_blocks: {}",
@@ -463,6 +532,31 @@ pub async fn run_once(config: &Config) -> Result<ArchiveRunReport> {
 }
 
 pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<ArchiveRunReport> {
+    // Best-effort network tip probe up front so every report (created or
+    // skipped) can expose chain-tip lag. A failing probe leaves the tip
+    // unknown rather than aborting the archive run.
+    let chain_tip_slot =
+        match crate::clickhouse::fetch_solana_tip_slot(&config.solana_rpc_url).await {
+            Ok(slot) => Some(slot),
+            Err(err) => {
+                debug!(
+                    archive_kind = kind.to_string(),
+                    %err, "failed to probe Solana network tip"
+                );
+                None
+            }
+        };
+    let started = Instant::now();
+    let mut report = run_once_for_kind_inner(config, kind).await?;
+    report.run_metrics.chain_tip_slot = chain_tip_slot;
+    report
+        .run_metrics
+        .phase_durations
+        .push(PhaseDuration::new("total", started.elapsed()));
+    Ok(report)
+}
+
+async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<ArchiveRunReport> {
     let destination = storage::destination(config, kind).await?;
     debug!(
         archive_kind = kind.to_string(),
@@ -587,10 +681,13 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             validation: None,
             deleted_clickhouse_range,
             cleaned_archives,
+            run_metrics: ArchiveRunMetrics::default(),
         };
         storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
         return Ok(report);
     }
+    let mut phase_durations = Vec::new();
+    let validate_started = Instant::now();
     let validation = client
         .validate_archive_range(
             &tables,
@@ -599,6 +696,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             plan.end_slot,
         )
         .await?;
+    phase_durations.push(PhaseDuration::new("validate", validate_started.elapsed()));
     debug!(
         archive_kind = kind.to_string(),
         missing_blocks = validation.missing_blocks.len(),
@@ -647,6 +745,8 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         "creating archive"
     );
     let mut manifest_tables = Vec::new();
+    let mut archived_bytes_total: Option<u64> = None;
+    let write_started = Instant::now();
     match &destination {
         ArchiveDestination::Local { directory } => {
             let staging_dir = storage::local_staging_bundle_dir(directory, &archive_name);
@@ -688,6 +788,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             );
             let manifest_json = serde_json::to_vec_pretty(&manifest).map_err(|err| anyhow!(err))?;
             fs::write(staging_dir.join(MANIFEST_FILE_NAME), manifest_json).await?;
+            archived_bytes_total = Some(staging_bundle_bytes(&staging_dir).await);
             fs::rename(
                 &staging_dir,
                 storage::local_bundle_dir(directory, &archive_name),
@@ -742,6 +843,7 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
             storage::write_manifest(config, kind, &archive_name, &manifest).await?;
         }
     }
+    phase_durations.push(PhaseDuration::new("write", write_started.elapsed()));
 
     let report_timestamp = unix_timestamp();
     storage::write_done_marker(
@@ -753,11 +855,23 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
     )
     .await?;
 
+    let delete_started = Instant::now();
     let deleted_clickhouse_range =
         maybe_delete_archived_data_range(config, kind, &client, &available_archive_tables, &plan)
             .await?;
+    phase_durations.push(PhaseDuration::new("delete_range", delete_started.elapsed()));
 
+    let cleanup_started = Instant::now();
     let cleaned_archives = storage::cleanup_archives(config, kind).await?;
+    phase_durations.push(PhaseDuration::new("cleanup", cleanup_started.elapsed()));
+
+    let archived_table_rows = manifest_tables
+        .iter()
+        .map(|table| ArchivedTableRows {
+            table: table.table_name.clone(),
+            rows: table.row_count,
+        })
+        .collect::<Vec<_>>();
     let report = ArchiveRunReport {
         timestamp_unix: report_timestamp,
         archive_created: true,
@@ -773,6 +887,12 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
         validation: Some(validation),
         deleted_clickhouse_range,
         cleaned_archives,
+        run_metrics: ArchiveRunMetrics {
+            phase_durations,
+            archived_table_rows,
+            archived_bytes_total,
+            chain_tip_slot: None,
+        },
     };
     storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
     info!(
@@ -881,6 +1001,25 @@ fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Sum the byte sizes of the files in a staged local archive bundle.
+///
+/// Best-effort: unreadable entries are skipped so byte accounting never fails
+/// an otherwise-successful archive.
+async fn staging_bundle_bytes(staging_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(mut entries) = fs::read_dir(staging_dir).await else {
+        return 0;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(metadata) = entry.metadata().await
+            && metadata.is_file()
+        {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
 }
 
 fn align_up(value: u64, width: u64) -> u64 {
