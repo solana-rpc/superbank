@@ -9,12 +9,12 @@ Superbank is a Rust workspace that ingests Solana ledger data into ClickHouse an
 ## Architecture
 
 ```
-Source [gRPC / RPC / Bigtable] --> superbank (ingestor) --> ClickHouse --> superbank-rpc (JSON-RPC server)
+Source [Fumarole / gRPC / RPC / Bigtable] --> superbank (ingestor) --> ClickHouse --> superbank-rpc (JSON-RPC + optional gRPC server)
 ```
 
 Two main crates in the workspace:
-- **`crates/superbank`** — Ingestor binary. Pulls Solana data from Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable and writes to ClickHouse.
-- **`crates/superbank-rpc`** — Axum-based JSON-RPC server. Reads from ClickHouse and serves Solana-compatible RPC. Has optional `grpc-head-cache` feature (in-memory head cache via Yellowstone) and `pyroscope` feature.
+- **`crates/superbank`** — Ingestor binary. Pulls Solana data from Yellowstone Fumarole, Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable and writes to ClickHouse.
+- **`crates/superbank-rpc`** — Axum-based JSON-RPC server. Reads from ClickHouse and serves Solana-compatible RPC. Has optional `grpc-head-cache`, `disk-cache`, `grpc-streaming`, and `pyroscope` features.
 
 Other key paths:
 - `ddl/` — ClickHouse schemas (local, cluster, replicated variants)
@@ -48,12 +48,13 @@ cargo fmt --all -- --check
 
 # Clippy (CI-style)
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings
 
 # Tests (minimum for PRs)
 cargo test --workspace --locked
 
 # Tests with optional features
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
+cargo test -p superbank-rpc --all-features --locked
 
 # k6 load test (basic)
 k6 run tests/k6/scenarios/basic/superbank-rpc-get-signatures.js -e RPC_URL=http://localhost:8899

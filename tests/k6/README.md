@@ -229,6 +229,14 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for
   -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
 # This alternates call order per iteration and reports which endpoint is faster by avg latency.
 
+# Include full transaction payloads and version fields in the comparison
+k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for-address.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e REFERENCE_RPC_URL=http://localhost:8898 \
+  -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt \
+  -e TFA_TRANSACTION_DETAILS=full \
+  -e TFA_MAX_SUPPORTED_TX_VERSION=0
+
 # JSON-RPC batch protocol validation (no reference RPC required)
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-batch.js \
   -e RPC_URL=http://localhost:8899
@@ -449,6 +457,11 @@ k6 run tests/k6/scenarios/replay/replay-test.js \
 ```
 
 ## Configuration
+
+Most scenarios assume Superbank's default HTTP behavior: JSON-RPC error bodies are returned with
+HTTP `200 OK`. If `SUPERBANK_RPC_EMIT_HTTP_ERRORS=true` is enabled on the target, selected
+server-side JSON-RPC failures are promoted to HTTP `503`; those responses count toward
+`http_req_failed` and `rpc_errors_http`.
 
 ### Environment Variables
 

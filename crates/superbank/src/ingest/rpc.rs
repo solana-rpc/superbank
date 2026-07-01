@@ -707,7 +707,7 @@ async fn resolve_rpc_range(
         (Some(to_slot), None) => {
             if to_slot < start {
                 return Err(anyhow!(
-                    "to-slot {} must be greater than or equal to rpc-from-slot {}",
+                    "rpc-to-slot {} must be greater than or equal to rpc-from-slot {}",
                     to_slot,
                     start
                 ));
@@ -717,7 +717,7 @@ async fn resolve_rpc_range(
         (None, Some(count)) => {
             let count_minus_one = count
                 .checked_sub(1)
-                .ok_or_else(|| anyhow!("rpc slot-count must be greater than 0"))?;
+                .ok_or_else(|| anyhow!("rpc-slot-count must be greater than 0"))?;
             start
                 .checked_add(count_minus_one)
                 .ok_or_else(|| anyhow!("rpc slot range exceeds u64::MAX"))?

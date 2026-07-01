@@ -121,6 +121,8 @@ scripts/dev/run-local-rpc.sh
 ### Key environment variables
 
 Common:
+- `SUPERBANK_RPC_FEATURES` (optional Cargo feature list used when building `superbank-rpc`, for
+  example `grpc-head-cache`, `disk-cache`, `grpc-streaming`, or `pyroscope`)
 - `RUST_LOG` (default: `info,clickhouse_rs=warn`)
 - `LOG_FORMAT` (default: `plain`, supports `json`)
 - `RPC_HOST` / `RPC_PORT` (defaults: `0.0.0.0` / `8899`)
@@ -141,6 +143,8 @@ Routing and shard options:
 - `CLICKHOUSE_SCOPE=distributed|shard-direct` (default: `distributed`)
 - `CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS` (default: `2000`)
 - `CLICKHOUSE_CLUSTER` (default: `{cluster}`)
+- `CLICKHOUSE_TOPOLOGY_CONFIG` (optional authoritative shard topology YAML; see
+  `../crates/superbank-rpc/README.md`)
 - `CLICKHOUSE_SHARD_FANOUT_CONCURRENCY` (default: `8`)
 - `CLICKHOUSE_HTTP_MAX_CONCURRENCY` (default: `512`; caps concurrent direct/scalar ClickHouse HTTP queries server-wide so HTTP connection demand does not track request/batch concurrency)
 - `CLICKHOUSE_HTTP_CONNECT_TIMEOUT_MS` (default: `2000`; TCP connect timeout for ClickHouse HTTP connections so connects fail fast under backpressure)
@@ -179,6 +183,22 @@ Notes:
 
 For the full `superbank-rpc` configuration surface (including additional ClickHouse table env vars),
 see `../crates/superbank-rpc/README.md`.
+
+### Optional Superbank gRPC streaming
+
+The Superbank gRPC streaming API is also a compile-time feature plus a runtime toggle:
+
+```bash
+SUPERBANK_RPC_FEATURES=grpc-streaming \
+SUPERBANK_GRPC_ENABLED=true \
+SUPERBANK_GRPC_PORT=10000 \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_USER=default \
+scripts/dev/run-local-rpc.sh
+```
+
+This starts the JSON-RPC server on `RPC_PORT` and the gRPC endpoint on `SUPERBANK_GRPC_PORT`.
+See `../crates/superbank-rpc/README.md` for the stream methods and gRPC-specific limits.
 
 ## Tilt (Kind + Kubernetes)
 
@@ -254,17 +274,18 @@ gh workflow run e2e.yml --ref <branch-name>
 
 ### Release flow
 
-Releases are tag-driven. Before cutting a release, update the workspace and member versions in
-`Cargo.toml` files, then create and push an annotated `vX.Y.Z` tag:
+Releases are tag-driven. Before cutting a release, update the shared package version under
+`[workspace.package]` in the root `Cargo.toml`, then create and push an annotated `vX.Y.Z` tag:
 
 ```bash
-git tag -a v0.4.0 -m "Release v0.4.0"
-git push origin v0.4.0
+git tag -a v0.5.0 -m "Release v0.5.0"
+git push origin v0.5.0
 ```
 
-The release workflow runs the Tilt E2E profile first, then GoReleaser builds both binaries for
-Linux amd64 and Linux arm64, publishes GitHub release notes, uploads `.tar.gz`
-archives, and generates `SHA256SUMS.txt`.
+The release workflow first verifies that the tag version matches the Cargo package versions. It
+then runs the Tilt E2E profile before GoReleaser builds both binaries for Linux amd64 and Linux
+arm64, publishes GitHub release notes, uploads `.tar.gz` archives, and generates
+`SHA256SUMS.txt`.
 
 ### Key environment variables
 

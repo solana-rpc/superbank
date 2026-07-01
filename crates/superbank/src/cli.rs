@@ -407,7 +407,7 @@ struct CliArgs {
     )]
     blocks_table: String,
 
-    /// Optional ClickHouse PoH entries table (gRPC live ingest only)
+    /// Optional ClickHouse PoH entries table (Fumarole/gRPC live ingest only)
     #[arg(
         long,
         env = "CLICKHOUSE_ENTRIES_TABLE",
@@ -1125,7 +1125,7 @@ fn validate_args(args: &Args) -> Result<()> {
             if let Some(count) = args.rpc_slot_count
                 && count == 0
             {
-                return Err(anyhow!("rpc slot-count must be greater than 0"));
+                return Err(anyhow!("rpc-slot-count must be greater than 0"));
             }
             if args.rpc_max_inflight == 0 {
                 return Err(anyhow!("rpc max-inflight must be greater than 0"));

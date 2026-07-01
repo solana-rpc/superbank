@@ -9,7 +9,7 @@ blocks, not a complete production recipe.
 - `deploy/k8s/`: Kubernetes manifests (applied by Tilt; reusable with `kubectl` if you provide the
   missing Secrets/ConfigMaps that Tilt generates).
 - `deploy/docker/Dockerfile.superbank-dev-runtime`: Runtime image used by Tilt that packages the
-  `superbank` ingestor and the `rpc` JSON-RPC server binaries.
+  `superbank` ingestor and `superbank-rpc` server binaries.
 
 ## Kubernetes manifests (`deploy/k8s/`)
 
@@ -68,6 +68,11 @@ Runs the JSON-RPC server (`crates/superbank-rpc`) as a Deployment plus a Service
   - Connects to ClickHouse at `http://clickhouse:8123` (database: `default`)
   - Credentials are provided via the Secret `superbank-clickhouse`
 
+The Tilt manifest builds `superbank-rpc` without optional Cargo features and exposes only JSON-RPC
+and metrics. To use the optional Superbank gRPC streaming API in Kubernetes, build
+`superbank-rpc` with `--features grpc-streaming`, set the `SUPERBANK_GRPC_*` environment variables,
+and add the gRPC container/service port (default `10000`) plus any desired port-forward.
+
 ### Ingest: RPC job vs gRPC daemon
 
 There are two ingestion variants under `deploy/k8s/`, selected by Tilt via `SUPERBANK_INGEST_MODE`.
@@ -114,6 +119,7 @@ this:
 1. Build Rust binaries locally:
    - Tilt runs a `local_resource` named `superbank-build` that builds `superbank` and `superbank-rpc` in release
      mode, then stages them into `dist/` as `dist/superbank` and `dist/superbank-rpc`.
+   - The checked-in Tilt build command does not enable optional `superbank-rpc` features.
    - When the binaries are built inside a Nix environment, they can reference a `/nix/store/...`
      dynamic linker. Tilt may use `patchelf` to rewrite the interpreter so they can run inside the
      Ubuntu-based runtime image.
@@ -150,7 +156,7 @@ this:
      ingestion.
    - Tilt port-forwards:
      - ClickHouse: `8123`, `9000`
-     - superbank-rpc: `8899`
+     - superbank-rpc JSON-RPC: `8899`
 
 6. Re-applying DDL:
    - Tilt defines a manual `local_resource` named `apply-clickhouse-schema` that re-applies the DDL
