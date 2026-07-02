@@ -15,7 +15,8 @@ use tracing::{debug, info};
 
 use crate::{
     clickhouse::{
-        ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, SlotRange, ValidationReport,
+        ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, DiskUsage, SlotRange,
+        TableSize, ValidationReport,
     },
     config::Config,
     manifest::{ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, SkippedArchiveTable},
@@ -353,6 +354,13 @@ pub struct ArchiveRunMetrics {
     pub chain_tip_slot: Option<u64>,
     /// Outcome of an overcount transaction-mismatch repair attempt, if one ran.
     pub mismatch_repair: Option<MismatchRepair>,
+    /// ClickHouse disk space at the time of this run, from `system.disks`. Empty
+    /// if the probe failed; best-effort like `chain_tip_slot`.
+    pub disk_usage: Vec<DiskUsage>,
+    /// Disk-space footprint of each archive-relevant DB table at the time of
+    /// this run, from `system.tables`. Empty if the probe failed; best-effort
+    /// like `chain_tip_slot`.
+    pub table_sizes: Vec<TableSize>,
 }
 
 /// Result of a `--repair-mismatches` dedup pass over overcount slots.
@@ -510,6 +518,37 @@ impl ArchiveRunReport {
         if let Some(chain_tip_slot) = self.run_metrics.chain_tip_slot {
             lines.push(format!("chain_tip_slot: {chain_tip_slot}"));
         }
+        if !self.run_metrics.disk_usage.is_empty() {
+            lines.push(format!(
+                "disk_usage: {}",
+                self.run_metrics
+                    .disk_usage
+                    .iter()
+                    .map(|disk| format!(
+                        "{}:{}:{}/{}",
+                        disk.name,
+                        disk.path,
+                        disk.used_bytes(),
+                        disk.total_bytes
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if !self.run_metrics.table_sizes.is_empty() {
+            lines.push(format!(
+                "table_sizes: {}",
+                self.run_metrics
+                    .table_sizes
+                    .iter()
+                    .map(|table| format!(
+                        "{}:{} bytes/{} rows",
+                        table.table_name, table.bytes, table.rows
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
         if let Some(repair) = &self.run_metrics.mismatch_repair {
             lines.push(format!(
                 "mismatch_repair: partitions={} overcount_before={} overcount_after={}",
@@ -574,9 +613,47 @@ pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<Arc
                 None
             }
         };
+    // Best-effort ClickHouse resource probes (disk space, table sizes), same
+    // rationale as the chain-tip probe above: every report should expose these
+    // without letting a failed probe abort the archive run.
+    let (disk_usage, table_sizes) = match ClickHouseClient::from_config(config) {
+        Ok(client) => {
+            let disk_usage = match client.fetch_disk_usage().await {
+                Ok(disk_usage) => disk_usage,
+                Err(err) => {
+                    debug!(
+                        archive_kind = kind.to_string(),
+                        %err, "failed to fetch ClickHouse disk usage"
+                    );
+                    Vec::new()
+                }
+            };
+            let archive_tables = DbTables::from_config(config).archive_tables();
+            let table_sizes = match client.fetch_table_sizes(&archive_tables).await {
+                Ok(table_sizes) => table_sizes,
+                Err(err) => {
+                    debug!(
+                        archive_kind = kind.to_string(),
+                        %err, "failed to fetch ClickHouse table sizes"
+                    );
+                    Vec::new()
+                }
+            };
+            (disk_usage, table_sizes)
+        }
+        Err(err) => {
+            debug!(
+                archive_kind = kind.to_string(),
+                %err, "failed to build ClickHouse client for resource probes"
+            );
+            (Vec::new(), Vec::new())
+        }
+    };
     let started = Instant::now();
     let mut report = run_once_for_kind_inner(config, kind).await?;
     report.run_metrics.chain_tip_slot = chain_tip_slot;
+    report.run_metrics.disk_usage = disk_usage;
+    report.run_metrics.table_sizes = table_sizes;
     report
         .run_metrics
         .phase_durations
@@ -976,6 +1053,8 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             archived_bytes_total,
             chain_tip_slot: None,
             mismatch_repair,
+            disk_usage: Vec::new(),
+            table_sizes: Vec::new(),
         },
     };
     storage::write_report(config, kind, &archive_name, &report.to_text()).await?;

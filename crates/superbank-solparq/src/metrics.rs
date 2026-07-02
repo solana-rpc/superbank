@@ -17,7 +17,7 @@ use tracing::warn;
 
 use crate::{
     archive::{ArchiveKind, ArchiveRunReport, ClickHouseBounds},
-    clickhouse::{MismatchDirection, SlotRange},
+    clickhouse::{DiskUsage, MismatchDirection, SlotRange, TableSize},
 };
 
 const MAX_RECENT_EVENTS: usize = 50;
@@ -97,6 +97,36 @@ struct RepairLabels {
     outcome: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DiskLabels {
+    disk: String,
+    path: String,
+}
+
+impl DiskLabels {
+    fn new(disk: &DiskUsage) -> Self {
+        Self {
+            disk: disk.name.clone(),
+            path: disk.path.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DbTableLabels {
+    table_kind: String,
+    table: String,
+}
+
+impl DbTableLabels {
+    fn new(size: &TableSize) -> Self {
+        Self {
+            table_kind: size.kind.as_str().to_string(),
+            table: size.table_name.clone(),
+        }
+    }
+}
+
 /// Validation issue categories, kept distinct so a dashboard can separate
 /// actionable gaps from expected leader gaps and other data problems.
 #[derive(Clone, Copy)]
@@ -129,6 +159,8 @@ pub struct PublicStatus {
     pub last_error_at_unix: Option<u64>,
     pub last_report: Option<ArchiveRunReport>,
     pub db_slots: Option<DbSlotStatus>,
+    pub disk_usage: Vec<DiskUsage>,
+    pub table_sizes: Vec<TableSize>,
     pub recent_events: Vec<ArchiveEvent>,
     pub known_gaps: Vec<KnownDataGap>,
     pub archives_created: u64,
@@ -211,6 +243,11 @@ struct Metrics {
     validation_db_block_slots: Family<KindLabels, Gauge>,
     validation_rpc_produced_slots: Family<KindLabels, Gauge>,
     known_gaps: Family<GapLabels, Gauge>,
+    disk_free_bytes: Family<DiskLabels, Gauge>,
+    disk_used_bytes: Family<DiskLabels, Gauge>,
+    disk_total_bytes: Family<DiskLabels, Gauge>,
+    db_table_bytes: Family<DbTableLabels, Gauge>,
+    db_table_rows: Family<DbTableLabels, Gauge>,
     // Counters.
     archives_created_total: Family<KindLabels, Counter>,
     archives_skipped_total: Family<SkipLabels, Counter>,
@@ -257,6 +294,11 @@ impl Metrics {
         let validation_db_block_slots = Family::<KindLabels, Gauge>::default();
         let validation_rpc_produced_slots = Family::<KindLabels, Gauge>::default();
         let known_gaps = Family::<GapLabels, Gauge>::default();
+        let disk_free_bytes = Family::<DiskLabels, Gauge>::default();
+        let disk_used_bytes = Family::<DiskLabels, Gauge>::default();
+        let disk_total_bytes = Family::<DiskLabels, Gauge>::default();
+        let db_table_bytes = Family::<DbTableLabels, Gauge>::default();
+        let db_table_rows = Family::<DbTableLabels, Gauge>::default();
         let archives_created_total = Family::<KindLabels, Counter>::default();
         let archives_skipped_total = Family::<SkipLabels, Counter>::default();
         let archive_errors_total = Family::<KindLabels, Counter>::default();
@@ -396,6 +438,31 @@ impl Metrics {
             "Currently tracked known data gaps by archive kind and classification",
             known_gaps.clone(),
         );
+        registry.register(
+            "disk_free_bytes",
+            "Free space on a ClickHouse-managed disk, from system.disks",
+            disk_free_bytes.clone(),
+        );
+        registry.register(
+            "disk_used_bytes",
+            "Used space on a ClickHouse-managed disk, from system.disks",
+            disk_used_bytes.clone(),
+        );
+        registry.register(
+            "disk_total_bytes",
+            "Total space on a ClickHouse-managed disk, from system.disks",
+            disk_total_bytes.clone(),
+        );
+        registry.register(
+            "db_table_bytes",
+            "Disk bytes used by a ClickHouse source table, from system.tables, by table_kind and table",
+            db_table_bytes.clone(),
+        );
+        registry.register(
+            "db_table_rows",
+            "Row count of a ClickHouse source table, from system.tables, by table_kind and table",
+            db_table_rows.clone(),
+        );
         // Counters are registered without the `_total` suffix; the OpenMetrics
         // encoder appends it, yielding e.g. `solparq_archives_created_total`.
         registry.register(
@@ -480,6 +547,11 @@ impl Metrics {
             validation_db_block_slots,
             validation_rpc_produced_slots,
             known_gaps,
+            disk_free_bytes,
+            disk_used_bytes,
+            disk_total_bytes,
+            db_table_bytes,
+            db_table_rows,
             archives_created_total,
             archives_skipped_total,
             archive_errors_total,
@@ -507,6 +579,33 @@ impl Metrics {
         self.last_db_latest_slot
             .store(bounds.latest_slot, Ordering::Relaxed);
         self.recompute_chain_tip_lag();
+    }
+
+    fn observe_disk_usage(&self, disks: &[DiskUsage]) {
+        for disk in disks {
+            let labels = DiskLabels::new(disk);
+            self.disk_free_bytes
+                .get_or_create(&labels)
+                .set(clamp_i64(disk.free_bytes));
+            self.disk_used_bytes
+                .get_or_create(&labels)
+                .set(clamp_i64(disk.used_bytes()));
+            self.disk_total_bytes
+                .get_or_create(&labels)
+                .set(clamp_i64(disk.total_bytes));
+        }
+    }
+
+    fn observe_table_sizes(&self, sizes: &[TableSize]) {
+        for size in sizes {
+            let labels = DbTableLabels::new(size);
+            self.db_table_bytes
+                .get_or_create(&labels)
+                .set(clamp_i64(size.bytes));
+            self.db_table_rows
+                .get_or_create(&labels)
+                .set(clamp_i64(size.rows));
+        }
     }
 
     fn observe_chain_tip(&self, tip_slot: u64) {
@@ -548,6 +647,8 @@ pub struct AppState {
     last_error_at_unix: AtomicU64,
     last_report: Mutex<Option<ArchiveRunReport>>,
     db_slots: Mutex<Option<DbSlotStatus>>,
+    disk_usage: Mutex<Vec<DiskUsage>>,
+    table_sizes: Mutex<Vec<TableSize>>,
     recent_events: Mutex<Vec<ArchiveEvent>>,
     known_gaps: Mutex<Vec<KnownDataGap>>,
     metrics: Metrics,
@@ -574,6 +675,8 @@ impl AppState {
             last_error_at_unix: AtomicU64::new(0),
             last_report: Mutex::new(None),
             db_slots: Mutex::new(None),
+            disk_usage: Mutex::new(Vec::new()),
+            table_sizes: Mutex::new(Vec::new()),
             recent_events: Mutex::new(Vec::new()),
             known_gaps: Mutex::new(Vec::new()),
             metrics: Metrics::new(started_at_unix),
@@ -629,6 +732,18 @@ impl AppState {
         }
         if let Some(tip_slot) = report.run_metrics.chain_tip_slot {
             self.metrics.observe_chain_tip(tip_slot);
+        }
+        if !report.run_metrics.disk_usage.is_empty() {
+            self.metrics
+                .observe_disk_usage(&report.run_metrics.disk_usage);
+            *self.disk_usage.lock().expect("disk_usage poisoned") =
+                report.run_metrics.disk_usage.clone();
+        }
+        if !report.run_metrics.table_sizes.is_empty() {
+            self.metrics
+                .observe_table_sizes(&report.run_metrics.table_sizes);
+            *self.table_sizes.lock().expect("table_sizes poisoned") =
+                report.run_metrics.table_sizes.clone();
         }
         if report.archive_created {
             self.archives_created.fetch_add(1, Ordering::Relaxed);
@@ -723,6 +838,12 @@ impl AppState {
                 .expect("last_report poisoned")
                 .clone(),
             db_slots: *self.db_slots.lock().expect("db_slots poisoned"),
+            disk_usage: self.disk_usage.lock().expect("disk_usage poisoned").clone(),
+            table_sizes: self
+                .table_sizes
+                .lock()
+                .expect("table_sizes poisoned")
+                .clone(),
             recent_events: self
                 .recent_events
                 .lock()

@@ -7,9 +7,9 @@ use superbank_solparq::{
         plan_archive_slot_range, plan_next_archive, safe_delete_archived_data_range,
     },
     clickhouse::{
-        ArchiveTableKind, DbTables, MismatchDirection, S3ArchiveSql, SlotRange,
-        TransactionMismatch, ValidationReport, build_delete_sql, build_local_parquet_query,
-        build_s3_archive_sql, build_s3_table_archive_sql,
+        ArchiveTableKind, DbTables, DiskUsage, MismatchDirection, S3ArchiveSql, SlotRange,
+        TableSize, TransactionMismatch, ValidationReport, build_delete_sql,
+        build_local_parquet_query, build_s3_archive_sql, build_s3_table_archive_sql,
     },
     config::{ArchiveLocation, Config},
     metrics::AppState,
@@ -1028,6 +1028,146 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
 }
 
 #[test]
+fn dashboard_and_metrics_expose_clickhouse_disk_usage() {
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+    ])
+    .expect("valid config");
+    let state = AppState::new();
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: false,
+        archive_skipped_reason: Some(
+            "not enough ClickHouse slots available for the next archive".to_string(),
+        ),
+        archive_name: None,
+        archive_kind: ArchiveKind::Custom { slots: 1_000 },
+        archive_epoch: None,
+        archive_slot_start: None,
+        archive_slot_end: None,
+        db_bounds: None,
+        destination: "./".to_string(),
+        archive_tables: Vec::new(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: ArchiveRunMetrics {
+            disk_usage: vec![DiskUsage {
+                name: "default".to_string(),
+                path: "/var/lib/clickhouse/".to_string(),
+                free_bytes: 25 * 1024 * 1024 * 1024,
+                total_bytes: 100 * 1024 * 1024 * 1024,
+            }],
+            ..Default::default()
+        },
+    });
+
+    let status = state.public_status();
+    let html = render_dashboard(&config, &status);
+    assert!(html.contains("ClickHouse disk usage"));
+    assert!(html.contains("<code>default</code>"));
+    assert!(html.contains("<code>/var/lib/clickhouse/</code>"));
+    assert!(html.contains("75.0 GB"));
+    assert!(html.contains("25.0 GB"));
+    assert!(html.contains("100.0 GB"));
+    assert!(html.contains("75.0%"));
+
+    let text = state.prometheus_text();
+    assert!(text.contains(
+        "solparq_disk_free_bytes{disk=\"default\",path=\"/var/lib/clickhouse/\"} 26843545600"
+    ));
+    assert!(text.contains(
+        "solparq_disk_used_bytes{disk=\"default\",path=\"/var/lib/clickhouse/\"} 80530636800"
+    ));
+    assert!(text.contains(
+        "solparq_disk_total_bytes{disk=\"default\",path=\"/var/lib/clickhouse/\"} 107374182400"
+    ));
+}
+
+#[test]
+fn dashboard_and_metrics_expose_db_table_sizes() {
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+    ])
+    .expect("valid config");
+    let state = AppState::new();
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: false,
+        archive_skipped_reason: Some(
+            "not enough ClickHouse slots available for the next archive".to_string(),
+        ),
+        archive_name: None,
+        archive_kind: ArchiveKind::Custom { slots: 1_000 },
+        archive_epoch: None,
+        archive_slot_start: None,
+        archive_slot_end: None,
+        db_bounds: None,
+        destination: "./".to_string(),
+        archive_tables: Vec::new(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: ArchiveRunMetrics {
+            table_sizes: vec![
+                TableSize {
+                    kind: ArchiveTableKind::Transactions,
+                    table_name: "transactions".to_string(),
+                    bytes: 50 * 1024 * 1024 * 1024,
+                    rows: 123_456_789,
+                },
+                TableSize {
+                    kind: ArchiveTableKind::BlocksMetadata,
+                    table_name: "blocks_metadata".to_string(),
+                    bytes: 1024 * 1024 * 1024,
+                    rows: 1_000_000,
+                },
+            ],
+            ..Default::default()
+        },
+    });
+
+    let status = state.public_status();
+    let html = render_dashboard(&config, &status);
+    assert!(html.contains("ClickHouse table sizes"));
+    assert!(html.contains("<code>transactions</code>"));
+    assert!(html.contains("<code>blocks_metadata</code>"));
+    assert!(html.contains("123,456,789"));
+    assert!(html.contains("50.0 GB"));
+    assert!(html.contains("1.0 GB"));
+    assert!(html.contains("51.0 GB"));
+
+    let text = state.prometheus_text();
+    assert!(text.contains(
+        "solparq_db_table_bytes{table_kind=\"transactions\",table=\"transactions\"} 53687091200"
+    ));
+    assert!(text.contains(
+        "solparq_db_table_rows{table_kind=\"transactions\",table=\"transactions\"} 123456789"
+    ));
+    assert!(text.contains(
+        "solparq_db_table_bytes{table_kind=\"blocks_metadata\",table=\"blocks_metadata\"} 1073741824"
+    ));
+}
+
+#[test]
 fn dashboard_renders_s3_output_location() {
     let config = Config::try_parse_from([
         "superbank-solparq",
@@ -1208,6 +1348,8 @@ fn metrics_endpoint_exposes_labeled_series() {
             archived_bytes_total: Some(4_096),
             chain_tip_slot: Some(432_432_099),
             mismatch_repair: None,
+            disk_usage: Vec::new(),
+            table_sizes: Vec::new(),
         },
     });
 

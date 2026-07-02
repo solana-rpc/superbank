@@ -442,6 +442,65 @@ impl ClickHouseClient {
         self.query_json_rows::<TransactionMismatch>(&sql).await
     }
 
+    /// Disk space ClickHouse reports for its own configured disks (`system.disks`).
+    /// Reflects whichever node serves this HTTP request, so on a cluster this is
+    /// per-node, not an aggregate across shards.
+    pub async fn fetch_disk_usage(&self) -> Result<Vec<DiskUsage>> {
+        #[derive(Debug, Deserialize)]
+        struct DiskRow {
+            name: String,
+            path: String,
+            free_space: u64,
+            total_space: u64,
+        }
+
+        let rows = self
+            .query_json_rows::<DiskRow>(
+                "SELECT name, path, free_space, total_space FROM system.disks ORDER BY name",
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DiskUsage {
+                name: row.name,
+                path: row.path,
+                free_bytes: row.free_space,
+                total_bytes: row.total_space,
+            })
+            .collect())
+    }
+
+    /// Disk-space footprint of each archive-relevant table (`system.tables`
+    /// `total_bytes`/`total_rows`). Only returns entries for tables that exist;
+    /// missing optional tables are silently omitted, matching `check_tables`.
+    pub async fn fetch_table_sizes(&self, tables: &[ArchiveDbTable]) -> Result<Vec<TableSize>> {
+        #[derive(Debug, Deserialize)]
+        struct SizeRow {
+            name: String,
+            total_bytes: Option<u64>,
+            total_rows: Option<u64>,
+        }
+
+        let rows = self
+            .query_json_rows::<SizeRow>(
+                "SELECT name, total_bytes, total_rows FROM system.tables WHERE database = currentDatabase()",
+            )
+            .await?;
+        Ok(tables
+            .iter()
+            .filter_map(|table| {
+                rows.iter()
+                    .find(|row| row.name == table.table_name)
+                    .map(|row| TableSize {
+                        kind: table.kind,
+                        table_name: table.table_name.clone(),
+                        bytes: row.total_bytes.unwrap_or(0),
+                        rows: row.total_rows.unwrap_or(0),
+                    })
+            })
+            .collect())
+    }
+
     async fn query_json_rows<T>(&self, sql: &str) -> Result<Vec<T>>
     where
         T: for<'de> Deserialize<'de>,
@@ -480,6 +539,31 @@ impl ClickHouseClient {
             Err(clickhouse_status_error(status, body, sql))
         }
     }
+}
+
+/// Disk space for a single ClickHouse-managed disk, as reported by `system.disks`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiskUsage {
+    pub name: String,
+    pub path: String,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl DiskUsage {
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.free_bytes)
+    }
+}
+
+/// Disk-space footprint of a single archive-relevant table, as reported by
+/// `system.tables`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TableSize {
+    pub kind: ArchiveTableKind,
+    pub table_name: String,
+    pub bytes: u64,
+    pub rows: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

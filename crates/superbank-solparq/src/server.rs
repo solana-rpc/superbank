@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     archive,
+    clickhouse::{DiskUsage, TableSize},
     config::{ArchiveLocation, Config},
     metrics::{AppState, ArchiveEvent, KnownDataGap, PublicStatus},
 };
@@ -495,6 +496,10 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
             )
         })
         .unwrap_or_else(|| "unknown".to_string());
+    let disk_summary = render_disk_summary(&status.disk_usage);
+    let disk_rows = render_disk_usage(&status.disk_usage);
+    let table_size_summary = render_table_size_summary(&status.table_sizes);
+    let table_size_rows = render_table_sizes(&status.table_sizes);
     let timeline = render_timeline(&status.recent_events);
     let event_rows = render_event_rows(&status.recent_events);
     let gap_rows = render_gap_rows(&status.known_gaps);
@@ -554,6 +559,12 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     .badge {{ display: inline-flex; justify-content: center; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; color: #fff; }}
     .gaps {{ overflow: auto; }}
     .gaps table {{ min-width: 988px; }}
+    .disks {{ overflow: auto; }}
+    .disks table {{ min-width: 760px; }}
+    .bar {{ display: inline-block; width: 140px; height: 8px; border-radius: 4px; background: #eef3f8; border: 1px solid var(--line); vertical-align: middle; overflow: hidden; }}
+    .bar-fill {{ display: block; height: 100%; background: var(--blue); }}
+    .bar-fill.warn {{ background: var(--amber); }}
+    .bar-fill.crit {{ background: var(--red); }}
     .created {{ background: var(--green); }}
     .skipped {{ background: var(--amber); }}
     .error {{ background: var(--red); }}
@@ -583,6 +594,8 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
       <div class="metric"><div class="label">Archives created</div><div class="value">{archives_created}</div></div>
       <div class="metric"><div class="label">Last run</div><div class="value">{last_run}</div></div>
       <div class="metric"><div class="label">Last success</div><div class="value">{last_success}</div></div>
+      <div class="metric"><div class="label">ClickHouse disk usage</div><div class="value">{disk_summary}</div></div>
+      <div class="metric"><div class="label">DB table sizes (total)</div><div class="value">{table_size_summary}</div></div>
     </div>
 
     <div class="two">
@@ -607,6 +620,14 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         </table>
       </section>
     </div>
+    <section class="disks">
+      <h2>ClickHouse disk usage</h2>
+      {disk_rows}
+    </section>
+    <section class="disks">
+      <h2>ClickHouse table sizes</h2>
+      {table_size_rows}
+    </section>
     <section class="gaps">
       <h2>Known data gaps</h2>
       {gap_rows}
@@ -620,6 +641,10 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         archives_created = format_u64(status.archives_created),
         last_run = html_escape(&format_utc_timestamp(status.last_run_at_unix)),
         last_success = html_escape(&format_utc_timestamp(status.last_success_at_unix)),
+        disk_summary = html_escape(&disk_summary),
+        disk_rows = disk_rows,
+        table_size_summary = html_escape(&table_size_summary),
+        table_size_rows = table_size_rows,
         timeline = timeline,
         event_rows = event_rows,
         gap_rows = gap_rows,
@@ -634,6 +659,110 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         archive_errors = format_u64(status.archive_errors),
         last_error = html_escape(&last_error_display),
     )
+}
+
+fn render_disk_summary(disks: &[DiskUsage]) -> String {
+    if disks.is_empty() {
+        return "unknown".to_string();
+    }
+    let total: u64 = disks.iter().map(|disk| disk.total_bytes).sum();
+    let used: u64 = disks.iter().map(DiskUsage::used_bytes).sum();
+    let percent = usage_percent(used, total);
+    format!(
+        "{} / {} ({percent:.0}%)",
+        format_bytes(used),
+        format_bytes(total)
+    )
+}
+
+fn render_disk_usage(disks: &[DiskUsage]) -> String {
+    if disks.is_empty() {
+        return "<p>No ClickHouse disk usage reported yet.</p>".to_string();
+    }
+    let rows = disks
+        .iter()
+        .map(|disk| {
+            let used = disk.used_bytes();
+            let percent = usage_percent(used, disk.total_bytes);
+            let bar_class = if percent >= 90.0 {
+                "crit"
+            } else if percent >= 75.0 {
+                "warn"
+            } else {
+                ""
+            };
+            format!(
+                "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td>\
+                 <td><span class=\"bar\"><span class=\"bar-fill {bar_class}\" style=\"width:{:.0}%\"></span></span> {percent:.1}%</td></tr>",
+                html_escape(&disk.name),
+                html_escape(&disk.path),
+                format_bytes(used),
+                format_bytes(disk.free_bytes),
+                format_bytes(disk.total_bytes),
+                percent.min(100.0),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<table><thead><tr><th>Disk</th><th>Path</th><th>Used</th><th>Free</th><th>Total</th><th>Usage</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
+}
+
+fn render_table_size_summary(tables: &[TableSize]) -> String {
+    if tables.is_empty() {
+        return "unknown".to_string();
+    }
+    let total_bytes: u64 = tables.iter().map(|table| table.bytes).sum();
+    let total_rows: u64 = tables.iter().map(|table| table.rows).sum();
+    format!(
+        "{} ({} rows)",
+        format_bytes(total_bytes),
+        format_u64(total_rows)
+    )
+}
+
+fn render_table_sizes(tables: &[TableSize]) -> String {
+    if tables.is_empty() {
+        return "<p>No ClickHouse table sizes reported yet.</p>".to_string();
+    }
+    let rows = tables
+        .iter()
+        .map(|table| {
+            format!(
+                "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                html_escape(table.kind.as_str()),
+                html_escape(&table.table_name),
+                format_u64(table.rows),
+                format_bytes(table.bytes),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<table><thead><tr><th>Archive table</th><th>ClickHouse table</th><th>Rows</th><th>Size</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
+}
+
+fn usage_percent(used: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes as f64;
+    let mut unit_idx = 0;
+    while value >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{value:.0} {}", UNITS[unit_idx])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_idx])
+    }
 }
 
 fn render_archive_table_list(status: &PublicStatus) -> String {

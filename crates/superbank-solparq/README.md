@@ -277,6 +277,11 @@ Currency (how up to date the data is):
 | `solparq_last_archived_start_slot` | gauge | `archive_kind` | Start slot of the most recent archive |
 | `solparq_last_archived_end_slot` | gauge | `archive_kind` | End slot of the most recent archive |
 | `solparq_last_archived_epoch` | gauge | `archive_kind` | Epoch of the most recent archive |
+| `solparq_disk_free_bytes` | gauge | `disk`, `path` | Free space on a ClickHouse-managed disk, from `system.disks` |
+| `solparq_disk_used_bytes` | gauge | `disk`, `path` | Used space on a ClickHouse-managed disk, from `system.disks` |
+| `solparq_disk_total_bytes` | gauge | `disk`, `path` | Total space on a ClickHouse-managed disk, from `system.disks` |
+| `solparq_db_table_bytes` | gauge | `table_kind`, `table` | Disk bytes used by a ClickHouse source table, from `system.tables` |
+| `solparq_db_table_rows` | gauge | `table_kind`, `table` | Row count of a ClickHouse source table, from `system.tables` |
 
 Throughput and outcomes:
 
@@ -325,6 +330,16 @@ separate actionable gaps from expected leader gaps and other problems:
 > ClickHouse-driven S3 exports do not report bytes written, so the byte gauge is
 > left unset for S3 archives.
 
+> `solparq_disk_*_bytes` come from `system.disks` on whichever ClickHouse node
+> serves the HTTP request, so on a cluster this is per-node disk usage, not a
+> cluster-wide aggregate.
+
+> `solparq_db_table_*` come from `system.tables` on whichever ClickHouse node
+> serves the HTTP request. On a `Distributed`-backed setup this reflects only
+> the local shard's data unless the table itself is a `Distributed` table.
+> Optional tables that are not present are simply omitted, matching
+> `check_tables`.
+
 #### Repairing transaction mismatches
 
 A transaction mismatch means a slot's `blocks_metadata.executed_transaction_count`
@@ -356,8 +371,9 @@ single node the defaults (local table = transactions table, no cluster) are fine
 An importable dashboard covering all of the above lives at
 [`grafana/solparq-ops-dashboard.json`](grafana/solparq-ops-dashboard.json). It is
 organised into rows — Overview, Currency, Throughput & outcomes, Latency, Data
-quality, Resources, and Transaction mismatches — and includes `Node` (`nodename`)
-and `Archive kind` template variables for filtering.
+quality, Resources (including ClickHouse disk and per-table sizes), and
+Transaction mismatches — and includes `Node` (`nodename`) and `Archive kind`
+template variables for filtering.
 
 **Multiple nodes:** every query is filtered by the `Node` variable and grouped by
 `nodename`, and each series is labelled with its node, so a Prometheus that
@@ -413,8 +429,10 @@ To mirror logs to a file as well as the terminal:
 
 The ops dashboard refreshes every 30 seconds. It shows human-readable UTC
 timestamps for last run and last success, the number of transaction slots
-available in ClickHouse, startup settings, skip reasons, known data gaps, and a
-color-coded archive timeline.
+available in ClickHouse, ClickHouse disk usage (used/free/total per disk, from
+`system.disks`), per-table row counts and sizes (from `system.tables`),
+startup settings, skip reasons, known data gaps, and a color-coded archive
+timeline.
 
 On shutdown, `superbank-solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
 shutdown signal stops new archive tasks from starting and waits for any archive
