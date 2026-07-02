@@ -1,0 +1,113 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.1.2.11
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-superbank}
+    # ClickHouse stays internal by default to avoid host port conflicts.
+    # Use `docker compose exec clickhouse clickhouse-client` for direct access.
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - clickhouse-client --query "SELECT 1"
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+  clickhouse-ddl:
+    image: clickhouse/clickhouse-server:26.1.2.11
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-superbank}
+    volumes:
+      - ./ddl/local:/ddl/local:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        for file in \
+          transactions.sql \
+          blocks_metadata.sql \
+          entries.sql \
+          gsfa.sql \
+          gsfa_hot.sql \
+          signatures.sql \
+          token_owner_activity.sql
+        do
+          echo "Applying /ddl/local/$${file}"
+          clickhouse-client \
+            --host clickhouse \
+            --multiquery < "/ddl/local/$${file}"
+        done
+
+  superbank-rpc:
+    image: superbank:local
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SUPERBANK_RPC_FEATURES: ${SUPERBANK_RPC_FEATURES:-}
+    depends_on:
+      clickhouse-ddl:
+        condition: service_completed_successfully
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,clickhouse_rs=warn}
+      LOG_FORMAT: ${LOG_FORMAT:-plain}
+      RPC_HOST: 0.0.0.0
+      RPC_PORT: 8899
+      METRICS_HOST: 0.0.0.0
+      METRICS_PORT: 9900
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-superbank}
+    ports:
+      - "${RPC_PORT:-8899}:8899"
+      - "${RPC_METRICS_PORT:-9900}:9900"
+
+  superbank-ingest-rpc:
+    profiles:
+      - ingest-rpc
+    image: superbank:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SUPERBANK_RPC_FEATURES: ${SUPERBANK_RPC_FEATURES:-}
+    depends_on:
+      clickhouse-ddl:
+        condition: service_completed_successfully
+    entrypoint:
+      - /usr/local/bin/superbank
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      SUPERBANK_SOURCE: rpc
+      RPC_URL: ${SUPERBANK_INGEST_RPC_URL:-https://api.mainnet-beta.solana.com}
+      RPC_FROM_SLOT: ${SUPERBANK_INGEST_RPC_FROM_SLOT:-0}
+      RPC_SLOT_COUNT: ${SUPERBANK_INGEST_SLOT_COUNT:-64}
+      RPC_MAX_INFLIGHT: ${SUPERBANK_INGEST_RPC_MAX_INFLIGHT:-4}
+      RPC_RETRY_BACKOFF_MS: ${SUPERBANK_INGEST_RPC_RETRY_BACKOFF_MS:-1000}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-superbank}
+      CLICKHOUSE_ENTRIES_TABLE: default.entries
+      METRICS_HOST: 0.0.0.0
+      METRICS_PORT: 9901
+    ports:
+      - "${INGEST_METRICS_PORT:-9901}:9901"
+
+volumes:
+  clickhouse-data:
