@@ -51,6 +51,8 @@ flowchart LR
   - [4) Run the ingestor](#4-run-the-ingestor)
   - [5) Run the RPC server](#5-run-the-rpc-server)
 - [Configuration](#configuration)
+- [Docker local development](#docker-local-development)
+- [Production image](#production-image)
 - [Load testing](#load-testing)
 - [Repository layout](#repository-layout)
 - [Development](#development)
@@ -171,6 +173,92 @@ curl -sS http://localhost:8899 \
   See `crates/superbank/README.md` and `superbank.example.yaml`.
 - `superbank-rpc` is configured via CLI flags and environment variables.
   See `crates/superbank-rpc/README.md`.
+
+## Docker local development
+
+Use Compose when you want the local ClickHouse + DDL + RPC stack without setting up Kubernetes/Tilt:
+
+```bash
+docker compose up --build
+```
+
+This starts ClickHouse, applies `ddl/local/*.sql`, builds the Superbank image, and runs
+`superbank-rpc` on `http://localhost:8899`. ClickHouse stays on the internal Compose network by
+default to avoid conflicts with local ClickHouse instances.
+
+To ingest a small bounded range through the Solana JSON-RPC source, enable the `ingest-rpc` profile:
+
+```bash
+SUPERBANK_INGEST_RPC_URL=https://api.mainnet-beta.solana.com \
+SUPERBANK_INGEST_RPC_FROM_SLOT=350918000 \
+SUPERBANK_INGEST_SLOT_COUNT=64 \
+docker compose --profile ingest-rpc up --build
+```
+
+The ingestor still requires an external data source. For larger or credentialed sources, set the
+same environment variables documented in `crates/superbank/README.md`.
+
+Useful local commands:
+
+```bash
+docker compose exec clickhouse clickhouse-client \
+  --user default --password superbank \
+  --query "SHOW TABLES"
+
+curl -sS http://localhost:8899 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getFirstAvailableBlock"}'
+```
+
+If you change DDL files after the first run, recreate the one-shot DDL container:
+
+```bash
+docker compose up --force-recreate clickhouse-ddl
+```
+
+## Production image
+
+Build the production image from the repo root:
+
+```bash
+docker build -t superbank:0.5.0 .
+```
+
+The image contains both binaries. It runs `superbank-rpc` by default:
+
+```bash
+docker run --rm -p 8899:8899 \
+  -e RPC_HOST=0.0.0.0 \
+  -e RPC_PORT=8899 \
+  -e CLICKHOUSE_URL=http://clickhouse:8123 \
+  -e CLICKHOUSE_DATABASE=default \
+  -e CLICKHOUSE_USER=default \
+  -e CLICKHOUSE_PASSWORD=superbank \
+  superbank:0.5.0
+```
+
+Run the ingestor from the same image by overriding the entrypoint:
+
+```bash
+docker run --rm --entrypoint /usr/local/bin/superbank \
+  -e SUPERBANK_SOURCE=rpc \
+  -e RPC_URL=https://api.mainnet-beta.solana.com \
+  -e RPC_FROM_SLOT=350918000 \
+  -e RPC_SLOT_COUNT=64 \
+  -e CLICKHOUSE_URL=http://clickhouse:8123 \
+  -e CLICKHOUSE_DATABASE=default \
+  -e CLICKHOUSE_USER=default \
+  -e CLICKHOUSE_PASSWORD=superbank \
+  superbank:0.5.0
+```
+
+Optional `superbank-rpc` features can be enabled at build time:
+
+```bash
+docker build \
+  --build-arg SUPERBANK_RPC_FEATURES=grpc-head-cache \
+  -t superbank:grpc-head-cache .
+```
 
 ## Load testing
 
