@@ -14,7 +14,9 @@ use tokio::fs;
 use tracing::{debug, info};
 
 use crate::{
-    clickhouse::{ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, ValidationReport},
+    clickhouse::{
+        ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, SlotRange, ValidationReport,
+    },
     config::Config,
     manifest::{ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, SkippedArchiveTable},
     storage::{self, ArchiveDestination},
@@ -349,6 +351,16 @@ pub struct ArchiveRunMetrics {
     /// Current Solana network tip (finalized) observed for this run, if the RPC
     /// probe succeeded. Enables the chain-tip lag metric.
     pub chain_tip_slot: Option<u64>,
+    /// Outcome of an overcount transaction-mismatch repair attempt, if one ran.
+    pub mismatch_repair: Option<MismatchRepair>,
+}
+
+/// Result of a `--repair-mismatches` dedup pass over overcount slots.
+#[derive(Debug, Clone, Serialize)]
+pub struct MismatchRepair {
+    pub partitions_optimized: u64,
+    pub overcount_slots_before: u64,
+    pub overcount_slots_after: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -498,6 +510,14 @@ impl ArchiveRunReport {
         if let Some(chain_tip_slot) = self.run_metrics.chain_tip_slot {
             lines.push(format!("chain_tip_slot: {chain_tip_slot}"));
         }
+        if let Some(repair) = &self.run_metrics.mismatch_repair {
+            lines.push(format!(
+                "mismatch_repair: partitions={} overcount_before={} overcount_after={}",
+                repair.partitions_optimized,
+                repair.overcount_slots_before,
+                repair.overcount_slots_after
+            ));
+        }
         if let Some(validation) = &self.validation {
             lines.push(format!(
                 "validation_missing_blocks: {}",
@@ -518,6 +538,14 @@ impl ArchiveRunReport {
             lines.push(format!(
                 "validation_transaction_mismatch_ranges: {}",
                 ValidationReport::format_ranges(&validation.transaction_mismatch_ranges)
+            ));
+            lines.push(format!(
+                "validation_transaction_undercount_ranges: {}",
+                ValidationReport::format_ranges(&validation.transaction_undercount_ranges)
+            ));
+            lines.push(format!(
+                "validation_transaction_overcount_ranges: {}",
+                ValidationReport::format_ranges(&validation.transaction_overcount_ranges)
             ));
             if let Some(error) = &validation.rpc_check_error {
                 lines.push(format!("validation_rpc_check_error: {error}"));
@@ -688,7 +716,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
     }
     let mut phase_durations = Vec::new();
     let validate_started = Instant::now();
-    let validation = client
+    let mut validation = client
         .validate_archive_range(
             &tables,
             &config.solana_rpc_url,
@@ -697,6 +725,57 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         )
         .await?;
     phase_durations.push(PhaseDuration::new("validate", validate_started.elapsed()));
+
+    // Attempt to repair overcount mismatches (duplicate rows) via ClickHouse
+    // dedup before deciding whether to archive. Undercount mismatches are left
+    // for re-ingestion. Re-validate after so the archive/skip decision uses the
+    // post-repair state.
+    let mismatch_repair =
+        if config.repair_mismatches && !validation.transaction_overcount_ranges.is_empty() {
+            let repair_started = Instant::now();
+            let partitions = epoch_partitions(&validation.transaction_overcount_ranges);
+            let overcount_slots_before = count_slots(&validation.transaction_overcount_ranges);
+            info!(
+                archive_kind = kind.to_string(),
+                partitions = partitions.len(),
+                overcount_slots = overcount_slots_before,
+                "repairing overcount transaction mismatches via dedup"
+            );
+            for partition in &partitions {
+                client
+                    .deduplicate_partition(
+                        &config.transactions_local_table,
+                        config.clickhouse_cluster.as_deref(),
+                        *partition,
+                    )
+                    .await?;
+            }
+            validation = client
+                .validate_archive_range(
+                    &tables,
+                    &config.solana_rpc_url,
+                    plan.start_slot,
+                    plan.end_slot,
+                )
+                .await?;
+            let overcount_slots_after = count_slots(&validation.transaction_overcount_ranges);
+            phase_durations.push(PhaseDuration::new("repair", repair_started.elapsed()));
+            info!(
+                archive_kind = kind.to_string(),
+                partitions = partitions.len(),
+                overcount_slots_before,
+                overcount_slots_after,
+                "mismatch repair completed"
+            );
+            Some(MismatchRepair {
+                partitions_optimized: partitions.len() as u64,
+                overcount_slots_before,
+                overcount_slots_after,
+            })
+        } else {
+            None
+        };
+
     debug!(
         archive_kind = kind.to_string(),
         missing_blocks = validation.missing_blocks.len(),
@@ -715,6 +794,8 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             report.db_bounds = Some(bounds);
             report.archive_tables = archive_tables;
             report.validation = Some(validation);
+            report.run_metrics.phase_durations = phase_durations;
+            report.run_metrics.mismatch_repair = mismatch_repair;
             return Ok(report);
         }
         if !confirm_validation_warnings(&plan, &validation)? {
@@ -726,6 +807,8 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             report.db_bounds = Some(bounds);
             report.archive_tables = archive_tables;
             report.validation = Some(validation);
+            report.run_metrics.phase_durations = phase_durations;
+            report.run_metrics.mismatch_repair = mismatch_repair;
             return Ok(report);
         }
     }
@@ -892,6 +975,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             archived_table_rows,
             archived_bytes_total,
             chain_tip_slot: None,
+            mismatch_repair,
         },
     };
     storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
@@ -1020,6 +1104,22 @@ async fn staging_bundle_bytes(staging_dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Distinct epoch partition ids (`intDiv(slot, EPOCH_SLOTS)`, the transactions
+/// table `PARTITION BY`) covered by the given slot ranges.
+pub fn epoch_partitions(ranges: &[SlotRange]) -> Vec<u64> {
+    let mut partitions = ranges
+        .iter()
+        .flat_map(|range| (range.start_slot / EPOCH_SLOTS)..=(range.end_slot / EPOCH_SLOTS))
+        .collect::<Vec<_>>();
+    partitions.sort_unstable();
+    partitions.dedup();
+    partitions
+}
+
+fn count_slots(ranges: &[SlotRange]) -> u64 {
+    ranges.iter().map(|range| range.slot_count).sum()
 }
 
 fn align_up(value: u64, width: u64) -> u64 {

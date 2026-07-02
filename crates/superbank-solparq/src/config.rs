@@ -30,12 +30,15 @@ pub struct Config {
     pub db_user: String,
     pub db_password: String,
     pub transactions_table: String,
+    pub transactions_local_table: String,
+    pub clickhouse_cluster: Option<String>,
     pub blocks_table: String,
     pub entries_table: String,
     pub gsfa_table: String,
     pub gsfa_hot_table: String,
     pub signatures_table: String,
     pub token_owner_activity_table: String,
+    pub repair_mismatches: bool,
     pub archive_kinds: Vec<ArchiveKind>,
     pub archive_location: ArchiveLocation,
     pub output_location: PathBuf,
@@ -136,13 +139,22 @@ impl Config {
             db_database: cli.db_database,
             db_user: cli.db_user,
             db_password: cli.db_password,
+            transactions_local_table: cli
+                .transactions_local_table
+                .clone()
+                .unwrap_or_else(|| cli.transactions_table.clone()),
             transactions_table: cli.transactions_table,
+            clickhouse_cluster: cli
+                .clickhouse_cluster
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             blocks_table: cli.blocks_table,
             entries_table: cli.entries_table,
             gsfa_table: cli.gsfa_table,
             gsfa_hot_table: cli.gsfa_hot_table,
             signatures_table: cli.signatures_table,
             token_owner_activity_table: cli.token_owner_activity_table,
+            repair_mismatches: cli.repair_mismatches,
             archive_kinds,
             archive_location: cli.archive_location,
             output_location: cli.archive_file_output_location,
@@ -204,6 +216,21 @@ struct Cli {
         default_value = "transactions"
     )]
     transactions_table: String,
+
+    /// Shard-local transactions table targeted by mismatch-repair OPTIMIZE
+    /// statements. Defaults to the transactions table name; set this to the
+    /// `*_local` table in clustered/replicated deployments (OPTIMIZE cannot run
+    /// on a Distributed table).
+    #[arg(
+        long = "db-transactions-local-table-name",
+        env = "SOLPARQ_DB_TRANSACTIONS_LOCAL_TABLE_NAME"
+    )]
+    transactions_local_table: Option<String>,
+
+    /// ClickHouse cluster name for `ON CLUSTER` mismatch-repair OPTIMIZE
+    /// statements. Leave unset for single-node deployments.
+    #[arg(long = "clickhouse-cluster", env = "SOLPARQ_CLICKHOUSE_CLUSTER")]
+    clickhouse_cluster: Option<String>,
 
     #[arg(
         long = "db-blocks-table-name",
@@ -324,6 +351,17 @@ struct Cli {
         default_value_t = false
     )]
     delete_archived_data_range: bool,
+
+    /// Attempt to repair overcount transaction mismatches before archiving by
+    /// running `OPTIMIZE ... FINAL DEDUPLICATE` on affected epoch partitions,
+    /// then re-validating. Undercount mismatches (missing rows) still require
+    /// re-ingestion and are left for an operator.
+    #[arg(
+        long = "repair-mismatches",
+        env = "SOLPARQ_REPAIR_MISMATCHES",
+        default_value_t = false
+    )]
+    repair_mismatches: bool,
 
     #[arg(
         long = "server-mode",

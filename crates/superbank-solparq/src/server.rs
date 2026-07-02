@@ -118,7 +118,7 @@ pub async fn run(config: Config) -> Result<()> {
     info!(
         ops_port = config.ops_port,
         metrics_port = config.metrics_port,
-        "superbank-solparq server mode started"
+        "Solparq server mode started"
     );
 
     let loop_state = state.clone();
@@ -507,7 +507,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="30">
-  <title>superbank-solparq Ops</title>
+  <title>Solparq Ops</title>
   <style>
     :root {{
       color-scheme: light;
@@ -572,7 +572,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
   <main>
     <header>
       <div>
-        <h1>superbank-solparq Ops</h1>
+        <h1>Solparq Ops</h1>
         <p>Auto-refreshes every 30 seconds</p>
       </div>
       <div class="pill {health_class}"><span class="dot"></span>{health_label}</div>

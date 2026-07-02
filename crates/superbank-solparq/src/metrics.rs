@@ -17,7 +17,7 @@ use tracing::warn;
 
 use crate::{
     archive::{ArchiveKind, ArchiveRunReport, ClickHouseBounds},
-    clickhouse::SlotRange,
+    clickhouse::{MismatchDirection, SlotRange},
 };
 
 const MAX_RECENT_EVENTS: usize = 50;
@@ -31,10 +31,11 @@ const PHASE_BUCKETS: [f64; 12] = [
 
 /// Data-gap classifications surfaced as `solparq_known_gaps` label values.
 /// Kept in sync with the classifications produced by [`AppState::record_known_gaps`].
-const GAP_CLASSIFICATIONS: [&str; 3] = [
+const GAP_CLASSIFICATIONS: [&str; 4] = [
     "Needs backfill",
     "Legit not-produced",
-    "Transaction mismatch",
+    "Transaction mismatch (undercount)",
+    "Transaction mismatch (overcount)",
 ];
 
 fn phase_histogram() -> Histogram {
@@ -82,6 +83,18 @@ struct GapLabels {
 struct ValidationLabels {
     archive_kind: String,
     category: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct MismatchLabels {
+    archive_kind: String,
+    direction: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RepairLabels {
+    archive_kind: String,
+    outcome: String,
 }
 
 /// Validation issue categories, kept distinct so a dashboard can separate
@@ -192,6 +205,7 @@ struct Metrics {
     archive_in_flight: Family<KindLabels, Gauge>,
     validation_slots: Family<ValidationLabels, Gauge>,
     validation_ranges: Family<ValidationLabels, Gauge>,
+    validation_mismatch_slots: Family<MismatchLabels, Gauge>,
     validation_range_start_slot: Family<KindLabels, Gauge>,
     validation_range_end_slot: Family<KindLabels, Gauge>,
     validation_db_block_slots: Family<KindLabels, Gauge>,
@@ -205,6 +219,7 @@ struct Metrics {
     clickhouse_range_deleted_total: Family<KindLabels, Counter>,
     validation_rpc_errors_total: Family<KindLabels, Counter>,
     validation_slots_total: Family<ValidationLabels, Counter>,
+    mismatch_repairs_total: Family<RepairLabels, Counter>,
     archive_rows_total: Family<TableLabels, Counter>,
     // Histograms.
     phase_duration_seconds: Family<PhaseLabels, Histogram>,
@@ -236,6 +251,7 @@ impl Metrics {
         let archive_in_flight = Family::<KindLabels, Gauge>::default();
         let validation_slots = Family::<ValidationLabels, Gauge>::default();
         let validation_ranges = Family::<ValidationLabels, Gauge>::default();
+        let validation_mismatch_slots = Family::<MismatchLabels, Gauge>::default();
         let validation_range_start_slot = Family::<KindLabels, Gauge>::default();
         let validation_range_end_slot = Family::<KindLabels, Gauge>::default();
         let validation_db_block_slots = Family::<KindLabels, Gauge>::default();
@@ -248,6 +264,7 @@ impl Metrics {
         let clickhouse_range_deleted_total = Family::<KindLabels, Counter>::default();
         let validation_rpc_errors_total = Family::<KindLabels, Counter>::default();
         let validation_slots_total = Family::<ValidationLabels, Counter>::default();
+        let mismatch_repairs_total = Family::<RepairLabels, Counter>::default();
         let archive_rows_total = Family::<TableLabels, Counter>::default();
         let phase_duration_seconds = Family::<PhaseLabels, Histogram>::new_with_constructor(
             phase_histogram as fn() -> Histogram,
@@ -350,6 +367,11 @@ impl Metrics {
             validation_ranges.clone(),
         );
         registry.register(
+            "validation_mismatch_slots",
+            "Transaction-count mismatch slots in the last validated range by archive kind and direction (undercount = missing rows, overcount = duplicate rows)",
+            validation_mismatch_slots.clone(),
+        );
+        registry.register(
             "validation_range_start_slot",
             "Start slot of the last validated range by archive kind",
             validation_range_start_slot.clone(),
@@ -412,6 +434,11 @@ impl Metrics {
             validation_slots_total.clone(),
         );
         registry.register(
+            "mismatch_repairs",
+            "Transaction-mismatch repair attempts by archive kind and outcome (repaired = clean after dedup, still_dirty = mismatch remains)",
+            mismatch_repairs_total.clone(),
+        );
+        registry.register(
             "archive_rows",
             "Total rows archived by archive kind and source table",
             archive_rows_total.clone(),
@@ -447,6 +474,7 @@ impl Metrics {
             archive_in_flight,
             validation_slots,
             validation_ranges,
+            validation_mismatch_slots,
             validation_range_start_slot,
             validation_range_end_slot,
             validation_db_block_slots,
@@ -459,6 +487,7 @@ impl Metrics {
             clickhouse_range_deleted_total,
             validation_rpc_errors_total,
             validation_slots_total,
+            mismatch_repairs_total,
             archive_rows_total,
             phase_duration_seconds,
             last_db_latest_slot: AtomicU64::new(0),
@@ -808,6 +837,20 @@ impl AppState {
                 validation.transaction_mismatches.len() as u64,
                 validation.transaction_mismatch_ranges.len() as u64,
             );
+            // Split mismatches by direction: undercount needs re-ingestion,
+            // overcount is dedup-fixable.
+            let undercount_slots: u64 = validation
+                .transaction_undercount_ranges
+                .iter()
+                .map(|range| range.slot_count)
+                .sum();
+            let overcount_slots: u64 = validation
+                .transaction_overcount_ranges
+                .iter()
+                .map(|range| range.slot_count)
+                .sum();
+            self.set_mismatch_slots(kind_label, MismatchDirection::Undercount, undercount_slots);
+            self.set_mismatch_slots(kind_label, MismatchDirection::Overcount, overcount_slots);
             Metrics::kind_gauge(&self.metrics.validation_range_start_slot, kind_label)
                 .set(clamp_i64(validation.start_slot));
             Metrics::kind_gauge(&self.metrics.validation_range_end_slot, kind_label)
@@ -822,6 +865,14 @@ impl AppState {
                     .get_or_create(&KindLabels::new(kind_label))
                     .inc();
             }
+        }
+        if let Some(repair) = &report.run_metrics.mismatch_repair {
+            let outcome = if repair.overcount_slots_after == 0 {
+                "repaired"
+            } else {
+                "still_dirty"
+            };
+            self.record_mismatch_repair(kind_label, outcome);
         }
     }
 
@@ -852,6 +903,26 @@ impl AppState {
                 .get_or_create(&labels)
                 .inc_by(slots);
         }
+    }
+
+    fn set_mismatch_slots(&self, kind_label: &str, direction: MismatchDirection, slots: u64) {
+        self.metrics
+            .validation_mismatch_slots
+            .get_or_create(&MismatchLabels {
+                archive_kind: kind_label.to_string(),
+                direction: direction.as_str().to_string(),
+            })
+            .set(clamp_i64(slots));
+    }
+
+    fn record_mismatch_repair(&self, kind_label: &str, outcome: &str) {
+        self.metrics
+            .mismatch_repairs_total
+            .get_or_create(&RepairLabels {
+                archive_kind: kind_label.to_string(),
+                outcome: outcome.to_string(),
+            })
+            .inc();
     }
 
     fn update_known_gap_metrics(&self, kind_label: &str) {
@@ -903,12 +974,20 @@ impl AppState {
                 "Slot not returned by Solana getBlocks",
             ));
         }
-        for range in &validation.transaction_mismatch_ranges {
+        for range in &validation.transaction_undercount_ranges {
             gaps.push(known_gap(
                 report,
-                "Transaction mismatch",
+                "Transaction mismatch (undercount)",
                 *range,
-                "Block transaction count does not match transaction rows",
+                "Fewer archived rows than the block declares; needs re-ingestion",
+            ));
+        }
+        for range in &validation.transaction_overcount_ranges {
+            gaps.push(known_gap(
+                report,
+                "Transaction mismatch (overcount)",
+                *range,
+                "More archived rows than the block declares; fixable by ClickHouse dedup",
             ));
         }
         let overflow = gaps.len().saturating_sub(MAX_RECENT_EVENTS);

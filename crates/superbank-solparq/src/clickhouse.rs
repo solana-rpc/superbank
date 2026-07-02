@@ -347,6 +347,26 @@ impl ClickHouseClient {
         Ok(())
     }
 
+    /// Force ClickHouse to merge and deduplicate a single epoch partition of the
+    /// transactions table, collapsing duplicate `(slot, slot_idx, signature)`
+    /// rows that inflate transaction-count validation. Must target the shard-local
+    /// table (OPTIMIZE is unsupported on Distributed tables); pass `cluster` to
+    /// fan the OPTIMIZE out across a clustered/replicated deployment.
+    pub async fn deduplicate_partition(
+        &self,
+        table: &str,
+        cluster: Option<&str>,
+        partition: u64,
+    ) -> Result<()> {
+        let on_cluster = match cluster {
+            Some(cluster) => format!(" ON CLUSTER `{cluster}`"),
+            None => String::new(),
+        };
+        let sql =
+            format!("OPTIMIZE TABLE {table}{on_cluster} PARTITION {partition} FINAL DEDUPLICATE");
+        self.execute(&sql).await
+    }
+
     pub async fn count_table_rows(
         &self,
         table: &ArchiveDbTable,
@@ -394,14 +414,27 @@ impl ClickHouseClient {
         start_slot: u64,
         end_slot: u64,
     ) -> Result<Vec<TransactionMismatch>> {
+        // Count logically-distinct transaction rows per slot, matching the
+        // ReplacingMergeTree dedup key (slot, slot_idx, signature). A raw count()
+        // would over-report while duplicate rows from retries/re-ingest wait for a
+        // background merge, producing false-positive overcounts. Transactions are
+        // deduped in a subquery so the LEFT JOIN never turns "no rows" into 1, and
+        // `max`/`any` collapse any duplicate block-metadata rows.
         let sql = format!(
-            "SELECT b.slot AS slot, b.executed_transaction_count AS expected, count(t.slot_idx) AS actual \
+            "SELECT b.slot AS slot, \
+                    max(b.executed_transaction_count) AS expected, \
+                    ifNull(any(tx.cnt), 0) AS actual \
              FROM {blocks} AS b \
-             LEFT JOIN {transactions} AS t ON t.slot = b.slot \
+             LEFT JOIN ( \
+                 SELECT slot, uniqExact(slot_idx, signature) AS cnt \
+                 FROM {transactions} \
+                 WHERE slot BETWEEN {start_slot} AND {end_slot} \
+                 GROUP BY slot \
+             ) AS tx ON tx.slot = b.slot \
              WHERE b.slot BETWEEN {start_slot} AND {end_slot} \
-             GROUP BY b.slot, b.executed_transaction_count \
+             GROUP BY b.slot \
              HAVING expected != actual \
-             ORDER BY b.slot \
+             ORDER BY slot \
              LIMIT 1000",
             blocks = tables.blocks_table,
             transactions = tables.transactions_table
@@ -487,6 +520,10 @@ pub struct ValidationReport {
     pub not_produced_slot_ranges: Vec<SlotRange>,
     pub transaction_mismatches: Vec<TransactionMismatch>,
     pub transaction_mismatch_ranges: Vec<SlotRange>,
+    /// Slots with fewer archived rows than declared — need re-ingestion.
+    pub transaction_undercount_ranges: Vec<SlotRange>,
+    /// Slots with more archived rows than declared — fixable by ClickHouse dedup.
+    pub transaction_overcount_ranges: Vec<SlotRange>,
     pub rpc_check_error: Option<String>,
 }
 
@@ -512,6 +549,16 @@ impl ValidationReport {
             .iter()
             .map(|mismatch| mismatch.slot)
             .collect::<Vec<_>>();
+        let undercount_slots = transaction_mismatches
+            .iter()
+            .filter(|mismatch| mismatch.direction() == MismatchDirection::Undercount)
+            .map(|mismatch| mismatch.slot)
+            .collect::<Vec<_>>();
+        let overcount_slots = transaction_mismatches
+            .iter()
+            .filter(|mismatch| mismatch.direction() == MismatchDirection::Overcount)
+            .map(|mismatch| mismatch.slot)
+            .collect::<Vec<_>>();
         let not_produced_slot_ranges = if rpc_check_error.is_none() {
             missing_ranges(start_slot, end_slot, &produced_slots)
         } else {
@@ -526,6 +573,8 @@ impl ValidationReport {
             missing_block_ranges: slot_ranges(&missing_blocks),
             not_produced_slot_ranges,
             transaction_mismatch_ranges: slot_ranges(&mismatch_slots),
+            transaction_undercount_ranges: slot_ranges(&undercount_slots),
+            transaction_overcount_ranges: slot_ranges(&overcount_slots),
             missing_blocks,
             transaction_mismatches,
             rpc_check_error,
@@ -562,6 +611,43 @@ pub struct TransactionMismatch {
     pub slot: u64,
     pub expected: u64,
     pub actual: u64,
+}
+
+/// Direction of a transaction-count mismatch, which decides how it can be
+/// repaired: an overcount is duplicate rows (fixable by ClickHouse dedup),
+/// an undercount is missing rows (needs re-ingestion from a source of truth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MismatchDirection {
+    Undercount,
+    Overcount,
+}
+
+impl MismatchDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MismatchDirection::Undercount => "undercount",
+            MismatchDirection::Overcount => "overcount",
+        }
+    }
+}
+
+impl TransactionMismatch {
+    /// Fewer archived rows than the block declares is an undercount; more is an
+    /// overcount. The detection query only reports slots where the two differ.
+    pub fn direction(&self) -> MismatchDirection {
+        if self.actual < self.expected {
+            MismatchDirection::Undercount
+        } else {
+            MismatchDirection::Overcount
+        }
+    }
+
+    /// Signed row delta (`actual - expected`).
+    pub fn delta(&self) -> i64 {
+        i64::try_from(self.actual).unwrap_or(i64::MAX)
+            - i64::try_from(self.expected).unwrap_or(i64::MAX)
+    }
 }
 
 fn slot_ranges(slots: &[u64]) -> Vec<SlotRange> {

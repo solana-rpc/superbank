@@ -3,13 +3,13 @@ use std::{fs, process::Command, str::FromStr};
 use superbank_solparq::{
     archive::{
         ArchiveKind, ArchiveRunMetrics, ArchiveRunReport, ArchiveRunTable, ArchiveSlotRange,
-        ArchivedTableRows, ClickHouseBounds, PhaseDuration, plan_archive_slot_range,
-        plan_next_archive, safe_delete_archived_data_range,
+        ArchivedTableRows, ClickHouseBounds, MismatchRepair, PhaseDuration, epoch_partitions,
+        plan_archive_slot_range, plan_next_archive, safe_delete_archived_data_range,
     },
     clickhouse::{
-        ArchiveTableKind, DbTables, S3ArchiveSql, SlotRange, TransactionMismatch, ValidationReport,
-        build_delete_sql, build_local_parquet_query, build_s3_archive_sql,
-        build_s3_table_archive_sql,
+        ArchiveTableKind, DbTables, MismatchDirection, S3ArchiveSql, SlotRange,
+        TransactionMismatch, ValidationReport, build_delete_sql, build_local_parquet_query,
+        build_s3_archive_sql, build_s3_table_archive_sql,
     },
     config::{ArchiveLocation, Config},
     metrics::AppState,
@@ -1207,6 +1207,7 @@ fn metrics_endpoint_exposes_labeled_series() {
             }],
             archived_bytes_total: Some(4_096),
             chain_tip_slot: Some(432_432_099),
+            mismatch_repair: None,
         },
     });
 
@@ -1308,4 +1309,142 @@ fn last_error_persists_across_skips_until_archive_created() {
     assert!(status.healthy);
     assert_eq!(status.last_error, None);
     assert!(status.last_error_at_unix.is_none());
+}
+
+#[test]
+fn transaction_mismatch_direction_and_delta() {
+    let under = TransactionMismatch {
+        slot: 1,
+        expected: 10,
+        actual: 8,
+    };
+    let over = TransactionMismatch {
+        slot: 2,
+        expected: 5,
+        actual: 7,
+    };
+    assert_eq!(under.direction(), MismatchDirection::Undercount);
+    assert_eq!(under.delta(), -2);
+    assert_eq!(over.direction(), MismatchDirection::Overcount);
+    assert_eq!(over.delta(), 2);
+}
+
+#[test]
+fn validation_splits_transaction_mismatches_by_direction() {
+    let mismatches = vec![
+        TransactionMismatch {
+            slot: 100,
+            expected: 10,
+            actual: 8,
+        },
+        TransactionMismatch {
+            slot: 101,
+            expected: 10,
+            actual: 9,
+        },
+        TransactionMismatch {
+            slot: 200,
+            expected: 5,
+            actual: 7,
+        },
+    ];
+    let report = ValidationReport::from_observed_slots(
+        100,
+        200,
+        vec![100, 101, 200],
+        vec![100, 101, 200],
+        mismatches,
+        None,
+    );
+
+    // Contiguous undercount slots collapse into one range; the overcount is separate.
+    assert_eq!(report.transaction_undercount_ranges.len(), 1);
+    assert_eq!(report.transaction_undercount_ranges[0].start_slot, 100);
+    assert_eq!(report.transaction_undercount_ranges[0].end_slot, 101);
+    assert_eq!(report.transaction_overcount_ranges.len(), 1);
+    assert_eq!(report.transaction_overcount_ranges[0].start_slot, 200);
+    assert_eq!(report.transaction_overcount_ranges[0].end_slot, 200);
+    // The combined range set still covers all mismatched slots.
+    assert_eq!(report.transaction_mismatch_ranges.len(), 2);
+}
+
+#[test]
+fn epoch_partitions_cover_all_epochs_touched_by_ranges() {
+    let ranges = vec![
+        SlotRange::new(0, 10),
+        SlotRange::new(431_999, 432_002),
+        SlotRange::new(864_000, 864_000),
+    ];
+    // Epoch = intDiv(slot, 432000): epoch 0, boundary 0->1, and epoch 2.
+    assert_eq!(epoch_partitions(&ranges), vec![0, 1, 2]);
+}
+
+#[test]
+fn metrics_expose_mismatch_direction_and_repair_outcome() {
+    let state = AppState::new();
+    let validation = ValidationReport::from_observed_slots(
+        100,
+        105,
+        vec![100, 101, 104],
+        vec![100, 101, 104],
+        vec![
+            TransactionMismatch {
+                slot: 100,
+                expected: 10,
+                actual: 8,
+            },
+            TransactionMismatch {
+                slot: 104,
+                expected: 5,
+                actual: 6,
+            },
+        ],
+        None,
+    );
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: true,
+        archive_skipped_reason: None,
+        archive_name: Some("epoch_1_0-431999.parquet".to_string()),
+        archive_kind: ArchiveKind::Epoch,
+        archive_epoch: Some(1),
+        archive_slot_start: Some(0),
+        archive_slot_end: Some(431_999),
+        db_bounds: None,
+        destination: "./archives".to_string(),
+        archive_tables: Vec::new(),
+        validation: Some(validation),
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: ArchiveRunMetrics {
+            mismatch_repair: Some(MismatchRepair {
+                partitions_optimized: 1,
+                overcount_slots_before: 1,
+                overcount_slots_after: 0,
+            }),
+            ..Default::default()
+        },
+    });
+
+    let text = state.prometheus_text();
+    assert!(text.contains(
+        "solparq_validation_mismatch_slots{archive_kind=\"epoch\",direction=\"undercount\"} 1"
+    ));
+    assert!(text.contains(
+        "solparq_validation_mismatch_slots{archive_kind=\"epoch\",direction=\"overcount\"} 1"
+    ));
+    // Overcount cleared after dedup -> repaired.
+    assert!(
+        text.contains(
+            "solparq_mismatch_repairs_total{archive_kind=\"epoch\",outcome=\"repaired\"} 1"
+        )
+    );
+    // Direction-split known gaps.
+    assert!(
+        state
+            .public_status()
+            .known_gaps
+            .iter()
+            .any(|gap| gap.classification == "Transaction mismatch (undercount)")
+    );
 }

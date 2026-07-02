@@ -316,20 +316,55 @@ separate actionable gaps from expected leader gaps and other problems:
 | `solparq_validation_range_end_slot` | gauge | `archive_kind` | End slot of the last validated range |
 | `solparq_validation_db_block_slots` | gauge | `archive_kind` | Block slots present in ClickHouse for the last validated range |
 | `solparq_validation_rpc_produced_slots` | gauge | `archive_kind` | Slots the RPC reports as produced for the last validated range |
+| `solparq_validation_mismatch_slots` | gauge | `archive_kind`, `direction` | Transaction-mismatch slots in the last validated range, by `direction` (`undercount` = missing rows, `overcount` = duplicate rows) |
 | `solparq_validation_rpc_errors_total` | counter | `archive_kind` | Validation runs where the Solana RPC cross-check failed |
-| `solparq_known_gaps` | gauge | `archive_kind`, `classification` | Currently tracked known data gaps, by classification (`Needs backfill`, `Legit not-produced`, `Transaction mismatch`) |
+| `solparq_mismatch_repairs_total` | counter | `archive_kind`, `outcome` | Overcount-mismatch repair attempts, by `outcome` (`repaired` = clean after dedup, `still_dirty` = mismatch remains) |
+| `solparq_known_gaps` | gauge | `archive_kind`, `classification` | Currently tracked known data gaps, by classification (`Needs backfill`, `Legit not-produced`, `Transaction mismatch (undercount)`, `Transaction mismatch (overcount)`) |
 
 > `solparq_last_archive_bytes` is only populated for local destinations.
 > ClickHouse-driven S3 exports do not report bytes written, so the byte gauge is
 > left unset for S3 archives.
+
+#### Repairing transaction mismatches
+
+A transaction mismatch means a slot's `blocks_metadata.executed_transaction_count`
+does not equal the number of logically-distinct `transactions` rows for that slot.
+Validation counts rows dedup-aware (matching the ReplacingMergeTree key
+`slot, slot_idx, signature`), so transient duplicates awaiting a background merge
+are not reported. Remaining mismatches split two ways:
+
+- **Overcount** (more rows than declared) — duplicate rows that have not merged
+  yet. Fixable inside ClickHouse by forcing dedup.
+- **Undercount** (fewer rows than declared) — rows that never landed. Requires
+  **re-ingesting** the affected slots from a source of truth (run the ingestor's
+  `getBlock` backfill over the slot range printed in the archive report / ops
+  dashboard). solparq does not re-ingest.
+
+With `--repair-mismatches` (`SOLPARQ_REPAIR_MISMATCHES`), solparq attempts to fix
+**overcount** mismatches before archiving: it runs
+`OPTIMIZE TABLE <transactions-local> PARTITION <epoch> FINAL DEDUPLICATE` on each
+affected epoch partition, then re-validates and only archives if the range is now
+clean. Undercount mismatches are left untouched.
+
+In clustered/replicated deployments `OPTIMIZE` must target the shard-local table,
+so set `--db-transactions-local-table-name` (e.g. `transactions_local`) and
+`--clickhouse-cluster` so the statement runs `ON CLUSTER` across all shards. On a
+single node the defaults (local table = transactions table, no cluster) are fine.
 
 #### Grafana dashboard
 
 An importable dashboard covering all of the above lives at
 [`grafana/solparq-ops-dashboard.json`](grafana/solparq-ops-dashboard.json). It is
 organised into rows — Overview, Currency, Throughput & outcomes, Latency, Data
-quality, and Resources — and includes an `archive_kind` template variable for
-filtering.
+quality, Resources, and Transaction mismatches — and includes `Node` (`nodename`)
+and `Archive kind` template variables for filtering.
+
+**Multiple nodes:** every query is filtered by the `Node` variable and grouped by
+`nodename`, and each series is labelled with its node, so a Prometheus that
+scrapes several solparq servers shows one series per node. Use the `Node` variable
+to focus on a single server or leave it on `All` to compare them side by side.
+This assumes your scrape config attaches a `nodename` label to each solparq
+target.
 
 To import: in Grafana, **Dashboards → New → Import**, upload the JSON (or paste
 its contents), and select your Prometheus datasource when prompted for
@@ -494,6 +529,9 @@ Common defaults:
 - `--archive-slot-range` unset
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset
+- `--repair-mismatches` unset (off)
+- `--db-transactions-local-table-name` unset (defaults to `--db-transactions-table-name`)
+- `--clickhouse-cluster` unset
 
 Use `-v` for debug logs and `-vv` for trace logs. `RUST_LOG` is also honored.
 
