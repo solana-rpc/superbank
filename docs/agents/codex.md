@@ -99,6 +99,7 @@ Validation (run and report results):
 - cargo fmt --all -- --check
   (If it fails: cargo fmt --all)
 - cargo clippy --workspace --all-targets --locked -- -D warnings
+- cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings
 - cargo test --workspace --locked
 
 Optional (stricter; matches `.pre-commit-config.yaml`):
@@ -147,7 +148,8 @@ Also run and report:
 - cargo clippy --workspace --all-targets --locked -- -D warnings
 - cargo test --workspace --locked
 - If your change affects optional superbank-rpc features, run:
-  cargo test -p superbank-rpc --features grpc-head-cache,pyroscope --locked
+  cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings
+  cargo test -p superbank-rpc --all-features --locked
 
 Deliverable:
 - Summary of the RPC change, plus the exact commands run and their key results (k6 pass/fail and any threshold failures).

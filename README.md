@@ -28,6 +28,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Ingest from Yellowstone Fumarole, Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable
 - Store blocks + transactions in ClickHouse (`ddl/`)
 - Serve Solana-compatible JSON-RPC backed by ClickHouse (`crates/superbank-rpc`)
+- Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
 ## Architecture
@@ -125,9 +126,10 @@ Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
-- RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `to-slot` or `slot-count`
+- RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
 - Bigtable: `source: bigtable` plus range/slot file and GCP credentials
-- Prometheus metrics: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`, exposed at `/metrics`)
+- Prometheus metrics and health: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`,
+  exposed at `/metrics` and `/health`) plus `health-stale-secs`
 - Optional static metrics label: `metrics-cluster-label`
 
 Full option reference: `crates/superbank/README.md`
@@ -171,6 +173,8 @@ curl -sS http://localhost:8899 \
 - `superbank` supports YAML config, CLI flags, and environment variables.
   Precedence is: flags > env > config file > defaults.
   See `crates/superbank/README.md` and `superbank.example.yaml`.
+  Fumarole ingest includes a default memory soft-limit backpressure guard; set
+  `fumarole-memory-soft-limit-bytes: 0` only if you want to disable it.
 - `superbank-rpc` is configured via CLI flags and environment variables.
   See `crates/superbank-rpc/README.md`.
 
@@ -336,8 +340,9 @@ cargo build -p superbank -p superbank-rpc
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p superbank-rpc --features grpc-head-cache,pyroscope,disk-cache --locked
+cargo test -p superbank-rpc --all-features --locked
 ```
 
 Local RPC helper:

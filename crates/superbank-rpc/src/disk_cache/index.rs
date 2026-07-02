@@ -817,6 +817,7 @@ mod tests {
             slot: 100,
             slot_idx: 0,
             block_time: Some(1_700_000_000),
+            is_vote: false,
             tx_version: None,
             tx_signatures: vec![[9u8; 64]],
             tx_num_required_signatures: 1,

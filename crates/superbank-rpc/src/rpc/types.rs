@@ -44,24 +44,24 @@ pub(crate) struct JsonRpcError {
 }
 
 #[derive(Serialize, Deserialize)]
-struct JsonRpcSuccessWire<T> {
-    jsonrpc: String,
-    id: Value,
+struct JsonRpcSuccessWire<J, I, T> {
+    jsonrpc: J,
+    id: I,
     result: T,
 }
 
 #[derive(Serialize, Deserialize)]
-struct JsonRpcErrorWire {
-    jsonrpc: String,
-    id: Value,
-    error: JsonRpcError,
+struct JsonRpcErrorWire<J, I, E> {
+    jsonrpc: J,
+    id: I,
+    error: E,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum JsonRpcResponseWire<T> {
-    Success(JsonRpcSuccessWire<T>),
-    Error(JsonRpcErrorWire),
+    Success(JsonRpcSuccessWire<String, Value, T>),
+    Error(JsonRpcErrorWire<String, Value, JsonRpcError>),
 }
 
 impl<T> Serialize for JsonRpcResponse<T>
@@ -74,15 +74,15 @@ where
     {
         match (&self.result, &self.error) {
             (Some(result), None) => JsonRpcSuccessWire {
-                jsonrpc: self.jsonrpc.as_ref().to_string(),
-                id: self.id.clone(),
+                jsonrpc: &self.jsonrpc,
+                id: &self.id,
                 result,
             }
             .serialize(serializer),
             (None, Some(error)) => JsonRpcErrorWire {
-                jsonrpc: self.jsonrpc.as_ref().to_string(),
-                id: self.id.clone(),
-                error: error.clone(),
+                jsonrpc: &self.jsonrpc,
+                id: &self.id,
+                error,
             }
             .serialize(serializer),
             _ => Err(S::Error::custom(

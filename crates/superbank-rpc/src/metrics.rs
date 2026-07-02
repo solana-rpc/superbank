@@ -473,6 +473,19 @@ struct HeadCacheActiveLabels {
     x_rpc_node: String,
 }
 
+#[cfg(feature = "grpc-streaming")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SuperbankGrpcMethodLabels {
+    method: String,
+}
+
+#[cfg(feature = "grpc-streaming")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SuperbankGrpcErrorLabels {
+    method: String,
+    stage: String,
+}
+
 #[derive(Debug, Error)]
 pub enum MetricsInitError {
     #[allow(dead_code)]
@@ -530,6 +543,15 @@ pub struct Metrics {
     head_cache_address_entries: Gauge,
     #[cfg(feature = "grpc-head-cache")]
     head_cache_slot_entries: Gauge,
+
+    #[cfg(feature = "grpc-streaming")]
+    superbank_grpc_stream_requests_total: Family<SuperbankGrpcMethodLabels, Counter>,
+    #[cfg(feature = "grpc-streaming")]
+    superbank_grpc_stream_chunks_total: Family<SuperbankGrpcMethodLabels, Counter>,
+    #[cfg(feature = "grpc-streaming")]
+    superbank_grpc_stream_messages_total: Family<SuperbankGrpcMethodLabels, Counter>,
+    #[cfg(feature = "grpc-streaming")]
+    superbank_grpc_stream_errors_total: Family<SuperbankGrpcErrorLabels, Counter>,
 
     #[cfg(feature = "disk-cache")]
     disk_cache_active: Gauge,
@@ -619,6 +641,15 @@ impl Metrics {
         let head_cache_address_entries = Gauge::default();
         #[cfg(feature = "grpc-head-cache")]
         let head_cache_slot_entries = Gauge::default();
+
+        #[cfg(feature = "grpc-streaming")]
+        let superbank_grpc_stream_requests_total = Family::default();
+        #[cfg(feature = "grpc-streaming")]
+        let superbank_grpc_stream_chunks_total = Family::default();
+        #[cfg(feature = "grpc-streaming")]
+        let superbank_grpc_stream_messages_total = Family::default();
+        #[cfg(feature = "grpc-streaming")]
+        let superbank_grpc_stream_errors_total = Family::default();
 
         #[cfg(feature = "disk-cache")]
         let disk_cache_active = Gauge::default();
@@ -815,6 +846,30 @@ impl Metrics {
             );
         }
 
+        #[cfg(feature = "grpc-streaming")]
+        {
+            registry.register(
+                "grpc_stream_requests",
+                "Total accepted Superbank gRPC stream requests by method",
+                superbank_grpc_stream_requests_total.clone(),
+            );
+            registry.register(
+                "grpc_stream_chunks",
+                "Total ClickHouse slot-range chunks fetched by Superbank gRPC streams",
+                superbank_grpc_stream_chunks_total.clone(),
+            );
+            registry.register(
+                "grpc_stream_messages",
+                "Total response messages emitted by Superbank gRPC streams",
+                superbank_grpc_stream_messages_total.clone(),
+            );
+            registry.register(
+                "grpc_stream_errors",
+                "Total Superbank gRPC stream errors by method and stage",
+                superbank_grpc_stream_errors_total.clone(),
+            );
+        }
+
         #[cfg(feature = "disk-cache")]
         {
             registry.register(
@@ -950,6 +1005,14 @@ impl Metrics {
             head_cache_address_entries,
             #[cfg(feature = "grpc-head-cache")]
             head_cache_slot_entries,
+            #[cfg(feature = "grpc-streaming")]
+            superbank_grpc_stream_requests_total,
+            #[cfg(feature = "grpc-streaming")]
+            superbank_grpc_stream_chunks_total,
+            #[cfg(feature = "grpc-streaming")]
+            superbank_grpc_stream_messages_total,
+            #[cfg(feature = "grpc-streaming")]
+            superbank_grpc_stream_errors_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_active,
             #[cfg(feature = "disk-cache")]
@@ -1615,6 +1678,56 @@ pub(crate) fn head_cache_drop_slot(
         metrics
             .head_cache_slot_entries
             .set(clamp_i64_usize(slot_entries));
+    }
+}
+
+#[cfg(feature = "grpc-streaming")]
+fn superbank_grpc_method_labels(method: &'static str) -> SuperbankGrpcMethodLabels {
+    SuperbankGrpcMethodLabels {
+        method: method.to_string(),
+    }
+}
+
+#[cfg(feature = "grpc-streaming")]
+pub(crate) fn superbank_grpc_stream_started(method: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .superbank_grpc_stream_requests_total
+            .get_or_create(&superbank_grpc_method_labels(method))
+            .inc();
+    }
+}
+
+#[cfg(feature = "grpc-streaming")]
+pub(crate) fn superbank_grpc_stream_chunk(method: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .superbank_grpc_stream_chunks_total
+            .get_or_create(&superbank_grpc_method_labels(method))
+            .inc();
+    }
+}
+
+#[cfg(feature = "grpc-streaming")]
+pub(crate) fn superbank_grpc_stream_message(method: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .superbank_grpc_stream_messages_total
+            .get_or_create(&superbank_grpc_method_labels(method))
+            .inc();
+    }
+}
+
+#[cfg(feature = "grpc-streaming")]
+pub(crate) fn superbank_grpc_stream_error(method: &'static str, stage: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .superbank_grpc_stream_errors_total
+            .get_or_create(&SuperbankGrpcErrorLabels {
+                method: method.to_string(),
+                stage: stage.to_string(),
+            })
+            .inc();
     }
 }
 

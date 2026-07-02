@@ -141,6 +141,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--fumarole-data-plane-tcp-connections` / `FUMAROLE_DATA_PLANE_TCP_CONNECTIONS` (default: 4; maximum: 20)
 - `--fumarole-concurrent-download-limit-per-tcp` / `FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP` (default: 2)
 - `--fumarole-data-channel-capacity` / `FUMAROLE_DATA_CHANNEL_CAPACITY` (default: 4096; Fumarole client data channel capacity)
+- `--fumarole-memory-soft-limit-bytes` / `FUMAROLE_MEMORY_SOFT_LIMIT_BYTES` (default: 25769803776; Fumarole backpressure guard soft limit, set 0 to disable)
 - `--fumarole-commit-interval-secs` / `FUMAROLE_COMMIT_INTERVAL_SECS` (default: 10)
 - `--fumarole-no-commit[=true|false]` / `FUMAROLE_NO_COMMIT` (default: false)
 - `--endpoint` / `DRAGONSMOUTH_ENDPOINT` (required for grpc source)
@@ -158,8 +159,8 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-url` / `RPC_URL` (required for rpc source)
 - `--rpc-from-slot` / `RPC_FROM_SLOT` (required for rpc source; use `*` for latest slot in
   `blocks_metadata`, `0` to start from earliest available slot)
-- `--to-slot` / `RPC_TO_SLOT` (required for rpc source if `--slot-count` not set)
-- `--slot-count` / `RPC_SLOT_COUNT` (required for rpc source if `--to-slot` not set)
+- `--rpc-to-slot` / `RPC_TO_SLOT` (required for rpc source if `--rpc-slot-count` not set)
+- `--rpc-slot-count` / `RPC_SLOT_COUNT` (required for rpc source if `--rpc-to-slot` not set)
 - `--rpc-timeout-secs` / `RPC_TIMEOUT_SECS` (default: 30)
 - `--rpc-retry-backoff-ms` / `RPC_RETRY_BACKOFF_MS` (default: 500)
 - `--rpc-max-inflight` / `RPC_MAX_INFLIGHT` (default: 64)
@@ -184,6 +185,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--clickhouse-url` / `CLICKHOUSE_URL` (default: `http://localhost:8123`)
 - `--metrics-host` / `METRICS_HOST` (default: `0.0.0.0`)
 - `--metrics-port` / `METRICS_PORT` (default: `9901`)
+- `--health-stale-secs` / `HEALTH_STALE_SECS` (default: 120; `/health` returns 503 when no successful ClickHouse flush has occurred within this many seconds; set 0 to disable)
 - `--metrics-cluster-label` / `METRICS_CLUSTER_LABEL` (optional static `cluster` label on all metrics)
 - `--clickhouse-database` / `CLICKHOUSE_DATABASE` (default: `default`)
 - `--clickhouse-user` / `CLICKHOUSE_USER` (default: `default`)
@@ -196,13 +198,25 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--blocks-flush-rows` / `BLOCKS_FLUSH_ROWS` (default: 2000)
 - `--flush-interval-secs` / `FLUSH_INTERVAL_SECS` (default: 5)
 - `--flush-every-block` / `FLUSH_EVERY_BLOCK` (default: false; Fumarole/gRPC/Bigtable only)
+- `--insert-max-retries` / `CLICKHOUSE_INSERT_MAX_RETRIES` (default: 5; stateless sources only: gRPC, RPC, Bigtable)
+- `--insert-retry-base-ms` / `CLICKHOUSE_INSERT_RETRY_BASE_MS` (default: 1000; initial ClickHouse insert retry backoff)
+- `--insert-retry-max-ms` / `CLICKHOUSE_INSERT_RETRY_MAX_MS` (default: 30000; maximum ClickHouse insert retry backoff)
 
 ## Notes
 
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
+- `/metrics` includes Fumarole backpressure gauges/counters such as
+  `superbank_ingest_fumarole_memory_soft_limit_bytes`,
+  `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
+  `superbank_ingest_fumarole_rss_bytes`, and
+  `superbank_ingest_fumarole_pressure_flushes_total`.
 - The ingestor writes **distributed** tables by default. Set table names if you want shard-local writes.
 - Fumarole ingest commits consumer-group progress only after pending ClickHouse rows have been flushed. Set `fumarole-no-commit: true` only for diagnostics.
+- Fumarole ingest applies a memory soft limit guard by default. When sampled RSS or Superbank's
+  estimated Fumarole assembler bytes reach `fumarole-memory-soft-limit-bytes`, Superbank stops
+  polling new Fumarole events while it flushes completed rows to ClickHouse, which backpressures
+  upstream downloads instead of letting memory grow unbounded.
 - `fumarole-from-slot` only initializes a Fumarole consumer group when
   `fumarole-create-consumer-group: true`; existing groups resume from the Fumarole-managed offset.
 - `dragonsmouth-from-slot: 0` attempts slot 0; if unavailable, superbank parses the gRPC error to

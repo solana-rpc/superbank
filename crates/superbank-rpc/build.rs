@@ -3,7 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-fn main() {
+fn emit_git_sha() {
     println!("cargo:rerun-if-env-changed=SUPERBANK_GIT_SHA");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 
@@ -18,4 +18,20 @@ fn main() {
     }
 
     println!("cargo:rustc-env=SUPERBANK_GIT_SHA={sha}");
+}
+
+#[cfg(feature = "grpc-streaming")]
+fn compile_protos() -> Result<(), Box<dyn std::error::Error>> {
+    let protos = ["proto/superbank.proto", "proto/confirmed_block.proto"];
+    tonic_prost_build::configure().compile_protos(&protos, &["proto"])?;
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    emit_git_sha();
+
+    #[cfg(feature = "grpc-streaming")]
+    compile_protos()?;
+
+    Ok(())
 }

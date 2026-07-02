@@ -407,6 +407,9 @@ pub struct StoredTransactionRecord {
     pub slot: u64,
     pub slot_idx: u32,
     pub block_time: Option<i64>,
+    #[cfg_attr(feature = "disk-cache", serde(skip, default))]
+    #[cfg_attr(not(feature = "grpc-streaming"), allow(dead_code))]
+    pub is_vote: bool,
     pub tx_version: Option<u8>,
     #[cfg_attr(feature = "disk-cache", serde(with = "serde_sig_vec"))]
     pub tx_signatures: Vec<[u8; 64]>,

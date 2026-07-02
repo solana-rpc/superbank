@@ -74,6 +74,10 @@ pub struct RpcConfig {
     #[arg(long, env = "RPC_BATCH_CONCURRENCY_LIMIT", default_value_t = 8)]
     pub(crate) rpc_batch_concurrency_limit: usize,
 
+    /// Emit HTTP 503 for JSON-RPC server-side failures while keeping response bodies unchanged.
+    #[arg(long, env = "SUPERBANK_RPC_EMIT_HTTP_ERRORS", default_value_t = false)]
+    pub(crate) emit_http_errors: bool,
+
     #[arg(long, env = "RPC_HOST", default_value = "0.0.0.0")]
     pub(crate) host: String,
 
@@ -87,6 +91,71 @@ pub struct RpcConfig {
     /// Port to bind the Prometheus metrics server.
     #[arg(long, env = "METRICS_PORT", default_value = "9900")]
     pub(crate) metrics_port: u16,
+
+    // --- Optional Superbank gRPC streaming API ---
+    #[cfg(feature = "grpc-streaming")]
+    /// Enable the Superbank gRPC streaming API.
+    #[arg(long, env = "SUPERBANK_GRPC_ENABLED", default_value_t = false)]
+    pub(crate) superbank_grpc_enabled: bool,
+
+    #[cfg(feature = "grpc-streaming")]
+    /// Host to bind the Superbank gRPC streaming API.
+    #[arg(long, env = "SUPERBANK_GRPC_HOST", default_value = "0.0.0.0")]
+    pub(crate) superbank_grpc_host: String,
+
+    #[cfg(feature = "grpc-streaming")]
+    /// Port to bind the Superbank gRPC streaming API.
+    #[arg(long, env = "SUPERBANK_GRPC_PORT", default_value_t = 10_000)]
+    pub(crate) superbank_grpc_port: u16,
+
+    #[cfg(feature = "grpc-streaming")]
+    /// Maximum inclusive slot range accepted by the Superbank gRPC streaming API.
+    #[arg(
+        long,
+        env = "SUPERBANK_GRPC_MAX_SLOT_RANGE",
+        default_value_t = 100,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) superbank_grpc_max_slot_range: u64,
+
+    #[cfg(feature = "grpc-streaming")]
+    /// Timeout for each Superbank gRPC ClickHouse chunk query (milliseconds).
+    #[arg(
+        long,
+        env = "SUPERBANK_GRPC_QUERY_TIMEOUT_MS",
+        default_value_t = 30_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) superbank_grpc_query_timeout_ms: u64,
+
+    #[cfg(feature = "grpc-streaming")]
+    /// Number of slots fetched per Superbank gRPC ClickHouse chunk query.
+    #[arg(
+        long,
+        env = "SUPERBANK_GRPC_CHUNK_SLOTS",
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) superbank_grpc_chunk_slots: u64,
+
+    #[cfg(feature = "grpc-streaming")]
+    /// Maximum encoded gRPC message size sent by the Superbank gRPC service.
+    #[arg(
+        long,
+        env = "SUPERBANK_GRPC_MAX_SEND_BYTES",
+        default_value_t = 104_857_600
+    )]
+    pub(crate) superbank_grpc_max_send_bytes: usize,
+
+    #[cfg(feature = "grpc-streaming")]
+    /// Maximum concurrent HTTP/2 streams per gRPC connection.
+    #[arg(
+        long,
+        env = "SUPERBANK_GRPC_MAX_CONCURRENT_STREAMS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub(crate) superbank_grpc_max_concurrent_streams: u32,
 
     /// Request headers to capture in route/request metrics (`X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`).
     #[arg(
@@ -609,12 +678,14 @@ mod config_tests {
 
     #[test]
     fn clickhouse_query_cache_defaults() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
         let cfg = RpcConfig::parse_from(["superbank-rpc"]);
 
         assert!(!cfg.clickhouse_query_cache_enabled);
         assert_eq!(cfg.clickhouse_query_cache_ttl_seconds, 1);
         assert!(!cfg.clickhouse_query_cache_share_between_users);
         assert!(!cfg.clickhouse_query_condition_cache_enabled);
+        assert!(!cfg.emit_http_errors);
         assert!(!cfg.metrics_capture_x_endpoint());
         assert!(!cfg.metrics_capture_x_rpc_node());
         assert!(!cfg.metrics_capture_x_subscription_id());
@@ -636,6 +707,23 @@ mod config_tests {
         assert_eq!(cfg.clickhouse_query_cache_ttl_seconds, 5);
         assert!(cfg.clickhouse_query_cache_share_between_users);
         assert!(cfg.clickhouse_query_condition_cache_enabled);
+    }
+
+    #[test]
+    fn emit_http_errors_flag_parses() {
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--emit-http-errors"]);
+
+        assert!(cfg.emit_http_errors);
+    }
+
+    #[test]
+    fn emit_http_errors_env_parses() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvVarGuard::set("SUPERBANK_RPC_EMIT_HTTP_ERRORS", "true");
+
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+
+        assert!(cfg.emit_http_errors);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub(crate) struct TransactionRow {
     pub(crate) slot: u64,
     pub(crate) slot_idx: u32,
     pub(crate) block_time: Option<i64>,
+    pub(crate) is_vote: bool,
     pub(crate) tx_version: Option<u8>,
     pub(crate) tx_signatures: Vec<Array<u8, 64>>,
     pub(crate) tx_num_required_signatures: u8,
@@ -164,6 +165,7 @@ pub(crate) struct BlockAccountsTransactionRow {
 #[derive(Deserialize, clickhouse::Row)]
 pub(crate) struct BlockFullTransactionRow {
     pub(crate) slot_idx: u32,
+    pub(crate) is_vote: bool,
     pub(crate) tx_version: Option<u8>,
     pub(crate) tx_signatures: Vec<Array<u8, 64>>,
     pub(crate) tx_num_required_signatures: u8,
@@ -236,6 +238,7 @@ pub(crate) fn map_transaction_row(row: TransactionRow) -> StoredTransactionRecor
         slot: row.slot,
         slot_idx: row.slot_idx,
         block_time: row.block_time,
+        is_vote: row.is_vote,
         tx_version: row.tx_version,
         tx_signatures: row.tx_signatures.into_iter().map(|sig| sig.0).collect(),
         tx_num_required_signatures: row.tx_num_required_signatures,
@@ -458,6 +461,7 @@ pub(crate) fn map_block_full_transaction_row(
         slot,
         slot_idx: row.slot_idx,
         block_time: None,
+        is_vote: row.is_vote,
         tx_version: row.tx_version,
         tx_signatures,
         tx_num_required_signatures: row.tx_num_required_signatures,

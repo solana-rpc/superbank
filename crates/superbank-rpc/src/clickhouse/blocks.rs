@@ -15,7 +15,7 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::client::ClickHouseClient;
 use super::constants::SLOT_SHARD_DIVISOR;
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 use super::queries::build_transactions_by_slot_range_query;
 use super::queries::{
     BLOCK_ACCOUNTS_BASE_COLUMNS, BLOCK_FULL_BASE_COLUMNS, BLOCK_METADATA_BASE_COLUMNS,
@@ -28,7 +28,7 @@ use super::rows::{
     map_block_full_transaction_row, map_block_metadata_base_row, map_block_metadata_row,
     map_block_signature_row,
 };
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 use super::rows::{TransactionRow, map_transaction_row};
 use super::types::{
     BlockMetadataRecord, InflationRewardRecord, QueryTimings, StoredAccountsTransactionRecord,
@@ -74,7 +74,7 @@ where
     shard_indices
 }
 
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShardSlotRange {
     shard_index: usize,
@@ -82,7 +82,7 @@ struct ShardSlotRange {
     end_slot: u64,
 }
 
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 fn shard_slot_ranges_for_slot_range<F>(
     start_slot: u64,
     end_slot: u64,
@@ -225,10 +225,10 @@ fn build_block_transactions_query(
     )
 }
 
-/// Range variant for disk-cache backfill: every block in `[start, end]`,
+/// Range variant for streaming/cache backfill: every block in `[start, end]`,
 /// rewards included, ascending. Always routed via the distributed table because
 /// slot ranges can straddle shard buckets.
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 fn build_block_metadata_range_query(
     table: &str,
     start_slot: u64,
@@ -327,7 +327,7 @@ async fn fetch_block_metadata_projection(
     }
 }
 
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 async fn fetch_block_metadata_range(
     client: &clickhouse::Client,
     query: &str,
@@ -356,7 +356,7 @@ async fn fetch_block_metadata_range(
     Ok((records, timings))
 }
 
-#[cfg(feature = "disk-cache")]
+#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 async fn fetch_transaction_range(
     client: &clickhouse::Client,
     query: &str,
@@ -1492,11 +1492,11 @@ impl ClickHouseClient {
     }
 
     /// All block metadata in `[start_slot, end_slot]`, ascending, rewards
-    /// included. Disk-cache backfill only: shard-direct deployments use the
+    /// included. Streaming/cache backfill: shard-direct deployments use the
     /// shard-local table for each covered slot bucket; distributed deployments
     /// use the distributed table. The caller-provided timeout is sized for
     /// range scans rather than interactive reads.
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     pub(crate) async fn get_block_metadata_by_slot_range(
         &self,
         start_slot: u64,
@@ -1573,9 +1573,9 @@ impl ClickHouseClient {
     }
 
     /// All transactions in `[start_slot, end_slot]`, ordered by
-    /// `(slot, slot_idx)` ascending. Disk-cache backfill only; see
+    /// `(slot, slot_idx)` ascending. See
     /// [`Self::get_block_metadata_by_slot_range`] for the routing rationale.
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     pub(crate) async fn get_block_full_transactions_by_slot_range(
         &self,
         start_slot: u64,
@@ -1663,7 +1663,7 @@ mod tests {
         build_block_transactions_query, build_transaction_count_query, normalize_slots,
         shard_indices_for_slot_range,
     };
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use super::{
         ShardSlotRange, build_block_metadata_range_query, shard_slot_ranges_for_slot_range,
     };
@@ -1696,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     fn shard_slot_ranges_for_slot_range_keeps_single_bucket_together() {
         let ranges = shard_slot_ranges_for_slot_range(10, 100, |bucket| (bucket % 3) as usize);
         assert_eq!(
@@ -1710,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     fn shard_slot_ranges_for_slot_range_splits_at_bucket_boundaries() {
         let start_slot = SLOT_SHARD_DIVISOR - 2;
         let end_slot = SLOT_SHARD_DIVISOR + 2;
@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "disk-cache")]
+    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     fn block_metadata_range_query_includes_bucket_predicate_for_shard_pruning() {
         let query = build_block_metadata_range_query(
             "default.blocks_metadata",
