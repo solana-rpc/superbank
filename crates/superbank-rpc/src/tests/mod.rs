@@ -36,8 +36,8 @@ use crate::clickhouse::{
 };
 use crate::handlers::blocks::{
     handle_get_block, handle_get_block_height, handle_get_block_time, handle_get_blocks,
-    handle_get_blocks_with_limit, handle_get_first_available_block, handle_get_health,
-    handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
+    handle_get_blocks_with_limit, handle_get_epoch_schedule, handle_get_first_available_block,
+    handle_get_health, handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
     handle_get_transaction_count, handle_minimum_ledger_slot,
 };
 use crate::handlers::handle_json_rpc_with_headers;
@@ -465,6 +465,16 @@ async fn parse_json_value_response(response: Response) -> Value {
         .await
         .expect("body bytes");
     serde_json::from_slice(&bytes).expect("json parse")
+}
+
+fn expected_epoch_schedule_response() -> Value {
+    json!({
+        "firstNormalEpoch": 14u64,
+        "firstNormalSlot": 524_256u64,
+        "leaderScheduleSlotOffset": 432_000u64,
+        "slotsPerEpoch": 432_000u64,
+        "warmup": true,
+    })
 }
 
 async fn handle_json_rpc_body_with_headers(
@@ -3177,6 +3187,73 @@ async fn handle_json_rpc_minimum_ledger_slot_routes_to_handler() {
     };
 
     let response = handle_json_rpc_request(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: expected no parameters");
+    assert!(parsed.result.is_none());
+}
+
+#[tokio::test]
+async fn handle_json_rpc_get_epoch_schedule_routes_to_handler() {
+    let state = test_state_with_clickhouse_url("http://127.0.0.1:1");
+
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: json!(1),
+        method: "getEpochSchedule".to_string(),
+        params: None,
+    };
+
+    let response = handle_json_rpc_request(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+
+    assert_eq!(parsed.result, Some(expected_epoch_schedule_response()));
+    assert!(parsed.error.is_none());
+}
+
+#[tokio::test]
+async fn get_epoch_schedule_accepts_no_params() {
+    let state = test_state();
+
+    let response = handle_get_epoch_schedule(state, json!(1), None)
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+
+    assert_eq!(parsed.result, Some(expected_epoch_schedule_response()));
+    assert!(parsed.error.is_none());
+}
+
+#[tokio::test]
+async fn get_epoch_schedule_accepts_empty_params() {
+    let state = test_state();
+
+    let response = handle_get_epoch_schedule(state, json!(1), Some(Vec::new()))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+
+    assert_eq!(parsed.result, Some(expected_epoch_schedule_response()));
+    assert!(parsed.error.is_none());
+}
+
+#[tokio::test]
+async fn get_epoch_schedule_rejects_unexpected_params() {
+    let state = test_state();
+
+    let response = handle_get_epoch_schedule(state, json!(1), Some(vec![json!(1u64)]))
+        .await
+        .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
     let parsed = parse_json_rpc_response(response).await;

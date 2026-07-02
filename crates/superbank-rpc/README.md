@@ -17,6 +17,7 @@ writer that matches the same schemas).
 - `getBlocks`
 - `getBlocksWithLimit`
 - `getHealth`
+- `getEpochSchedule`
 - `getFirstAvailableBlock`
 - `minimumLedgerSlot`
 - `getInflationReward`
