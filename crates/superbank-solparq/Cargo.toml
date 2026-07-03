@@ -1,9 +1,9 @@
 [package]
 name = "superbank-solparq"
-version = "0.5.0-solparq.2"
-edition = "2024"
-license = "AGPL-3.0-only"
-publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 anyhow = "1.0"
