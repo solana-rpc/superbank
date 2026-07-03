@@ -153,6 +153,7 @@ pub struct ClickHouseClient {
     database: String,
     user: String,
     password: String,
+    archive_settings: String,
 }
 
 impl ClickHouseClient {
@@ -165,6 +166,7 @@ impl ClickHouseClient {
             database: config.db_database.clone(),
             user: config.db_user.clone(),
             password: config.db_password.clone(),
+            archive_settings: config.clickhouse_archive_settings.clone(),
         })
     }
 
@@ -257,7 +259,12 @@ impl ClickHouseClient {
         }
 
         let tmp_path = path.with_extension("parquet.tmp");
-        let query = build_local_parquet_query(transactions_table, start_slot, end_slot);
+        let query = build_local_parquet_query(
+            transactions_table,
+            start_slot,
+            end_slot,
+            &self.archive_settings,
+        );
         let response = self.post_sql(&query).await?;
         let mut stream = response.bytes_stream();
         let mut file = fs::File::create(&tmp_path)
@@ -292,7 +299,8 @@ impl ClickHouseClient {
         }
 
         let tmp_path = path.with_extension("parquet.tmp");
-        let query = build_local_table_parquet_query(table, start_slot, end_slot);
+        let query =
+            build_local_table_parquet_query(table, start_slot, end_slot, &self.archive_settings);
         let response = self.post_sql(&query).await?;
         let mut stream = response.bytes_stream();
         let mut file = fs::File::create(&tmp_path)
@@ -781,9 +789,11 @@ pub fn build_local_parquet_query(
     transactions_table: &str,
     start_slot: u64,
     end_slot: u64,
+    settings: &str,
 ) -> String {
     format!(
-        "SELECT * FROM {transactions_table} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY slot, slot_idx, signature FORMAT Parquet"
+        "SELECT * FROM {transactions_table} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY slot, slot_idx, signature{settings} FORMAT Parquet",
+        settings = settings_suffix(settings, " ")
     )
 }
 
@@ -791,11 +801,13 @@ pub fn build_local_table_parquet_query(
     table: &ArchiveDbTable,
     start_slot: u64,
     end_slot: u64,
+    settings: &str,
 ) -> String {
     format!(
-        "SELECT * FROM {table_name} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY {order_by} FORMAT Parquet",
+        "SELECT * FROM {table_name} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY {order_by}{settings} FORMAT Parquet",
         table_name = table.table_name,
-        order_by = table.order_by
+        order_by = table.order_by,
+        settings = settings_suffix(settings, " ")
     )
 }
 
@@ -810,6 +822,10 @@ pub struct S3ArchiveSql<'a> {
     pub archive_name: &'a str,
     pub access_key: &'a str,
     pub secret_key: &'a str,
+    /// Raw ClickHouse `SETTINGS` clause body appended to the export query to
+    /// bound memory (see [`Config::clickhouse_archive_settings`]). Empty omits
+    /// the clause.
+    pub settings: &'a str,
 }
 
 pub fn build_s3_archive_sql(params: S3ArchiveSql<'_>) -> String {
@@ -824,7 +840,7 @@ pub fn build_s3_table_archive_sql(params: S3ArchiveSql<'_>) -> String {
         &format!("{}/{}", params.archive_name, params.table.file_name()),
     );
     format!(
-        "INSERT INTO FUNCTION s3(\n  '{}',\n  '{}',\n  '{}',\n  'Parquet'\n)\nSELECT *\nFROM {table_name}\nWHERE slot BETWEEN {start_slot} AND {end_slot}\nORDER BY {order_by}",
+        "INSERT INTO FUNCTION s3(\n  '{}',\n  '{}',\n  '{}',\n  'Parquet'\n)\nSELECT *\nFROM {table_name}\nWHERE slot BETWEEN {start_slot} AND {end_slot}\nORDER BY {order_by}{settings}",
         escape_sql_string(&url),
         escape_sql_string(params.access_key),
         escape_sql_string(params.secret_key),
@@ -832,7 +848,20 @@ pub fn build_s3_table_archive_sql(params: S3ArchiveSql<'_>) -> String {
         start_slot = params.start_slot,
         end_slot = params.end_slot,
         order_by = params.table.order_by,
+        settings = settings_suffix(params.settings, "\n"),
     )
+}
+
+/// Render a `SETTINGS` clause suffix, or an empty string when no settings are
+/// configured. `separator` precedes the clause (a space for single-line local
+/// queries, a newline for the multi-line S3 statement).
+fn settings_suffix(settings: &str, separator: &str) -> String {
+    let settings = settings.trim();
+    if settings.is_empty() {
+        String::new()
+    } else {
+        format!("{separator}SETTINGS {settings}")
+    }
 }
 
 pub fn build_delete_sql(tables: &DbTables, start_slot: u64, end_slot: u64) -> Vec<String> {

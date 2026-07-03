@@ -1042,6 +1042,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
                         archive_name: &archive_name,
                         access_key: &s3.auth_key,
                         secret_key: &s3.auth_secret_key,
+                        settings: &config.clickhouse_archive_settings,
                     });
                 client.execute(&sql).await?;
                 let row_count = client

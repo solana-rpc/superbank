@@ -32,6 +32,10 @@ pub struct Config {
     pub transactions_table: String,
     pub transactions_local_table: String,
     pub clickhouse_cluster: Option<String>,
+    /// Raw `SETTINGS` clause appended to the archive `SELECT`/`INSERT ... SELECT`
+    /// queries that export Parquet. Bounds per-query memory so a full-epoch
+    /// export does not trip the server memory limit. Empty disables the clause.
+    pub clickhouse_archive_settings: String,
     pub blocks_table: String,
     pub entries_table: String,
     pub gsfa_table: String,
@@ -149,6 +153,7 @@ impl Config {
                 .clickhouse_cluster
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            clickhouse_archive_settings: cli.clickhouse_archive_settings.trim().to_string(),
             blocks_table: cli.blocks_table,
             entries_table: cli.entries_table,
             gsfa_table: cli.gsfa_table,
@@ -233,6 +238,18 @@ struct Cli {
     /// statements. Leave unset for single-node deployments.
     #[arg(long = "clickhouse-cluster", env = "SOLPARQ_CLICKHOUSE_CLUSTER")]
     clickhouse_cluster: Option<String>,
+
+    /// Raw ClickHouse `SETTINGS` appended to the Parquet-export queries (both S3
+    /// and local). Keeps a full-epoch export from exceeding the server memory
+    /// limit by spilling the sort to disk, capping read parallelism, and
+    /// shrinking the Parquet writer's in-memory row group. Pass an empty string
+    /// to omit the clause entirely, or override with your own tuning.
+    #[arg(
+        long = "clickhouse-archive-settings",
+        env = "SOLPARQ_CLICKHOUSE_ARCHIVE_SETTINGS",
+        default_value = "max_bytes_before_external_sort=1073741824, max_threads=4, output_format_parquet_row_group_size=100000"
+    )]
+    clickhouse_archive_settings: String,
 
     #[arg(
         long = "db-blocks-table-name",

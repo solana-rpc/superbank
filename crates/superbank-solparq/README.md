@@ -390,6 +390,24 @@ so set `--db-transactions-local-table-name` (e.g. `transactions_local`) and
 `--clickhouse-cluster` so the statement runs `ON CLUSTER` across all shards. On a
 single node the defaults (local table = transactions table, no cluster) are fine.
 
+#### Bounding ClickHouse memory during export
+
+Each Parquet export is a single `SELECT * ... ORDER BY ...` over a whole slot
+range. For an epoch (432,000 slots) of the wide `transactions` table this can
+exceed the ClickHouse server memory limit and fail with `MEMORY_LIMIT_EXCEEDED`.
+To keep the export bounded, solparq appends a `SETTINGS` clause to the export
+query, controlled by `--clickhouse-archive-settings`
+(`SOLPARQ_CLICKHOUSE_ARCHIVE_SETTINGS`). The default,
+
+```
+max_bytes_before_external_sort=1073741824, max_threads=4, output_format_parquet_row_group_size=100000
+```
+
+spills the sort to disk, caps read parallelism, and shrinks the Parquet writer's
+in-memory row group. Override it with your own ClickHouse settings (e.g. raise
+`max_threads` on a large box), or pass an empty string to omit the clause
+entirely.
+
 #### Grafana dashboard
 
 An importable dashboard covering all of the above lives at
@@ -605,6 +623,7 @@ Common defaults:
 - `--repair-mismatches` unset (off)
 - `--db-transactions-local-table-name` unset (defaults to `--db-transactions-table-name`)
 - `--clickhouse-cluster` unset
+- `--clickhouse-archive-settings max_bytes_before_external_sort=1073741824, max_threads=4, output_format_parquet_row_group_size=100000`
 - `--dry-run` unset (off)
 
 Use `-v` for debug logs and `-vv` for trace logs. `RUST_LOG` is also honored.
