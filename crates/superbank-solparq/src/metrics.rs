@@ -118,6 +118,17 @@ struct DbTableLabels {
     table: String,
 }
 
+/// Labels for the `solparq_build_info` gauge. Follows the Prometheus
+/// `*_build_info` convention: a constant `1` gauge whose labels carry the build
+/// identity, so a dashboard can display the running version/commit and alert on
+/// unexpected version churn.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BuildInfoLabels {
+    name: String,
+    version: String,
+    git_sha: String,
+}
+
 impl DbTableLabels {
     fn new(size: &TableSize) -> Self {
         Self {
@@ -151,6 +162,7 @@ impl ValidationCategory {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicStatus {
+    pub build: crate::manifest::ManifestProducer,
     pub started_at_unix: u64,
     pub last_run_at_unix: Option<u64>,
     pub last_success_at_unix: Option<u64>,
@@ -269,6 +281,15 @@ impl Metrics {
     fn new(started_at_unix: u64) -> Self {
         let started_at: Gauge = Gauge::default();
         started_at.set(clamp_i64(started_at_unix));
+        let build_info = Family::<BuildInfoLabels, Gauge>::default();
+        let producer = crate::manifest::ManifestProducer::current();
+        build_info
+            .get_or_create(&BuildInfoLabels {
+                name: producer.name,
+                version: producer.version,
+                git_sha: producer.git_sha,
+            })
+            .set(1);
         let health = Gauge::default();
         health.set(1);
         let check_interval_seconds = Gauge::default();
@@ -313,6 +334,11 @@ impl Metrics {
         );
 
         let mut registry = Registry::with_prefix("solparq");
+        registry.register(
+            "build_info",
+            "Build identity of the running binary (constant 1; see name/version/git_sha labels)",
+            build_info.clone(),
+        );
         registry.register(
             "started_at_unix",
             "Process start time as a Unix timestamp",
@@ -826,6 +852,7 @@ impl AppState {
 
     pub fn public_status(&self) -> PublicStatus {
         PublicStatus {
+            build: crate::manifest::ManifestProducer::current(),
             started_at_unix: self.started_at_unix,
             last_run_at_unix: nonzero(self.last_run_at_unix.load(Ordering::Relaxed)),
             last_success_at_unix: nonzero(self.last_success_at_unix.load(Ordering::Relaxed)),
@@ -878,20 +905,25 @@ impl AppState {
                 })
                 .observe(phase.seconds);
         }
-        let mut total_rows = 0u64;
-        for table in &run.archived_table_rows {
-            total_rows = total_rows.saturating_add(table.rows);
-            self.metrics
-                .archive_rows_total
-                .get_or_create(&TableLabels {
-                    archive_kind: kind_label.to_string(),
-                    table: table.table.clone(),
-                })
-                .inc_by(table.rows);
-        }
-        if report.archive_created && !run.archived_table_rows.is_empty() {
-            Metrics::kind_gauge(&self.metrics.last_archive_rows, kind_label)
-                .set(clamp_i64(total_rows));
+        // Row counts on a non-created report (e.g. a dry run previewing what
+        // would be archived) must never feed the cumulative "rows archived"
+        // counter or gauge; only a real archive advances them.
+        if report.archive_created {
+            let mut total_rows = 0u64;
+            for table in &run.archived_table_rows {
+                total_rows = total_rows.saturating_add(table.rows);
+                self.metrics
+                    .archive_rows_total
+                    .get_or_create(&TableLabels {
+                        archive_kind: kind_label.to_string(),
+                        table: table.table.clone(),
+                    })
+                    .inc_by(table.rows);
+            }
+            if !run.archived_table_rows.is_empty() {
+                Metrics::kind_gauge(&self.metrics.last_archive_rows, kind_label)
+                    .set(clamp_i64(total_rows));
+            }
         }
         if let Some(bytes) = run.archived_bytes_total {
             Metrics::kind_gauge(&self.metrics.last_archive_bytes, kind_label).set(clamp_i64(bytes));
@@ -1162,6 +1194,9 @@ fn classify_skip_reason(report: &ArchiveRunReport) -> Option<String> {
             return Some("data-gap".to_string());
         }
         return Some("validation-warning".to_string());
+    }
+    if reason.contains("dry-run") {
+        return Some("dry-run".to_string());
     }
     Some("skipped".to_string())
 }

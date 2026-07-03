@@ -429,6 +429,8 @@ async fn status(State(ops): State<OpsState>) -> Json<serde_json::Value> {
             "last_success_utc": format_utc_timestamp(status.last_success_at_unix)
         },
         "settings": {
+            "version": status.build.version,
+            "git_sha": status.build.git_sha,
             "archive_kinds": ops.config.archive_kinds.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "archive_location": format!("{:?}", ops.config.archive_location),
             "output_location": ops.config.output_location,
@@ -505,6 +507,8 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     let gap_rows = render_gap_rows(&status.known_gaps);
     let archive_tables = render_archive_table_list(status);
     let output = dashboard_output(config);
+    let version = format!("v{}", status.build.version);
+    let version_detail = format!("{} ({})", version, status.build.git_sha);
     format!(
         r#"<!doctype html>
 <html>
@@ -584,7 +588,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     <header>
       <div>
         <h1>Solparq Ops</h1>
-        <p>Auto-refreshes every 30 seconds</p>
+        <p>{version} · Auto-refreshes every 30 seconds</p>
       </div>
       <div class="pill {health_class}"><span class="dot"></span>{health_label}</div>
     </header>
@@ -607,6 +611,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
       <section>
         <h2>Startup settings</h2>
         <table>
+          <tr><th>Version</th><td>{version_detail}</td></tr>
           <tr><th>Archive types</th><td>{archive_types}</td></tr>
           <tr><th>Location</th><td>{location}</td></tr>
           <tr><th>Output</th><td><code>{output}</code></td></tr>
@@ -637,6 +642,8 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
 </html>"#,
         health_class = health_class,
         health_label = health_label,
+        version = html_escape(&version),
+        version_detail = html_escape(&version_detail),
         db_slots = html_escape(&db_slots),
         archives_created = format_u64(status.archives_created),
         last_run = html_escape(&format_utc_timestamp(status.last_run_at_unix)),

@@ -120,7 +120,7 @@
   "timezone": "",
   "title": "Solparq Ops",
   "uid": "solparq-ops",
-  "version": 1,
+  "version": 2,
   "weekStart": "",
   "panels": [
     {
@@ -135,6 +135,66 @@
       "title": "Overview",
       "type": "row",
       "panels": []
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Running superbank-solparq build. Value is the constant 1 gauge solparq_build_info; the displayed text is its version and git_sha labels.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "id": 8,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "solparq_build_info{nodename=~\"$nodename\"}",
+          "legendFormat": "v{{version}} ({{git_sha}})",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Version",
+      "type": "stat"
     },
     {
       "datasource": {
@@ -177,8 +237,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 0,
+        "w": 3,
+        "x": 6,
         "y": 1
       },
       "id": 2,
@@ -238,8 +298,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
+        "w": 3,
+        "x": 9,
         "y": 1
       },
       "id": 3,
@@ -303,8 +363,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
+        "w": 3,
+        "x": 12,
         "y": 1
       },
       "id": 4,
@@ -368,8 +428,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
+        "w": 3,
+        "x": 15,
         "y": 1
       },
       "id": 5,
@@ -425,8 +485,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 16,
+        "w": 3,
+        "x": 18,
         "y": 1
       },
       "id": 6,
@@ -486,8 +546,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 20,
+        "w": 3,
+        "x": 21,
         "y": 1
       },
       "id": 7,
@@ -1971,7 +2031,7 @@
           },
           "editorMode": "code",
           "expr": "solparq_disk_used_bytes{nodename=~\"$nodename\"}",
-          "legendFormat": "{{nodename}} · {{disk}} · used",
+          "legendFormat": "{{nodename}} \u00b7 {{disk}} \u00b7 used",
           "range": true,
           "refId": "A"
         },
@@ -1982,7 +2042,7 @@
           },
           "editorMode": "code",
           "expr": "solparq_disk_total_bytes{nodename=~\"$nodename\"}",
-          "legendFormat": "{{nodename}} · {{disk}} · total",
+          "legendFormat": "{{nodename}} \u00b7 {{disk}} \u00b7 total",
           "range": true,
           "refId": "B"
         }
@@ -2047,7 +2107,7 @@
           },
           "editorMode": "code",
           "expr": "100 * solparq_disk_used_bytes{nodename=~\"$nodename\"} / solparq_disk_total_bytes{nodename=~\"$nodename\"}",
-          "legendFormat": "{{nodename}} · {{disk}}",
+          "legendFormat": "{{nodename}} \u00b7 {{disk}}",
           "range": true,
           "refId": "A"
         }
@@ -2100,7 +2160,7 @@
           },
           "editorMode": "code",
           "expr": "solparq_db_table_bytes{nodename=~\"$nodename\"}",
-          "legendFormat": "{{nodename}} · {{table}}",
+          "legendFormat": "{{nodename}} \u00b7 {{table}}",
           "range": true,
           "refId": "A"
         }
@@ -2153,7 +2213,7 @@
           },
           "editorMode": "code",
           "expr": "solparq_db_table_rows{nodename=~\"$nodename\"}",
-          "legendFormat": "{{nodename}} · {{table}}",
+          "legendFormat": "{{nodename}} \u00b7 {{table}}",
           "range": true,
           "refId": "A"
         }

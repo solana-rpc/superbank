@@ -57,6 +57,8 @@ pub struct ArchiveSummary {
     pub archive_path: String,
     pub archive_name: String,
     pub parsed_name: Option<ParsedArchiveName>,
+    pub format_version: Option<u32>,
+    pub producer: Option<ManifestProducerSummary>,
     pub tables: Vec<ArchiveTableSummary>,
     pub transaction_rows: u64,
     pub actual_min_slot: Option<u64>,
@@ -66,6 +68,15 @@ pub struct ArchiveSummary {
     pub row_groups: usize,
     pub columns: usize,
     pub size_bytes: Option<u64>,
+}
+
+/// Producer build identity read back out of a bundle's `manifest.json`.
+/// Absent for archives written before this field existed (`format_version < 2`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestProducerSummary {
+    pub name: String,
+    pub version: String,
+    pub git_sha: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,6 +114,10 @@ struct OpenArchive {
 
 #[derive(Debug, Clone, Deserialize)]
 struct BundleManifest {
+    #[serde(default)]
+    format_version: Option<u32>,
+    #[serde(default)]
+    producer: Option<ManifestProducerSummary>,
     archive_id: String,
     tables: Vec<BundleManifestTable>,
 }
@@ -178,6 +193,8 @@ async fn summarize_parquet_archive(input: ArchiveInput) -> Result<ArchiveSummary
         archive_path: archive.path,
         archive_name: archive_name.clone(),
         parsed_name: archive.parsed_name,
+        format_version: None,
+        producer: None,
         tables: vec![ArchiveTableSummary {
             kind: "transactions".to_string(),
             table_name: "transactions".to_string(),
@@ -213,6 +230,8 @@ fn bundle_summary(
         archive_path,
         archive_name: manifest.archive_id.clone(),
         parsed_name: parse_archive_name(&manifest.archive_id),
+        format_version: manifest.format_version,
+        producer: manifest.producer.clone(),
         tables: manifest.table_summaries(),
         transaction_rows,
         actual_min_slot: tx_summary.actual_min_slot,
@@ -231,6 +250,8 @@ fn empty_bundle_parquet_summary(archive_id: &str, archive_path: String) -> Archi
         archive_path,
         archive_name: archive_id.to_string(),
         parsed_name: parse_archive_name(archive_id),
+        format_version: None,
+        producer: None,
         tables: Vec::new(),
         transaction_rows: 0,
         actual_min_slot: None,

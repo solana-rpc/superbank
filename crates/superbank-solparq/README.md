@@ -41,6 +41,29 @@ ClickHouse cleanup that is due. If the target archive bundle already exists
 without a `.done*` marker, the incomplete bundle is removed before the archive
 is recreated.
 
+`manifest.json` carries a `format_version` (bump on schema changes) and a
+`producer` block recording the build identity of the `superbank-solparq`
+binary that wrote the archive:
+
+```json
+{
+  "format_version": 2,
+  "producer": {
+    "name": "superbank-solparq",
+    "version": "0.5.1-rc1-sp1",
+    "git_sha": "abcdef1234567890"
+  }
+}
+```
+
+`git_sha` comes from `SUPERBANK_GIT_SHA` (or `GITHUB_SHA` in CI) at build time,
+the same convention used by `superbank` and `superbank-rpc`; it is `"unknown"`
+for local builds without that env var set. Readers ignore unrecognized
+manifest fields, so older `superbank-solparq-read` builds can still read
+newer bundles, and `producer`/`format_version` are `null`/absent when reading
+bundles written before this field existed (`format_version` 1). `superbank-solparq-read summary`
+prints both fields.
+
 ## Build
 
 From the repository root:
@@ -257,6 +280,7 @@ Liveness and configuration:
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
+| `solparq_build_info` | gauge | `name`, `version`, `git_sha` | Constant `1`; the running binary's build identity carried in the labels |
 | `solparq_health` | gauge | — | `1` when the last loop had no error, else `0` |
 | `solparq_started_at_unix` | gauge | — | Process start time (Unix seconds) |
 | `solparq_check_interval_seconds` | gauge | — | Configured archive check interval |
@@ -288,7 +312,7 @@ Throughput and outcomes:
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
 | `solparq_archives_created_total` | counter | `archive_kind` | Archives created successfully |
-| `solparq_archives_skipped_total` | counter | `archive_kind`, `reason` | Planning runs skipped, by skip reason (`not-enough-slots`, `no-data`, `user-declined`, `data-gap`, `validation-warning`, `skipped`) |
+| `solparq_archives_skipped_total` | counter | `archive_kind`, `reason` | Planning runs skipped, by skip reason (`not-enough-slots`, `no-data`, `user-declined`, `data-gap`, `validation-warning`, `dry-run`, `skipped`) |
 | `solparq_archive_errors_total` | counter | `archive_kind` | Archive loop errors |
 | `solparq_archives_cleaned_total` | counter | `archive_kind` | Old archive bundles pruned by retention |
 | `solparq_clickhouse_range_deleted_total` | counter | `archive_kind` | Archived ClickHouse ranges deleted |
@@ -300,7 +324,7 @@ Latency (histograms, seconds):
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
-| `solparq_phase_duration_seconds` | histogram | `archive_kind`, `phase` | Per-phase archive latency. Phases: `validate`, `write`, `delete_range`, `cleanup`, `total` |
+| `solparq_phase_duration_seconds` | histogram | `archive_kind`, `phase` | Per-phase archive latency. Phases: `validate`, `repair`, `write`, `dry_run_count`, `delete_range`, `cleanup`, `total` |
 
 Data quality — validation issues are split by `category` so a dashboard can
 separate actionable gaps from expected leader gaps and other problems:
@@ -370,10 +394,11 @@ single node the defaults (local table = transactions table, no cluster) are fine
 
 An importable dashboard covering all of the above lives at
 [`grafana/solparq-ops-dashboard.json`](grafana/solparq-ops-dashboard.json). It is
-organised into rows — Overview, Currency, Throughput & outcomes, Latency, Data
-quality, Resources (including ClickHouse disk and per-table sizes), and
-Transaction mismatches — and includes `Node` (`nodename`) and `Archive kind`
-template variables for filtering.
+organised into rows — Overview (including a **Version** stat sourced from
+`solparq_build_info`), Currency, Throughput & outcomes, Latency, Data quality,
+Resources (including ClickHouse disk and per-table sizes), and Transaction
+mismatches — and includes `Node` (`nodename`) and `Archive kind` template
+variables for filtering.
 
 **Multiple nodes:** every query is filtered by the `Node` variable and grouped by
 `nodename`, and each series is labelled with its node, so a Prometheus that
@@ -427,12 +452,13 @@ To mirror logs to a file as well as the terminal:
 --log-file ./solparq.log
 ```
 
-The ops dashboard refreshes every 30 seconds. It shows human-readable UTC
+The ops dashboard refreshes every 30 seconds. It shows the running binary
+version and git commit (in the header and startup settings), human-readable UTC
 timestamps for last run and last success, the number of transaction slots
 available in ClickHouse, ClickHouse disk usage (used/free/total per disk, from
 `system.disks`), per-table row counts and sizes (from `system.tables`),
 startup settings, skip reasons, known data gaps, and a color-coded archive
-timeline.
+timeline. The `/status` JSON endpoint also reports `version` and `git_sha`.
 
 On shutdown, `superbank-solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
 shutdown signal stops new archive tasks from starting and waits for any archive
@@ -482,6 +508,35 @@ Override it with:
 ```bash
 --solana-rpc-url https://your.rpc.endpoint
 ```
+
+## Dry Run
+
+`--dry-run` (`SOLPARQ_DRY_RUN`) plans and validates an archive without making
+any changes. It works in both one-shot and `--server-mode` runs:
+
+```bash
+cargo run -p superbank-solparq -- \
+  --db-server 192.168.0.184 \
+  --db-user admin \
+  --db-password 'change-me' \
+  --archive-range-type hourly \
+  --dry-run
+```
+
+ClickHouse and Solana RPC reads (bounds, validation, row counts) still run
+normally, but a dry run never:
+
+- writes Parquet files, `manifest.json`, `SHA256SUMS.txt`, or a `.done*` marker
+- runs the `--repair-mismatches` `OPTIMIZE ... DEDUPLICATE` step
+- deletes the archived ClickHouse range (`--delete-archived-data-range`)
+- prunes old archives (`--archives-to-keep`)
+
+The one-shot report (and, in `--server-mode`, the ops dashboard/metrics) shows
+what the run would have archived: the planned archive name, slot range, and
+per-table row counts, alongside the same validation output a real run would
+see. If validation warnings would normally prompt for confirmation, a dry run
+skips the prompt and reports the archive as skipped instead (matching what a
+non-interactive real run would require: `--force-archive`).
 
 ## Cleanup
 
@@ -550,6 +605,7 @@ Common defaults:
 - `--repair-mismatches` unset (off)
 - `--db-transactions-local-table-name` unset (defaults to `--db-transactions-table-name`)
 - `--clickhouse-cluster` unset
+- `--dry-run` unset (off)
 
 Use `-v` for debug logs and `-vv` for trace logs. `RUST_LOG` is also honored.
 

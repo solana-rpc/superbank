@@ -58,11 +58,13 @@ pub fn format_summary(summary: &ArchiveSummary) -> String {
         })
         .unwrap_or_else(|| "unparsed".to_string());
     format!(
-        "archive: {}\npath: {}\narchive_format: {}\nparsed: {}\ntransaction_rows: {}\nactual_min_slot: {}\nactual_max_slot: {}\nobserved_slots: {}\nobserved_blocks: {}\nrow_groups: {}\ncolumns: {}\nsize_bytes: {}\n{}",
+        "archive: {}\npath: {}\narchive_format: {}\nparsed: {}\nformat_version: {}\nproducer: {}\ntransaction_rows: {}\nactual_min_slot: {}\nactual_max_slot: {}\nobserved_slots: {}\nobserved_blocks: {}\nrow_groups: {}\ncolumns: {}\nsize_bytes: {}\n{}",
         summary.archive_name,
         summary.archive_path,
         summary.archive_format,
         parsed,
+        option_u32(summary.format_version),
+        format_producer(summary),
         summary.transaction_rows,
         option_u64(summary.actual_min_slot),
         option_u64(summary.actual_max_slot),
@@ -73,6 +75,19 @@ pub fn format_summary(summary: &ArchiveSummary) -> String {
         option_u64(summary.size_bytes),
         format_table_summaries(summary),
     )
+}
+
+fn format_producer(summary: &ArchiveSummary) -> String {
+    summary
+        .producer
+        .as_ref()
+        .map(|producer| {
+            format!(
+                "{} {} ({})",
+                producer.name, producer.version, producer.git_sha
+            )
+        })
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_table_summaries(summary: &ArchiveSummary) -> String {
@@ -156,6 +171,12 @@ fn escape_csv(value: &str) -> String {
 }
 
 fn option_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn option_u32(value: Option<u32>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())

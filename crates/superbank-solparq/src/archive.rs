@@ -762,15 +762,25 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             archive_kind = kind.to_string(),
             archive_name, "archive already has done marker; treating as successful"
         );
-        let deleted_clickhouse_range = maybe_delete_archived_data_range(
-            config,
-            kind,
-            &client,
-            &available_archive_tables,
-            &plan,
-        )
-        .await?;
-        let cleaned_archives = storage::cleanup_archives(config, kind).await?;
+        let (deleted_clickhouse_range, cleaned_archives) = if config.dry_run {
+            info!(
+                archive_kind = kind.to_string(),
+                archive_name,
+                "dry-run: skipping ClickHouse range deletion and archive cleanup for already-done archive"
+            );
+            (false, Vec::new())
+        } else {
+            let deleted_clickhouse_range = maybe_delete_archived_data_range(
+                config,
+                kind,
+                &client,
+                &available_archive_tables,
+                &plan,
+            )
+            .await?;
+            let cleaned_archives = storage::cleanup_archives(config, kind).await?;
+            (deleted_clickhouse_range, cleaned_archives)
+        };
         let report = ArchiveRunReport {
             timestamp_unix: unix_timestamp(),
             archive_created: true,
@@ -788,7 +798,9 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             cleaned_archives,
             run_metrics: ArchiveRunMetrics::default(),
         };
-        storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
+        if !config.dry_run {
+            storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
+        }
         return Ok(report);
     }
     let mut phase_durations = Vec::new();
@@ -807,51 +819,59 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
     // dedup before deciding whether to archive. Undercount mismatches are left
     // for re-ingestion. Re-validate after so the archive/skip decision uses the
     // post-repair state.
-    let mismatch_repair =
+    let mismatch_repair = if config.dry_run {
         if config.repair_mismatches && !validation.transaction_overcount_ranges.is_empty() {
-            let repair_started = Instant::now();
-            let partitions = epoch_partitions(&validation.transaction_overcount_ranges);
-            let overcount_slots_before = count_slots(&validation.transaction_overcount_ranges);
             info!(
                 archive_kind = kind.to_string(),
-                partitions = partitions.len(),
-                overcount_slots = overcount_slots_before,
-                "repairing overcount transaction mismatches via dedup"
+                overcount_slots = count_slots(&validation.transaction_overcount_ranges),
+                "dry-run: skipping overcount mismatch repair (no ClickHouse changes made)"
             );
-            for partition in &partitions {
-                client
-                    .deduplicate_partition(
-                        &config.transactions_local_table,
-                        config.clickhouse_cluster.as_deref(),
-                        *partition,
-                    )
-                    .await?;
-            }
-            validation = client
-                .validate_archive_range(
-                    &tables,
-                    &config.solana_rpc_url,
-                    plan.start_slot,
-                    plan.end_slot,
+        }
+        None
+    } else if config.repair_mismatches && !validation.transaction_overcount_ranges.is_empty() {
+        let repair_started = Instant::now();
+        let partitions = epoch_partitions(&validation.transaction_overcount_ranges);
+        let overcount_slots_before = count_slots(&validation.transaction_overcount_ranges);
+        info!(
+            archive_kind = kind.to_string(),
+            partitions = partitions.len(),
+            overcount_slots = overcount_slots_before,
+            "repairing overcount transaction mismatches via dedup"
+        );
+        for partition in &partitions {
+            client
+                .deduplicate_partition(
+                    &config.transactions_local_table,
+                    config.clickhouse_cluster.as_deref(),
+                    *partition,
                 )
                 .await?;
-            let overcount_slots_after = count_slots(&validation.transaction_overcount_ranges);
-            phase_durations.push(PhaseDuration::new("repair", repair_started.elapsed()));
-            info!(
-                archive_kind = kind.to_string(),
-                partitions = partitions.len(),
-                overcount_slots_before,
-                overcount_slots_after,
-                "mismatch repair completed"
-            );
-            Some(MismatchRepair {
-                partitions_optimized: partitions.len() as u64,
-                overcount_slots_before,
-                overcount_slots_after,
-            })
-        } else {
-            None
-        };
+        }
+        validation = client
+            .validate_archive_range(
+                &tables,
+                &config.solana_rpc_url,
+                plan.start_slot,
+                plan.end_slot,
+            )
+            .await?;
+        let overcount_slots_after = count_slots(&validation.transaction_overcount_ranges);
+        phase_durations.push(PhaseDuration::new("repair", repair_started.elapsed()));
+        info!(
+            archive_kind = kind.to_string(),
+            partitions = partitions.len(),
+            overcount_slots_before,
+            overcount_slots_after,
+            "mismatch repair completed"
+        );
+        Some(MismatchRepair {
+            partitions_optimized: partitions.len() as u64,
+            overcount_slots_before,
+            overcount_slots_after,
+        })
+    } else {
+        None
+    };
 
     debug!(
         archive_kind = kind.to_string(),
@@ -875,6 +895,19 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             report.run_metrics.mismatch_repair = mismatch_repair;
             return Ok(report);
         }
+        if config.dry_run {
+            let mut report = ArchiveRunReport::skipped(
+                kind,
+                destination.describe(),
+                "validation warnings require --force-archive (dry-run: not prompting)",
+            );
+            report.db_bounds = Some(bounds);
+            report.archive_tables = archive_tables;
+            report.validation = Some(validation);
+            report.run_metrics.phase_durations = phase_durations;
+            report.run_metrics.mismatch_repair = mismatch_repair;
+            return Ok(report);
+        }
         if !confirm_validation_warnings(&plan, &validation)? {
             let mut report = ArchiveRunReport::skipped(
                 kind,
@@ -888,6 +921,36 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             report.run_metrics.mismatch_repair = mismatch_repair;
             return Ok(report);
         }
+    }
+
+    if config.dry_run {
+        info!(
+            archive_kind = kind.to_string(),
+            archive_name,
+            start_slot = plan.start_slot,
+            end_slot = plan.end_slot,
+            "dry-run: archive would be created; counting rows without writing any files"
+        );
+        let count_started = Instant::now();
+        let archived_table_rows =
+            count_would_be_archived_rows(&client, &available_archive_tables, &plan).await?;
+        phase_durations.push(PhaseDuration::new("dry_run_count", count_started.elapsed()));
+        let mut report = ArchiveRunReport::skipped(
+            kind,
+            destination.describe(),
+            "dry-run: archive would be created; no files written and no ClickHouse changes made",
+        );
+        report.archive_name = Some(archive_name.clone());
+        report.archive_epoch = Some(plan.epoch);
+        report.archive_slot_start = Some(plan.start_slot);
+        report.archive_slot_end = Some(plan.end_slot);
+        report.db_bounds = Some(bounds);
+        report.archive_tables = archive_tables;
+        report.validation = Some(validation);
+        report.run_metrics.phase_durations = phase_durations;
+        report.run_metrics.archived_table_rows = archived_table_rows;
+        report.run_metrics.mismatch_repair = mismatch_repair;
+        return Ok(report);
     }
 
     if storage::remove_archive_bundle(config, kind, &archive_name).await? {
@@ -1164,6 +1227,27 @@ fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Read-only row counts for a would-be dry-run archive, table by table. Used
+/// in place of the real write path so a dry run can still report how many
+/// rows each table would contribute without streaming any Parquet data.
+async fn count_would_be_archived_rows(
+    client: &ClickHouseClient,
+    tables: &[ArchiveDbTable],
+    plan: &ArchivePlan,
+) -> Result<Vec<ArchivedTableRows>> {
+    let mut rows = Vec::with_capacity(tables.len());
+    for table in tables {
+        let row_count = client
+            .count_table_rows(table, plan.start_slot, plan.end_slot)
+            .await?;
+        rows.push(ArchivedTableRows {
+            table: table.table_name.clone(),
+            rows: row_count,
+        });
+    }
+    Ok(rows)
 }
 
 /// Sum the byte sizes of the files in a staged local archive bundle.

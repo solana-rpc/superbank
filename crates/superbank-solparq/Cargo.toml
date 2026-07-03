@@ -1,6 +1,6 @@
 [package]
 name = "superbank-solparq"
-version = "0.5.1-rc1-sp1"
+version = "0.5.0-solparq.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false

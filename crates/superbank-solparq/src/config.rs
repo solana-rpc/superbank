@@ -55,6 +55,7 @@ pub struct Config {
     pub archive_slot_range: Option<ArchiveSlotRange>,
     pub log_file: Option<PathBuf>,
     pub verbose: u8,
+    pub dry_run: bool,
 }
 
 impl Config {
@@ -171,6 +172,7 @@ impl Config {
             archive_slot_range: cli.archive_slot_range,
             log_file: cli.log_file,
             verbose: cli.verbose,
+            dry_run: cli.dry_run,
         })
     }
 
@@ -420,6 +422,13 @@ struct Cli {
 
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
+
+    /// Plan and validate archives without writing any files, deleting
+    /// ClickHouse data, or creating done markers. Works in both one-shot and
+    /// `--server-mode`; validation still runs read-only ClickHouse/RPC
+    /// queries, and reports show what would have been archived.
+    #[arg(long = "dry-run", env = "SOLPARQ_DRY_RUN", default_value_t = false)]
+    dry_run: bool,
 }
 
 fn parse_archive_kinds(values: &[String], custom_slot_range: u64) -> Result<Vec<ArchiveKind>> {

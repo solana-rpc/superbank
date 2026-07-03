@@ -345,6 +345,41 @@ fn config_applies_required_defaults_and_s3_validation() {
     assert_eq!(config.metrics_port, 31_313);
     assert_eq!(config.archives_to_keep, 5);
     assert_eq!(config.solana_rpc_url, "https://api.mainnet-beta.solana.com");
+    assert!(!config.dry_run);
+}
+
+#[test]
+fn config_accepts_dry_run_flag_in_one_shot_and_server_mode() {
+    let one_shot = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--dry-run",
+    ])
+    .expect("valid config");
+    assert!(one_shot.dry_run);
+
+    let server_mode = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+        "--dry-run",
+    ])
+    .expect("valid config");
+    assert!(server_mode.dry_run);
 }
 
 #[test]
@@ -1290,6 +1325,107 @@ fn dashboard_renders_skip_reasons_and_known_gap_tables() {
     assert!(html.contains("101"));
     assert!(html.contains("102-104"));
     assert!(html.contains("skipped: data-gap"));
+}
+
+#[test]
+fn dry_run_report_is_classified_as_dry_run_and_does_not_inflate_row_counters() {
+    let state = AppState::new();
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_200,
+        archive_created: false,
+        archive_skipped_reason: Some(
+            "dry-run: archive would be created; no files written and no ClickHouse changes made"
+                .to_string(),
+        ),
+        archive_name: Some("custom_0_10-1009.parquet".to_string()),
+        archive_kind: ArchiveKind::Custom { slots: 1_000 },
+        archive_epoch: Some(0),
+        archive_slot_start: Some(10),
+        archive_slot_end: Some(1_009),
+        db_bounds: Some(ClickHouseBounds {
+            earliest_slot: 10,
+            latest_slot: 1_009,
+        }),
+        destination: "./".to_string(),
+        archive_tables: Vec::new(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: ArchiveRunMetrics {
+            archived_table_rows: vec![ArchivedTableRows {
+                table: "transactions".to_string(),
+                rows: 1_000,
+            }],
+            ..Default::default()
+        },
+    });
+
+    let status = state.public_status();
+    assert_eq!(
+        status
+            .recent_events
+            .last()
+            .and_then(|event| event.skip_reason_code.as_deref()),
+        Some("dry-run")
+    );
+
+    let text = state.prometheus_text();
+    assert!(
+        text.contains(
+            r#"solparq_archives_skipped_total{archive_kind="custom",reason="dry-run"} 1"#
+        )
+    );
+    // The dry-run row count must not create a data point for this archive_kind/table
+    // pair on either the cumulative counter or the last-archive gauge; only a real
+    // archive creation may do that.
+    assert!(!text.contains(r#"archive_kind="custom",table="transactions""#));
+    assert!(!text.contains(r#"solparq_last_archive_rows{archive_kind="custom"}"#));
+}
+
+#[test]
+fn build_info_is_exposed_on_metrics_and_status() {
+    let state = AppState::new();
+
+    // The build identity is available to the ops dashboard / status JSON.
+    let status = state.public_status();
+    assert_eq!(status.build.name, env!("CARGO_PKG_NAME"));
+    assert_eq!(status.build.version, env!("CARGO_PKG_VERSION"));
+    assert!(!status.build.git_sha.is_empty());
+
+    // ...and exposed as a constant-1 build_info gauge for Grafana. Labels are
+    // emitted in field-declaration order: name, version, git_sha.
+    let text = state.prometheus_text();
+    let expected = format!(
+        r#"solparq_build_info{{name="{}",version="{}",git_sha="{}"}} 1"#,
+        status.build.name, status.build.version, status.build.git_sha
+    );
+    assert!(
+        text.contains(&expected),
+        "missing build_info series:\n{text}"
+    );
+}
+
+#[test]
+fn dashboard_shows_binary_version() {
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+    ])
+    .expect("valid config");
+    let state = AppState::new();
+    let status = state.public_status();
+    let html = render_dashboard(&config, &status);
+
+    assert!(html.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    assert!(html.contains(&status.build.git_sha));
 }
 
 #[test]
