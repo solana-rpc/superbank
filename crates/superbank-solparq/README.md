@@ -205,6 +205,13 @@ s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/manifest.json
 s3://<bucket>/<bucket-path>/<archive-type>/<archive-id>/.done.<hostname>.txt
 ```
 
+`SHA256SUMS.txt` is only written for S3 archives when
+`--archive-s3-write-checksums` (env `SOLPARQ_ARCHIVE_S3_WRITE_CHECKSUMS`) is set.
+It is off by default: ClickHouse writes the Parquet objects straight to S3, so
+checksumming them requires downloading every object back, which is
+API-rate-limit intensive on large archives. Local archives always write
+`SHA256SUMS.txt` (they hash files already on disk).
+
 `manifest.json` is written after the table objects and checksum file. The final
 success marker is `.done.<hostname>.txt`.
 

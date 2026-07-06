@@ -1050,11 +1050,14 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
                     .await?;
                 manifest_tables.push(ArchiveManifestTable::from_table(table, row_count));
             }
-            let checksum_file_names = manifest_tables
-                .iter()
-                .map(|table| table.file_name.clone())
-                .collect::<Vec<_>>();
-            storage::write_s3_sha256sums(config, kind, &archive_name, &checksum_file_names).await?;
+            if config.s3_write_checksums {
+                let checksum_file_names = manifest_tables
+                    .iter()
+                    .map(|table| table.file_name.clone())
+                    .collect::<Vec<_>>();
+                storage::write_s3_sha256sums(config, kind, &archive_name, &checksum_file_names)
+                    .await?;
+            }
             let manifest = ArchiveManifest::new(
                 archive_name.clone(),
                 kind,

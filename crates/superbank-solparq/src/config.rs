@@ -47,6 +47,11 @@ pub struct Config {
     pub archive_location: ArchiveLocation,
     pub output_location: PathBuf,
     pub s3: Option<S3Config>,
+    /// Write `SHA256SUMS.txt` for S3 archives. Disabled by default: ClickHouse
+    /// writes the Parquet objects directly to S3, so computing checksums forces
+    /// superbank to download every object back, which is API-rate-limit
+    /// intensive on large archives.
+    pub s3_write_checksums: bool,
     pub force_archive: bool,
     pub delete_archived_data_range: bool,
     pub server_mode: bool,
@@ -165,6 +170,7 @@ impl Config {
             archive_location: cli.archive_location,
             output_location: cli.archive_file_output_location,
             s3,
+            s3_write_checksums: cli.archive_s3_write_checksums,
             force_archive: cli.force_archive,
             delete_archived_data_range: cli.delete_archived_data_range,
             server_mode: cli.server_mode,
@@ -356,6 +362,17 @@ struct Cli {
         default_value = "us-east-1"
     )]
     archive_s3_region: String,
+
+    /// Write `SHA256SUMS.txt` for S3 archives. Off by default: ClickHouse writes
+    /// the Parquet objects straight to S3, so checksumming them requires
+    /// downloading every object back, which is API-rate-limit intensive on large
+    /// archives. Enable only when integrity manifests are worth that cost.
+    #[arg(
+        long = "archive-s3-write-checksums",
+        env = "SOLPARQ_ARCHIVE_S3_WRITE_CHECKSUMS",
+        default_value_t = false
+    )]
+    archive_s3_write_checksums: bool,
 
     #[arg(
         long = "force-archive",
