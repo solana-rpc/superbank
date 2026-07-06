@@ -6,7 +6,7 @@ use serde::Serialize;
 #[derive(Debug, Parser)]
 #[command(
     name = "superbank-solparq-read",
-    version,
+    version = env!("SUPERBANK_LONG_VERSION"),
     about = "Inspect and read superbank-solparq Parquet archives"
 )]
 pub struct Cli {
