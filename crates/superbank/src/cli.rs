@@ -295,6 +295,10 @@ struct CliArgs {
     #[arg(long, env = "RPC_DISCOVERY_CHUNK_SLOTS", default_value_t = 10_000)]
     rpc_discovery_chunk_slots: u64,
 
+    /// Skip slots already ingested into ClickHouse during RPC discovery (re-run to backfill gaps)
+    #[arg(long, env = "RPC_SKIP_INGESTED_SLOTS", default_value_t = false)]
+    rpc_skip_ingested_slots: bool,
+
     /// Bigtable range spec: slots "123:456", epochs "1-10", or single epoch "5"
     #[arg(long, env = "BIGTABLE_RANGE")]
     bigtable_range: Option<String>,
@@ -478,6 +482,7 @@ pub(crate) struct Args {
     pub(crate) rpc_flush_every_slots: u64,
     pub(crate) rpc_progress_every_slots: u64,
     pub(crate) rpc_discovery_chunk_slots: u64,
+    pub(crate) rpc_skip_ingested_slots: bool,
     pub(crate) bigtable_range: Option<String>,
     pub(crate) bigtable_slot_file: Option<PathBuf>,
     pub(crate) bigtable_instance: String,
@@ -579,6 +584,8 @@ struct FileConfig {
     rpc_progress_every_slots: Option<u64>,
     #[serde(alias = "rpc_discovery_chunk_slots")]
     rpc_discovery_chunk_slots: Option<u64>,
+    #[serde(alias = "rpc_skip_ingested_slots")]
+    rpc_skip_ingested_slots: Option<bool>,
     #[serde(alias = "bigtable_range")]
     bigtable_range: Option<String>,
     #[serde(alias = "bigtable_slot_file")]
@@ -830,6 +837,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "rpc_discovery_chunk_slots",
             cli.rpc_discovery_chunk_slots,
             file_config.rpc_discovery_chunk_slots,
+        ),
+        rpc_skip_ingested_slots: merge_value(
+            &matches,
+            "rpc_skip_ingested_slots",
+            cli.rpc_skip_ingested_slots,
+            file_config.rpc_skip_ingested_slots,
         ),
         bigtable_range: merge_option(
             &matches,
@@ -1755,6 +1768,7 @@ rpc-from-slot: 456
             rpc_flush_every_slots: 500,
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
+            rpc_skip_ingested_slots: false,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),

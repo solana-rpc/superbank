@@ -40,6 +40,7 @@ grpc-slot-notifications: true
 # rpc-flush-every-slots: 500
 # rpc-progress-every-slots: 100
 # rpc-discovery-chunk-slots: 10000
+# rpc-skip-ingested-slots: false
 
 # Bigtable source options (required when source is "bigtable"; set exactly one of bigtable-range or bigtable-slot-file)
 # rpc-url: "https://api.mainnet-beta.solana.com" # required for epoch ranges
