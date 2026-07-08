@@ -186,6 +186,12 @@ Use Compose when you want the local ClickHouse + DDL + RPC stack without setting
 docker compose up --build
 ```
 
+If you prefer the Tilt dashboard for the same Docker Compose stack, use the Compose shim:
+
+```bash
+tilt up -f Tiltfile.compose
+```
+
 This starts ClickHouse, applies `ddl/local/*.sql`, builds the Superbank image, and runs
 `superbank-rpc` on `http://localhost:8899`. ClickHouse stays on the internal Compose network by
 default to avoid conflicts with local ClickHouse instances.
@@ -198,6 +204,16 @@ SUPERBANK_INGEST_RPC_FROM_SLOT=350918000 \
 SUPERBANK_INGEST_SLOT_COUNT=64 \
 docker compose --profile ingest-rpc up --build
 ```
+
+To expose the optional ingestor in the Tilt UI, enable the same Compose profile before starting the
+shim:
+
+```bash
+COMPOSE_PROFILES=ingest-rpc tilt up -f Tiltfile.compose
+```
+
+`superbank-ingest-rpc` is manual in `Tiltfile.compose`, so trigger it from the Tilt UI when you want
+the optional ingest container.
 
 The ingestor still requires an external data source. For larger or credentialed sources, set the
 same environment variables documented in `crates/superbank/README.md`.
