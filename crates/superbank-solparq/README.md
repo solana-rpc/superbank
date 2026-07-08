@@ -581,11 +581,14 @@ To delete the archived ClickHouse data range after a successful archive:
 When multiple archive types are configured, ClickHouse data deletion is gated by
 the completed archive high-watermark for every configured type. After any
 archive succeeds, `superbank-solparq` checks the latest completed archive for each type
-and deletes only the part of the current archive range that all types have
-already covered. For example, if `custom:500` and `hourly` are both configured,
-early `custom:500` archives will defer deletion until an `hourly` archive covers
-the same slots. Once the `hourly` archive exists, later `custom:500` completions
-can delete their safe ranges without waiting for another hourly cycle.
+and deletes everything from the beginning of the table up to the highest slot
+that all configured types have already covered. Sweeping from slot `0` (rather
+than only the current archive's range) ensures no older slots are stranded when
+one archive type was lagging while an earlier range was written. For example, if
+`custom:500` and `hourly` are both configured, early `custom:500` archives will
+defer deletion until an `hourly` archive covers the same slots. Once the
+`hourly` archive exists, later `custom:500` completions can delete every slot up
+to their safe high-watermark without waiting for another hourly cycle.
 
 That deletes matching slots from:
 

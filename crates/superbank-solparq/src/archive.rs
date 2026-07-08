@@ -278,9 +278,24 @@ pub fn plan_archive_slot_range(
     }))
 }
 
+/// Compute the ClickHouse slot range that is safe to delete after an archive is
+/// created.
+///
+/// Deletion always starts from slot `0`, not from the current archive's start
+/// slot: once every configured archive type has archived a slot, that slot (and
+/// everything before it) is redundant in ClickHouse regardless of which archive
+/// run first covered it. Starting from the current archive's start slot would
+/// strand older slots that were left behind when another archive type was
+/// lagging.
+///
+/// The range end (`safe_end_slot`) is the highest slot that *every* configured
+/// archive type has archived — the minimum of each type's latest archive end
+/// slot, capped at the current archive's end slot. This preserves the rule that
+/// data is only deleted once no archive type still needs it in ClickHouse. If
+/// any configured type has not produced an archive yet, nothing is safe to
+/// delete.
 pub fn safe_delete_archived_data_range(
     config: &Config,
-    current_start_slot: u64,
     current_end_slot: u64,
     latest_archive_names: &[(ArchiveKind, Option<String>)],
 ) -> Result<Option<crate::clickhouse::SlotRange>> {
@@ -309,14 +324,7 @@ pub fn safe_delete_archived_data_range(
         safe_end_slot = safe_end_slot.min(parsed.end_slot);
     }
 
-    if safe_end_slot < current_start_slot {
-        return Ok(None);
-    }
-
-    Ok(Some(crate::clickhouse::SlotRange::new(
-        current_start_slot,
-        safe_end_slot,
-    )))
+    Ok(Some(crate::clickhouse::SlotRange::new(0, safe_end_slot)))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1148,12 +1156,8 @@ async fn maybe_delete_archived_data_range(
     }
 
     let latest_archive_names = storage::latest_archive_names(config).await?;
-    let safe_delete_range = safe_delete_archived_data_range(
-        config,
-        plan.start_slot,
-        plan.end_slot,
-        &latest_archive_names,
-    )?;
+    let safe_delete_range =
+        safe_delete_archived_data_range(config, plan.end_slot, &latest_archive_names)?;
     if let Some(range) = safe_delete_range {
         info!(
             archive_kind = kind.to_string(),

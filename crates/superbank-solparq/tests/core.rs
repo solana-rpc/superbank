@@ -692,7 +692,6 @@ fn clickhouse_cleanup_waits_until_all_archive_types_cover_range() {
 
     let delete_range = safe_delete_archived_data_range(
         &config,
-        0,
         499,
         &[
             (
@@ -728,7 +727,6 @@ fn clickhouse_cleanup_allows_smaller_kind_after_larger_kind_covers_range() {
 
     let delete_range = safe_delete_archived_data_range(
         &config,
-        0,
         499,
         &[
             (
@@ -766,7 +764,6 @@ fn clickhouse_cleanup_deletes_only_safe_prefix_when_other_kinds_lag() {
 
     let delete_range = safe_delete_archived_data_range(
         &config,
-        0,
         431_999,
         &[
             (
@@ -780,6 +777,39 @@ fn clickhouse_cleanup_deletes_only_safe_prefix_when_other_kinds_lag() {
     .expect("safe delete check");
 
     assert_eq!(delete_range, Some(SlotRange::new(0, 999)));
+}
+
+#[test]
+fn clickhouse_cleanup_removes_slots_before_current_archive_start() {
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "epoch",
+        "--server-mode",
+        "--delete-archived-data-range",
+    ])
+    .expect("valid config");
+
+    // A continuation archive covering the second epoch (432000-863999). Older
+    // slots from the first epoch (0-431999) must still be swept even though this
+    // archive does not start at slot 0.
+    let delete_range = safe_delete_archived_data_range(
+        &config,
+        863_999,
+        &[(
+            ArchiveKind::Epoch,
+            Some("epoch_1_432000-863999".to_string()),
+        )],
+    )
+    .expect("safe delete check");
+
+    assert_eq!(delete_range, Some(SlotRange::new(0, 863_999)));
 }
 
 #[test]
