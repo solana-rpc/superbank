@@ -1005,12 +1005,22 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         "archive validation completed"
     );
     log_validation_gaps(kind, &validation);
-    if validation.has_warnings() && !config.force_archive {
+    if config.allow_rpc_validation_failure
+        && validation.rpc_check_error.is_some()
+        && !validation.has_data_warnings()
+    {
+        warn!(
+            archive_kind = kind.to_string(),
+            rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or_default(),
+            "Solana RPC produced-slots cross-check failed but --allow-rpc-validation-failure is set; archiving without missing-block verification"
+        );
+    }
+    if validation.blocks_archive(config.allow_rpc_validation_failure) && !config.force_archive {
         if config.server_mode {
             let mut report = ArchiveRunReport::skipped(
                 kind,
                 destination.describe(),
-                "validation warnings require --force-archive in server mode",
+                server_mode_skip_reason(&validation, config),
             );
             report.db_bounds = Some(bounds);
             report.archive_tables = archive_tables;
@@ -1336,6 +1346,20 @@ fn skipped_archive_tables(
         .filter(|table| !available.contains(&(table.kind, table.table_name.as_str())))
         .map(|table| SkippedArchiveTable::unavailable(&table))
         .collect()
+}
+
+/// Explains why a server-mode run skipped, pointing at the narrowest remedy:
+/// the RPC-failure escape hatch when that is the only blocker, otherwise
+/// `--force-archive`.
+fn server_mode_skip_reason(validation: &ValidationReport, config: &Config) -> &'static str {
+    if !config.allow_rpc_validation_failure
+        && validation.rpc_check_error.is_some()
+        && !validation.has_data_warnings()
+    {
+        "Solana RPC cross-check failed; set --allow-rpc-validation-failure to archive without it (or --force-archive to override all validation warnings) in server mode"
+    } else {
+        "validation warnings require --force-archive in server mode"
+    }
 }
 
 fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport) -> Result<bool> {

@@ -53,6 +53,11 @@ pub struct Config {
     /// intensive on large archives.
     pub s3_write_checksums: bool,
     pub force_archive: bool,
+    /// Allow archiving to proceed when the Solana RPC produced-slots cross-check
+    /// fails (e.g. the provider disables `getBlocks`). Verified data problems
+    /// (missing blocks, transaction mismatches) still block; only the
+    /// "couldn't verify" condition is treated as non-blocking. Off by default.
+    pub allow_rpc_validation_failure: bool,
     /// Backfill blocks missing from the archive's slot range (detected by
     /// validation) from Solana RPC before archiving, by invoking the `superbank`
     /// RPC ingestor as a subprocess. Off by default.
@@ -182,6 +187,7 @@ impl Config {
             s3,
             s3_write_checksums: cli.archive_s3_write_checksums,
             force_archive: cli.force_archive,
+            allow_rpc_validation_failure: cli.allow_rpc_validation_failure,
             backfill_gaps: cli.backfill_gaps,
             backfill_superbank_bin: cli.backfill_superbank_bin,
             backfill_include_undercounts: cli.backfill_include_undercounts,
@@ -396,6 +402,18 @@ struct Cli {
         default_value_t = false
     )]
     force_archive: bool,
+
+    /// Allow archiving when the Solana RPC produced-slots cross-check fails
+    /// (e.g. the provider disables `getBlocks`). Unlike `--force-archive`, this
+    /// still blocks on verified data problems (missing blocks, transaction
+    /// mismatches) — it only stops a "couldn't verify" condition from stalling
+    /// archiving. Note: missing-block detection is unavailable for that run.
+    #[arg(
+        long = "allow-rpc-validation-failure",
+        env = "SOLPARQ_ALLOW_RPC_VALIDATION_FAILURE",
+        default_value_t = false
+    )]
+    allow_rpc_validation_failure: bool,
 
     /// Backfill blocks missing from the archive's slot range from Solana RPC
     /// before archiving, by invoking the `superbank` RPC ingestor as a

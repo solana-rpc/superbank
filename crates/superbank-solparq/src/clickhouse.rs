@@ -681,6 +681,25 @@ impl ValidationReport {
             || self.rpc_check_error.is_some()
     }
 
+    /// Verified data problems that always block archiving: blocks Solana
+    /// produced but we are missing, or transaction-count mismatches. Excludes
+    /// the RPC cross-check *failure*, which is a "couldn't verify" condition
+    /// rather than a detected gap.
+    pub fn has_data_warnings(&self) -> bool {
+        !self.missing_blocks.is_empty() || !self.transaction_mismatches.is_empty()
+    }
+
+    /// Whether validation results should block archiving. When
+    /// `allow_rpc_failure` is set, an RPC cross-check failure alone does not
+    /// block — only verified data problems do.
+    pub fn blocks_archive(&self, allow_rpc_failure: bool) -> bool {
+        if allow_rpc_failure {
+            self.has_data_warnings()
+        } else {
+            self.has_warnings()
+        }
+    }
+
     pub fn has_known_data_gaps(&self) -> bool {
         !self.missing_block_ranges.is_empty()
             || !self.not_produced_slot_ranges.is_empty()

@@ -86,6 +86,12 @@ pub async fn run_backfill(config: &Config, tables: &DbTables, slots: &[u64]) -> 
         .env("CLICKHOUSE_PASSWORD", &config.db_password)
         .env("CLICKHOUSE_TRANSACTIONS_TABLE", &tables.transactions_table)
         .env("CLICKHOUSE_BLOCKS_TABLE", &tables.blocks_table)
+        // The ingestor binds a Prometheus metrics/health server on startup
+        // (default 0.0.0.0:9901). A backfill runs on the same host as the live
+        // ingestor, so pin it to an OS-assigned ephemeral port on localhost to
+        // avoid an "address already in use" bind conflict.
+        .env("METRICS_HOST", "127.0.0.1")
+        .env("METRICS_PORT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());

@@ -1365,6 +1365,37 @@ fn archive_report_includes_human_timestamp_and_hostname() {
 }
 
 #[test]
+fn rpc_check_failure_blocks_only_without_allow_flag() {
+    // getBlocks failed: rpc_check_error set, no produced slots, no data problems.
+    let rpc_failed = ValidationReport::from_observed_slots(
+        1_000,
+        1_010,
+        vec![1_000, 1_002],
+        Vec::new(),
+        Vec::new(),
+        Some("Solana RPC getBlocks error: {\"code\":405,\"message\":\"Bad method\"}".to_string()),
+    );
+    assert!(rpc_failed.has_warnings());
+    assert!(!rpc_failed.has_data_warnings());
+    // Blocks under strict default, but not when the RPC failure is allowed.
+    assert!(rpc_failed.blocks_archive(false));
+    assert!(!rpc_failed.blocks_archive(true));
+
+    // A real missing block blocks regardless of the allow flag.
+    let missing_block = ValidationReport::from_observed_slots(
+        1_000,
+        1_010,
+        vec![1_000],
+        vec![1_000, 1_001],
+        Vec::new(),
+        None,
+    );
+    assert!(missing_block.has_data_warnings());
+    assert!(missing_block.blocks_archive(true));
+    assert!(missing_block.blocks_archive(false));
+}
+
+#[test]
 fn archive_report_document_is_json_with_producer_and_run_facts() {
     let report = ArchiveRunReport {
         timestamp_unix: 1_700_000_000,

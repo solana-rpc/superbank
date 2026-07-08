@@ -560,6 +560,26 @@ Before writing an archive, `superbank-solparq` checks:
 If warnings are found in regular mode, `superbank-solparq` asks for confirmation before
 creating the archive. Use `--force-archive` to archive despite warnings.
 
+### When the RPC cross-check itself fails
+
+The produced-slots check calls Solana `getBlocks`. Some RPC providers disable
+`getBlocks` (it is expensive) and return an error such as
+`{"code":405,"message":"Bad method"}`. That failure is recorded as
+`rpc_check_error`, and by default it is treated as a validation warning — so in
+`--server-mode` archiving is skipped (it requires `--force-archive`), even when
+the block and transaction-count checks are clean.
+
+Set `--allow-rpc-validation-failure` (`SOLPARQ_ALLOW_RPC_VALIDATION_FAILURE`) to
+let archiving proceed when *only* the RPC cross-check failed. Unlike
+`--force-archive`, this still blocks on verified data problems (missing blocks,
+transaction-count mismatches) — it only stops a "couldn't verify" condition from
+stalling the archiver. Note the trade-off: with `getBlocks` unavailable,
+missing-block detection is disabled for that run, so it relies on the
+transaction-count check and on ingestion completeness. The failure is still
+logged and exposed via the `missing_block` / `rpc_errors` validation metrics.
+Prefer pointing `--solana-rpc-url` at an endpoint that supports `getBlocks` when
+you want full verification.
+
 The default Solana RPC endpoint is:
 
 ```text
@@ -600,6 +620,9 @@ Details and limitations:
 - The `superbank` binary must be available (on `PATH`, or set
   `--backfill-superbank-bin` / `SOLPARQ_BACKFILL_SUPERBANK_BIN`). ClickHouse and
   RPC config are passed to the subprocess via environment variables.
+- The subprocess is launched with `METRICS_HOST=127.0.0.1` and `METRICS_PORT=0`
+  (an OS-assigned ephemeral port) so its metrics/health server does not collide
+  with a live ingestor already bound to `9901` on the same host.
 - Backfill is **best-effort**: if the subprocess can't be spawned or exits
   non-zero, the failure is logged and the run falls through to the normal
   validation gate (skip / `--force-archive` / prompt). Re-validation always runs
@@ -709,6 +732,7 @@ Common defaults:
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset
 - `--repair-mismatches` unset (off)
+- `--allow-rpc-validation-failure` unset (off)
 - `--backfill-gaps` unset (off)
 - `--backfill-superbank-bin superbank`
 - `--backfill-include-undercounts` on (only applies when `--backfill-gaps` is set)
