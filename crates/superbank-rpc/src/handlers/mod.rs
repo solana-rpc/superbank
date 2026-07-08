@@ -538,6 +538,7 @@ fn metrics_method_label(method: &str) -> &'static str {
         "getEpochInfo" => "getEpochInfo",
         "getTransactionCount" => "getTransactionCount",
         "getLatestBlockhash" => "getLatestBlockhash",
+        "isBlockhashValid" => "isBlockhashValid",
         "getBlockTime" => "getBlockTime",
         "getBlocks" => "getBlocks",
         "getBlocksWithLimit" => "getBlocksWithLimit",
@@ -868,6 +869,9 @@ async fn dispatch_json_rpc_request(
             }
             "getLatestBlockhash" => {
                 blocks::handle_get_latest_blockhash(state, id_for_dispatch, params).await
+            }
+            "isBlockhashValid" => {
+                blocks::handle_is_blockhash_valid(state, id_for_dispatch, params).await
             }
             "getBlockTime" => blocks::handle_get_block_time(state, id_for_dispatch, params).await,
             "getBlocks" => blocks::handle_get_blocks(state, id_for_dispatch, params).await,

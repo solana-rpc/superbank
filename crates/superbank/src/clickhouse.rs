@@ -184,6 +184,27 @@ pub(crate) async fn fetch_latest_slot_from_blocks(
     Ok(row.max_slot)
 }
 
+pub(crate) async fn fetch_present_slots_in_range(
+    clickhouse: &ClickHouseClient,
+    blocks_table: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u64>> {
+    #[derive(Debug, Deserialize, Row)]
+    struct SlotRow {
+        slot: u64,
+    }
+
+    let query = format!("SELECT slot FROM {blocks_table} WHERE slot >= {start} AND slot <= {end}");
+    let rows = clickhouse
+        .query(&query)
+        .fetch_all::<SlotRow>()
+        .await
+        .with_context(|| format!("query present slots in [{start}, {end}] from {blocks_table}"))?;
+
+    Ok(rows.into_iter().map(|row| row.slot).collect())
+}
+
 pub(crate) async fn flush_buffers(
     client: &ClickHouseClient,
     tables: &InsertTables,
@@ -520,6 +541,7 @@ mod tests {
             rpc_flush_every_slots: 500,
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
+            rpc_skip_ingested_slots: false,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),

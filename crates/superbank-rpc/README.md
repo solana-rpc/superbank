@@ -14,6 +14,7 @@ writer that matches the same schemas).
 - `getEpochInfo`
 - `getTransactionCount`
 - `getLatestBlockhash`
+- `isBlockhashValid`
 - `getBlockTime`
 - `getBlocks`
 - `getBlocksWithLimit`
@@ -162,6 +163,7 @@ qualifying slot.
 - `getSlot`
 - `getTransactionCount`
 - `getLatestBlockhash`
+- `isBlockhashValid`
 - `getBlocks`
 - `getBlocksWithLimit`
 

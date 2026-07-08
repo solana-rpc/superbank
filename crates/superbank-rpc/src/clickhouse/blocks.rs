@@ -225,6 +225,42 @@ fn build_block_transactions_query(
     )
 }
 
+// Efficiency bound for the isBlockhashValid lookup so the query hits the slot primary
+// key, not the unindexed blockhash. It must still exceed MAX_PROCESSING_AGE (150), since
+// skipped slots make slots >= block heights, or valid rows fall outside the scan.
+const BLOCKHASH_VALID_SLOT_WINDOW: u64 = 512;
+
+fn build_blockhash_valid_query(
+    table: &str,
+    blockhash_literal: &str,
+    start_slot: u64,
+    end_slot: u64,
+    min_block_height: u64,
+    settings_clause: &str,
+) -> String {
+    let start_bucket = start_slot / SLOT_SHARD_DIVISOR;
+    let end_bucket = end_slot / SLOT_SHARD_DIVISOR;
+    format!(
+        "SELECT 1 AS present
+             FROM {blocks_metadata_table}
+             PREWHERE
+                intDiv(slot, {slot_shard_divisor}) BETWEEN {start_bucket} AND {end_bucket}
+                AND slot BETWEEN {start_slot} AND {end_slot}
+             WHERE blockhash = {blockhash_literal} AND block_height >= {min_block_height}
+             LIMIT 1
+             {settings_clause}",
+        blocks_metadata_table = table,
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+        start_bucket = start_bucket,
+        end_bucket = end_bucket,
+        start_slot = start_slot,
+        end_slot = end_slot,
+        blockhash_literal = blockhash_literal,
+        min_block_height = min_block_height,
+        settings_clause = settings_clause,
+    )
+}
+
 /// Range variant for streaming/cache backfill: every block in `[start, end]`,
 /// rewards included, ascending. Always routed via the distributed table because
 /// slot ranges can straddle shard buckets.
@@ -514,6 +550,61 @@ impl ClickHouseClient {
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             Ok(row.max_slot)
+        })
+        .await
+    }
+
+    pub async fn is_blockhash_valid_in_window(
+        &self,
+        blockhash: &[u8; 32],
+        context_slot: u64,
+        min_block_height: u64,
+    ) -> ProcessingResult<(bool, QueryTimings)> {
+        self.with_timeout("is_blockhash_valid", async {
+            #[derive(Deserialize, clickhouse::Row)]
+            struct PresentRow {
+                present: u8,
+            }
+
+            let blocks_metadata_table = &self.blocks_metadata_table;
+            let settings_clause = self
+                .select_settings_clause("is_blockhash_valid", QueryFreshnessClass::TipSensitive);
+            let start_slot = context_slot.saturating_sub(BLOCKHASH_VALID_SLOT_WINDOW);
+            let blockhash_literal = format!(
+                "toFixedString(unhex('{}'), 32)",
+                hex::encode(blockhash).to_uppercase()
+            );
+            let query = build_blockhash_valid_query(
+                blocks_metadata_table,
+                &blockhash_literal,
+                start_slot,
+                context_slot,
+                min_block_height,
+                &settings_clause,
+            );
+            let start = Instant::now();
+            let mut cursor = self
+                .client
+                .query(&query)
+                .fetch::<PresentRow>()
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+
+            let row_opt = cursor
+                .next()
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let exists = row_opt.is_some_and(|row| row.present == 1);
+
+            let timings = QueryTimings {
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                received_bytes: cursor.received_bytes(),
+                decoded_bytes: cursor.decoded_bytes(),
+                rows_read: Some(0),
+                rows_read_unknown: true,
+                rows_returned: u64::from(exists),
+            };
+
+            Ok((exists, timings))
         })
         .await
     }
@@ -1660,8 +1751,8 @@ impl ClickHouseClient {
 mod tests {
     use super::{
         BlockTransactionProjection, SLOT_SHARD_DIVISOR, build_block_metadata_query,
-        build_block_transactions_query, build_transaction_count_query, normalize_slots,
-        shard_indices_for_slot_range,
+        build_block_transactions_query, build_blockhash_valid_query, build_transaction_count_query,
+        normalize_slots, shard_indices_for_slot_range,
     };
     #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use super::{
@@ -1766,6 +1857,24 @@ mod tests {
 
         assert!(query.contains("intDiv(slot, 432000) BETWEEN 1 AND 1"));
         assert!(query.contains("AND slot BETWEEN 432001 AND 432010"));
+    }
+
+    #[test]
+    fn blockhash_valid_query_uses_slot_bounds_and_inclusive_height() {
+        let query = build_blockhash_valid_query(
+            "default.blocks_metadata",
+            "toFixedString(unhex('AB'), 32)",
+            744,
+            1000,
+            850,
+            "",
+        );
+
+        assert!(query.contains("intDiv(slot, 432000) BETWEEN 0 AND 0"));
+        assert!(query.contains("AND slot BETWEEN 744 AND 1000"));
+        assert!(query.contains("blockhash = toFixedString(unhex('AB'), 32)"));
+        assert!(query.contains("block_height >= 850"));
+        assert!(query.contains("LIMIT 1"));
     }
 
     #[test]
