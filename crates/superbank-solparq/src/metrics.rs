@@ -366,7 +366,7 @@ impl Metrics {
         );
         registry.register(
             "db_slots_available",
-            "Number of transaction slots visible in ClickHouse",
+            "Number of distinct transaction slots visible in ClickHouse",
             db_slots_available.clone(),
         );
         registry.register(

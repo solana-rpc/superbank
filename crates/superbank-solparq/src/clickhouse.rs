@@ -197,10 +197,11 @@ impl ClickHouseClient {
         struct BoundsRow {
             earliest_slot: Option<u64>,
             latest_slot: Option<u64>,
+            distinct_slots: u64,
         }
 
         let sql = format!(
-            "SELECT minOrNull(slot) AS earliest_slot, maxOrNull(slot) AS latest_slot FROM {transactions_table}"
+            "SELECT minOrNull(slot) AS earliest_slot, maxOrNull(slot) AS latest_slot, uniqExact(slot) AS distinct_slots FROM {transactions_table}"
         );
         let rows = self.query_json_rows::<BoundsRow>(&sql).await?;
         let Some(row) = rows.into_iter().next() else {
@@ -210,6 +211,7 @@ impl ClickHouseClient {
             (Some(earliest_slot), Some(latest_slot)) => Ok(Some(ClickHouseBounds {
                 earliest_slot,
                 latest_slot,
+                distinct_slots: row.distinct_slots,
             })),
             _ => Ok(None),
         }

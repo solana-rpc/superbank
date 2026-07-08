@@ -27,6 +27,7 @@ fn hourly_plan_uses_prompt_filename_convention() {
         ClickHouseBounds {
             earliest_slot: 427_236_024,
             latest_slot: 427_245_023,
+            distinct_slots: 9_000,
         },
         None,
         true,
@@ -48,6 +49,7 @@ fn epoch_plan_aligns_to_epoch_boundary_after_earliest_available_slot() {
         ClickHouseBounds {
             earliest_slot: 426_800_000,
             latest_slot: 427_247_999,
+            distinct_slots: 448_000,
         },
         None,
         true,
@@ -69,6 +71,7 @@ fn custom_plan_defaults_to_one_thousand_slots_and_continues_after_last_archive()
         ClickHouseBounds {
             earliest_slot: 10_000,
             latest_slot: 12_999,
+            distinct_slots: 3_000,
         },
         Some("custom_0_10000-10999.parquet"),
         true,
@@ -90,6 +93,7 @@ fn plan_can_start_from_oldest_slot_when_continuation_is_disabled() {
         ClickHouseBounds {
             earliest_slot: 10_000,
             latest_slot: 12_999,
+            distinct_slots: 3_000,
         },
         Some("custom_0_10000-10999.parquet"),
         false,
@@ -110,6 +114,7 @@ fn explicit_slot_range_plan_uses_requested_inclusive_range() {
         ClickHouseBounds {
             earliest_slot: 500,
             latest_slot: 4_000,
+            distinct_slots: 3_501,
         },
         ArchiveSlotRange::new(1_000, 3_222).expect("valid slot range"),
     )
@@ -130,6 +135,7 @@ fn explicit_slot_range_plan_requires_clickhouse_to_cover_range() {
         ClickHouseBounds {
             earliest_slot: 1_500,
             latest_slot: 3_000,
+            distinct_slots: 1_501,
         },
         ArchiveSlotRange::new(1_000, 3_222).expect("valid slot range"),
     )
@@ -1011,6 +1017,7 @@ fn app_state_tracks_db_slots_and_archive_timeline() {
         Some(ClickHouseBounds {
             earliest_slot: 427_270_662,
             latest_slot: 427_271_661,
+            distinct_slots: 1_000,
         }),
     );
     state.record_report(ArchiveRunReport {
@@ -1025,6 +1032,7 @@ fn app_state_tracks_db_slots_and_archive_timeline() {
         db_bounds: Some(ClickHouseBounds {
             earliest_slot: 427_270_662,
             latest_slot: 427_271_661,
+            distinct_slots: 1_000,
         }),
         destination: "./archives".to_string(),
         archive_tables: Vec::new(),
@@ -1068,6 +1076,7 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
         Some(ClickHouseBounds {
             earliest_slot: 10,
             latest_slot: 1_009,
+            distinct_slots: 1_000,
         }),
     );
     state.record_report(ArchiveRunReport {
@@ -1082,6 +1091,7 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
         db_bounds: Some(ClickHouseBounds {
             earliest_slot: 10,
             latest_slot: 1_009,
+            distinct_slots: 1_000,
         }),
         destination: "./".to_string(),
         archive_tables: vec![
@@ -1356,6 +1366,7 @@ fn dashboard_renders_skip_reasons_and_known_gap_tables() {
         db_bounds: Some(ClickHouseBounds {
             earliest_slot: 100,
             latest_slot: 110,
+            distinct_slots: 11,
         }),
         destination: "./".to_string(),
         archive_tables: Vec::new(),
@@ -1403,6 +1414,7 @@ fn dry_run_report_is_classified_as_dry_run_and_does_not_inflate_row_counters() {
         db_bounds: Some(ClickHouseBounds {
             earliest_slot: 10,
             latest_slot: 1_009,
+            distinct_slots: 1_000,
         }),
         destination: "./".to_string(),
         archive_tables: Vec::new(),
@@ -1518,6 +1530,7 @@ fn metrics_endpoint_exposes_labeled_series() {
         db_bounds: Some(ClickHouseBounds {
             earliest_slot: 432_000_000,
             latest_slot: 432_432_049,
+            distinct_slots: 432_050,
         }),
         destination: "./archives".to_string(),
         archive_tables: Vec::new(),

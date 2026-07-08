@@ -142,13 +142,15 @@ impl fmt::Display for ArchiveKind {
 pub struct ClickHouseBounds {
     pub earliest_slot: u64,
     pub latest_slot: u64,
+    /// Count of distinct slots that actually have data, not the
+    /// `latest_slot - earliest_slot + 1` span. Slot production can skip slots,
+    /// so the span overstates how many slots are really present.
+    pub distinct_slots: u64,
 }
 
 impl ClickHouseBounds {
     pub fn slots_available(self) -> u64 {
-        self.latest_slot
-            .saturating_sub(self.earliest_slot)
-            .saturating_add(1)
+        self.distinct_slots
     }
 }
 

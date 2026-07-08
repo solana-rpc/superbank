@@ -301,7 +301,7 @@ Currency (how up to date the data is):
 | --- | --- | --- | --- |
 | `solparq_db_earliest_slot` | gauge | — | Earliest transaction slot in ClickHouse |
 | `solparq_db_latest_slot` | gauge | — | Latest transaction slot in ClickHouse |
-| `solparq_db_slots_available` | gauge | — | Transaction slots visible in ClickHouse |
+| `solparq_db_slots_available` | gauge | — | Distinct transaction slots visible in ClickHouse |
 | `solparq_chain_tip_slot` | gauge | — | Latest Solana network slot (finalized) via `getSlot` |
 | `solparq_chain_tip_lag_slots` | gauge | — | Network tip minus latest ClickHouse slot |
 | `solparq_db_lag_slots` | gauge | `archive_kind` | Latest ClickHouse slot minus latest archived slot |
