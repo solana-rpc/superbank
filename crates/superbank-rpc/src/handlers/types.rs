@@ -261,6 +261,11 @@ pub(crate) struct GetLatestBlockhashResult {
     pub(crate) context: RpcContextSlot,
     pub(crate) value: GetLatestBlockhashValue,
 }
+#[derive(Debug, Serialize)]
+pub(crate) struct IsBlockhashValidResult {
+    pub(crate) context: RpcContextSlot,
+    pub(crate) value: bool,
+}
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SignatureStatusesResult {

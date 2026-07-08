@@ -16,6 +16,7 @@ use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{EncodeError, TransactionDetails, UiTransactionEncoding};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -25,7 +26,7 @@ use crate::handlers::{
     types::{
         GetBlockHeightConfig, GetBlocksConfig, GetInflationRewardConfig, GetLatestBlockhashConfig,
         GetLatestBlockhashResult, GetLatestBlockhashValue, GetSlotConfig, InflationRewardInfo,
-        MAX_GET_BLOCKS_RANGE, RpcContextSlot, reject_unknown_fields,
+        IsBlockhashValidResult, MAX_GET_BLOCKS_RANGE, RpcContextSlot, reject_unknown_fields,
     },
 };
 use crate::hydration::{BlockHydrationError, hydrate_block_payload};
@@ -1020,6 +1021,240 @@ pub(crate) async fn handle_get_latest_blockhash(
         add_downstream_header(&mut resp, &timings);
     }
     route.success();
+    Ok(resp)
+}
+
+pub(crate) async fn handle_is_blockhash_valid(
+    state: Arc<AppState>,
+    id: Value,
+    params: Option<Vec<Value>>,
+) -> Result<Response, StatusCode> {
+    let mut route = RouteMetric::for_state("isBlockhashValid", state.as_ref());
+
+    let Some(params) = params.filter(|v| !v.is_empty()) else {
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            "Invalid params: expected a blockhash string",
+            None,
+        ));
+    };
+    let Some(blockhash_str) = params.first().and_then(Value::as_str) else {
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            "Invalid params: blockhash must be a base-58 encoded string",
+            None,
+        ));
+    };
+    let Ok(blockhash) = Hash::from_str(blockhash_str) else {
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            "Invalid params: invalid blockhash",
+            None,
+        ));
+    };
+    let blockhash_bytes = blockhash.to_bytes();
+
+    let config = match params.get(1) {
+        None => GetLatestBlockhashConfig::default(),
+        Some(v) if v.is_null() => GetLatestBlockhashConfig::default(),
+        Some(v) if v.is_object() => {
+            match serde_json::from_value::<GetLatestBlockhashConfig>(v.clone()) {
+                Ok(config) => config,
+                Err(e) => {
+                    warn!(error = %e, "Invalid isBlockhashValid config");
+                    route.invalid_params();
+                    return Ok(json_rpc_error_response(
+                        id,
+                        -32602,
+                        "Invalid params: failed to parse config".to_string(),
+                        None,
+                    ));
+                }
+            }
+        }
+        Some(_) => {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(
+                id,
+                -32602,
+                "Invalid params: config must be an object",
+                None,
+            ));
+        }
+    };
+    let commitment = config.commitment.unwrap_or_default();
+
+    if commitment.is_processed() {
+        #[cfg(feature = "grpc-head-cache")]
+        {
+            if state.head_cache.is_none() {
+                route.invalid_params();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32602,
+                    "Only confirmed or finalized commitments are supported",
+                    Some(json!({ "requestedCommitment": commitment.commitment })),
+                ));
+            }
+        }
+        #[cfg(not(feature = "grpc-head-cache"))]
+        {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(
+                id,
+                -32602,
+                "Only confirmed or finalized commitments are supported",
+                Some(json!({ "requestedCommitment": commitment.commitment })),
+            ));
+        }
+    }
+
+    let head_candidate = {
+        #[cfg(feature = "grpc-head-cache")]
+        {
+            if let Some(cache) = state.head_cache.as_ref() {
+                route.head_cache_read();
+                cache.latest_blockhash_info_at_least(commitment.commitment)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "grpc-head-cache"))]
+        {
+            None
+        }
+    };
+    #[cfg(feature = "grpc-head-cache")]
+    let head_context_source = LatestSlotSource::HeadCache;
+    #[cfg(not(feature = "grpc-head-cache"))]
+    let head_context_source = LatestSlotSource::ClickHouse;
+
+    let (context_slot, use_head, context_source) = if let Some((head_slot, _, _)) = head_candidate {
+        (head_slot, true, head_context_source)
+    } else {
+        let (slot, source) = match state
+            .resolve_latest_slot_with_source("is_blockhash_valid", commitment.commitment)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                metrics::backend_error("get_latest_finalized_slot");
+                error!("Failed to fetch latest slot for isBlockhashValid: {}", e);
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        };
+        (slot, false, source)
+    };
+    if use_head {
+        #[cfg(feature = "grpc-head-cache")]
+        route.source_head_cache();
+    } else {
+        match context_source {
+            LatestSlotSource::ClickHouse => route.source_clickhouse(),
+            #[cfg(feature = "grpc-head-cache")]
+            LatestSlotSource::HeadCache => route.source_head_cache(),
+        }
+    }
+
+    if let Some(min_context_slot) = config.min_context_slot
+        && context_slot < min_context_slot
+    {
+        route.rpc_error();
+        return Ok(json_rpc_error_response(
+            id,
+            JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32,
+            "Minimum context slot has not been reached",
+            Some(json!({ "contextSlot": context_slot })),
+        ));
+    }
+
+    let current_block_height = if use_head {
+        let (_slot, _blockhash, block_height): (u64, [u8; 32], u64) =
+            head_candidate.expect("use_head implies head_candidate");
+        block_height
+    } else {
+        route.source_clickhouse();
+        let (row_opt, timings) = match state
+            .clickhouse
+            .get_blockhash_height_by_slot(context_slot)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                metrics::backend_error("get_blockhash_height_by_slot");
+                error!(
+                    "Failed to query ClickHouse for block height at slot {}: {}",
+                    context_slot, e
+                );
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        };
+        let Some((_blockhash, height_opt)) = row_opt else {
+            error!(
+                slot = context_slot,
+                "Block height unavailable for isBlockhashValid"
+            );
+            let mut resp = json_rpc_internal_error_response(id);
+            add_downstream_header(&mut resp, &timings);
+            return Ok(resp);
+        };
+        let Some(height) = height_opt else {
+            error!(
+                slot = context_slot,
+                "Block height unavailable for isBlockhashValid"
+            );
+            let mut resp = json_rpc_internal_error_response(id);
+            add_downstream_header(&mut resp, &timings);
+            return Ok(resp);
+        };
+        height
+    };
+
+    let min_block_height = current_block_height.saturating_sub(MAX_PROCESSING_AGE as u64);
+
+    #[cfg(feature = "grpc-head-cache")]
+    if let Some(cache) = state.head_cache.as_ref() {
+        route.head_cache_read();
+        if let Some(valid) =
+            cache.blockhash_valid_at_least(blockhash_bytes, min_block_height, commitment.commitment)
+        {
+            route.source_head_cache();
+            route.success();
+            let result = IsBlockhashValidResult {
+                context: RpcContextSlot { slot: context_slot },
+                value: valid,
+            };
+            return Ok(json_rpc_success_response(id, json!(result)));
+        }
+    }
+
+    route.source_clickhouse();
+    let (value, timings) = match state
+        .clickhouse
+        .is_blockhash_valid_in_window(&blockhash_bytes, context_slot, min_block_height)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            metrics::backend_error("is_blockhash_valid");
+            error!("Failed to query ClickHouse for isBlockhashValid: {}", e);
+            return Ok(json_rpc_internal_error_response(id));
+        }
+    };
+
+    route.success();
+    let result = IsBlockhashValidResult {
+        context: RpcContextSlot { slot: context_slot },
+        value,
+    };
+    let mut resp = json_rpc_success_response(id, json!(result));
+    add_downstream_header(&mut resp, &timings);
     Ok(resp)
 }
 

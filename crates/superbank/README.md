@@ -158,7 +158,11 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--grpc-slot-notifications[=true|false]` / `GRPC_SLOT_NOTIFICATIONS` (default: true; subscribe to slot notifications on the gRPC stream to populate `superbank_ingest_chain_tip_lag`)
 - `--rpc-url` / `RPC_URL` (required for rpc source)
 - `--rpc-from-slot` / `RPC_FROM_SLOT` (required for rpc source; use `*` for latest slot in
-  `blocks_metadata`, `0` to start from earliest available slot)
+  `blocks_metadata`, `0` to start from earliest available slot). To resume an interrupted
+  backfill, re-run with the same range and `--rpc-skip-ingested-slots`: discovery then skips
+  slots already in `blocks_metadata` and re-fetches only the gaps. Without the flag, discovery
+  re-fetches the whole range. `*` resumes from the highest stored slot and won't refill earlier
+  gaps, so use the range form with the flag to recover.
 - `--rpc-to-slot` / `RPC_TO_SLOT` (required for rpc source if `--rpc-slot-count` not set)
 - `--rpc-slot-count` / `RPC_SLOT_COUNT` (required for rpc source if `--rpc-to-slot` not set)
 - `--rpc-timeout-secs` / `RPC_TIMEOUT_SECS` (default: 30)
@@ -168,6 +172,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-flush-every-slots` / `RPC_FLUSH_EVERY_SLOTS` (default: 500)
 - `--rpc-progress-every-slots` / `RPC_PROGRESS_EVERY_SLOTS` (default: 100)
 - `--rpc-discovery-chunk-slots` / `RPC_DISCOVERY_CHUNK_SLOTS` (default: 10000)
+- `--rpc-skip-ingested-slots` / `RPC_SKIP_INGESTED_SLOTS` (default: false; when set, rpc discovery skips slots already in `blocks_metadata` so a re-run backfills only the gaps)
 - `--bigtable-range` / `BIGTABLE_RANGE` (required unless using `BIGTABLE_SLOT_FILE`; `123:456` slots, `1-10` epochs, or `5` epoch)
 - `--bigtable-slot-file` / `BIGTABLE_SLOT_FILE` (optional; whitespace-separated slot list, mutually exclusive with `BIGTABLE_RANGE`)
 - `--bigtable-instance` / `BIGTABLE_INSTANCE` (default: `solana-ledger`)

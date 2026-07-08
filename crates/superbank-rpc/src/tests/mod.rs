@@ -38,7 +38,7 @@ use crate::handlers::blocks::{
     handle_get_block, handle_get_block_height, handle_get_block_time, handle_get_blocks,
     handle_get_blocks_with_limit, handle_get_first_available_block, handle_get_health,
     handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
-    handle_get_transaction_count, handle_minimum_ledger_slot,
+    handle_get_transaction_count, handle_is_blockhash_valid, handle_minimum_ledger_slot,
 };
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::handlers::signatures::{
@@ -2231,6 +2231,193 @@ async fn get_latest_blockhash_processed_from_head_cache() {
                 "lastValidBlockHeight": expected_last_valid,
             },
         }))
+    );
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_missing_blockhash() {
+    let state = test_state();
+    let response = handle_is_blockhash_valid(state, json!(1), None)
+        .await
+        .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: expected a blockhash string");
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_non_string_blockhash() {
+    let state = test_state();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(123)]))
+        .await
+        .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: blockhash must be a base-58 encoded string"
+    );
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_malformed_blockhash() {
+    let state = test_state();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!("not_base58")]))
+        .await
+        .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: invalid blockhash");
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_non_object_config() {
+    let state = test_state();
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response =
+        handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash), json!(1)]))
+            .await
+            .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: config must be an object");
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_processed_commitment() {
+    let state = test_state();
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(
+        state,
+        json!(1),
+        Some(vec![json!(blockhash), json!({ "commitment": "processed" })]),
+    )
+    .await
+    .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(
+        err.message,
+        "Only confirmed or finalized commitments are supported"
+    );
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_min_context_slot_not_reached() {
+    let state = test_state();
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(
+        state,
+        json!(1),
+        Some(vec![json!(blockhash), json!({ "minContextSlot": 2 })]),
+    )
+    .await
+    .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(
+        err.code,
+        JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32
+    );
+    assert_eq!(err.message, "Minimum context slot has not been reached");
+    assert_eq!(
+        err.data.and_then(|d| d.get("contextSlot").cloned()),
+        Some(json!(1u64))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn is_blockhash_valid_true_from_head_cache() {
+    let cache = Arc::new(HeadCache::new(32, 1024));
+    cache.note_slot_commitment(10, CommitmentLevel::Finalized);
+    cache.note_block_height(10, 123);
+    cache.note_blockhash(10, [1u8; 32]);
+    let state = test_state_with_head_cache(cache);
+
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash)]))
+        .await
+        .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(
+        parsed.result,
+        Some(json!({ "context": { "slot": 10u64 }, "value": true }))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn is_blockhash_valid_true_at_window_boundary_from_head_cache() {
+    // A blockhash whose block_height is exactly the floor (current - MAX_PROCESSING_AGE)
+    // is still valid; guards the inclusive `>=` boundary.
+    let cache = Arc::new(HeadCache::new(256, 1024));
+    cache.note_slot_commitment(200, CommitmentLevel::Finalized);
+    cache.note_block_height(200, 200);
+    cache.note_blockhash(200, [1u8; 32]);
+    // min_block_height = 200 - 150 = 50; height 50 is exactly on the boundary.
+    cache.note_slot_commitment(60, CommitmentLevel::Finalized);
+    cache.note_block_height(60, 50);
+    cache.note_blockhash(60, [2u8; 32]);
+    let state = test_state_with_head_cache(cache);
+
+    let blockhash = Hash::from([2u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash)]))
+        .await
+        .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(
+        parsed.result,
+        Some(json!({ "context": { "slot": 200u64 }, "value": true }))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn is_blockhash_valid_false_for_aged_out_head_cache() {
+    // A blockhash present in the cache but below the height floor is invalid
+    // (the Some(false) branch), answered without touching ClickHouse.
+    let cache = Arc::new(HeadCache::new(256, 1024));
+    cache.note_slot_commitment(200, CommitmentLevel::Finalized);
+    cache.note_block_height(200, 200);
+    cache.note_blockhash(200, [1u8; 32]);
+    // min_block_height = 200 - 150 = 50; height 40 is below the floor.
+    cache.note_slot_commitment(45, CommitmentLevel::Finalized);
+    cache.note_block_height(45, 40);
+    cache.note_blockhash(45, [2u8; 32]);
+    let state = test_state_with_head_cache(cache);
+
+    let blockhash = Hash::from([2u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash)]))
+        .await
+        .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(
+        parsed.result,
+        Some(json!({ "context": { "slot": 200u64 }, "value": false }))
     );
 }
 
