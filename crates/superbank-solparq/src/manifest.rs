@@ -6,7 +6,7 @@ use crate::{
 };
 
 pub const MANIFEST_FILE_NAME: &str = "manifest.json";
-pub const REPORT_FILE_NAME: &str = "report.txt";
+pub const REPORT_FILE_NAME: &str = "report.json";
 pub const SHA256SUMS_FILE_NAME: &str = "SHA256SUMS.txt";
 pub const DONE_FILE_PREFIX: &str = ".done";
 
@@ -14,6 +14,9 @@ pub const DONE_FILE_PREFIX: &str = ".done";
 /// the highest version it understands to detect archives written by a newer
 /// producer.
 pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+
+/// Bump when the `report.json` schema changes.
+pub const REPORT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveManifest {

@@ -11,15 +11,19 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::fs;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
+    backfill,
     clickhouse::{
         ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, DiskUsage, SlotRange,
         TableSize, ValidationReport,
     },
     config::Config,
-    manifest::{ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, SkippedArchiveTable},
+    manifest::{
+        ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, ManifestProducer,
+        REPORT_FORMAT_VERSION, SkippedArchiveTable,
+    },
     storage::{self, ArchiveDestination},
 };
 
@@ -349,6 +353,38 @@ pub struct ArchiveRunReport {
     pub run_metrics: ArchiveRunMetrics,
 }
 
+/// The `report.json` document written next to each archive. Wraps the run report
+/// with the same build-identity block the manifest carries (`producer`,
+/// `format_version`) plus the resolved hostname and human-readable timestamp, so
+/// a report can be traced to the exact binary and node that produced it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveReportDocument {
+    pub report_version: u32,
+    pub producer: ManifestProducer,
+    pub hostname: String,
+    /// Human-readable UTC form of `timestamp_unix`.
+    pub timestamp_utc: String,
+    #[serde(flatten)]
+    pub report: ArchiveRunReport,
+}
+
+impl ArchiveReportDocument {
+    pub fn new(report: ArchiveRunReport) -> Self {
+        let timestamp_utc = format_unix_timestamp_utc(report.timestamp_unix);
+        Self {
+            report_version: REPORT_FORMAT_VERSION,
+            producer: ManifestProducer::current(),
+            hostname: node_hostname(),
+            timestamp_utc,
+            report,
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).map_err(|err| anyhow!(err))
+    }
+}
+
 /// Per-run operational measurements consumed by the metrics layer.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ArchiveRunMetrics {
@@ -364,6 +400,8 @@ pub struct ArchiveRunMetrics {
     pub chain_tip_slot: Option<u64>,
     /// Outcome of an overcount transaction-mismatch repair attempt, if one ran.
     pub mismatch_repair: Option<MismatchRepair>,
+    /// Outcome of a `--backfill-gaps` RPC backfill attempt, if one ran.
+    pub gap_backfill: Option<GapBackfill>,
     /// ClickHouse disk space at the time of this run, from `system.disks`. Empty
     /// if the probe failed; best-effort like `chain_tip_slot`.
     pub disk_usage: Vec<DiskUsage>,
@@ -379,6 +417,17 @@ pub struct MismatchRepair {
     pub partitions_optimized: u64,
     pub overcount_slots_before: u64,
     pub overcount_slots_after: u64,
+}
+
+/// Result of a `--backfill-gaps` RPC backfill pass over missing slots.
+#[derive(Debug, Clone, Serialize)]
+pub struct GapBackfill {
+    /// Slots handed to the backfill subprocess.
+    pub slots_targeted: u64,
+    /// Missing blocks still absent after re-validation (0 = fully repaired).
+    pub missing_blocks_after: u64,
+    /// Whether the backfill subprocess exited successfully.
+    pub succeeded: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -565,6 +614,12 @@ impl ArchiveRunReport {
                 repair.partitions_optimized,
                 repair.overcount_slots_before,
                 repair.overcount_slots_after
+            ));
+        }
+        if let Some(backfill) = &self.run_metrics.gap_backfill {
+            lines.push(format!(
+                "gap_backfill: slots_targeted={} missing_after={} succeeded={}",
+                backfill.slots_targeted, backfill.missing_blocks_after, backfill.succeeded
             ));
         }
         if let Some(validation) = &self.validation {
@@ -809,7 +864,8 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             run_metrics: ArchiveRunMetrics::default(),
         };
         if !config.dry_run {
-            storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
+            let document = ArchiveReportDocument::new(report.clone());
+            storage::write_report(config, kind, &archive_name, &document.to_json()?).await?;
         }
         return Ok(report);
     }
@@ -883,6 +939,64 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         None
     };
 
+    // Backfill blocks that are missing locally (produced on-chain per getBlocks
+    // but absent from ClickHouse) by re-ingesting them via the `superbank` RPC
+    // ingestor, then re-validate so the archive/skip decision reflects the fill.
+    // Best-effort: a failed backfill falls through to the normal warning gate.
+    let gap_backfill = if !config.backfill_gaps {
+        None
+    } else {
+        let target_slots =
+            backfill::backfill_target_slots(&validation, config.backfill_include_undercounts);
+        if target_slots.is_empty() {
+            None
+        } else if config.dry_run {
+            info!(
+                archive_kind = kind.to_string(),
+                slots_targeted = target_slots.len(),
+                "dry-run: skipping gap backfill (no ClickHouse changes made)"
+            );
+            None
+        } else {
+            let backfill_started = Instant::now();
+            let slots_targeted = target_slots.len() as u64;
+            info!(
+                archive_kind = kind.to_string(),
+                slots_targeted, "backfilling missing blocks before archive"
+            );
+            let succeeded = match backfill::run_backfill(config, &tables, &target_slots).await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(
+                        archive_kind = kind.to_string(),
+                        error = %err,
+                        "gap backfill failed; proceeding to the validation gate"
+                    );
+                    false
+                }
+            };
+            validation = client
+                .validate_archive_range(
+                    &tables,
+                    &config.solana_rpc_url,
+                    plan.start_slot,
+                    plan.end_slot,
+                )
+                .await?;
+            let missing_blocks_after = validation.missing_blocks.len() as u64;
+            phase_durations.push(PhaseDuration::new("backfill", backfill_started.elapsed()));
+            info!(
+                archive_kind = kind.to_string(),
+                slots_targeted, missing_blocks_after, succeeded, "gap backfill completed"
+            );
+            Some(GapBackfill {
+                slots_targeted,
+                missing_blocks_after,
+                succeeded,
+            })
+        }
+    };
+
     debug!(
         archive_kind = kind.to_string(),
         missing_blocks = validation.missing_blocks.len(),
@@ -903,6 +1017,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             report.validation = Some(validation);
             report.run_metrics.phase_durations = phase_durations;
             report.run_metrics.mismatch_repair = mismatch_repair;
+            report.run_metrics.gap_backfill = gap_backfill;
             return Ok(report);
         }
         if config.dry_run {
@@ -916,6 +1031,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             report.validation = Some(validation);
             report.run_metrics.phase_durations = phase_durations;
             report.run_metrics.mismatch_repair = mismatch_repair;
+            report.run_metrics.gap_backfill = gap_backfill;
             return Ok(report);
         }
         if !confirm_validation_warnings(&plan, &validation)? {
@@ -929,6 +1045,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             report.validation = Some(validation);
             report.run_metrics.phase_durations = phase_durations;
             report.run_metrics.mismatch_repair = mismatch_repair;
+            report.run_metrics.gap_backfill = gap_backfill;
             return Ok(report);
         }
     }
@@ -960,6 +1077,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         report.run_metrics.phase_durations = phase_durations;
         report.run_metrics.archived_table_rows = archived_table_rows;
         report.run_metrics.mismatch_repair = mismatch_repair;
+        report.run_metrics.gap_backfill = gap_backfill;
         return Ok(report);
     }
 
@@ -1130,11 +1248,13 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             archived_bytes_total,
             chain_tip_slot: None,
             mismatch_repair,
+            gap_backfill,
             disk_usage: Vec::new(),
             table_sizes: Vec::new(),
         },
     };
-    storage::write_report(config, kind, &archive_name, &report.to_text()).await?;
+    let document = ArchiveReportDocument::new(report.clone());
+    storage::write_report(config, kind, &archive_name, &document.to_json()?).await?;
     info!(
         archive_kind = kind.to_string(),
         archive_name,
@@ -1339,5 +1459,5 @@ fn system_hostname() -> Option<String> {
 }
 
 pub fn report_path_for_local_archive(directory: PathBuf, archive_name: &str) -> PathBuf {
-    directory.join(format!(".{archive_name}.report.txt"))
+    directory.join(format!(".{archive_name}.report.json"))
 }

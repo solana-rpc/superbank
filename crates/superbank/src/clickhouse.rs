@@ -184,6 +184,29 @@ pub(crate) async fn fetch_latest_slot_from_blocks(
     Ok(row.max_slot)
 }
 
+/// Distinct slots already present in the blocks table within the inclusive
+/// `[start, end]` range. Used by RPC gap-fill discovery to skip slots that have
+/// already been ingested.
+pub(crate) async fn fetch_present_slots(
+    clickhouse: &ClickHouseClient,
+    blocks_table: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u64>> {
+    let query = format!(
+        "SELECT DISTINCT slot FROM {blocks_table} WHERE slot BETWEEN ? AND ? ORDER BY slot"
+    );
+    clickhouse
+        .query(&query)
+        .bind(start)
+        .bind(end)
+        .fetch_all::<u64>()
+        .await
+        .with_context(|| {
+            format!("query present slots from {blocks_table} between {start} and {end}")
+        })
+}
+
 pub(crate) async fn flush_buffers(
     client: &ClickHouseClient,
     tables: &InsertTables,
@@ -520,6 +543,8 @@ mod tests {
             rpc_flush_every_slots: 500,
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
+            rpc_fill_gaps: false,
+            rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),

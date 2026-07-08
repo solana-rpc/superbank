@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod backfill;
 pub mod clickhouse;
 pub mod config;
 pub mod manifest;

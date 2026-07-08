@@ -269,6 +269,7 @@ struct Metrics {
     validation_rpc_errors_total: Family<KindLabels, Counter>,
     validation_slots_total: Family<ValidationLabels, Counter>,
     mismatch_repairs_total: Family<RepairLabels, Counter>,
+    gap_backfills_total: Family<RepairLabels, Counter>,
     archive_rows_total: Family<TableLabels, Counter>,
     // Histograms.
     phase_duration_seconds: Family<PhaseLabels, Histogram>,
@@ -328,6 +329,7 @@ impl Metrics {
         let validation_rpc_errors_total = Family::<KindLabels, Counter>::default();
         let validation_slots_total = Family::<ValidationLabels, Counter>::default();
         let mismatch_repairs_total = Family::<RepairLabels, Counter>::default();
+        let gap_backfills_total = Family::<RepairLabels, Counter>::default();
         let archive_rows_total = Family::<TableLabels, Counter>::default();
         let phase_duration_seconds = Family::<PhaseLabels, Histogram>::new_with_constructor(
             phase_histogram as fn() -> Histogram,
@@ -532,6 +534,11 @@ impl Metrics {
             mismatch_repairs_total.clone(),
         );
         registry.register(
+            "gap_backfills",
+            "Pre-archive RPC gap backfill attempts by archive kind and outcome (filled = no missing blocks remain, partial = some blocks still missing, failed = backfill subprocess errored)",
+            gap_backfills_total.clone(),
+        );
+        registry.register(
             "archive_rows",
             "Total rows archived by archive kind and source table",
             archive_rows_total.clone(),
@@ -586,6 +593,7 @@ impl Metrics {
             validation_rpc_errors_total,
             validation_slots_total,
             mismatch_repairs_total,
+            gap_backfills_total,
             archive_rows_total,
             phase_duration_seconds,
             last_db_latest_slot: AtomicU64::new(0),
@@ -1027,6 +1035,16 @@ impl AppState {
             };
             self.record_mismatch_repair(kind_label, outcome);
         }
+        if let Some(backfill) = &report.run_metrics.gap_backfill {
+            let outcome = if !backfill.succeeded {
+                "failed"
+            } else if backfill.missing_blocks_after == 0 {
+                "filled"
+            } else {
+                "partial"
+            };
+            self.record_gap_backfill(kind_label, outcome);
+        }
     }
 
     /// Record the last-validated-range gauges and cumulative counter for one
@@ -1071,6 +1089,16 @@ impl AppState {
     fn record_mismatch_repair(&self, kind_label: &str, outcome: &str) {
         self.metrics
             .mismatch_repairs_total
+            .get_or_create(&RepairLabels {
+                archive_kind: kind_label.to_string(),
+                outcome: outcome.to_string(),
+            })
+            .inc();
+    }
+
+    fn record_gap_backfill(&self, kind_label: &str, outcome: &str) {
+        self.metrics
+            .gap_backfills_total
             .get_or_create(&RepairLabels {
                 archive_kind: kind_label.to_string(),
                 outcome: outcome.to_string(),

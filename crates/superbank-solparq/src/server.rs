@@ -618,6 +618,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
           <tr><th>Archive tables</th><td>{archive_tables}</td></tr>
           <tr><th>Archives to keep</th><td>{archives_to_keep}</td></tr>
           <tr><th>Continue from last archive</th><td>{continue_from_last_archive}</td></tr>
+          <tr><th>Gap backfill</th><td>{backfill_gaps}</td></tr>
           <tr><th>Check interval</th><td>{check_interval} seconds</td></tr>
           <tr><th>Skipped</th><td>{archives_skipped}</td></tr>
           <tr><th>Errors</th><td>{archive_errors}</td></tr>
@@ -661,11 +662,20 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         archive_tables = archive_tables,
         archives_to_keep = format_u64(config.archives_to_keep as u64),
         continue_from_last_archive = config.continue_from_last_archive,
+        backfill_gaps = backfill_summary(config),
         check_interval = format_u64(config.archive_check_interval_secs),
         archives_skipped = format_u64(status.archives_skipped),
         archive_errors = format_u64(status.archive_errors),
         last_error = html_escape(&last_error_display),
     )
+}
+
+fn backfill_summary(config: &Config) -> String {
+    if config.backfill_gaps {
+        html_escape(&format!("enabled (via {})", config.backfill_superbank_bin))
+    } else {
+        "disabled".to_string()
+    }
 }
 
 fn render_disk_summary(disks: &[DiskUsage]) -> String {

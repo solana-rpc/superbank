@@ -295,6 +295,17 @@ struct CliArgs {
     #[arg(long, env = "RPC_DISCOVERY_CHUNK_SLOTS", default_value_t = 10_000)]
     rpc_discovery_chunk_slots: u64,
 
+    /// Backfill only slots missing from ClickHouse: discovery subtracts slots
+    /// already present in the blocks table, so getBlock is only called for gaps.
+    #[arg(long, env = "RPC_FILL_GAPS", default_value_t = false)]
+    rpc_fill_gaps: bool,
+
+    /// Fetch exactly the slots in this whitespace-separated file (getBlock per
+    /// slot, no getBlocks discovery). Mutually exclusive with --rpc-fill-gaps,
+    /// --rpc-from-slot, --rpc-to-slot, and --rpc-slot-count.
+    #[arg(long, env = "RPC_SLOT_LIST", value_name = "PATH")]
+    rpc_slot_list: Option<PathBuf>,
+
     /// Bigtable range spec: slots "123:456", epochs "1-10", or single epoch "5"
     #[arg(long, env = "BIGTABLE_RANGE")]
     bigtable_range: Option<String>,
@@ -478,6 +489,8 @@ pub(crate) struct Args {
     pub(crate) rpc_flush_every_slots: u64,
     pub(crate) rpc_progress_every_slots: u64,
     pub(crate) rpc_discovery_chunk_slots: u64,
+    pub(crate) rpc_fill_gaps: bool,
+    pub(crate) rpc_slot_list: Option<PathBuf>,
     pub(crate) bigtable_range: Option<String>,
     pub(crate) bigtable_slot_file: Option<PathBuf>,
     pub(crate) bigtable_instance: String,
@@ -579,6 +592,10 @@ struct FileConfig {
     rpc_progress_every_slots: Option<u64>,
     #[serde(alias = "rpc_discovery_chunk_slots")]
     rpc_discovery_chunk_slots: Option<u64>,
+    #[serde(alias = "rpc_fill_gaps")]
+    rpc_fill_gaps: Option<bool>,
+    #[serde(alias = "rpc_slot_list")]
+    rpc_slot_list: Option<PathBuf>,
     #[serde(alias = "bigtable_range")]
     bigtable_range: Option<String>,
     #[serde(alias = "bigtable_slot_file")]
@@ -830,6 +847,18 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "rpc_discovery_chunk_slots",
             cli.rpc_discovery_chunk_slots,
             file_config.rpc_discovery_chunk_slots,
+        ),
+        rpc_fill_gaps: merge_value(
+            &matches,
+            "rpc_fill_gaps",
+            cli.rpc_fill_gaps,
+            file_config.rpc_fill_gaps,
+        ),
+        rpc_slot_list: merge_option(
+            &matches,
+            "rpc_slot_list",
+            cli.rpc_slot_list,
+            file_config.rpc_slot_list,
         ),
         bigtable_range: merge_option(
             &matches,
@@ -1107,25 +1136,39 @@ fn validate_args(args: &Args) -> Result<()> {
                     "rpc source requires --rpc-url / RPC_URL / config rpc_url"
                 ));
             }
-            if args.rpc_from_slot.is_none() {
-                return Err(anyhow!(
-                    "rpc source requires --rpc-from-slot / RPC_FROM_SLOT / config rpc-from-slot"
-                ));
-            }
-            if args.rpc_to_slot.is_some() && args.rpc_slot_count.is_some() {
-                return Err(anyhow!(
-                    "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
-                ));
-            }
-            if args.rpc_to_slot.is_none() && args.rpc_slot_count.is_none() {
-                return Err(anyhow!(
-                    "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
-                ));
-            }
-            if let Some(count) = args.rpc_slot_count
-                && count == 0
-            {
-                return Err(anyhow!("rpc-slot-count must be greater than 0"));
+            if args.rpc_slot_list.is_some() {
+                // Slot-list mode fetches exactly the listed slots; range and
+                // gap-fill flags do not apply and must not be combined with it.
+                if args.rpc_from_slot.is_some()
+                    || args.rpc_to_slot.is_some()
+                    || args.rpc_slot_count.is_some()
+                    || args.rpc_fill_gaps
+                {
+                    return Err(anyhow!(
+                        "rpc-slot-list is mutually exclusive with rpc-from-slot, rpc-to-slot, rpc-slot-count, and rpc-fill-gaps"
+                    ));
+                }
+            } else {
+                if args.rpc_from_slot.is_none() {
+                    return Err(anyhow!(
+                        "rpc source requires --rpc-from-slot / RPC_FROM_SLOT / config rpc-from-slot"
+                    ));
+                }
+                if args.rpc_to_slot.is_some() && args.rpc_slot_count.is_some() {
+                    return Err(anyhow!(
+                        "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
+                    ));
+                }
+                if args.rpc_to_slot.is_none() && args.rpc_slot_count.is_none() {
+                    return Err(anyhow!(
+                        "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
+                    ));
+                }
+                if let Some(count) = args.rpc_slot_count
+                    && count == 0
+                {
+                    return Err(anyhow!("rpc-slot-count must be greater than 0"));
+                }
             }
             if args.rpc_max_inflight == 0 {
                 return Err(anyhow!("rpc max-inflight must be greater than 0"));
@@ -1611,6 +1654,33 @@ rpc-from-slot: 456
     }
 
     #[test]
+    fn validate_accepts_rpc_slot_list_without_range() {
+        let mut args = fumarole_args();
+        args.source = IngestSource::Rpc;
+        args.rpc_url = Some("https://api.mainnet-beta.solana.com".to_string());
+        args.rpc_slot_list = Some(PathBuf::from("/tmp/slots.txt"));
+
+        validate_args(&args).expect("valid rpc slot-list args");
+    }
+
+    #[test]
+    fn validate_rejects_rpc_slot_list_with_range() {
+        let mut args = fumarole_args();
+        args.source = IngestSource::Rpc;
+        args.rpc_url = Some("https://api.mainnet-beta.solana.com".to_string());
+        args.rpc_slot_list = Some(PathBuf::from("/tmp/slots.txt"));
+        args.rpc_from_slot = Some(FromSlotSpec::Slot(200_000_000));
+        args.rpc_slot_count = Some(100);
+
+        let err = validate_args(&args).expect_err("slot-list with range");
+
+        assert!(
+            err.to_string()
+                .contains("rpc-slot-list is mutually exclusive")
+        );
+    }
+
+    #[test]
     fn validate_rejects_rpc_without_rpc_from_slot() {
         let mut args = fumarole_args();
         args.source = IngestSource::Rpc;
@@ -1755,6 +1825,8 @@ rpc-from-slot: 456
             rpc_flush_every_slots: 500,
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
+            rpc_fill_gaps: false,
+            rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),

@@ -8,7 +8,7 @@ Archive bundles use:
 ```text
 type_epoch_from-slot_to-slot/
   manifest.json
-  report.txt
+  report.json
   SHA256SUMS.txt
   .done.<hostname>.txt
   transactions.parquet
@@ -33,8 +33,13 @@ without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
 entries for later PoH-specific tooling.
 
 `SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
-bundle. `report.txt` records the run timestamp in Unix and UTC forms plus the
-node `$HOSTNAME`. A `.done.<hostname>.txt` marker is written after the archive data
+bundle. `report.json` is a machine-readable run report: it carries a
+`report_version` and the same `producer` build-identity block as the manifest
+(binary name, version, git SHA), the run timestamp in Unix and UTC forms, the
+node `$HOSTNAME`, and the full run outcome — planned/created archive details,
+validation results, and `run_metrics` (per-phase durations, per-table row
+counts, mismatch-repair and gap-backfill outcomes, disk/table sizes). A
+`.done.<hostname>.txt` marker is written after the archive data
 and manifest exist; if a later run sees an archive with any `.done*` marker, it
 treats that archive as already successful and still performs any safe
 ClickHouse cleanup that is due. If the target archive bundle already exists
@@ -63,6 +68,38 @@ manifest fields, so older `superbank-solparq-read` builds can still read
 newer bundles, and `producer`/`format_version` are `null`/absent when reading
 bundles written before this field existed (`format_version` 1). `superbank-solparq-read summary`
 prints both fields.
+
+`report.json` shares the `producer` build-identity block and adds the run
+outcome. Its top level is flattened, so run fields sit alongside the header:
+
+```json
+{
+  "report_version": 1,
+  "producer": {
+    "name": "superbank-solparq",
+    "version": "0.5.1-rc1-sp1",
+    "git_sha": "abcdef1234567890"
+  },
+  "hostname": "archiver-01",
+  "timestamp_unix": 1700000000,
+  "timestamp_utc": "2023-11-14 22:13:20 UTC",
+  "archive_created": true,
+  "archive_name": "hourly_988_427236024-427245023.parquet",
+  "archive_kind": { "type": "hourly" },
+  "archive_slot_start": 427236024,
+  "archive_slot_end": 427245023,
+  "validation": { "missing_blocks": [], "transaction_mismatches": [] },
+  "run_metrics": {
+    "phase_durations": [{ "phase": "validate", "seconds": 1.2 }],
+    "archived_table_rows": [{ "table": "transactions", "rows": 123456 }],
+    "mismatch_repair": null,
+    "gap_backfill": { "slots_targeted": 3, "missing_blocks_after": 0, "succeeded": true }
+  }
+}
+```
+
+(Fields that are `None`/empty for a given run — e.g. `mismatch_repair`,
+`gap_backfill`, `db_bounds` — are `null` or omitted.)
 
 ## Build
 
@@ -331,7 +368,7 @@ Latency (histograms, seconds):
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
-| `solparq_phase_duration_seconds` | histogram | `archive_kind`, `phase` | Per-phase archive latency. Phases: `validate`, `repair`, `write`, `dry_run_count`, `delete_range`, `cleanup`, `total` |
+| `solparq_phase_duration_seconds` | histogram | `archive_kind`, `phase` | Per-phase archive latency. Phases: `validate`, `repair`, `backfill`, `write`, `dry_run_count`, `delete_range`, `cleanup`, `total` |
 
 Data quality — validation issues are split by `category` so a dashboard can
 separate actionable gaps from expected leader gaps and other problems:
@@ -355,6 +392,7 @@ separate actionable gaps from expected leader gaps and other problems:
 | `solparq_validation_mismatch_slots` | gauge | `archive_kind`, `direction` | Transaction-mismatch slots in the last validated range, by `direction` (`undercount` = missing rows, `overcount` = duplicate rows) |
 | `solparq_validation_rpc_errors_total` | counter | `archive_kind` | Validation runs where the Solana RPC cross-check failed |
 | `solparq_mismatch_repairs_total` | counter | `archive_kind`, `outcome` | Overcount-mismatch repair attempts, by `outcome` (`repaired` = clean after dedup, `still_dirty` = mismatch remains) |
+| `solparq_gap_backfills_total` | counter | `archive_kind`, `outcome` | Pre-archive RPC gap-backfill attempts (`--backfill-gaps`), by `outcome` (`filled` = no missing blocks remain, `partial` = some blocks still missing, `failed` = backfill subprocess errored) |
 | `solparq_known_gaps` | gauge | `archive_kind`, `classification` | Currently tracked known data gaps, by classification (`Needs backfill`, `Legit not-produced`, `Transaction mismatch (undercount)`, `Transaction mismatch (overcount)`) |
 
 > `solparq_last_archive_bytes` is only populated for local destinations.
@@ -534,6 +572,45 @@ Override it with:
 --solana-rpc-url https://your.rpc.endpoint
 ```
 
+### Backfilling gaps before archiving
+
+By default a missing block just produces a warning (skip in server mode, prompt
+otherwise). With `--backfill-gaps` (`SOLPARQ_BACKFILL_GAPS`), `superbank-solparq`
+instead **repairs** the range before archiving: it takes the missing slots that
+validation already found (`missing_blocks`, plus transaction-undercount slots
+unless `--backfill-include-undercounts=false`), and invokes the `superbank` RPC
+ingestor as a subprocess to fetch and insert exactly those slots
+(`--source rpc --rpc-slot-list`). It then re-validates and proceeds with the
+archive decision on the post-backfill state. This makes server mode
+self-healing across transient ingest hiccups.
+
+```bash
+cargo run -p superbank-solparq -- \
+  --db-server 192.168.0.184 \
+  --db-user admin \
+  --db-password 'change-me' \
+  --archive-range-type hourly \
+  --backfill-gaps \
+  --backfill-superbank-bin /usr/local/bin/superbank \
+  --solana-rpc-url https://your.rpc.endpoint
+```
+
+Details and limitations:
+
+- The `superbank` binary must be available (on `PATH`, or set
+  `--backfill-superbank-bin` / `SOLPARQ_BACKFILL_SUPERBANK_BIN`). ClickHouse and
+  RPC config are passed to the subprocess via environment variables.
+- Backfill is **best-effort**: if the subprocess can't be spawned or exits
+  non-zero, the failure is logged and the run falls through to the normal
+  validation gate (skip / `--force-archive` / prompt). Re-validation always runs
+  so the archive decision reflects reality.
+- Re-ingesting is idempotent (`ReplacingMergeTree(slot)`), so backfilling slots
+  that already exist is safe.
+- **Entries are not restored**: RPC `getBlock` carries no PoH `entries`; backfill
+  fills `blocks_metadata` and `transactions` only. Validation today checks only
+  blocks and transaction counts, so this does not block the archive.
+- `--dry-run` skips backfill (it only logs how many slots it would fetch).
+
 ## Dry Run
 
 `--dry-run` (`SOLPARQ_DRY_RUN`) plans and validates an archive without making
@@ -553,6 +630,7 @@ normally, but a dry run never:
 
 - writes Parquet files, `manifest.json`, `SHA256SUMS.txt`, or a `.done*` marker
 - runs the `--repair-mismatches` `OPTIMIZE ... DEDUPLICATE` step
+- runs the `--backfill-gaps` RPC backfill subprocess
 - deletes the archived ClickHouse range (`--delete-archived-data-range`)
 - prunes old archives (`--archives-to-keep`)
 
@@ -631,6 +709,9 @@ Common defaults:
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset
 - `--repair-mismatches` unset (off)
+- `--backfill-gaps` unset (off)
+- `--backfill-superbank-bin superbank`
+- `--backfill-include-undercounts` on (only applies when `--backfill-gaps` is set)
 - `--db-transactions-local-table-name` unset (defaults to `--db-transactions-table-name`)
 - `--clickhouse-cluster` unset
 - `--clickhouse-archive-settings max_bytes_before_external_sort=1073741824, max_threads=4, output_format_parquet_row_group_size=100000`

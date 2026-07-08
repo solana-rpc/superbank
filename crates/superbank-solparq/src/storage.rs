@@ -548,7 +548,7 @@ fn object_path_for_archive(config: &S3Config, kind: ArchiveKind, archive_name: &
 
 fn object_path_for_report(config: &S3Config, kind: ArchiveKind, archive_name: &str) -> ObjectPath {
     ObjectPath::from(format!(
-        "{}/.{}.report.txt",
+        "{}/.{}.report.json",
         s3_prefix_for_kind(config, kind),
         archive_name
     ))

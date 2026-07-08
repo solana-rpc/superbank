@@ -2,9 +2,10 @@ use std::{fs, process::Command, str::FromStr};
 
 use superbank_solparq::{
     archive::{
-        ArchiveKind, ArchiveRunMetrics, ArchiveRunReport, ArchiveRunTable, ArchiveSlotRange,
-        ArchivedTableRows, ClickHouseBounds, MismatchRepair, PhaseDuration, epoch_partitions,
-        plan_archive_slot_range, plan_next_archive, safe_delete_archived_data_range,
+        ArchiveKind, ArchiveReportDocument, ArchiveRunMetrics, ArchiveRunReport, ArchiveRunTable,
+        ArchiveSlotRange, ArchivedTableRows, ClickHouseBounds, GapBackfill, MismatchRepair,
+        PhaseDuration, epoch_partitions, plan_archive_slot_range, plan_next_archive,
+        safe_delete_archived_data_range,
     },
     clickhouse::{
         ArchiveTableKind, DbTables, DiskUsage, MismatchDirection, S3ArchiveSql, SlotRange,
@@ -303,9 +304,14 @@ fn binary_reports_crate_version() {
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        concat!("superbank-solparq ", env!("CARGO_PKG_VERSION"))
+    // The version line starts with "superbank-solparq <semver>" and, when the
+    // build embedded a git SHA (SUPERBANK_LONG_VERSION), is followed by
+    // " (<short-sha>)". Assert the stable prefix so both forms pass.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version_line = stdout.trim();
+    assert!(
+        version_line.starts_with(concat!("superbank-solparq ", env!("CARGO_PKG_VERSION"))),
+        "unexpected version line: {version_line}"
     );
 }
 
@@ -1359,6 +1365,55 @@ fn archive_report_includes_human_timestamp_and_hostname() {
 }
 
 #[test]
+fn archive_report_document_is_json_with_producer_and_run_facts() {
+    let report = ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: true,
+        archive_skipped_reason: None,
+        archive_name: Some("custom_0_10-1009.parquet".to_string()),
+        archive_kind: ArchiveKind::Custom { slots: 1_000 },
+        archive_epoch: Some(0),
+        archive_slot_start: Some(10),
+        archive_slot_end: Some(1_009),
+        db_bounds: None,
+        destination: "./".to_string(),
+        archive_tables: Vec::new(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: ArchiveRunMetrics {
+            gap_backfill: Some(GapBackfill {
+                slots_targeted: 2,
+                missing_blocks_after: 0,
+                succeeded: true,
+            }),
+            ..Default::default()
+        },
+    };
+
+    let json = ArchiveReportDocument::new(report)
+        .to_json()
+        .expect("to_json");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+    // Manifest-style build identity.
+    assert_eq!(value["report_version"], 1);
+    assert_eq!(value["producer"]["name"], "superbank-solparq");
+    assert!(value["producer"]["version"].is_string());
+    assert!(value["producer"]["git_sha"].is_string());
+    assert!(value["hostname"].is_string());
+    // Timestamps: raw unix (flattened from the report) plus human UTC.
+    assert_eq!(value["timestamp_unix"], 1_700_000_000u64);
+    assert_eq!(value["timestamp_utc"], "2023-11-14 22:13:20 UTC");
+    // Core archive facts are flattened to the top level.
+    assert_eq!(value["archive_created"], true);
+    assert_eq!(value["archive_name"], "custom_0_10-1009.parquet");
+    // New run facts (gap backfill) are included via run_metrics.
+    assert_eq!(value["run_metrics"]["gap_backfill"]["slots_targeted"], 2);
+    assert_eq!(value["run_metrics"]["gap_backfill"]["succeeded"], true);
+}
+
+#[test]
 fn dashboard_renders_skip_reasons_and_known_gap_tables() {
     let config = Config::try_parse_from([
         "superbank-solparq",
@@ -1585,6 +1640,7 @@ fn metrics_endpoint_exposes_labeled_series() {
             archived_bytes_total: Some(4_096),
             chain_tip_slot: Some(432_432_099),
             mismatch_repair: None,
+            gap_backfill: None,
             disk_usage: Vec::new(),
             table_sizes: Vec::new(),
         },
@@ -1825,5 +1881,40 @@ fn metrics_expose_mismatch_direction_and_repair_outcome() {
             .known_gaps
             .iter()
             .any(|gap| gap.classification == "Transaction mismatch (undercount)")
+    );
+}
+
+#[test]
+fn metrics_expose_gap_backfill_outcome() {
+    let state = AppState::new();
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: true,
+        archive_skipped_reason: None,
+        archive_name: Some("epoch_1_0-431999.parquet".to_string()),
+        archive_kind: ArchiveKind::Epoch,
+        archive_epoch: Some(1),
+        archive_slot_start: Some(0),
+        archive_slot_end: Some(431_999),
+        db_bounds: None,
+        destination: "./archives".to_string(),
+        archive_tables: Vec::new(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: ArchiveRunMetrics {
+            gap_backfill: Some(GapBackfill {
+                slots_targeted: 3,
+                missing_blocks_after: 1,
+                succeeded: true,
+            }),
+            ..Default::default()
+        },
+    });
+
+    let text = state.prometheus_text();
+    // Subprocess succeeded but a block is still missing -> partial.
+    assert!(
+        text.contains("solparq_gap_backfills_total{archive_kind=\"epoch\",outcome=\"partial\"} 1")
     );
 }

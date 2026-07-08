@@ -53,6 +53,16 @@ pub struct Config {
     /// intensive on large archives.
     pub s3_write_checksums: bool,
     pub force_archive: bool,
+    /// Backfill blocks missing from the archive's slot range (detected by
+    /// validation) from Solana RPC before archiving, by invoking the `superbank`
+    /// RPC ingestor as a subprocess. Off by default.
+    pub backfill_gaps: bool,
+    /// Path to the `superbank` binary used for gap backfill (resolved from
+    /// `PATH` when a bare name).
+    pub backfill_superbank_bin: String,
+    /// Also backfill slots flagged as transaction undercounts (block present but
+    /// fewer archived rows than declared); re-ingest re-inserts and dedups.
+    pub backfill_include_undercounts: bool,
     pub delete_archived_data_range: bool,
     pub server_mode: bool,
     pub ops_port: u16,
@@ -172,6 +182,9 @@ impl Config {
             s3,
             s3_write_checksums: cli.archive_s3_write_checksums,
             force_archive: cli.force_archive,
+            backfill_gaps: cli.backfill_gaps,
+            backfill_superbank_bin: cli.backfill_superbank_bin,
+            backfill_include_undercounts: cli.backfill_include_undercounts,
             delete_archived_data_range: cli.delete_archived_data_range,
             server_mode: cli.server_mode,
             ops_port: cli.ops_port,
@@ -383,6 +396,34 @@ struct Cli {
         default_value_t = false
     )]
     force_archive: bool,
+
+    /// Backfill blocks missing from the archive's slot range from Solana RPC
+    /// before archiving, by invoking the `superbank` RPC ingestor as a
+    /// subprocess. Uses `--solana-rpc-url` and the configured ClickHouse
+    /// connection. Off by default.
+    #[arg(
+        long = "backfill-gaps",
+        env = "SOLPARQ_BACKFILL_GAPS",
+        default_value_t = false
+    )]
+    backfill_gaps: bool,
+
+    /// Path to the `superbank` binary used for gap backfill.
+    #[arg(
+        long = "backfill-superbank-bin",
+        env = "SOLPARQ_BACKFILL_SUPERBANK_BIN",
+        default_value = "superbank"
+    )]
+    backfill_superbank_bin: String,
+
+    /// Also backfill slots flagged as transaction undercounts (block present but
+    /// fewer archived rows than declared).
+    #[arg(
+        long = "backfill-include-undercounts",
+        env = "SOLPARQ_BACKFILL_INCLUDE_UNDERCOUNTS",
+        default_value_t = true
+    )]
+    backfill_include_undercounts: bool,
 
     #[arg(
         long = "delete-archived-data-range",

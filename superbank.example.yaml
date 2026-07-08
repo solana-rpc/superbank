@@ -40,6 +40,13 @@ grpc-slot-notifications: true
 # rpc-flush-every-slots: 500
 # rpc-progress-every-slots: 100
 # rpc-discovery-chunk-slots: 10000
+# Backfill only slots missing from ClickHouse in the [from,to] range: discovery
+# subtracts slots already present in the blocks table, so getBlock is only
+# called for gaps. Safe to run alongside live ingest (ReplacingMergeTree).
+# rpc-fill-gaps: false
+# Fetch exactly the slots in this file (getBlock per slot, no getBlocks
+# discovery). Mutually exclusive with rpc-from-slot/to-slot/slot-count/fill-gaps.
+# rpc-slot-list: "/path/to/slots.txt"
 
 # Bigtable source options (required when source is "bigtable"; set exactly one of bigtable-range or bigtable-slot-file)
 # rpc-url: "https://api.mainnet-beta.solana.com" # required for epoch ranges

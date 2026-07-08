@@ -100,6 +100,64 @@ CLICKHOUSE_DATABASE=default \
 cargo run -p superbank --
 ```
 
+## Backfilling gaps with RPC
+
+If a crash, ClickHouse downtime, or a failed flush leaves holes in the ingested
+data, the RPC source can repair them. The RPC source is already a bounded,
+one-shot backfiller: it discovers the blocks in a `[--rpc-from-slot,
+--rpc-to-slot]` window via `getBlocks` (which excludes leader-skipped slots),
+fetches each with `getBlock`, and exits. Because the tables are
+`ReplacingMergeTree(slot)`, re-ingesting existing slots is idempotent, so a
+backfill can run alongside the live ingestor.
+
+To avoid re-fetching blocks you already have, add `--rpc-fill-gaps`. During
+discovery it subtracts the slots already present in `blocks_metadata` for each
+chunk, so `getBlock` is only issued for the genuinely missing slots. This keeps
+RPC request volume proportional to the size of the gaps, not the size of the
+window — important when the RPC endpoint is rate-limited.
+
+```bash
+SUPERBANK_SOURCE=rpc \
+RPC_URL=https://api.mainnet-beta.solana.com \
+RPC_FROM_SLOT=200000000 \
+RPC_TO_SLOT=200100000 \
+RPC_FILL_GAPS=true \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+Notes:
+
+- You still supply the range to scan (`--rpc-to-slot` or `--rpc-slot-count`).
+  Gap detection is authoritative because `getBlocks` reports exactly which slots
+  produced blocks; a missing slot number that Solana skipped is never counted as
+  a gap.
+- Run it as a one-shot job (e.g. a periodic sweep of the recent range) while
+  Fumarole/gRPC handle live ingest.
+- Each discovery chunk logs `blocks_with_data`, `already_present`, and `missing`
+  so you can see how much is actually being backfilled.
+
+### When the missing slots are already known: `--rpc-slot-list`
+
+If a caller already knows exactly which slots to fetch, pass them in a
+whitespace-separated file with `--rpc-slot-list`. This skips `getBlocks`
+discovery entirely and issues one `getBlock` per listed slot — the most
+RPC-frugal mode. It is mutually exclusive with the range/gap-fill flags.
+
+```bash
+SUPERBANK_SOURCE=rpc \
+RPC_URL=https://api.mainnet-beta.solana.com \
+RPC_SLOT_LIST=/path/to/slots.txt \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+The file accepts one or more slot numbers per line; `#` starts a comment. This
+is the mode `superbank-solparq --backfill-gaps` invokes as a subprocess, since
+its validation step already computes the exact missing slots.
+
 ## Configuration (config file, env, flags)
 
 All options can be passed via YAML config file, `--flag`, or environment variable.
@@ -168,6 +226,11 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-flush-every-slots` / `RPC_FLUSH_EVERY_SLOTS` (default: 500)
 - `--rpc-progress-every-slots` / `RPC_PROGRESS_EVERY_SLOTS` (default: 100)
 - `--rpc-discovery-chunk-slots` / `RPC_DISCOVERY_CHUNK_SLOTS` (default: 10000)
+- `--rpc-fill-gaps` / `RPC_FILL_GAPS` (default: false; backfill only slots missing from
+  `blocks_metadata` in the `[from,to]` range — see [Backfilling gaps with RPC](#backfilling-gaps-with-rpc))
+- `--rpc-slot-list` / `RPC_SLOT_LIST` (optional; whitespace-separated slot list file — fetch
+  exactly those slots with no `getBlocks` discovery; mutually exclusive with `--rpc-from-slot`,
+  `--rpc-to-slot`, `--rpc-slot-count`, and `--rpc-fill-gaps`)
 - `--bigtable-range` / `BIGTABLE_RANGE` (required unless using `BIGTABLE_SLOT_FILE`; `123:456` slots, `1-10` epochs, or `5` epoch)
 - `--bigtable-slot-file` / `BIGTABLE_SLOT_FILE` (optional; whitespace-separated slot list, mutually exclusive with `BIGTABLE_RANGE`)
 - `--bigtable-instance` / `BIGTABLE_INSTANCE` (default: `solana-ledger`)
