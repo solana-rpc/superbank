@@ -37,7 +37,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     fi \
     && cp target/release/superbank-rpc /app/superbank-rpc
 
-FROM ubuntu:24.04 AS runtime
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates libssl3 libstdc++6 \
