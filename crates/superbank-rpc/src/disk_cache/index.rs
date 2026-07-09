@@ -185,6 +185,32 @@ impl DiskCacheInner {
         })
     }
 
+    pub(crate) fn get_sig_statuses_sync(
+        &self,
+        signatures: &[Signature],
+    ) -> Vec<Option<DiskSigStatus>> {
+        let cf = match self.cf(schema::CF_SIG) {
+            Ok(cf) => cf,
+            Err(_) => return vec![None; signatures.len()],
+        };
+        self.db
+            .batched_multi_get_cf(&cf, signatures, false)
+            .into_iter()
+            .map(|result| {
+                let raw = result.ok().flatten()?;
+                let value = codec::decode_sig_value(&raw)?;
+                if value.slot < self.min_retained() {
+                    return None;
+                }
+                Some(DiskSigStatus {
+                    slot: value.slot,
+                    slot_idx: value.idx,
+                    err: value.err,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn signature_position_sync(&self, signature: &Signature) -> Option<SignatureSlot> {
         self.get_sig_status_sync(signature)
             .map(|status| SignatureSlot {
