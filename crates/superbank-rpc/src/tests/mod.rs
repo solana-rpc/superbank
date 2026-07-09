@@ -6333,7 +6333,10 @@ mod disk_cache_tier {
         let response = handle_get_signature_statuses(
             state,
             json!(1),
-            Some(vec![json!([signatures[0], signatures[1]])]),
+            Some(vec![
+                json!([signatures[0], signatures[1]]),
+                json!({ "searchTransactionHistory": true }),
+            ]),
         )
         .await
         .expect("response");
@@ -6351,6 +6354,40 @@ mod disk_cache_tier {
                 Some("finalized")
             );
             assert_eq!(status.get("slot").and_then(Value::as_u64), Some(100));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_signature_statuses_skips_disk_without_search_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let signatures = write_block(&disk, 100, 99, 2);
+        let state = state_with_disk_cache(disk);
+
+        for (case, config) in [
+            ("omitted", None),
+            ("false", Some(json!({ "searchTransactionHistory": false }))),
+        ] {
+            let mut params = vec![json!([signatures[0].clone(), signatures[1].clone()])];
+            if let Some(config) = config {
+                params.push(config);
+            }
+
+            let response = handle_get_signature_statuses(state.clone(), json!(1), Some(params))
+                .await
+                .expect("response");
+            let parsed = parse_json_rpc_response(response).await;
+            assert!(parsed.error.is_none(), "{case}: {:?}", parsed.error);
+            let value = parsed
+                .result
+                .and_then(|mut result| result.get_mut("value").map(Value::take))
+                .expect("statuses");
+            let statuses = value.as_array().expect("array");
+            assert_eq!(statuses.len(), 2);
+            assert!(
+                statuses.iter().all(Value::is_null),
+                "{case}: expected no historical lookup, got {statuses:?}"
+            );
         }
     }
 
@@ -6737,7 +6774,29 @@ mod disk_cache_tier {
     }
 
     #[tokio::test]
-    async fn get_signature_statuses_unknown_signature_consults_clickhouse() {
+    async fn get_signature_statuses_unknown_signature_with_search_history_consults_clickhouse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        write_block(&disk, 100, 99, 1);
+        let state = state_with_disk_cache(disk);
+
+        let unknown = bs58::encode([7u8; 64]).into_string();
+        let response = handle_get_signature_statuses(
+            state,
+            json!(1),
+            Some(vec![
+                json!([unknown]),
+                json!({ "searchTransactionHistory": true }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_some(), "fallthrough should hit ClickHouse");
+    }
+
+    #[tokio::test]
+    async fn get_signature_statuses_unknown_signature_without_search_history_returns_null() {
         let dir = tempfile::tempdir().expect("tempdir");
         let disk = open_disk_cache(&dir);
         write_block(&disk, 100, 99, 1);
@@ -6748,6 +6807,13 @@ mod disk_cache_tier {
             .await
             .expect("response");
         let parsed = parse_json_rpc_response(response).await;
-        assert!(parsed.error.is_some(), "fallthrough should hit ClickHouse");
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let value = parsed
+            .result
+            .and_then(|mut result| result.get_mut("value").map(Value::take))
+            .expect("statuses");
+        let statuses = value.as_array().expect("array");
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].is_null());
     }
 }

@@ -109,17 +109,23 @@ pub(crate) async fn handle_get_signature_statuses(
         ));
     }
 
-    if let Some(config_value) = params.get(1).filter(|value| !value.is_null())
-        && serde_json::from_value::<GetSignatureStatusesConfig>(config_value.clone()).is_err()
-    {
-        route.invalid_params();
-        return Ok(json_rpc_error_response(
-            id,
-            -32602,
-            "Invalid params: failed to parse config",
-            None,
-        ));
-    }
+    let search_transaction_history = match params.get(1).filter(|value| !value.is_null()) {
+        Some(config_value) => {
+            match serde_json::from_value::<GetSignatureStatusesConfig>(config_value.clone()) {
+                Ok(config) => config.search_transaction_history.unwrap_or(false),
+                Err(_) => {
+                    route.invalid_params();
+                    return Ok(json_rpc_error_response(
+                        id,
+                        -32602,
+                        "Invalid params: failed to parse config",
+                        None,
+                    ));
+                }
+            }
+        }
+        None => false,
+    };
 
     let mut inputs: Vec<Option<String>> = Vec::with_capacity(signatures.len());
     let mut unique_valid: Vec<String> = Vec::new();
@@ -191,10 +197,10 @@ pub(crate) async fn handle_get_signature_statuses(
     };
 
     // Disk tier: finalized statuses for signatures the head cache does not hold.
-    // A disk miss proves nothing (the signature may predate the window), so the
-    // remainder still goes to ClickHouse.
+    // Per getSignatureStatuses semantics, historical tiers are searched only
+    // when searchTransactionHistory is set.
     #[cfg(feature = "disk-cache")]
-    let disk_statuses: HashMap<String, (u64, Option<Value>)> =
+    let disk_statuses: HashMap<String, (u64, Option<Value>)> = if search_transaction_history {
         if let Some(disk) = state.disk_cache.as_ref() {
             let pending: Vec<(String, Signature)> = unique_valid
                 .iter()
@@ -226,7 +232,10 @@ pub(crate) async fn handle_get_signature_statuses(
             }
         } else {
             HashMap::new()
-        };
+        }
+    } else {
+        HashMap::new()
+    };
 
     #[cfg(feature = "disk-cache")]
     let in_disk = |sig: &String| disk_statuses.contains_key(sig);
@@ -234,42 +243,43 @@ pub(crate) async fn handle_get_signature_statuses(
     let in_disk = |_sig: &String| false;
 
     let mut timings: Option<crate::clickhouse::QueryTimings> = None;
-    let status_map: HashMap<String, SignatureStatusRecord> = if unique_valid.is_empty() {
-        HashMap::new()
-    } else {
-        #[cfg(feature = "grpc-head-cache")]
-        let to_query = unique_valid
-            .iter()
-            .filter(|sig| !head_statuses.contains_key(*sig) && !in_disk(sig))
-            .cloned()
-            .collect::<Vec<_>>();
-        #[cfg(not(feature = "grpc-head-cache"))]
-        let to_query: Vec<String> = unique_valid
-            .iter()
-            .filter(|sig| !in_disk(sig))
-            .cloned()
-            .collect();
-
-        if to_query.is_empty() {
+    let status_map: HashMap<String, SignatureStatusRecord> =
+        if unique_valid.is_empty() || !search_transaction_history {
             HashMap::new()
         } else {
-            route.source_clickhouse();
-            match state.clickhouse.get_signature_statuses(&to_query).await {
-                Ok((records, query_timings)) => {
-                    timings = Some(query_timings);
-                    records
-                        .into_iter()
-                        .map(|record| (record.signature.clone(), record))
-                        .collect()
-                }
-                Err(e) => {
-                    metrics::backend_error("get_signature_statuses");
-                    error!("Failed to query ClickHouse for signature statuses: {}", e);
-                    return Ok(json_rpc_internal_error_response(id));
+            #[cfg(feature = "grpc-head-cache")]
+            let to_query = unique_valid
+                .iter()
+                .filter(|sig| !head_statuses.contains_key(*sig) && !in_disk(sig))
+                .cloned()
+                .collect::<Vec<_>>();
+            #[cfg(not(feature = "grpc-head-cache"))]
+            let to_query: Vec<String> = unique_valid
+                .iter()
+                .filter(|sig| !in_disk(sig))
+                .cloned()
+                .collect();
+
+            if to_query.is_empty() {
+                HashMap::new()
+            } else {
+                route.source_clickhouse();
+                match state.clickhouse.get_signature_statuses(&to_query).await {
+                    Ok((records, query_timings)) => {
+                        timings = Some(query_timings);
+                        records
+                            .into_iter()
+                            .map(|record| (record.signature.clone(), record))
+                            .collect()
+                    }
+                    Err(e) => {
+                        metrics::backend_error("get_signature_statuses");
+                        error!("Failed to query ClickHouse for signature statuses: {}", e);
+                        return Ok(json_rpc_internal_error_response(id));
+                    }
                 }
             }
-        }
-    };
+        };
 
     let mut value = Vec::with_capacity(inputs.len());
     let mut has_clickhouse_match = false;

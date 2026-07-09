@@ -154,7 +154,6 @@ pub(crate) const MAX_GET_BLOCKS_RANGE: u64 = 500_000;
 #[derive(Debug, Deserialize)]
 pub(crate) struct GetSignatureStatusesConfig {
     #[serde(rename = "searchTransactionHistory")]
-    #[allow(dead_code)]
     pub(crate) search_transaction_history: Option<bool>,
 }
 
