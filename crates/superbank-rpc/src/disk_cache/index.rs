@@ -483,11 +483,15 @@ impl DiskCacheInner {
             Ok(cf) => cf,
             Err(_) => return vec![None; positions.len()],
         };
-        positions
+        let keys: Vec<_> = positions
             .iter()
-            .map(|&(slot, idx)| {
-                self.db
-                    .get_pinned_cf(&tx_cf, schema::tx_key(slot, idx))
+            .map(|&(slot, idx)| schema::tx_key(slot, idx))
+            .collect();
+        self.db
+            .batched_multi_get_cf(&tx_cf, &keys, false)
+            .into_iter()
+            .map(|result| {
+                result
                     .ok()
                     .flatten()
                     .and_then(|raw| codec::decode_record::<StoredTransactionRecord>(&raw))
