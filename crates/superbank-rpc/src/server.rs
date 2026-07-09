@@ -67,6 +67,7 @@ fn build_shard_routing_config(args: &RpcConfig) -> Option<ShardRoutingConfig> {
             token_owner_activity_local_table: args
                 .clickhouse_token_owner_activity_local_table
                 .clone(),
+            transfers_local_table: args.clickhouse_transfers_local_table.clone(),
             transactions_local_table: args.clickhouse_transactions_local_table.clone(),
             blocks_metadata_local_table: args.clickhouse_blocks_metadata_local_table.clone(),
         })

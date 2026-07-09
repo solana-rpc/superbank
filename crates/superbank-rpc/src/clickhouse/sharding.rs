@@ -48,6 +48,7 @@ pub(crate) struct ShardRoutingConfig {
     pub(crate) gsfa_local_table: Option<String>,
     pub(crate) signatures_local_table: Option<String>,
     pub(crate) token_owner_activity_local_table: Option<String>,
+    pub(crate) transfers_local_table: Option<String>,
     pub(crate) transactions_local_table: Option<String>,
     pub(crate) blocks_metadata_local_table: Option<String>,
 }

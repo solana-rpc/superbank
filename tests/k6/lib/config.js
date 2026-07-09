@@ -132,6 +132,28 @@ export const config = {
   transactionsForAddressStatus: __ENV.TFA_STATUS || null,
   transactionsForAddressTokenAccounts: __ENV.TFA_TOKEN_ACCOUNTS || null,
 
+  // getTransfersByAddress options
+  transfersByAddressSortOrder: __ENV.TRANSFERS_SORT_ORDER || 'desc',
+  transfersByAddressLimit: Number(__ENV.TRANSFERS_LIMIT || 100),
+  transfersByAddressCommitment: __ENV.TRANSFERS_COMMITMENT || 'finalized',
+  transfersByAddressSolMode: __ENV.TRANSFERS_SOL_MODE || 'merged',
+  transfersByAddressMinContextSlot:
+    __ENV.TRANSFERS_MIN_CONTEXT_SLOT !== undefined
+      ? Number(__ENV.TRANSFERS_MIN_CONTEXT_SLOT)
+      : null,
+  transfersByAddressPaginationToken: __ENV.TRANSFERS_PAGINATION_TOKEN || null,
+  transfersByAddressDirection: __ENV.TRANSFERS_DIRECTION || 'any',
+  transfersByAddressMint: __ENV.TRANSFERS_MINT || null,
+  transfersByAddressWith: __ENV.TRANSFERS_WITH || null,
+  transfersByAddressAmountGte:
+    __ENV.TRANSFERS_AMOUNT_GTE !== undefined
+      ? Number(__ENV.TRANSFERS_AMOUNT_GTE)
+      : null,
+  transfersByAddressAmountLte:
+    __ENV.TRANSFERS_AMOUNT_LTE !== undefined
+      ? Number(__ENV.TRANSFERS_AMOUNT_LTE)
+      : null,
+
   // WebSocket signature stream (used by head-cache tests)
   solanaWsUrl: __ENV.SOLANA_WS_URL || null,
   wsMention:
@@ -231,6 +253,52 @@ export function transactionsForAddressOptions() {
   }
   if (config.transactionsForAddressTokenAccounts) {
     filters.tokenAccounts = config.transactionsForAddressTokenAccounts;
+  }
+  if (Object.keys(filters).length > 0) {
+    options.filters = filters;
+  }
+
+  return options;
+}
+
+export function transfersByAddressOptions() {
+  const options = {
+    sortOrder: config.transfersByAddressSortOrder,
+    limit: config.transfersByAddressLimit,
+  };
+
+  if (config.transfersByAddressCommitment) {
+    options.commitment = config.transfersByAddressCommitment;
+  }
+  if (config.transfersByAddressSolMode) {
+    options.solMode = config.transfersByAddressSolMode;
+  }
+  if (config.transfersByAddressMinContextSlot !== null) {
+    options.minContextSlot = config.transfersByAddressMinContextSlot;
+  }
+  if (config.transfersByAddressPaginationToken) {
+    options.paginationToken = config.transfersByAddressPaginationToken;
+  }
+  if (config.transfersByAddressDirection) {
+    options.direction = config.transfersByAddressDirection;
+  }
+  if (config.transfersByAddressMint) {
+    options.mint = config.transfersByAddressMint;
+  }
+  if (config.transfersByAddressWith) {
+    options.with = config.transfersByAddressWith;
+  }
+
+  const filters = {};
+  const amount = {};
+  if (config.transfersByAddressAmountGte !== null) {
+    amount.gte = config.transfersByAddressAmountGte;
+  }
+  if (config.transfersByAddressAmountLte !== null) {
+    amount.lte = config.transfersByAddressAmountLte;
+  }
+  if (Object.keys(amount).length > 0) {
+    filters.amount = amount;
   }
   if (Object.keys(filters).length > 0) {
     options.filters = filters;

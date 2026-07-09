@@ -81,8 +81,8 @@ ClickHouse.
 
 For single-node ClickHouse (local dev), apply the schemas under `ddl/local/` in this order.
 `transactions.sql` must be applied before the materialized-view schemas (`gsfa*.sql`,
-`signatures.sql`, and `token_owner_activity.sql`) because those views read from the transactions
-table.
+`signatures.sql`, `token_owner_activity.sql`, and `transfers.sql`) because those views
+read from the transactions table.
 
 ```bash
 cat ddl/local/transactions.sql | docker exec -i clickhouse clickhouse-client --multiquery
@@ -93,6 +93,7 @@ cat ddl/local/gsfa.sql | docker exec -i clickhouse clickhouse-client --multiquer
 cat ddl/local/signatures.sql | docker exec -i clickhouse clickhouse-client --multiquery
 # Optional: required only for `tokenAccounts` filters in `getTransactionsForAddress`.
 cat ddl/local/token_owner_activity.sql | docker exec -i clickhouse clickhouse-client --multiquery
+cat ddl/local/transfers.sql | docker exec -i clickhouse clickhouse-client --multiquery
 ```
 
 If you use `gsfa_hot.sql` and want hot addresses excluded from the main GSFA table, apply

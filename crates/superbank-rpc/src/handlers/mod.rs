@@ -531,6 +531,7 @@ fn metrics_method_label(method: &str) -> &'static str {
     match method {
         "getSignaturesForAddress" => "getSignaturesForAddress",
         "getTransactionsForAddress" => "getTransactionsForAddress",
+        "getTransfersByAddress" => "getTransfersByAddress",
         "getSignatureStatuses" => "getSignatureStatuses",
         "getBlock" => "getBlock",
         "getBlockHeight" => "getBlockHeight",
@@ -854,6 +855,9 @@ async fn dispatch_json_rpc_request(
             "getTransactionsForAddress" => {
                 transactions::handle_get_transactions_for_address(state, id_for_dispatch, params)
                     .await
+            }
+            "getTransfersByAddress" => {
+                transactions::handle_get_transfers_by_address(state, id_for_dispatch, params).await
             }
             "getSignatureStatuses" => {
                 signatures::handle_get_signature_statuses(state, id_for_dispatch, params).await

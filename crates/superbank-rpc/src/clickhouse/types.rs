@@ -236,6 +236,104 @@ pub struct TransactionsForAddressRecord {
     pub block_time: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirectionFilter {
+    Any,
+    In,
+    Out,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolMode {
+    Merged,
+    Separate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TokenTransferTypes {
+    #[default]
+    Transfer,
+    Mint,
+    Burn,
+    Wrap,
+    CloseAccount,
+    ChangeOwner,
+    WithdrawWithheldFee,
+}
+
+impl TryFrom<&str> for TokenTransferTypes {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "transfer" => Ok(Self::Transfer),
+            "mint" => Ok(Self::Mint),
+            "burn" => Ok(Self::Burn),
+            "wrap" => Ok(Self::Wrap),
+            "closeAccount" => Ok(Self::CloseAccount),
+            "changeOwner" => Ok(Self::ChangeOwner),
+            "withdrawWithheldFee" => Ok(Self::WithdrawWithheldFee),
+            _ => Err(format!("Invalid transfer type: {value}")),
+        }
+    }
+}
+
+impl From<TokenTransferTypes> for &'static str {
+    fn from(value: TokenTransferTypes) -> Self {
+        match value {
+            TokenTransferTypes::Transfer => "transfer",
+            TokenTransferTypes::Mint => "mint",
+            TokenTransferTypes::Burn => "burn",
+            TokenTransferTypes::Wrap => "wrap",
+            TokenTransferTypes::CloseAccount => "closeAccount",
+            TokenTransferTypes::ChangeOwner => "changeOwner",
+            TokenTransferTypes::WithdrawWithheldFee => "withdrawWithheldFee",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransferPositionFilter {
+    pub slot: u64,
+    pub slot_idx: u32,
+    pub transfer_idx: u32,
+    pub inner_instruction_idx: u32,
+    pub transfer_type: TokenTransferTypes,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransfersByAddressQuery {
+    pub address: String,
+    pub limit: u64,
+    pub sort_order: SortOrder,
+    pub sol_mode: SolMode,
+    pub pagination: Option<TransferPositionFilter>,
+    pub amount_filter: Option<NumericFilter<f64>>,
+    pub slot_filter: Option<NumericFilter<u64>>,
+    pub block_time_filter: Option<NumericFilter<i64>>,
+    pub direction: TransferDirectionFilter,
+    pub mint: Option<String>,
+    pub with_account: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferRecord {
+    pub signature: String,
+    pub slot: u64,
+    pub slot_idx: u32,
+    pub transfer_idx: u32,
+    pub inner_instruction_idx: u32,
+    pub block_time: Option<i64>,
+    pub transfer_type: String,
+    pub amount: String,
+    pub mint: Option<String>,
+    pub decimals: Option<u8>,
+    pub from_user_account: Option<String>,
+    pub to_user_account: Option<String>,
+    pub from_token_account: Option<String>,
+    pub to_token_account: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "disk-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockMetadataRecord {

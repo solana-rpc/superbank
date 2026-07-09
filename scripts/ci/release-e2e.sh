@@ -246,6 +246,7 @@ export SIGNATURE_FILE="${POOL_DIR}/signatures.txt"
 export SLOT_FILE="${POOL_DIR}/slots.txt"
 export HOT_ADDRESS="${HOT_ADDRESS:-$(head -n 1 "${ADDRESS_FILE}")}"
 export TFA_REFERENCE_RPC_URL="${TFA_REFERENCE_RPC_URL:-${RPC_URL}}"
+export TBA_REFERENCE_RPC_URL="${TBA_REFERENCE_RPC_URL:-${RPC_URL}}"
 
 if [[ "${SUPERBANK_E2E_REFERENCE_RPC_URL}" == "self" ]]; then
   export REFERENCE_RPC_URL="${RPC_URL}"

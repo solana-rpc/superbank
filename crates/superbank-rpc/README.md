@@ -23,6 +23,7 @@ writer that matches the same schemas).
 - `getInflationReward`
 - `getEpochSchedule`
 - `getTransactionsForAddress` (custom)
+- `getTransfersByAddress` (custom)
 
 Notes:
 - JSON-RPC batch envelopes are supported. Batch execution is bounded by
@@ -64,6 +65,13 @@ Notes:
   these aliases cannot be combined with same-side slot filters (`lt`/`lte` for `beforeSlot`,
   `gt`/`gte` for `untilSlot`).
   Token account filters require the token-owner activity table (see below).
+- `getTransfersByAddress` supports historical SOL/SPL transfers with
+  top-level `with`, `direction=in|out`, `mint`, `solMode=merged|separate`, `sortOrder=asc|desc`,
+  `limit`, `paginationToken` (`slot:transactionIdx:instructionIdx:innerInstructionIdx:type`),
+  `commitment`, `minContextSlot`, and `filters.amount|slot|blockTime`. Amounts are raw integer
+  strings (lamports for SOL, token base units for SPL), with `uiAmount` derived from decimals.
+  The index is derived from pre/post balance deltas, so the opposite user account is nullable when
+  no counterparty can be inferred. This method requires the transfers table (see below).
 
 ## ClickHouse schemas
 
@@ -81,10 +89,12 @@ Required files in the chosen set:
 Optional:
 - `gsfa_hot.sql` when using hot-address routing.
 - `token_owner_activity.sql` when using token-owner filters in `getTransactionsForAddress`.
+- `transfers.sql` when using `getTransfersByAddress`.
 
 Apply `transactions.sql` before the materialized-view schemas (`gsfa*.sql`, `signatures.sql`, and
-`token_owner_activity.sql`) because those views read from the transactions table. If you use
-`gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then apply `gsfa_hot.sql`.
+`token_owner_activity.sql`, `transfers.sql`) because those views read from the
+transactions table. If you use `gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then
+apply `gsfa_hot.sql`.
 
 ## Run
 
@@ -377,6 +387,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-local backing table behind `CLICKHOUSE_GSFA_HOT_TABLE`. |
 | `--clickhouse-signatures-local-table` | `CLICKHOUSE_SIGNATURES_LOCAL_TABLE` | — | — |
 | `--clickhouse-token-owner-activity-local-table` | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE` | — | — |
+| `--clickhouse-transfers-local-table` | `CLICKHOUSE_TRANSFERS_LOCAL_TABLE` | — | — |
 | `--clickhouse-transactions-local-table` | `CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE` | — | — |
 | `--clickhouse-blocks-metadata-local-table` | `CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE` | — | — |
 | `--clickhouse-shard-http-port` | `CLICKHOUSE_SHARD_HTTP_PORT` | — | — |
@@ -392,6 +403,8 @@ Table selection (environment variables, read at startup):
 | `CLICKHOUSE_GSFA_HOT_TABLE` | `default.gsfa_hot` | — |
 | `CLICKHOUSE_SIGNATURE_STATUSES_TABLE` | `default.signatures` | — |
 | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE` | `default.token_owner_activity` | — |
+| `CLICKHOUSE_TRANSFERS_TABLE` | `default.transfers` | Transfers ledger used by `getTransfersByAddress`. |
+| `CLICKHOUSE_TRANSFERS_BY_ADDRESS_TABLE` | — | Legacy alias for `CLICKHOUSE_TRANSFERS_TABLE`. |
 
 Shard routing:
 When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and
@@ -462,6 +475,7 @@ Additional env flags:
 
 - Scope: `superbank-rpc` applies `use_query_condition_cache=1` only on selected historical address-filtered reads:
   - `getTransactionsForAddress`
+  - `getTransfersByAddress`
   - the transactions-table fallback path for `getSignaturesForAddress`
 - Point lookups and slot-range reads do not opt in.
 - This setting is enabled separately from the query-result cache via:
