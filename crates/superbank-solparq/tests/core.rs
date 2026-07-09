@@ -1115,8 +1115,14 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
             distinct_slots: 1_000,
         }),
     );
+    // Timeline shows only the last 2 hours, so use a recent timestamp.
+    let recent_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        - 60;
     state.record_report(ArchiveRunReport {
-        timestamp_unix: 1_700_000_000,
+        timestamp_unix: recent_unix,
         archive_created: true,
         archive_skipped_reason: None,
         archive_name: Some("custom_0_10-1009.parquet".to_string()),
@@ -1153,7 +1159,6 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
     assert!(html.contains("http-equiv=\"refresh\" content=\"30\""));
     assert!(html.contains("Slots available"));
     assert!(html.contains("1,000"));
-    assert!(html.contains("2023-11-14 22:13:20 UTC"));
     assert!(html.contains("Archive timeline"));
     assert!(html.contains("Continue from last archive"));
     assert!(html.contains("Archive tables"));
@@ -1468,8 +1473,14 @@ fn dashboard_renders_skip_reasons_and_known_gap_tables() {
         Vec::new(),
         None,
     );
+    // Recent timestamp so the skip event shows in the 2-hour timeline table.
+    let recent_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        - 60;
     state.record_report(ArchiveRunReport {
-        timestamp_unix: 1_700_000_100,
+        timestamp_unix: recent_unix,
         archive_created: false,
         archive_skipped_reason: Some(
             "validation warnings require --force-archive in server mode".to_string(),
@@ -1506,10 +1517,71 @@ fn dashboard_renders_skip_reasons_and_known_gap_tables() {
 
     assert!(html.contains("Known data gaps"));
     assert!(html.contains("Needs backfill"));
-    assert!(html.contains("Legit not-produced"));
+    // Actual gap (missing block at slot 101) is shown; leader-skipped
+    // ("Legit not-produced") ranges like 102-104 are filtered out.
     assert!(html.contains("101"));
-    assert!(html.contains("102-104"));
+    assert!(!html.contains("Legit not-produced"));
+    assert!(!html.contains("102-104"));
     assert!(html.contains("skipped: data-gap"));
+}
+
+#[test]
+fn dashboard_renders_gap_repairs_section_with_outcomes() {
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "custom",
+        "--server-mode",
+    ])
+    .expect("valid config");
+    let state = AppState::new();
+    state.record_report(ArchiveRunReport {
+        timestamp_unix: 1_700_000_000,
+        archive_created: true,
+        archive_skipped_reason: None,
+        archive_name: Some("custom_0_100-110.parquet".to_string()),
+        archive_kind: ArchiveKind::Custom { slots: 1_000 },
+        archive_epoch: Some(0),
+        archive_slot_start: Some(100),
+        archive_slot_end: Some(110),
+        db_bounds: None,
+        destination: "./".to_string(),
+        archive_tables: Vec::new(),
+        validation: None,
+        deleted_clickhouse_range: false,
+        cleaned_archives: Vec::new(),
+        run_metrics: ArchiveRunMetrics {
+            // Backfill fully repaired -> success.
+            gap_backfill: Some(GapBackfill {
+                slots_targeted: 3,
+                missing_blocks_after: 0,
+                succeeded: true,
+            }),
+            // Dedup left overcounts behind -> failed.
+            mismatch_repair: Some(MismatchRepair {
+                partitions_optimized: 1,
+                overcount_slots_before: 2,
+                overcount_slots_after: 2,
+            }),
+            ..Default::default()
+        },
+    });
+
+    let html = render_dashboard(&config, &state.public_status());
+
+    assert!(html.contains("Gap repairs"));
+    assert!(html.contains("RPC backfill"));
+    assert!(html.contains("Dedup repair"));
+    // Distinct outcomes render as success/failed badges.
+    assert!(html.contains(">success<"));
+    assert!(html.contains(">failed<"));
+    assert!(html.contains("100-110"));
 }
 
 #[test]

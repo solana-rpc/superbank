@@ -34,8 +34,21 @@ use crate::{
     archive,
     clickhouse::{DiskUsage, TableSize},
     config::{ArchiveLocation, Config},
-    metrics::{AppState, ArchiveEvent, KnownDataGap, PublicStatus},
+    metrics::{
+        AppState, ArchiveEvent, GapRepairEvent, KnownDataGap, LEGIT_NOT_PRODUCED_CLASSIFICATION,
+        PublicStatus,
+    },
 };
+
+/// Window shown by the archive timeline and its event table.
+const TIMELINE_WINDOW_SECS: u64 = 2 * 60 * 60;
+
+fn current_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 type ArchiveRunFuture = Pin<Box<dyn Future<Output = Result<archive::ArchiveRunReport>> + Send>>;
 type ArchiveRunFactory =
@@ -502,9 +515,19 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     let disk_rows = render_disk_usage(&status.disk_usage);
     let table_size_summary = render_table_size_summary(&status.table_sizes);
     let table_size_rows = render_table_sizes(&status.table_sizes);
-    let timeline = render_timeline(&status.recent_events);
-    let event_rows = render_event_rows(&status.recent_events);
+    // Timeline and its table show only the last 2 hours of events.
+    let now_unix = current_unix();
+    let window_start = now_unix.saturating_sub(TIMELINE_WINDOW_SECS);
+    let recent_window = status
+        .recent_events
+        .iter()
+        .filter(|event| event.timestamp_unix >= window_start)
+        .cloned()
+        .collect::<Vec<_>>();
+    let timeline = render_timeline(&recent_window, window_start, now_unix);
+    let event_rows = render_event_rows(&recent_window);
     let gap_rows = render_gap_rows(&status.known_gaps);
+    let repair_rows = render_repair_rows(&status.gap_repairs);
     let archive_tables = render_archive_table_list(status);
     let output = dashboard_output(config);
     let version = format!("v{}", status.build.version);
@@ -551,13 +574,16 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     .label {{ color: var(--muted); font-size: 13px; margin-bottom: 7px; }}
     .value {{ font-size: 23px; font-weight: 720; overflow-wrap: anywhere; }}
     section {{ padding: 18px; margin-bottom: 18px; }}
-    .two {{ display: grid; gap: 18px; grid-template-columns: minmax(0, 1.35fr) minmax(416px, .65fr); }}
+    .two {{ display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr) minmax(560px, 0.85fr); align-items: stretch; }}
+    .timeline-section {{ display: flex; flex-direction: column; }}
+    .settings th {{ width: 210px; white-space: nowrap; }}
+    .settings td {{ overflow-wrap: anywhere; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
     th {{ width: 273px; color: var(--muted); font-weight: 620; }}
     tr:last-child th, tr:last-child td {{ border-bottom: 0; }}
     .timeline svg {{ width: 100%; height: auto; display: block; }}
-    .events {{ margin-top: 12px; max-height: 260px; overflow: auto; border-top: 1px solid var(--line); }}
+    .events {{ margin-top: 12px; flex: 1 1 auto; min-height: 220px; overflow: auto; border-top: 1px solid var(--line); }}
     .event {{ display: grid; grid-template-columns: 164px 142px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14px; }}
     .event:last-child {{ border-bottom: 0; }}
     .badge {{ display: inline-flex; justify-content: center; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; color: #fff; }}
@@ -603,12 +629,12 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     </div>
 
     <div class="two">
-      <section>
-        <h2>Archive timeline</h2>
+      <section class="timeline-section">
+        <h2>Archive timeline (last 2h)</h2>
         <div class="timeline">{timeline}</div>
         <div class="events">{event_rows}</div>
       </section>
-      <section>
+      <section class="settings">
         <h2>Startup settings</h2>
         <table>
           <tr><th>Version</th><td>{version_detail}</td></tr>
@@ -638,6 +664,10 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
       <h2>Known data gaps</h2>
       {gap_rows}
     </section>
+    <section class="gaps">
+      <h2>Gap repairs</h2>
+      {repair_rows}
+    </section>
   </main>
 </body>
 </html>"#,
@@ -656,6 +686,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
         timeline = timeline,
         event_rows = event_rows,
         gap_rows = gap_rows,
+        repair_rows = repair_rows,
         archive_types = html_escape(&archive_types),
         location = html_escape(&format!("{:?}", config.archive_location)),
         output = html_escape(&output),
@@ -815,20 +846,24 @@ fn dashboard_output(config: &Config) -> String {
     }
 }
 
-fn render_timeline(events: &[ArchiveEvent]) -> String {
+fn render_timeline(events: &[ArchiveEvent], window_start: u64, now_unix: u64) -> String {
     if events.is_empty() {
-        return "<p>No archive events yet.</p>".to_string();
+        return "<p>No archive events in the last 2 hours.</p>".to_string();
     }
     let width = 760.0;
     let height = 150.0;
     let left = 34.0;
     let right = width - 34.0;
-    let span = (events.len().saturating_sub(1)).max(1) as f64;
+    // Map a unix timestamp to an x position across the 2-hour window.
+    let window = (now_unix.saturating_sub(window_start)).max(1) as f64;
+    let x_for = |ts: u64| {
+        let elapsed = ts.saturating_sub(window_start).min(now_unix - window_start) as f64;
+        left + (right - left) * (elapsed / window)
+    };
     let points = events
         .iter()
-        .enumerate()
-        .map(|(idx, event)| {
-            let x = left + (right - left) * (idx as f64 / span);
+        .map(|event| {
+            let x = x_for(event.timestamp_unix);
             let y = match event.outcome.as_str() {
                 "created" => 36.0,
                 "skipped" => 74.0,
@@ -838,11 +873,6 @@ fn render_timeline(events: &[ArchiveEvent]) -> String {
             (x, y, event)
         })
         .collect::<Vec<_>>();
-    let polyline = points
-        .iter()
-        .map(|(x, y, _)| format!("{x:.1},{y:.1}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     let circles = points
         .iter()
         .map(|(x, y, event)| {
@@ -856,26 +886,26 @@ fn render_timeline(events: &[ArchiveEvent]) -> String {
         })
         .collect::<String>();
     format!(
-        "<svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-label=\"Archive event timeline\">\
+        "<svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-label=\"Archive event timeline for the last 2 hours\">\
          <line x1=\"34\" y1=\"36\" x2=\"726\" y2=\"36\" stroke=\"#d9e1ec\"/>\
          <line x1=\"34\" y1=\"74\" x2=\"726\" y2=\"74\" stroke=\"#d9e1ec\"/>\
          <line x1=\"34\" y1=\"112\" x2=\"726\" y2=\"112\" stroke=\"#d9e1ec\"/>\
          <text x=\"0\" y=\"40\" font-size=\"11\" fill=\"#637083\">ok</text>\
          <text x=\"0\" y=\"78\" font-size=\"11\" fill=\"#637083\">skip</text>\
          <text x=\"0\" y=\"116\" font-size=\"11\" fill=\"#637083\">err</text>\
-         <polyline points=\"{polyline}\" fill=\"none\" stroke=\"#2f6fed\" stroke-width=\"2\" opacity=\"0.45\"/>\
+         <text x=\"34\" y=\"140\" font-size=\"11\" fill=\"#637083\">2h ago</text>\
+         <text x=\"690\" y=\"140\" font-size=\"11\" fill=\"#637083\">now</text>\
          {circles}</svg>"
     )
 }
 
 fn render_event_rows(events: &[ArchiveEvent]) -> String {
     if events.is_empty() {
-        return "<p>No recent archive events.</p>".to_string();
+        return "<p>No archive events in the last 2 hours.</p>".to_string();
     }
     events
         .iter()
         .rev()
-        .take(12)
         .map(|event| {
             let detail = event
                 .archive_name
@@ -901,13 +931,19 @@ fn render_event_rows(events: &[ArchiveEvent]) -> String {
 }
 
 fn render_gap_rows(gaps: &[KnownDataGap]) -> String {
-    if gaps.is_empty() {
-        return "<p>No known data gaps from recent archive validations.</p>".to_string();
-    }
-    let rows = gaps
+    // Show only actual data gaps that need action; leader-skipped slots
+    // ("Legit not-produced") are expected and not archiving problems.
+    let actual = gaps
         .iter()
         .rev()
+        .filter(|gap| gap.classification != LEGIT_NOT_PRODUCED_CLASSIFICATION)
         .take(24)
+        .collect::<Vec<_>>();
+    if actual.is_empty() {
+        return "<p>No actual data gaps from recent archive validations.</p>".to_string();
+    }
+    let rows = actual
+        .into_iter()
         .map(|gap| {
             let range = if gap.start_slot == gap.end_slot {
                 gap.start_slot.to_string()
@@ -927,6 +963,42 @@ fn render_gap_rows(gaps: &[KnownDataGap]) -> String {
         .collect::<String>();
     format!(
         "<table><thead><tr><th>Seen</th><th>Archive type</th><th>Classification</th><th>Range</th><th>Slots</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>"
+    )
+}
+
+fn render_repair_rows(repairs: &[GapRepairEvent]) -> String {
+    if repairs.is_empty() {
+        return "<p>No gap repairs attempted in recent archive runs.</p>".to_string();
+    }
+    let rows = repairs
+        .iter()
+        .rev()
+        .take(24)
+        .map(|repair| {
+            let range = match (repair.start_slot, repair.end_slot) {
+                (Some(start), Some(end)) if start == end => start.to_string(),
+                (Some(start), Some(end)) => format!("{start}-{end}"),
+                _ => "-".to_string(),
+            };
+            let (outcome_label, outcome_class) = if repair.succeeded {
+                ("success", "created")
+            } else {
+                ("failed", "error")
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><span class=\"badge {}\">{}</span></td><td>{}</td></tr>",
+                html_escape(&format_utc_timestamp(Some(repair.timestamp_unix))),
+                html_escape(&repair.archive_kind),
+                html_escape(&repair.kind),
+                html_escape(&range),
+                outcome_class,
+                outcome_label,
+                html_escape(&repair.detail)
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<table><thead><tr><th>Seen</th><th>Archive type</th><th>Repair</th><th>Range</th><th>Outcome</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>"
     )
 }
 

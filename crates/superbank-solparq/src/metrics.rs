@@ -29,11 +29,16 @@ const PHASE_BUCKETS: [f64; 12] = [
     0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_800.0, 3_600.0,
 ];
 
+/// Classification for slots Solana never produced (leader-skipped). Expected,
+/// not an archiving problem — the ops dashboard filters these out of the gaps
+/// table. Kept as a shared const so the recorder and the dashboard agree.
+pub const LEGIT_NOT_PRODUCED_CLASSIFICATION: &str = "Legit not-produced";
+
 /// Data-gap classifications surfaced as `solparq_known_gaps` label values.
 /// Kept in sync with the classifications produced by [`AppState::record_known_gaps`].
 const GAP_CLASSIFICATIONS: [&str; 4] = [
     "Needs backfill",
-    "Legit not-produced",
+    LEGIT_NOT_PRODUCED_CLASSIFICATION,
     "Transaction mismatch (undercount)",
     "Transaction mismatch (overcount)",
 ];
@@ -175,6 +180,7 @@ pub struct PublicStatus {
     pub table_sizes: Vec<TableSize>,
     pub recent_events: Vec<ArchiveEvent>,
     pub known_gaps: Vec<KnownDataGap>,
+    pub gap_repairs: Vec<GapRepairEvent>,
     pub archives_created: u64,
     pub archives_skipped: u64,
     pub archive_errors: u64,
@@ -217,6 +223,20 @@ pub struct KnownDataGap {
     pub start_slot: u64,
     pub end_slot: u64,
     pub slot_count: u64,
+    pub detail: String,
+}
+
+/// A gap-repair attempt (RPC backfill or dedup) recorded from a run report, for
+/// the ops dashboard's repaired-gaps section.
+#[derive(Debug, Clone, Serialize)]
+pub struct GapRepairEvent {
+    pub timestamp_unix: u64,
+    pub archive_kind: String,
+    /// Human label for the repair mechanism, e.g. "RPC backfill" or "Dedup".
+    pub kind: String,
+    pub succeeded: bool,
+    pub start_slot: Option<u64>,
+    pub end_slot: Option<u64>,
     pub detail: String,
 }
 
@@ -685,6 +705,7 @@ pub struct AppState {
     table_sizes: Mutex<Vec<TableSize>>,
     recent_events: Mutex<Vec<ArchiveEvent>>,
     known_gaps: Mutex<Vec<KnownDataGap>>,
+    gap_repairs: Mutex<Vec<GapRepairEvent>>,
     metrics: Metrics,
 }
 
@@ -713,6 +734,7 @@ impl AppState {
             table_sizes: Mutex::new(Vec::new()),
             recent_events: Mutex::new(Vec::new()),
             known_gaps: Mutex::new(Vec::new()),
+            gap_repairs: Mutex::new(Vec::new()),
             metrics: Metrics::new(started_at_unix),
         })
     }
@@ -802,6 +824,7 @@ impl AppState {
         }
         self.record_archive_metrics(&report);
         self.record_known_gaps(&report);
+        self.record_gap_repairs(&report);
         self.update_known_gap_metrics(kind_label);
         // The check completed without erroring, so the service is healthy again.
         // Only a genuine archive creation clears the last error — routine skipped
@@ -885,6 +908,11 @@ impl AppState {
                 .expect("recent_events poisoned")
                 .clone(),
             known_gaps: self.known_gaps.lock().expect("known_gaps poisoned").clone(),
+            gap_repairs: self
+                .gap_repairs
+                .lock()
+                .expect("gap_repairs poisoned")
+                .clone(),
             archives_created: self.archives_created.load(Ordering::Relaxed),
             archives_skipped: self.archives_skipped.load(Ordering::Relaxed),
             archive_errors: self.archive_errors.load(Ordering::Relaxed),
@@ -1150,7 +1178,7 @@ impl AppState {
         for range in &validation.not_produced_slot_ranges {
             gaps.push(known_gap(
                 report,
-                "Legit not-produced",
+                LEGIT_NOT_PRODUCED_CLASSIFICATION,
                 *range,
                 "Slot not returned by Solana getBlocks",
             ));
@@ -1174,6 +1202,47 @@ impl AppState {
         let overflow = gaps.len().saturating_sub(MAX_RECENT_EVENTS);
         if overflow > 0 {
             gaps.drain(0..overflow);
+        }
+    }
+
+    fn record_gap_repairs(&self, report: &ArchiveRunReport) {
+        let kind_label = report.archive_kind.label().to_string();
+        let mut repairs = self.gap_repairs.lock().expect("gap_repairs poisoned");
+        if let Some(backfill) = &report.run_metrics.gap_backfill {
+            repairs.push(GapRepairEvent {
+                timestamp_unix: report.timestamp_unix,
+                archive_kind: kind_label.clone(),
+                kind: "RPC backfill".to_string(),
+                // A backfill is only a success if it ran cleanly AND no produced
+                // block is still missing afterward.
+                succeeded: backfill.succeeded && backfill.missing_blocks_after == 0,
+                start_slot: report.archive_slot_start,
+                end_slot: report.archive_slot_end,
+                detail: format!(
+                    "targeted {} slot(s); {} still missing after",
+                    backfill.slots_targeted, backfill.missing_blocks_after
+                ),
+            });
+        }
+        if let Some(repair) = &report.run_metrics.mismatch_repair {
+            repairs.push(GapRepairEvent {
+                timestamp_unix: report.timestamp_unix,
+                archive_kind: kind_label,
+                kind: "Dedup repair".to_string(),
+                succeeded: repair.overcount_slots_after == 0,
+                start_slot: report.archive_slot_start,
+                end_slot: report.archive_slot_end,
+                detail: format!(
+                    "{} partition(s); overcount {}→{}",
+                    repair.partitions_optimized,
+                    repair.overcount_slots_before,
+                    repair.overcount_slots_after
+                ),
+            });
+        }
+        let overflow = repairs.len().saturating_sub(MAX_RECENT_EVENTS);
+        if overflow > 0 {
+            repairs.drain(0..overflow);
         }
     }
 }
