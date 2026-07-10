@@ -41,7 +41,7 @@ use crate::{
 };
 
 /// Window shown by the archive timeline and its event table.
-const TIMELINE_WINDOW_SECS: u64 = 2 * 60 * 60;
+const TIMELINE_WINDOW_SECS: u64 = 60 * 60;
 
 fn current_unix() -> u64 {
     std::time::SystemTime::now()
@@ -515,7 +515,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     let disk_rows = render_disk_usage(&status.disk_usage);
     let table_size_summary = render_table_size_summary(&status.table_sizes);
     let table_size_rows = render_table_sizes(&status.table_sizes);
-    // Timeline and its table show only the last 2 hours of events.
+    // Timeline and its table show only the last 1 hour of events.
     let now_unix = current_unix();
     let window_start = now_unix.saturating_sub(TIMELINE_WINDOW_SECS);
     let recent_window = status
@@ -583,7 +583,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     th {{ width: 273px; color: var(--muted); font-weight: 620; }}
     tr:last-child th, tr:last-child td {{ border-bottom: 0; }}
     .timeline svg {{ width: 100%; height: auto; display: block; }}
-    .events {{ margin-top: 12px; flex: 1 1 auto; min-height: 220px; overflow: auto; border-top: 1px solid var(--line); }}
+    .events {{ margin-top: 12px; flex: 1 1 0; min-height: 0; overflow: auto; border-top: 1px solid var(--line); }}
     .event {{ display: grid; grid-template-columns: 164px 142px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14px; }}
     .event:last-child {{ border-bottom: 0; }}
     .badge {{ display: inline-flex; justify-content: center; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; color: #fff; }}
@@ -630,7 +630,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
 
     <div class="two">
       <section class="timeline-section">
-        <h2>Archive timeline (last 2h)</h2>
+        <h2>Archive timeline (last 1h)</h2>
         <div class="timeline">{timeline}</div>
         <div class="events">{event_rows}</div>
       </section>
@@ -848,13 +848,13 @@ fn dashboard_output(config: &Config) -> String {
 
 fn render_timeline(events: &[ArchiveEvent], window_start: u64, now_unix: u64) -> String {
     if events.is_empty() {
-        return "<p>No archive events in the last 2 hours.</p>".to_string();
+        return "<p>No archive events in the last 1 hour.</p>".to_string();
     }
     let width = 760.0;
     let height = 150.0;
     let left = 34.0;
     let right = width - 34.0;
-    // Map a unix timestamp to an x position across the 2-hour window.
+    // Map a unix timestamp to an x position across the 1-hour window.
     let window = (now_unix.saturating_sub(window_start)).max(1) as f64;
     let x_for = |ts: u64| {
         let elapsed = ts.saturating_sub(window_start).min(now_unix - window_start) as f64;
@@ -886,14 +886,14 @@ fn render_timeline(events: &[ArchiveEvent], window_start: u64, now_unix: u64) ->
         })
         .collect::<String>();
     format!(
-        "<svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-label=\"Archive event timeline for the last 2 hours\">\
+        "<svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-label=\"Archive event timeline for the last 1 hour\">\
          <line x1=\"34\" y1=\"36\" x2=\"726\" y2=\"36\" stroke=\"#d9e1ec\"/>\
          <line x1=\"34\" y1=\"74\" x2=\"726\" y2=\"74\" stroke=\"#d9e1ec\"/>\
          <line x1=\"34\" y1=\"112\" x2=\"726\" y2=\"112\" stroke=\"#d9e1ec\"/>\
          <text x=\"0\" y=\"40\" font-size=\"11\" fill=\"#637083\">ok</text>\
          <text x=\"0\" y=\"78\" font-size=\"11\" fill=\"#637083\">skip</text>\
          <text x=\"0\" y=\"116\" font-size=\"11\" fill=\"#637083\">err</text>\
-         <text x=\"34\" y=\"140\" font-size=\"11\" fill=\"#637083\">2h ago</text>\
+         <text x=\"34\" y=\"140\" font-size=\"11\" fill=\"#637083\">1h ago</text>\
          <text x=\"690\" y=\"140\" font-size=\"11\" fill=\"#637083\">now</text>\
          {circles}</svg>"
     )
@@ -901,7 +901,7 @@ fn render_timeline(events: &[ArchiveEvent], window_start: u64, now_unix: u64) ->
 
 fn render_event_rows(events: &[ArchiveEvent]) -> String {
     if events.is_empty() {
-        return "<p>No archive events in the last 2 hours.</p>".to_string();
+        return "<p>No archive events in the last 1 hour.</p>".to_string();
     }
     events
         .iter()
