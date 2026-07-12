@@ -14,6 +14,7 @@ This `docs/` directory contains longer-form documentation. For the main quicksta
 - Architecture overview: [docs/architecture.md](architecture.md)
 - Local development: [docs/development.md](development.md)
 - Deployment notes: [docs/deployment.md](deployment.md)
+- Analyst-friendly ClickHouse views: [docs/analyst-views.md](analyst-views.md)
 - Troubleshooting: [docs/troubleshooting.md](troubleshooting.md)
 
 ## Component references

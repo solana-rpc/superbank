@@ -16,11 +16,18 @@ Each folder contains the same file basenames:
 - `gsfa_hot.sql`
 - `signatures.sql`
 - `token_owner_activity.sql`
+- `view_tx_summary.sql`
+- `view_sol_transfers.sql`
+- `view_token_transfers.sql`
+- `view_transactions_decoded.sql`
 
 Pick one folder and apply the matching schema set consistently.
 Apply `transactions.sql` before materialized-view files such as `gsfa*.sql`, `signatures.sql`, and
 `token_owner_activity.sql`; those views select from the transactions table and will fail if it does
 not exist yet.
+The `view_*.sql` files are optional analyst-friendly plain views over `default.transactions`;
+they also apply after `transactions.sql`. See `docs/analyst-views.md` for their semantics and
+example queries.
 `gsfa_nohot.sql` is an alternative to `gsfa.sql`; do not apply both for the same schema set.
 `entries.sql` is required for Superbank Fumarole/gRPC source defaults and for PoH entry ingestion
 from Old Faithful / Jetstreamer. RPC and Bigtable sources do not populate `entries`.
