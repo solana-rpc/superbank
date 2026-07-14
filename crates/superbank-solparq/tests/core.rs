@@ -1115,7 +1115,6 @@ fn dashboard_renders_refresh_slot_status_human_times_and_timeline() {
             distinct_slots: 1_000,
         }),
     );
-    // Timeline shows only the last 1 hour, so use a recent timestamp.
     let recent_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")

@@ -40,16 +40,6 @@ use crate::{
     },
 };
 
-/// Window shown by the archive timeline and its event table.
-const TIMELINE_WINDOW_SECS: u64 = 60 * 60;
-
-fn current_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 type ArchiveRunFuture = Pin<Box<dyn Future<Output = Result<archive::ArchiveRunReport>> + Send>>;
 type ArchiveRunFactory =
     Arc<dyn Fn(archive::ArchiveKind) -> ArchiveRunFuture + Send + Sync + 'static>;
@@ -515,17 +505,8 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     let disk_rows = render_disk_usage(&status.disk_usage);
     let table_size_summary = render_table_size_summary(&status.table_sizes);
     let table_size_rows = render_table_sizes(&status.table_sizes);
-    // Timeline and its table show only the last 1 hour of events.
-    let now_unix = current_unix();
-    let window_start = now_unix.saturating_sub(TIMELINE_WINDOW_SECS);
-    let recent_window = status
-        .recent_events
-        .iter()
-        .filter(|event| event.timestamp_unix >= window_start)
-        .cloned()
-        .collect::<Vec<_>>();
-    let timeline = render_timeline(&recent_window, window_start, now_unix);
-    let event_rows = render_event_rows(&recent_window);
+    let timeline = render_timeline(&status.recent_events);
+    let event_rows = render_event_rows(&status.recent_events);
     let gap_rows = render_gap_rows(&status.known_gaps);
     let repair_rows = render_repair_rows(&status.gap_repairs);
     let archive_tables = render_archive_table_list(status);
@@ -574,10 +555,8 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
     .label {{ color: var(--muted); font-size: 13px; margin-bottom: 7px; }}
     .value {{ font-size: 23px; font-weight: 720; overflow-wrap: anywhere; }}
     section {{ padding: 18px; margin-bottom: 18px; }}
-    .two {{ display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr) minmax(560px, 0.85fr); align-items: stretch; }}
+    .two {{ display: grid; gap: 18px; grid-template-columns: minmax(0, 1fr) minmax(560px, 0.85fr); }}
     .timeline-section {{ display: flex; flex-direction: column; }}
-    .settings th {{ width: 210px; white-space: nowrap; }}
-    .settings td {{ overflow-wrap: anywhere; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
     th {{ width: 273px; color: var(--muted); font-weight: 620; }}
@@ -630,11 +609,11 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
 
     <div class="two">
       <section class="timeline-section">
-        <h2>Archive timeline (last 1h)</h2>
+        <h2>Archive timeline</h2>
         <div class="timeline">{timeline}</div>
         <div class="events">{event_rows}</div>
       </section>
-      <section class="settings">
+      <section>
         <h2>Startup settings</h2>
         <table>
           <tr><th>Version</th><td>{version_detail}</td></tr>
@@ -846,24 +825,20 @@ fn dashboard_output(config: &Config) -> String {
     }
 }
 
-fn render_timeline(events: &[ArchiveEvent], window_start: u64, now_unix: u64) -> String {
+fn render_timeline(events: &[ArchiveEvent]) -> String {
     if events.is_empty() {
-        return "<p>No archive events in the last 1 hour.</p>".to_string();
+        return "<p>No archive events yet.</p>".to_string();
     }
     let width = 760.0;
     let height = 150.0;
     let left = 34.0;
     let right = width - 34.0;
-    // Map a unix timestamp to an x position across the 1-hour window.
-    let window = (now_unix.saturating_sub(window_start)).max(1) as f64;
-    let x_for = |ts: u64| {
-        let elapsed = ts.saturating_sub(window_start).min(now_unix - window_start) as f64;
-        left + (right - left) * (elapsed / window)
-    };
+    let span = (events.len().saturating_sub(1)).max(1) as f64;
     let points = events
         .iter()
-        .map(|event| {
-            let x = x_for(event.timestamp_unix);
+        .enumerate()
+        .map(|(idx, event)| {
+            let x = left + (right - left) * (idx as f64 / span);
             let y = match event.outcome.as_str() {
                 "created" => 36.0,
                 "skipped" => 74.0,
@@ -873,6 +848,11 @@ fn render_timeline(events: &[ArchiveEvent], window_start: u64, now_unix: u64) ->
             (x, y, event)
         })
         .collect::<Vec<_>>();
+    let polyline = points
+        .iter()
+        .map(|(x, y, _)| format!("{x:.1},{y:.1}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let circles = points
         .iter()
         .map(|(x, y, event)| {
@@ -886,26 +866,26 @@ fn render_timeline(events: &[ArchiveEvent], window_start: u64, now_unix: u64) ->
         })
         .collect::<String>();
     format!(
-        "<svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-label=\"Archive event timeline for the last 1 hour\">\
+        "<svg viewBox=\"0 0 {width:.0} {height:.0}\" role=\"img\" aria-label=\"Archive event timeline\">\
          <line x1=\"34\" y1=\"36\" x2=\"726\" y2=\"36\" stroke=\"#d9e1ec\"/>\
          <line x1=\"34\" y1=\"74\" x2=\"726\" y2=\"74\" stroke=\"#d9e1ec\"/>\
          <line x1=\"34\" y1=\"112\" x2=\"726\" y2=\"112\" stroke=\"#d9e1ec\"/>\
          <text x=\"0\" y=\"40\" font-size=\"11\" fill=\"#637083\">ok</text>\
          <text x=\"0\" y=\"78\" font-size=\"11\" fill=\"#637083\">skip</text>\
          <text x=\"0\" y=\"116\" font-size=\"11\" fill=\"#637083\">err</text>\
-         <text x=\"34\" y=\"140\" font-size=\"11\" fill=\"#637083\">1h ago</text>\
-         <text x=\"690\" y=\"140\" font-size=\"11\" fill=\"#637083\">now</text>\
+         <polyline points=\"{polyline}\" fill=\"none\" stroke=\"#2f6fed\" stroke-width=\"2\" opacity=\"0.45\"/>\
          {circles}</svg>"
     )
 }
 
 fn render_event_rows(events: &[ArchiveEvent]) -> String {
     if events.is_empty() {
-        return "<p>No archive events in the last 1 hour.</p>".to_string();
+        return "<p>No recent archive events.</p>".to_string();
     }
     events
         .iter()
         .rev()
+        .take(60)
         .map(|event| {
             let detail = event
                 .archive_name

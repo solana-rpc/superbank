@@ -20,7 +20,7 @@ use crate::{
     clickhouse::{DiskUsage, MismatchDirection, SlotRange, TableSize},
 };
 
-const MAX_RECENT_EVENTS: usize = 50;
+const MAX_RECENT_EVENTS: usize = 60;
 
 /// Duration buckets for archive phase timings. Archive phases range from
 /// sub-second (cleanup) to tens of minutes (writing an epoch of Parquet), so
