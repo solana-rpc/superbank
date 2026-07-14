@@ -174,6 +174,25 @@ FROM
                                     reinterpretAsUInt8(substring(ix.5, 1, 1)) = 26
                                         AND reinterpretAsUInt8(substring(ix.5, 2, 1)) IN (2, 3),
                                     toUInt8(1),
+                                    -- 38: WithdrawExcessLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 38
+                                        -- Ignore zero-amount transfers.
+                                        AND toUInt64(arrayElement(meta_pre_balances, arrayElement(ix.4, 1) + 1))
+                                            > toUInt64(arrayElement(meta_post_balances, arrayElement(ix.4, 1) + 1)),
+                                    toUInt8(1),
+                                    -- 45: UnwrapLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 45
+                                        AND multiIf(
+                                            reinterpretAsUInt8(substring(ix.5, 2, 1)) = 1,
+                                            reinterpretAsUInt64(substring(ix.5, 3, 8)),
+                                            toUInt64OrZero(
+                                                arrayElement(
+                                                    meta_pre_token_amount,
+                                                    indexOf(meta_pre_token_account_index, arrayElement(ix.4, 1))
+                                                )
+                                            )
+                                        ) > 0,
+                                    toUInt8(1),
                                     toUInt8(0)
                                 ),
                             toUInt8(0)
@@ -216,6 +235,17 @@ FROM
                                     reinterpretAsUInt8(substring(ix.5, 1, 1)) = 26
                                         AND reinterpretAsUInt8(substring(ix.5, 2, 1)) IN (2, 3),
                                     'withdrawWithheldFee',
+                                    -- 38: WithdrawExcessLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 38,
+                                    'transfer',
+                                    -- 45: UnwrapLamports with explicit amount.
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 45
+                                        AND reinterpretAsUInt8(substring(ix.5, 2, 1)) = 1,
+                                    'transfer',
+                                    -- 45: UnwrapLamports without explicit amount closes the token account.
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 45
+                                        AND reinterpretAsUInt8(substring(ix.5, 2, 1)) = 0,
+                                    'closeAccount',
                                     -- Unreachable
                                     ''
                                 ),
@@ -279,7 +309,9 @@ FROM
                                         ) AS Nullable(FixedString(32))
                                     ),
                                     -- 9: CloseAccount
-                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 9,
+                                    -- 38: WithdrawExcessLamports
+                                    -- 45: UnwrapLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) IN (9, 38, 45),
                                     CAST(arrayElement(account_keys_all, arrayElement(ix.4, 3) + 1) AS Nullable(FixedString(32))),
                                     -- 6: SetAuthority
                                     reinterpretAsUInt8(substring(ix.5, 1, 1)) = 6
@@ -353,7 +385,9 @@ FROM
                                     reinterpretAsUInt8(substring(ix.5, 1, 1)) IN (8, 15),
                                     CAST(NULL AS Nullable(FixedString(32))),
                                     -- 9: CloseAccount
-                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 9,
+                                    -- 38: WithdrawExcessLamports
+                                    -- 45: UnwrapLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) IN (9, 38, 45),
                                     CAST(arrayElement(account_keys_all, arrayElement(ix.4, 2) + 1) AS Nullable(FixedString(32))),
                                     -- 6: SetAuthority
                                     reinterpretAsUInt8(substring(ix.5, 1, 1)) = 6
@@ -378,9 +412,11 @@ FROM
                                     -- 9: CloseAccount
                                     -- 12: TransferChecked
                                     -- 15: BurnChecked
+                                    -- 38: WithdrawExcessLamports
+                                    -- 45: UnwrapLamports
                                     -- 26: TransferFee
                                         -- 1: TransferCheckedWithFee
-                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) IN (3, 8, 9, 12, 15)
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) IN (3, 8, 9, 12, 15, 38, 45)
                                         OR (
                                             reinterpretAsUInt8(substring(ix.5, 1, 1)) = 26
                                             AND reinterpretAsUInt8(substring(ix.5, 2, 1)) = 1
@@ -509,6 +545,26 @@ FROM
                                             )
                                         )
                                     ),
+                                    -- 38: WithdrawExcessLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 38,
+                                    toString(
+                                        toUInt64(arrayElement(meta_pre_balances, arrayElement(ix.4, 1) + 1))
+                                        - toUInt64(arrayElement(meta_post_balances, arrayElement(ix.4, 1) + 1))
+                                    ),
+                                    -- 45: UnwrapLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) = 45,
+                                    toString(
+                                        multiIf(
+                                            reinterpretAsUInt8(substring(ix.5, 2, 1)) = 1,
+                                            reinterpretAsUInt64(substring(ix.5, 3, 8)),
+                                            toUInt64OrZero(
+                                                arrayElement(
+                                                    meta_pre_token_amount,
+                                                    indexOf(meta_pre_token_account_index, arrayElement(ix.4, 1))
+                                                )
+                                            )
+                                        )
+                                    ),
                                     '0'
                                 ),
                             '0'
@@ -551,6 +607,10 @@ FROM
                                     reinterpretAsUInt8(substring(ix.5, 1, 1)) = 26
                                         AND reinterpretAsUInt8(substring(ix.5, 2, 1)) IN (2, 3),
                                     CAST(arrayElement(account_keys_all, arrayElement(ix.4, 1) + 1) AS Nullable(FixedString(32))),
+                                    -- 38: WithdrawExcessLamports
+                                    -- 45: UnwrapLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) IN (38, 45),
+                                    CAST(native_sol_mint AS Nullable(FixedString(32))),
                                     CAST(NULL AS Nullable(FixedString(32)))
                                 ),
                             CAST(NULL AS Nullable(FixedString(32)))
@@ -601,6 +661,10 @@ FROM
                                             defaultValueOfTypeName('UInt8')
                                         ) AS Nullable(UInt8)
                                     ),
+                                    -- 38: WithdrawExcessLamports
+                                    -- 45: UnwrapLamports
+                                    reinterpretAsUInt8(substring(ix.5, 1, 1)) IN (38, 45),
+                                    CAST(9 AS Nullable(UInt8)),
                                     CAST(NULL AS Nullable(UInt8))
                                 ),
                             CAST(NULL AS Nullable(UInt8))
