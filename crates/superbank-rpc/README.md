@@ -72,6 +72,8 @@ Notes:
   strings (lamports for SOL, token base units for SPL), with `uiAmount` derived from decimals.
   The index is derived from pre/post balance deltas, so the opposite user account is nullable when
   no counterparty can be inferred. This method requires the transfers table (see below).
+  Response `paginationToken` is non-null only when another matching page exists after all filters
+  are applied; the token points to the last row returned by the current page.
 
 ## ClickHouse schemas
 

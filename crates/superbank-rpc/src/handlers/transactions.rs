@@ -374,6 +374,33 @@ fn map_transfer_record_to_response(
     }
 }
 
+fn transfer_pagination_token(record: &TransferRecord) -> String {
+    let transfer_type =
+        TokenTransferTypes::try_from(record.transfer_type.as_str()).unwrap_or_default();
+    format!(
+        "{}:{}:{}:{}:{}",
+        record.slot,
+        record.slot_idx,
+        record.transfer_idx,
+        record.inner_instruction_idx,
+        <&'static str>::from(transfer_type)
+    )
+}
+
+fn paginate_transfer_records(
+    mut records: Vec<TransferRecord>,
+    limit: u64,
+) -> (Vec<TransferRecord>, Option<String>) {
+    let limit = limit as usize;
+    if records.len() <= limit {
+        return (records, None);
+    }
+
+    records.truncate(limit);
+    let pagination_token = records.last().map(transfer_pagination_token);
+    (records, pagination_token)
+}
+
 fn format_ui_amount(amount: &str, decimals: Option<u8>) -> String {
     let decimals = decimals.unwrap_or(0) as usize;
     if decimals == 0 {
@@ -2258,18 +2285,7 @@ pub(crate) async fn handle_get_transfers_by_address(
         }
     };
 
-    let pagination_token = records.last().map(|record| {
-        let transfer_type =
-            TokenTransferTypes::try_from(record.transfer_type.as_str()).unwrap_or_default();
-        format!(
-            "{}:{}:{}:{}:{}",
-            record.slot,
-            record.slot_idx,
-            record.transfer_idx,
-            record.inner_instruction_idx,
-            <&'static str>::from(transfer_type)
-        )
-    });
+    let (records, pagination_token) = paginate_transfer_records(records, limit);
     let confirmation_status = options.commitment.as_deref().unwrap_or("finalized");
     let data = records
         .into_iter()
@@ -2604,6 +2620,40 @@ mod tests {
         let mapped = map_transfer_record_to_response(record, SolMode::Merged, "finalized");
         assert_eq!(mapped.from_token_account, None);
         assert_eq!(mapped.to_token_account, None);
+    }
+
+    #[test]
+    fn paginate_transfer_records_only_returns_token_when_extra_row_exists() {
+        fn record(slot_idx: u32) -> TransferRecord {
+            TransferRecord {
+                signature: format!("sig-{slot_idx}"),
+                slot: 10,
+                slot_idx,
+                transfer_idx: 2,
+                inner_instruction_idx: 0,
+                block_time: None,
+                transfer_type: "transfer".to_string(),
+                amount: "1000".to_string(),
+                mint: Some(NATIVE_SOL_MINT.to_string()),
+                decimals: Some(9),
+                from_user_account: None,
+                to_user_account: None,
+                from_token_account: None,
+                to_token_account: None,
+            }
+        }
+
+        let (page, token) = paginate_transfer_records(vec![record(3), record(2)], 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(token, None);
+
+        let (page, token) = paginate_transfer_records(vec![record(3), record(2), record(1)], 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(
+            token.as_deref(),
+            Some("10:2:2:0:transfer"),
+            "cursor should point at the last returned row, not the extra lookahead row"
+        );
     }
 
     #[test]

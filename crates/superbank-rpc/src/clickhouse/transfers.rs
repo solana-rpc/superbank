@@ -254,7 +254,7 @@ fn build_transfers_by_address_query(
          {settings_clause}",
         body = body,
         order = order,
-        limit = query.limit,
+        limit = query.limit.saturating_add(1),
         settings_clause = settings_clause,
     ))
 }
@@ -429,5 +429,16 @@ mod tests {
         assert!(sql.contains(
             "ORDER BY slot DESC, slot_idx DESC, transfer_idx DESC, inner_instruction_idx DESC, transfer_type DESC"
         ));
+    }
+
+    #[test]
+    fn query_fetches_one_extra_row_to_detect_next_page() {
+        let mut query = base_query(SolMode::Separate);
+        query.limit = 7;
+
+        let sql = build_transfers_by_address_query("default.transfers", &query, "")
+            .expect("query should build");
+
+        assert!(sql.contains("LIMIT 8"));
     }
 }
