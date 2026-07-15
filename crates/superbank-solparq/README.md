@@ -1,3 +1,14 @@
+<div align="center">
+
+<h1>
+  <img width="440" alt="Superbank" src="../../docs/assets/solparq.png" />
+  <br/>Superbank - Solparq
+</h1>
+
+Archive Solana ledger data to Parquet bundles.
+
+</div>
+
 # superbank-solparq
 
 `superbank-solparq` archives Superbank/Solana ClickHouse tables to Parquet bundles.
