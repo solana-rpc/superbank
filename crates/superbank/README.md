@@ -4,7 +4,8 @@ Ingest Solana blocks from Yellowstone Fumarole, a Yellowstone gRPC stream
 (DragonsMouth), Solana JSON-RPC `getBlock`, or Solana Bigtable and write to
 ClickHouse `transactions` + `blocks_metadata` tables. When using Yellowstone
 Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
-default.
+default. The `solparq` source runs in reverse: it restores `superbank-solparq`
+Parquet archive bundles (local or S3) back into ClickHouse.
 
 ## Prereqs
 
@@ -158,6 +159,67 @@ The file accepts one or more slot numbers per line; `#` starts a comment. This
 is the mode `superbank-solparq --backfill-gaps` invokes as a subprocess, since
 its validation step already computes the exact missing slots.
 
+## Restoring from solparq Parquet archives
+
+The `solparq` source is the inverse of the `superbank-solparq` archiver: it reads
+archive bundles and loads every table in each bundle's `manifest.json` back into
+ClickHouse. Loading is ClickHouse-native and schema-symmetric with the export —
+no rows are decoded in-process:
+
+- **S3** — `INSERT INTO <table> SELECT * FROM s3(<url>, <key>, <secret>, 'Parquet')`,
+  so ClickHouse pulls each object directly.
+- **Local** — `INSERT INTO <table> FORMAT Parquet` with the bundle's parquet file
+  streamed as the request body.
+
+Each table is restored into the configured `CLICKHOUSE_DATABASE` under the bare
+table name recorded in the manifest, regardless of where the archive was
+produced. Because the destination tables are `ReplacingMergeTree(slot)`,
+re-restoring a range is idempotent once background merges run (duplicates may be
+visible transiently until then).
+
+**Version support:** every bundle is gated on its manifest `format_version`.
+Archives at or below the version this build understands (and legacy bundles with
+no version field) are restored; a bundle written by a newer producer is refused
+with an error rather than misread.
+
+Restore from a local archive directory:
+
+```bash
+SUPERBANK_SOURCE=solparq \
+SOLPARQ_ARCHIVE_LOCATION=local \
+SOLPARQ_ARCHIVE_PATH=/var/lib/superbank/archives \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+Restore from S3 (env var names match `superbank-solparq`):
+
+```bash
+SUPERBANK_SOURCE=solparq \
+SOLPARQ_ARCHIVE_LOCATION=s3 \
+SOLPARQ_ARCHIVE_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+SOLPARQ_ARCHIVE_S3_BUCKET_NAME=my-bucket \
+SOLPARQ_ARCHIVE_S3_BUCKET_PATH=solana/mainnet \
+SOLPARQ_ARCHIVE_S3_AUTH_KEY=... \
+SOLPARQ_ARCHIVE_S3_AUTH_SECRET_KEY=... \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+Notes:
+
+- Restrict the restore to a slot window with `--solparq-from-slot` /
+  `--solparq-to-slot`. Bundles outside the window are skipped; for S3 the window
+  is also applied as a `WHERE slot BETWEEN ...` row filter. (Local restore filters
+  at bundle granularity only, since it streams whole files.)
+- Restrict which tables are restored with `--solparq-tables`
+  (e.g. `transactions,blocks_metadata`).
+- The `superbank` binary depends on `superbank-solparq` only to reuse the archive
+  manifest format (single source of truth for the version gate); the restore path
+  itself does no in-process Parquet decoding.
+
 ## Configuration (config file, env, flags)
 
 All options can be passed via YAML config file, `--flag`, or environment variable.
@@ -191,7 +253,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 ### Options
 
 - `--config` / `SUPERBANK_CONFIG` (optional YAML config path)
-- `--source` / `SUPERBANK_SOURCE` (required: `fumarole`, `grpc`, `rpc`, or `bigtable`)
+- `--source` / `SUPERBANK_SOURCE` (required: `fumarole`, `grpc`, `rpc`, `bigtable`, or `solparq`)
 - `--fumarole-endpoint` / `FUMAROLE_ENDPOINT` (required for fumarole source)
 - `--fumarole-x-token` / `FUMAROLE_X_TOKEN` (optional)
 - `--fumarole-consumer-group` / `FUMAROLE_CONSUMER_GROUP` (required for fumarole source)
@@ -245,6 +307,18 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--bigtable-insert-concurrency` / `BIGTABLE_INSERT_CONCURRENCY` (default: 1)
 - `--bigtable-decode-concurrency` / `BIGTABLE_DECODE_CONCURRENCY` (default: available CPU threads)
 - `--bigtable-progress-every-slots` / `BIGTABLE_PROGRESS_EVERY_SLOTS` (default: 10000)
+- `--solparq-archive-location` / `SOLPARQ_ARCHIVE_LOCATION` (required for solparq source: `local` or `s3`)
+- `--solparq-archive-path` / `SOLPARQ_ARCHIVE_PATH` (required for local solparq restore; a bundle dir or a dir of bundles)
+- `--solparq-archive-s3-endpoint` / `SOLPARQ_ARCHIVE_S3_ENDPOINT` (required for s3 solparq restore)
+- `--solparq-archive-s3-bucket-name` / `SOLPARQ_ARCHIVE_S3_BUCKET_NAME` (required for s3 solparq restore)
+- `--solparq-archive-s3-bucket-path` / `SOLPARQ_ARCHIVE_S3_BUCKET_PATH` (optional prefix within the bucket)
+- `--solparq-archive-s3-auth-key` / `SOLPARQ_ARCHIVE_S3_AUTH_KEY` (required for s3 solparq restore)
+- `--solparq-archive-s3-auth-secret-key` / `SOLPARQ_ARCHIVE_S3_AUTH_SECRET_KEY` (required for s3 solparq restore)
+- `--solparq-archive-s3-region` / `SOLPARQ_ARCHIVE_S3_REGION` (default: `us-east-1`)
+- `--solparq-from-slot` / `SOLPARQ_FROM_SLOT` (optional; skip bundles below this slot, filter rows for S3)
+- `--solparq-to-slot` / `SOLPARQ_TO_SLOT` (optional; skip bundles above this slot, filter rows for S3)
+- `--solparq-tables` / `SOLPARQ_TABLES` (optional comma-separated table kinds; default: every table in the bundle)
+- `--solparq-clickhouse-settings` / `SOLPARQ_CLICKHOUSE_SETTINGS` (optional raw ClickHouse `SETTINGS` clause for restore statements)
 - `--clickhouse-url` / `CLICKHOUSE_URL` (default: `http://localhost:8123`)
 - `--metrics-host` / `METRICS_HOST` (default: `0.0.0.0`)
 - `--metrics-port` / `METRICS_PORT` (default: `9901`)

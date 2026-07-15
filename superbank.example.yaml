@@ -1,7 +1,7 @@
 # Superbank ingestor example configuration.
 # Copy to superbank.yaml and pass via --config / SUPERBANK_CONFIG.
 
-source: "grpc" # fumarole | grpc | rpc | bigtable
+source: "grpc" # fumarole | grpc | rpc | bigtable | solparq
 
 endpoint: "https://your.dragonsmouth.endpoint:443"
 x-token: "your-token"
@@ -64,6 +64,30 @@ grpc-slot-notifications: true
 # bigtable-insert-concurrency: 1
 # bigtable-decode-concurrency: 8
 # bigtable-progress-every-slots: 10000
+
+# solparq source options (required when source is "solparq"): restore
+# superbank-solparq Parquet archive bundles back into ClickHouse. Loading is
+# ClickHouse-native (s3() for S3, INSERT ... FORMAT Parquet for local) and every
+# table in each bundle's manifest is restored into the configured
+# clickhouse-database. Bundles whose manifest format_version is newer than this
+# build understands are refused.
+# solparq-archive-location: "local" # local | s3
+# Local archive location:
+# solparq-archive-path: "/var/lib/superbank/archives" # a bundle dir, or a dir of bundles
+# S3 archive location (reuses the same env vars / names as superbank-solparq):
+# solparq-archive-s3-endpoint: "https://s3.us-east-1.amazonaws.com"
+# solparq-archive-s3-bucket-name: "my-bucket"
+# solparq-archive-s3-bucket-path: "solana/mainnet"
+# solparq-archive-s3-auth-key: "ACCESS_KEY"
+# solparq-archive-s3-auth-secret-key: "SECRET_KEY"
+# solparq-archive-s3-region: "us-east-1"
+# Optional slot window: skips bundles outside [from,to]; also filters rows for S3.
+# solparq-from-slot: 0
+# solparq-to-slot: 0
+# Restrict to specific archived tables (default: every table in the bundle).
+# solparq-tables: "transactions,blocks_metadata"
+# Raw ClickHouse SETTINGS clause appended to restore statements to bound memory.
+# solparq-clickhouse-settings: ""
 
 clickhouse-url: "http://localhost:8123"
 metrics-host: "0.0.0.0"

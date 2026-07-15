@@ -30,6 +30,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Serve Solana-compatible JSON-RPC backed by ClickHouse (`crates/superbank-rpc`)
 - Archive Superbank ClickHouse table bundles to Parquet (`crates/superbank-solparq`)
 - Inspect and read superbank-solparq Parquet archives from local files or S3 (`superbank-solparq-read` binary in `crates/superbank-solparq`)
+- Restore superbank-solparq Parquet archives (local or S3) back into ClickHouse (`source: solparq`)
 - Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
@@ -130,6 +131,9 @@ Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
   (add `rpc-fill-gaps` to backfill only slots missing from ClickHouse in that range)
 - Bigtable: `source: bigtable` plus range/slot file and GCP credentials
+- solparq restore: `source: solparq`, `solparq-archive-location` (`local`/`s3`) plus
+  `solparq-archive-path` or the `solparq-archive-s3-*` settings — loads Parquet
+  archive bundles back into ClickHouse
 - Prometheus metrics and health: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`,
   exposed at `/metrics` and `/health`) plus `health-stale-secs`
 - Optional static metrics label: `metrics-cluster-label`
@@ -241,7 +245,7 @@ rows already present on the target by exact table key instead of failing the run
 
 ## Repository layout
 
-- `crates/superbank` ingestor binary (Yellowstone Fumarole, Yellowstone gRPC, Solana JSON-RPC, or Solana Bigtable sources)
+- `crates/superbank` ingestor binary (Yellowstone Fumarole, Yellowstone gRPC, Solana JSON-RPC, or Solana Bigtable sources, plus the `solparq` source that restores Parquet archives back into ClickHouse)
 - `crates/superbank-rpc` Solana-compatible JSON-RPC server backed by ClickHouse
 - `crates/superbank-solparq` ClickHouse table archiver that writes Parquet bundles locally or to S3-compatible storage
 - `ddl/` ClickHouse schemas (transactions, block metadata, optional PoH entries, GSFA/signatures, token owner activity)

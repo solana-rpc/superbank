@@ -7,3 +7,4 @@ pub(crate) mod bigtable;
 pub(crate) mod fumarole;
 pub(crate) mod grpc;
 pub(crate) mod rpc;
+pub(crate) mod solparq;

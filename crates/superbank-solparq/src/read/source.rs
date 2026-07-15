@@ -206,7 +206,7 @@ fn required_s3_value(value: &Option<String>, name: &str) -> Result<String> {
     Ok(value.clone())
 }
 
-fn build_s3_store(config: &S3ArchiveConfig) -> Result<Arc<dyn ObjectStore>> {
+pub fn build_s3_store(config: &S3ArchiveConfig) -> Result<Arc<dyn ObjectStore>> {
     let allow_http = config.endpoint.starts_with("http://");
     let store = AmazonS3Builder::new()
         .with_endpoint(config.endpoint.clone())
