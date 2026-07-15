@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Example configuration for superbank-verify (Proof-of-History validator).
+# Precedence: CLI flags > environment variables > this file > defaults.
+# Pass with --config superbank-verify.yaml or SUPERBANK_VERIFY_CONFIG.
+
+# Range selection: exactly one of `range` / `full`.
+# range: "250000000:250001000"   # slots (a:b), epochs (a-b), or one epoch (a)
+full: true
+
+# structural = invariants only (fast); full = recompute every SHA-256 hash.
+mode: structural
+
+# Cluster shape (defaults are mainnet-beta).
+slots-per-epoch: 432000
+epoch-warmup: true
+ticks-per-slot: 64
+expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+# hashes_per_tick eras "<from_slot>:<value>,..." (0 disables the check for an
+# era). Default: built-in mainnet history — only override for other clusters.
+# hashes-per-tick-schedule: "0:12500"
+
+# External trust anchors, checked against recorded blockhashes.
+# anchor:
+#   - "290000000:<base58-blockhash-from-a-trusted-rpc>"
+
+# Throughput.
+window-slots: 256
+fetch-ahead: 3
+verify-threads: 0 # 0 = all available cores
+
+# Resumability & reporting.
+# checkpoint-file: /var/lib/superbank/verify.checkpoint.json
+# resume: true
+# report-file: /var/lib/superbank/verify-findings.jsonl
+max-failures: 0 # abort after N failed slots (0 = unlimited)
+allow-unverifiable: false
+
+# ClickHouse connection (same variables as the other superbank binaries).
+clickhouse-url: "http://localhost:8123"
+clickhouse-database: "default"
+clickhouse-user: "default"
+clickhouse-password: ""
+blocks-table: "default.blocks_metadata"
+entries-table: "default.entries"
+transactions-table: "default.transactions"
+
+# Metrics / health.
+metrics-host: "0.0.0.0"
+metrics-port: 9902
+health-stale-secs: 300
+# metrics-cluster-label: "mainnet"
+
+progress-every-slots: 10000

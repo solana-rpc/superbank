@@ -109,5 +109,35 @@ services:
     ports:
       - "${INGEST_METRICS_PORT:-9901}:9901"
 
+  superbank-verify:
+    profiles:
+      - verify
+    image: superbank:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SUPERBANK_RPC_FEATURES: ${SUPERBANK_RPC_FEATURES:-}
+    depends_on:
+      clickhouse-ddl:
+        condition: service_completed_successfully
+    entrypoint:
+      - /usr/local/bin/superbank-verify
+    # Default: structural sweep over everything present. Override with e.g.
+    # `docker compose run --rm superbank-verify --range 100:200 --mode full`.
+    command:
+      - --full
+    restart: "no"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-superbank}
+      METRICS_HOST: 0.0.0.0
+      METRICS_PORT: 9902
+    ports:
+      - "${VERIFY_METRICS_PORT:-9902}:9902"
+
 volumes:
   clickhouse-data:
