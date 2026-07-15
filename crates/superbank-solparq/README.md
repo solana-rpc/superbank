@@ -1,7 +1,7 @@
 <div align="center">
 
 <h1>
-  <img width="440" alt="Superbank" src="../../docs/assets/solparq.png" />
+  <img width="660" alt="Superbank" src="../../docs/assets/solparq.png" />
   <br/>Superbank - Solparq
 </h1>
 
