@@ -7,7 +7,7 @@ authors.workspace = true
 publish = false
 
 [workspace.package]
-version = "0.5.0-solparq.11"
+version = "0.5.0-solparq.12"
 edition = "2024"
 license = "AGPL-3.0-only"
 authors = [
