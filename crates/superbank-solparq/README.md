@@ -5,7 +5,7 @@
   <br/>Superbank - Solparq
 </h1>
 
-Archive Solana ledger data to Parquet bundles.
+Archive Superbank ClickHouse data into validated Parquet bundles.
 
 </div>
 
