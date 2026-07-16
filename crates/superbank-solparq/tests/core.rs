@@ -32,6 +32,7 @@ fn hourly_plan_uses_prompt_filename_convention() {
         },
         None,
         true,
+        false,
     )
     .expect("plan should succeed")
     .expect("enough slots are available");
@@ -54,6 +55,7 @@ fn epoch_plan_aligns_to_epoch_boundary_after_earliest_available_slot() {
         },
         None,
         true,
+        false,
     )
     .expect("plan should succeed")
     .expect("enough slots are available");
@@ -76,6 +78,7 @@ fn custom_plan_defaults_to_one_thousand_slots_and_continues_after_last_archive()
         },
         Some("custom_0_10000-10999.parquet"),
         true,
+        false,
     )
     .expect("plan should succeed")
     .expect("enough slots are available");
@@ -98,6 +101,7 @@ fn plan_can_start_from_oldest_slot_when_continuation_is_disabled() {
         },
         Some("custom_0_10000-10999.parquet"),
         false,
+        false,
     )
     .expect("plan should succeed")
     .expect("enough slots are available");
@@ -106,6 +110,91 @@ fn plan_can_start_from_oldest_slot_when_continuation_is_disabled() {
     assert_eq!(plan.start_slot, 10_000);
     assert_eq!(plan.end_slot, 10_999);
     assert_eq!(plan.file_name(), "custom_0_10000-10999.parquet");
+}
+
+#[test]
+fn custom_aligned_snaps_first_window_to_slot_boundary() {
+    let kind = ArchiveKind::Custom { slots: 1_000 };
+    // Earliest available slot is mid-window (10_500); alignment snaps the first
+    // archive up to the next 1_000 boundary and skips the leading partial window.
+    let plan = plan_next_archive(
+        kind,
+        ClickHouseBounds {
+            earliest_slot: 10_500,
+            latest_slot: 13_000,
+            distinct_slots: 2_500,
+        },
+        None,
+        true,
+        true,
+    )
+    .expect("plan should succeed")
+    .expect("a full aligned window is available");
+
+    assert_eq!(plan.start_slot, 11_000);
+    assert_eq!(plan.end_slot, 11_999);
+    assert_eq!(plan.file_name(), "custom_0_11000-11999.parquet");
+}
+
+#[test]
+fn custom_aligned_waits_until_full_window_available() {
+    let kind = ArchiveKind::Custom { slots: 1_000 };
+    // custom:1000 aligned to boundary 1_000, but only ~500 slots of the window
+    // are present (latest 1_499 < window end 1_999), so the run waits.
+    let plan = plan_next_archive(
+        kind,
+        ClickHouseBounds {
+            earliest_slot: 1_000,
+            latest_slot: 1_499,
+            distinct_slots: 500,
+        },
+        None,
+        true,
+        true,
+    )
+    .expect("plan should succeed");
+    assert_eq!(plan, None, "should wait for the full 1000-1999 window");
+
+    // Once ClickHouse reaches the window end, the aligned archive is created.
+    let plan = plan_next_archive(
+        kind,
+        ClickHouseBounds {
+            earliest_slot: 1_000,
+            latest_slot: 2_050,
+            distinct_slots: 1_051,
+        },
+        None,
+        true,
+        true,
+    )
+    .expect("plan should succeed")
+    .expect("the full window is now available");
+
+    assert_eq!(plan.start_slot, 1_000);
+    assert_eq!(plan.end_slot, 1_999);
+    assert_eq!(plan.file_name(), "custom_0_1000-1999.parquet");
+}
+
+#[test]
+fn custom_aligned_continuation_stays_on_boundary() {
+    let kind = ArchiveKind::Custom { slots: 1_000 };
+    let plan = plan_next_archive(
+        kind,
+        ClickHouseBounds {
+            earliest_slot: 1_000,
+            latest_slot: 3_500,
+            distinct_slots: 2_500,
+        },
+        Some("custom_0_1000-1999.parquet"),
+        true,
+        true,
+    )
+    .expect("plan should succeed")
+    .expect("next aligned window is available");
+
+    assert_eq!(plan.start_slot, 2_000);
+    assert_eq!(plan.end_slot, 2_999);
+    assert_eq!(plan.file_name(), "custom_0_2000-2999.parquet");
 }
 
 #[test]

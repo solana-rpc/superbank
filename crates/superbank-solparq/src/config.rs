@@ -52,6 +52,12 @@ pub struct Config {
     pub token_owner_activity_table: String,
     pub repair_mismatches: bool,
     pub archive_kinds: Vec<ArchiveKind>,
+    /// Snap `custom:<slots>` archives onto fixed slot-count boundaries (e.g.
+    /// custom:1000 -> 1000, 2000, 3000) instead of starting at the earliest
+    /// available slot. Each archive then covers a whole `[k*slots, (k+1)*slots)`
+    /// window, and a run waits until ClickHouse holds the full window before
+    /// archiving. Off by default; only affects the `custom` archive kind.
+    pub custom_aligned: bool,
     pub archive_location: ArchiveLocation,
     pub output_location: PathBuf,
     pub s3: Option<S3Config>,
@@ -191,6 +197,7 @@ impl Config {
             token_owner_activity_table: cli.token_owner_activity_table,
             repair_mismatches: cli.repair_mismatches,
             archive_kinds,
+            custom_aligned: cli.custom_aligned,
             archive_location: cli.archive_location,
             output_location: cli.archive_file_output_location,
             s3,
@@ -363,6 +370,19 @@ struct Cli {
 
     #[arg(long, env = "SOLPARQ_CUSTOM_SLOT_RANGE", default_value_t = DEFAULT_CUSTOM_SLOTS)]
     custom_slot_range: u64,
+
+    /// Snap `custom:<slots>` archives onto fixed slot-count boundaries (e.g.
+    /// custom:1000 produces windows at 1000, 2000, 3000, ...) rather than
+    /// starting at the earliest available slot. A run then waits until ClickHouse
+    /// holds the full aligned window before archiving. Off by default; only
+    /// affects the `custom` archive kind (hourly is never aligned, epoch is
+    /// always aligned to its own boundary).
+    #[arg(
+        long = "custom-aligned",
+        env = "SOLPARQ_CUSTOM_ALIGNED",
+        default_value_t = false
+    )]
+    custom_aligned: bool,
 
     #[arg(
         long = "archive-location-type",

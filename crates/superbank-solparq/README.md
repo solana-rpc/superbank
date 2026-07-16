@@ -590,6 +590,28 @@ Multiple `--archive-range-type` values are allowed only with `--server-mode`.
 Only one custom archive range size can be configured at a time, because custom
 archives use the shared `custom_*` archive namespace.
 
+### Aligned custom archives
+
+By default a `custom` archive starts at the earliest slot available in ClickHouse
+and steps forward in fixed-size windows from there. Pass `--custom-aligned`
+(env `SOLPARQ_CUSTOM_ALIGNED`, off by default) to instead snap custom windows onto
+fixed slot-count boundaries — `custom:1000` produces `1000, 2000, 3000, …` so each
+archive covers a whole `[k*slots, (k+1)*slots)` window. A run waits until ClickHouse
+holds the full window before archiving: with `custom:1000`, if only slots
+`1000–1499` are present it skips the run; once data reaches slot `1999` it writes
+`custom_0_1000-1999`. This mirrors how `epoch` archives already align to epoch
+boundaries. Notes:
+
+- Only the `custom` kind is affected (`hourly` never aligns; `epoch` always aligns
+  to its own boundary).
+- Aligning skips any leading partial window: if the earliest slot is `10_500`, the
+  first `custom:1000` archive is `11000-11999` and slots `10_500–10_999` are not
+  archived by this kind — the same trade-off `epoch` already makes for a partial
+  leading epoch. Take care when `custom` is the only configured kind combined with
+  `--delete-archived-data-range`.
+- Enabling it on an existing unaligned custom history realigns forward from the
+  next boundary after the last archive.
+
 ## Validation
 
 Before writing an archive, `superbank-solparq` checks:
@@ -772,6 +794,7 @@ Common defaults:
 - `--ops-port 30303`
 - `--metrics-port 31313`
 - `--archive-slot-range` unset
+- `--custom-aligned` unset (off; only affects `custom` — see [Aligned custom archives](#aligned-custom-archives))
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset
 - `--repair-mismatches` unset (off)

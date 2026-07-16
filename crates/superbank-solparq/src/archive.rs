@@ -213,6 +213,7 @@ pub fn plan_next_archive(
     bounds: ClickHouseBounds,
     last_archive_name: Option<&str>,
     continue_from_last_archive: bool,
+    custom_aligned: bool,
 ) -> Result<Option<ArchivePlan>> {
     if bounds.latest_slot < bounds.earliest_slot {
         return Ok(None);
@@ -238,6 +239,18 @@ pub fn plan_next_archive(
             }
         }
         None => kind.first_start_slot(bounds.earliest_slot),
+    };
+
+    // With `--custom-aligned`, snap custom archives onto fixed slot-count
+    // boundaries (custom:1000 -> 1000, 2000, 3000, ...) so every archive covers a
+    // whole `[k*slots, (k+1)*slots)` window. Continuation already lands on a
+    // boundary; `align_up` also bootstraps from an unaligned earliest slot or a
+    // pre-alignment archive history, skipping the leading partial window. Once
+    // aligned, the `end_slot > latest_slot` check below makes the run wait until
+    // the full window is present in ClickHouse before archiving.
+    let start_slot = match kind {
+        ArchiveKind::Custom { slots } if custom_aligned => align_up(start_slot, slots),
+        _ => start_slot,
     };
 
     let slot_count = kind.slot_count();
@@ -803,6 +816,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
                 bounds,
                 last_archive.as_deref(),
                 config.continue_from_last_archive,
+                config.custom_aligned,
             )?,
             "not enough ClickHouse slots available for the next archive",
         )
