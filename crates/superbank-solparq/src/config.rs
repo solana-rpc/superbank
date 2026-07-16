@@ -380,6 +380,8 @@ struct Cli {
     #[arg(
         long = "custom-aligned",
         env = "SOLPARQ_CUSTOM_ALIGNED",
+        action = ArgAction::Set,
+        num_args = 1,
         default_value_t = false
     )]
     custom_aligned: bool,
