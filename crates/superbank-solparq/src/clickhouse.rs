@@ -377,6 +377,12 @@ impl ClickHouseClient {
         self.execute(&sql).await
     }
 
+    /// Deduplicated row count for an archive table over `[start_slot, end_slot]`.
+    ///
+    /// Uses `FINAL` so the count reflects logically-distinct rows rather than a
+    /// raw `count()` that varies with ReplacingMergeTree merge timing. See
+    /// [`build_count_query`] for why this is stable and reproducible across
+    /// independent deployments archiving the same slot range.
     pub async fn count_table_rows(
         &self,
         table: &ArchiveDbTable,
@@ -388,9 +394,11 @@ impl ClickHouseClient {
             rows: u64,
         }
 
-        let sql = format!(
-            "SELECT count() AS rows FROM {} WHERE slot BETWEEN {start_slot} AND {end_slot}",
-            table.table_name
+        let sql = build_count_query(
+            &table.table_name,
+            start_slot,
+            end_slot,
+            &self.archive_settings,
         );
         let rows = self.query_json_rows::<CountRow>(&sql).await?;
         Ok(rows.into_iter().next().map(|row| row.rows).unwrap_or(0))
@@ -814,6 +822,40 @@ pub fn build_local_parquet_query(
 ) -> String {
     format!(
         "SELECT * FROM {transactions_table} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY slot, slot_idx, signature{settings} FORMAT Parquet",
+        settings = settings_suffix(settings, " ")
+    )
+}
+
+/// Build a deduplicated row-count query for a ReplacingMergeTree archive table.
+///
+/// The archive tables are all `ReplacingMergeTree`, so retries and re-ingestion
+/// leave duplicate physical rows that only collapse once an asynchronous
+/// background merge runs. A raw `count()` therefore over-reports by however many
+/// duplicates happen to be un-merged at query time — a value that drifts with
+/// merge scheduling, so two independent deployments archiving the identical slot
+/// range can report different counts (e.g. the `gsfa` mismatch between the US and
+/// EU epoch_1001 archives). `FINAL` applies the ReplacingMergeTree collapse at
+/// query time via a streaming merge on each table's sorting key, yielding the
+/// logically-distinct count. It is memory-light (unlike a large `uniqExact` over
+/// billions of rows) and needs no per-table key config. On clustered
+/// deployments the archive reads the `Distributed` surface; every table's shard
+/// key is a prefix-compatible function of its sorting key (epoch for
+/// slot-keyed tables, `cityHash64(address|signature)` for the bucketed indexes),
+/// so rows sharing a dedup key co-locate on one shard and per-shard `FINAL` is
+/// globally correct.
+///
+/// Note: the export query ([`build_local_table_parquet_query`] /
+/// [`build_s3_table_archive_sql`]) still writes raw rows, so this count can be
+/// below the Parquet file's physical row count; the restore side treats
+/// `row_count` as informational and never gates on it.
+pub fn build_count_query(
+    table_name: &str,
+    start_slot: u64,
+    end_slot: u64,
+    settings: &str,
+) -> String {
+    format!(
+        "SELECT count() AS rows FROM {table_name} FINAL WHERE slot BETWEEN {start_slot} AND {end_slot}{settings}",
         settings = settings_suffix(settings, " ")
     )
 }

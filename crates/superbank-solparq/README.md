@@ -263,6 +263,15 @@ API-rate-limit intensive on large archives. Local archives always write
 `manifest.json` is written after the table objects and checksum file. The final
 success marker is `.done.<hostname>.txt`.
 
+Each entry in the manifest `tables` array records a `row_count`. Because every
+archive table is a `ReplacingMergeTree`, the count is taken with `FINAL` so it
+reflects logically-distinct rows rather than a raw `count()` that varies with
+background-merge timing. This keeps the value stable and reproducible: two
+deployments (e.g. US and EU) archiving the identical slot range report identical
+row counts. The count can be below the Parquet file's physical row count, which
+still includes duplicate rows left by retries/re-ingestion until they merge; the
+restore side treats `row_count` as informational and does not gate on it.
+
 ## Read Archives
 
 Use `superbank-solparq-read` to inspect local or S3 archives without connecting to

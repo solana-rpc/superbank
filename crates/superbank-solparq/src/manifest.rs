@@ -89,6 +89,10 @@ pub struct ArchiveManifestTable {
     pub kind: String,
     pub table_name: String,
     pub file_name: String,
+    /// Logically-distinct (ReplacingMergeTree-deduplicated) row count for the
+    /// archived slot range. Counted with `FINAL` so it is stable across
+    /// deployments and independent of merge timing; may be below the Parquet
+    /// file's physical row count, which still includes un-merged duplicates.
     pub row_count: u64,
     pub required: bool,
 }

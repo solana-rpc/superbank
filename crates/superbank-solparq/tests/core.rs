@@ -9,7 +9,7 @@ use superbank_solparq::{
     },
     clickhouse::{
         ArchiveTableKind, DbTables, DiskUsage, MismatchDirection, S3ArchiveSql, SlotRange,
-        TableSize, TransactionMismatch, ValidationReport, build_delete_sql,
+        TableSize, TransactionMismatch, ValidationReport, build_count_query, build_delete_sql,
         build_local_parquet_query, build_s3_archive_sql, build_s3_table_archive_sql,
     },
     config::{ArchiveLocation, Config},
@@ -620,6 +620,26 @@ fn local_parquet_query_omits_settings_clause_when_unset() {
     assert_eq!(
         sql,
         "SELECT * FROM default.transactions WHERE slot BETWEEN 1 AND 9 ORDER BY slot, slot_idx, signature FORMAT Parquet"
+    );
+}
+
+#[test]
+fn count_query_deduplicates_with_final() {
+    let sql = build_count_query("default.gsfa", 42, 84, "");
+
+    assert_eq!(
+        sql,
+        "SELECT count() AS rows FROM default.gsfa FINAL WHERE slot BETWEEN 42 AND 84"
+    );
+}
+
+#[test]
+fn count_query_appends_settings_clause_when_set() {
+    let sql = build_count_query("default.gsfa", 42, 84, "max_threads=4");
+
+    assert_eq!(
+        sql,
+        "SELECT count() AS rows FROM default.gsfa FINAL WHERE slot BETWEEN 42 AND 84 SETTINGS max_threads=4"
     );
 }
 
