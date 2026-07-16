@@ -268,8 +268,9 @@ archive table is a `ReplacingMergeTree`, the count is taken with `FINAL` so it
 reflects logically-distinct rows rather than a raw `count()` that varies with
 background-merge timing. This keeps the value stable and reproducible: two
 deployments (e.g. US and EU) archiving the identical slot range report identical
-row counts. The count can be below the Parquet file's physical row count, which
-still includes duplicate rows left by retries/re-ingestion until they merge; the
+row counts. With deduplicated exports enabled (the default — see [Deduplicated
+exports](#deduplicated-exports)) the Parquet file holds exactly this many rows;
+with them disabled the file can hold more (un-merged duplicates), and the
 restore side treats `row_count` as informational and does not gate on it.
 
 ## Read Archives
@@ -472,6 +473,28 @@ spills the sort to disk, caps read parallelism, and shrinks the Parquet writer's
 in-memory row group. Override it with your own ClickHouse settings (e.g. raise
 `max_threads` on a large box), or pass an empty string to omit the clause
 entirely.
+
+#### Deduplicated exports
+
+All archive tables are `ReplacingMergeTree`, so retries and re-ingestion leave
+duplicate physical rows until an asynchronous background merge collapses them.
+By default (`--archive-dedup-export true`, `SOLPARQ_ARCHIVE_DEDUP_EXPORT`) solparq
+adds `FINAL` to the export `SELECT`, so the Parquet files contain
+logically-distinct rows that match the deduplicated manifest `row_count` and two
+deployments archiving the same slot range produce byte-identical files. `FINAL`
+is a streaming merge on each table's sorting key; on clustered deployments the
+shard key is a prefix-compatible function of that sorting key, so per-shard
+`FINAL` on the `Distributed` surface is globally correct.
+
+The cost is an extra merge pass at export time. It is near-free for the
+epoch-partitioned `transactions`/`entries`/`blocks_metadata` (a single, settled
+partition) and heaviest for the bucket-partitioned `gsfa`/`signatures` indexes.
+On very large or fragmented tables, add
+`do_not_merge_across_partitions_select_final=1` (and tune `max_final_threads`) via
+`--clickhouse-archive-settings` to speed FINAL up. Pass
+`--archive-dedup-export false` to fall back to a raw `SELECT *` export; the files
+then keep un-merged duplicates and can exceed the manifest `row_count`, but
+restore still collapses them into the destination `ReplacingMergeTree`.
 
 #### Grafana dashboard
 
@@ -759,6 +782,7 @@ Common defaults:
 - `--db-transactions-local-table-name` unset (defaults to `--db-transactions-table-name`)
 - `--clickhouse-cluster` unset
 - `--clickhouse-archive-settings max_bytes_before_external_sort=1073741824, max_threads=4, output_format_parquet_row_group_size=100000`
+- `--archive-dedup-export true` (on; `FINAL` export — see [Deduplicated exports](#deduplicated-exports))
 - `--dry-run` unset (off)
 
 Use `-v` for debug logs and `-vv` for trace logs. `RUST_LOG` is also honored.

@@ -154,6 +154,7 @@ pub struct ClickHouseClient {
     user: String,
     password: String,
     archive_settings: String,
+    archive_dedup_export: bool,
 }
 
 impl ClickHouseClient {
@@ -167,6 +168,7 @@ impl ClickHouseClient {
             user: config.db_user.clone(),
             password: config.db_password.clone(),
             archive_settings: config.clickhouse_archive_settings.clone(),
+            archive_dedup_export: config.archive_dedup_export,
         })
     }
 
@@ -266,6 +268,7 @@ impl ClickHouseClient {
             start_slot,
             end_slot,
             &self.archive_settings,
+            self.archive_dedup_export,
         );
         let response = self.post_sql(&query).await?;
         let mut stream = response.bytes_stream();
@@ -301,8 +304,13 @@ impl ClickHouseClient {
         }
 
         let tmp_path = path.with_extension("parquet.tmp");
-        let query =
-            build_local_table_parquet_query(table, start_slot, end_slot, &self.archive_settings);
+        let query = build_local_table_parquet_query(
+            table,
+            start_slot,
+            end_slot,
+            &self.archive_settings,
+            self.archive_dedup_export,
+        );
         let response = self.post_sql(&query).await?;
         let mut stream = response.bytes_stream();
         let mut file = fs::File::create(&tmp_path)
@@ -819,9 +827,11 @@ pub fn build_local_parquet_query(
     start_slot: u64,
     end_slot: u64,
     settings: &str,
+    dedup: bool,
 ) -> String {
     format!(
-        "SELECT * FROM {transactions_table} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY slot, slot_idx, signature{settings} FORMAT Parquet",
+        "SELECT * FROM {transactions_table}{dedup} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY slot, slot_idx, signature{settings} FORMAT Parquet",
+        dedup = final_suffix(dedup),
         settings = settings_suffix(settings, " ")
     )
 }
@@ -844,10 +854,11 @@ pub fn build_local_parquet_query(
 /// so rows sharing a dedup key co-locate on one shard and per-shard `FINAL` is
 /// globally correct.
 ///
-/// Note: the export query ([`build_local_table_parquet_query`] /
-/// [`build_s3_table_archive_sql`]) still writes raw rows, so this count can be
-/// below the Parquet file's physical row count; the restore side treats
-/// `row_count` as informational and never gates on it.
+/// Note: when the export query ([`build_local_table_parquet_query`] /
+/// [`build_s3_table_archive_sql`]) runs without `FINAL` (dedup export disabled),
+/// it writes raw rows, so this count can be below the Parquet file's physical
+/// row count; the restore side treats `row_count` as informational and never
+/// gates on it. With dedup export enabled the file and this count agree.
 pub fn build_count_query(
     table_name: &str,
     start_slot: u64,
@@ -865,10 +876,12 @@ pub fn build_local_table_parquet_query(
     start_slot: u64,
     end_slot: u64,
     settings: &str,
+    dedup: bool,
 ) -> String {
     format!(
-        "SELECT * FROM {table_name} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY {order_by}{settings} FORMAT Parquet",
+        "SELECT * FROM {table_name}{dedup} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY {order_by}{settings} FORMAT Parquet",
         table_name = table.table_name,
+        dedup = final_suffix(dedup),
         order_by = table.order_by,
         settings = settings_suffix(settings, " ")
     )
@@ -889,6 +902,10 @@ pub struct S3ArchiveSql<'a> {
     /// bound memory (see [`Config::clickhouse_archive_settings`]). Empty omits
     /// the clause.
     pub settings: &'a str,
+    /// Export logically-distinct rows by adding `FINAL` to the `SELECT`, so the
+    /// Parquet file matches the deduplicated manifest `row_count`. See
+    /// [`build_count_query`] for the dedup semantics.
+    pub dedup: bool,
 }
 
 pub fn build_s3_archive_sql(params: S3ArchiveSql<'_>) -> String {
@@ -903,16 +920,25 @@ pub fn build_s3_table_archive_sql(params: S3ArchiveSql<'_>) -> String {
         &format!("{}/{}", params.archive_name, params.table.file_name()),
     );
     format!(
-        "INSERT INTO FUNCTION s3(\n  '{}',\n  '{}',\n  '{}',\n  'Parquet'\n)\nSELECT *\nFROM {table_name}\nWHERE slot BETWEEN {start_slot} AND {end_slot}\nORDER BY {order_by}{settings}",
+        "INSERT INTO FUNCTION s3(\n  '{}',\n  '{}',\n  '{}',\n  'Parquet'\n)\nSELECT *\nFROM {table_name}{dedup}\nWHERE slot BETWEEN {start_slot} AND {end_slot}\nORDER BY {order_by}{settings}",
         escape_sql_string(&url),
         escape_sql_string(params.access_key),
         escape_sql_string(params.secret_key),
         table_name = params.table.table_name,
+        dedup = final_suffix(params.dedup),
         start_slot = params.start_slot,
         end_slot = params.end_slot,
         order_by = params.table.order_by,
         settings = settings_suffix(params.settings, "\n"),
     )
+}
+
+/// Render the ` FINAL` modifier when a deduplicated export is requested, or an
+/// empty string otherwise. `FINAL` makes ClickHouse collapse ReplacingMergeTree
+/// duplicates at query time so the exported Parquet holds logically-distinct
+/// rows (see [`build_count_query`]).
+fn final_suffix(dedup: bool) -> &'static str {
+    if dedup { " FINAL" } else { "" }
 }
 
 /// Render a `SETTINGS` clause suffix, or an empty string when no settings are

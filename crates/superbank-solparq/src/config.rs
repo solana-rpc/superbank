@@ -36,6 +36,14 @@ pub struct Config {
     /// queries that export Parquet. Bounds per-query memory so a full-epoch
     /// export does not trip the server memory limit. Empty disables the clause.
     pub clickhouse_archive_settings: String,
+    /// Add `FINAL` to the Parquet-export `SELECT`s so the archived files contain
+    /// logically-distinct (ReplacingMergeTree-collapsed) rows and match the
+    /// deduplicated manifest `row_count`. On by default; this makes two
+    /// deployments archiving the same slot range produce byte-identical files at
+    /// the cost of an extra merge pass at export time (heaviest on the
+    /// bucket-partitioned gsfa/signatures tables). Disable to fall back to a raw
+    /// `SELECT *` export.
+    pub archive_dedup_export: bool,
     pub blocks_table: String,
     pub entries_table: String,
     pub gsfa_table: String,
@@ -174,6 +182,7 @@ impl Config {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
             clickhouse_archive_settings: cli.clickhouse_archive_settings.trim().to_string(),
+            archive_dedup_export: cli.archive_dedup_export,
             blocks_table: cli.blocks_table,
             entries_table: cli.entries_table,
             gsfa_table: cli.gsfa_table,
@@ -278,6 +287,22 @@ struct Cli {
         default_value = "max_bytes_before_external_sort=1073741824, max_threads=4, output_format_parquet_row_group_size=100000"
     )]
     clickhouse_archive_settings: String,
+
+    /// Export logically-distinct rows by adding `FINAL` to the Parquet-export
+    /// queries, so the archived files contain ReplacingMergeTree-collapsed rows
+    /// that match the deduplicated manifest `row_count`, and two deployments
+    /// archiving the same slot range produce byte-identical files. On by
+    /// default. Costs an extra merge pass at export time (heaviest on the
+    /// bucket-partitioned gsfa/signatures tables); pass
+    /// `--archive-dedup-export false` to fall back to a raw `SELECT *` export.
+    #[arg(
+        long = "archive-dedup-export",
+        env = "SOLPARQ_ARCHIVE_DEDUP_EXPORT",
+        action = ArgAction::Set,
+        num_args = 1,
+        default_value_t = true
+    )]
+    archive_dedup_export: bool,
 
     #[arg(
         long = "db-blocks-table-name",

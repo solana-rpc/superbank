@@ -1181,6 +1181,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
                         access_key: &s3.auth_key,
                         secret_key: &s3.auth_secret_key,
                         settings: &config.clickhouse_archive_settings,
+                        dedup: config.archive_dedup_export,
                     });
                 client.execute(&sql).await?;
                 let row_count = client

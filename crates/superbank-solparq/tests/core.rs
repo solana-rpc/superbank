@@ -506,6 +506,7 @@ fn s3_archive_sql_uses_clickhouse_s3_function_and_stable_order() {
         access_key: "access",
         secret_key: "secret",
         settings: "max_bytes_before_external_sort=1073741824, max_threads=4",
+        dedup: false,
     });
 
     assert!(sql.contains("INSERT INTO FUNCTION s3("));
@@ -552,6 +553,7 @@ fn s3_archive_sql_omits_settings_clause_when_unset() {
         access_key: "access",
         secret_key: "secret",
         settings: "  ",
+        dedup: false,
     });
 
     assert!(
@@ -588,14 +590,49 @@ fn s3_table_archive_sql_writes_bundle_table_object() {
         access_key: "access",
         secret_key: "secret",
         settings: "max_threads=4",
+        dedup: true,
     });
 
     assert!(sql.contains(
         "'https://s3.us-west.example/bucket/prefix/hourly/hourly_0_42-84/entries.parquet'"
     ));
-    assert!(sql.contains("FROM entries"));
+    assert!(sql.contains("FROM entries FINAL"));
     assert!(sql.contains("WHERE slot BETWEEN 42 AND 84"));
     assert!(sql.contains("ORDER BY slot, entry_index\nSETTINGS max_threads=4"));
+}
+
+#[test]
+fn s3_archive_sql_omits_final_when_dedup_disabled() {
+    let table = DbTables {
+        transactions_table: "transactions".to_string(),
+        blocks_table: "blocks_metadata".to_string(),
+        entries_table: "entries".to_string(),
+        gsfa_table: "gsfa".to_string(),
+        gsfa_hot_table: "gsfa_hot".to_string(),
+        signatures_table: "signatures".to_string(),
+        token_owner_activity_table: "token_owner_activity".to_string(),
+    }
+    .archive_tables()
+    .into_iter()
+    .find(|table| table.kind.as_str() == "entries")
+    .expect("entries table");
+
+    let sql = build_s3_table_archive_sql(S3ArchiveSql {
+        table: &table,
+        start_slot: 42,
+        end_slot: 84,
+        endpoint: "https://s3.us-west.example",
+        bucket: "bucket",
+        bucket_path: "prefix/hourly",
+        archive_name: "hourly_0_42-84",
+        access_key: "access",
+        secret_key: "secret",
+        settings: "max_threads=4",
+        dedup: false,
+    });
+
+    assert!(sql.contains("\nFROM entries\n"));
+    assert!(!sql.contains("FINAL"));
 }
 
 #[test]
@@ -605,17 +642,18 @@ fn local_parquet_query_streams_parquet_with_stable_order() {
         1,
         9,
         "max_bytes_before_external_sort=1073741824",
+        true,
     );
 
     assert_eq!(
         sql,
-        "SELECT * FROM default.transactions WHERE slot BETWEEN 1 AND 9 ORDER BY slot, slot_idx, signature SETTINGS max_bytes_before_external_sort=1073741824 FORMAT Parquet"
+        "SELECT * FROM default.transactions FINAL WHERE slot BETWEEN 1 AND 9 ORDER BY slot, slot_idx, signature SETTINGS max_bytes_before_external_sort=1073741824 FORMAT Parquet"
     );
 }
 
 #[test]
 fn local_parquet_query_omits_settings_clause_when_unset() {
-    let sql = build_local_parquet_query("default.transactions", 1, 9, "");
+    let sql = build_local_parquet_query("default.transactions", 1, 9, "", false);
 
     assert_eq!(
         sql,
