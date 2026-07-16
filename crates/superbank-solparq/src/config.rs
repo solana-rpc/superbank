@@ -464,6 +464,8 @@ struct Cli {
     #[arg(
         long = "backfill-include-undercounts",
         env = "SOLPARQ_BACKFILL_INCLUDE_UNDERCOUNTS",
+        action = ArgAction::Set,
+        num_args = 1,
         default_value_t = true
     )]
     backfill_include_undercounts: bool,
