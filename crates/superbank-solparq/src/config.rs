@@ -298,16 +298,16 @@ struct Cli {
     /// Export logically-distinct rows by adding `FINAL` to the Parquet-export
     /// queries, so the archived files contain ReplacingMergeTree-collapsed rows
     /// that match the deduplicated manifest `row_count`, and two deployments
-    /// archiving the same slot range produce byte-identical files. On by
+    /// archiving the same slot range produce byte-identical files. Off by
     /// default. Costs an extra merge pass at export time (heaviest on the
-    /// bucket-partitioned gsfa/signatures tables); pass
-    /// `--archive-dedup-export false` to fall back to a raw `SELECT *` export.
+    /// bucket-partitioned gsfa/signatures tables); off by default, pass
+    /// `--archive-dedup-export true` to enable the deduplicated export.
     #[arg(
         long = "archive-dedup-export",
         env = "SOLPARQ_ARCHIVE_DEDUP_EXPORT",
         action = ArgAction::Set,
         num_args = 1,
-        default_value_t = true
+        default_value_t = false
     )]
     archive_dedup_export: bool,
 

@@ -478,8 +478,8 @@ entirely.
 
 All archive tables are `ReplacingMergeTree`, so retries and re-ingestion leave
 duplicate physical rows until an asynchronous background merge collapses them.
-By default (`--archive-dedup-export true`, `SOLPARQ_ARCHIVE_DEDUP_EXPORT`) solparq
-adds `FINAL` to the export `SELECT`, so the Parquet files contain
+Pass `--archive-dedup-export true` (`SOLPARQ_ARCHIVE_DEDUP_EXPORT`) to make
+solparq add `FINAL` to the export `SELECT`, so the Parquet files contain
 logically-distinct rows that match the deduplicated manifest `row_count` and two
 deployments archiving the same slot range produce byte-identical files. `FINAL`
 is a streaming merge on each table's sorting key; on clustered deployments the
@@ -491,9 +491,9 @@ epoch-partitioned `transactions`/`entries`/`blocks_metadata` (a single, settled
 partition) and heaviest for the bucket-partitioned `gsfa`/`signatures` indexes.
 On very large or fragmented tables, add
 `do_not_merge_across_partitions_select_final=1` (and tune `max_final_threads`) via
-`--clickhouse-archive-settings` to speed FINAL up. Pass
-`--archive-dedup-export false` to fall back to a raw `SELECT *` export; the files
-then keep un-merged duplicates and can exceed the manifest `row_count`, but
+`--clickhouse-archive-settings` to speed FINAL up. By default
+(`--archive-dedup-export false`) solparq performs a raw `SELECT *` export; the
+files then keep un-merged duplicates and can exceed the manifest `row_count`, but
 restore still collapses them into the destination `ReplacingMergeTree`.
 
 #### Grafana dashboard
@@ -805,7 +805,7 @@ Common defaults:
 - `--db-transactions-local-table-name` unset (defaults to `--db-transactions-table-name`)
 - `--clickhouse-cluster` unset
 - `--clickhouse-archive-settings max_bytes_before_external_sort=1073741824, max_threads=4, output_format_parquet_row_group_size=100000`
-- `--archive-dedup-export true` (on; `FINAL` export — see [Deduplicated exports](#deduplicated-exports))
+- `--archive-dedup-export false` (off; raw `SELECT *` export — see [Deduplicated exports](#deduplicated-exports))
 - `--dry-run` unset (off)
 
 Use `-v` for debug logs and `-vv` for trace logs. `RUST_LOG` is also honored.
