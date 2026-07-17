@@ -36,9 +36,9 @@ use crate::clickhouse::{
 };
 use crate::handlers::blocks::{
     handle_get_block, handle_get_block_height, handle_get_block_time, handle_get_blocks,
-    handle_get_blocks_with_limit, handle_get_first_available_block, handle_get_health,
-    handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
-    handle_get_transaction_count, handle_minimum_ledger_slot,
+    handle_get_blocks_with_limit, handle_get_epoch_schedule, handle_get_first_available_block,
+    handle_get_health, handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
+    handle_get_transaction_count, handle_is_blockhash_valid, handle_minimum_ledger_slot,
 };
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::handlers::signatures::{
@@ -2234,6 +2234,193 @@ async fn get_latest_blockhash_processed_from_head_cache() {
     );
 }
 
+#[tokio::test]
+async fn is_blockhash_valid_rejects_missing_blockhash() {
+    let state = test_state();
+    let response = handle_is_blockhash_valid(state, json!(1), None)
+        .await
+        .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: expected a blockhash string");
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_non_string_blockhash() {
+    let state = test_state();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(123)]))
+        .await
+        .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: blockhash must be a base-58 encoded string"
+    );
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_malformed_blockhash() {
+    let state = test_state();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!("not_base58")]))
+        .await
+        .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: invalid blockhash");
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_non_object_config() {
+    let state = test_state();
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response =
+        handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash), json!(1)]))
+            .await
+            .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: config must be an object");
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_processed_commitment() {
+    let state = test_state();
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(
+        state,
+        json!(1),
+        Some(vec![json!(blockhash), json!({ "commitment": "processed" })]),
+    )
+    .await
+    .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(
+        err.message,
+        "Only confirmed or finalized commitments are supported"
+    );
+}
+
+#[tokio::test]
+async fn is_blockhash_valid_rejects_min_context_slot_not_reached() {
+    let state = test_state();
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(
+        state,
+        json!(1),
+        Some(vec![json!(blockhash), json!({ "minContextSlot": 2 })]),
+    )
+    .await
+    .expect("response");
+    let err = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("error present");
+    assert_eq!(
+        err.code,
+        JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32
+    );
+    assert_eq!(err.message, "Minimum context slot has not been reached");
+    assert_eq!(
+        err.data.and_then(|d| d.get("contextSlot").cloned()),
+        Some(json!(1u64))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn is_blockhash_valid_true_from_head_cache() {
+    let cache = Arc::new(HeadCache::new(32, 1024));
+    cache.note_slot_commitment(10, CommitmentLevel::Finalized);
+    cache.note_block_height(10, 123);
+    cache.note_blockhash(10, [1u8; 32]);
+    let state = test_state_with_head_cache(cache);
+
+    let blockhash = Hash::from([1u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash)]))
+        .await
+        .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(
+        parsed.result,
+        Some(json!({ "context": { "slot": 10u64 }, "value": true }))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn is_blockhash_valid_true_at_window_boundary_from_head_cache() {
+    // A blockhash whose block_height is exactly the floor (current - MAX_PROCESSING_AGE)
+    // is still valid; guards the inclusive `>=` boundary.
+    let cache = Arc::new(HeadCache::new(256, 1024));
+    cache.note_slot_commitment(200, CommitmentLevel::Finalized);
+    cache.note_block_height(200, 200);
+    cache.note_blockhash(200, [1u8; 32]);
+    // min_block_height = 200 - 150 = 50; height 50 is exactly on the boundary.
+    cache.note_slot_commitment(60, CommitmentLevel::Finalized);
+    cache.note_block_height(60, 50);
+    cache.note_blockhash(60, [2u8; 32]);
+    let state = test_state_with_head_cache(cache);
+
+    let blockhash = Hash::from([2u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash)]))
+        .await
+        .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(
+        parsed.result,
+        Some(json!({ "context": { "slot": 200u64 }, "value": true }))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn is_blockhash_valid_false_for_aged_out_head_cache() {
+    // A blockhash present in the cache but below the height floor is invalid
+    // (the Some(false) branch), answered without touching ClickHouse.
+    let cache = Arc::new(HeadCache::new(256, 1024));
+    cache.note_slot_commitment(200, CommitmentLevel::Finalized);
+    cache.note_block_height(200, 200);
+    cache.note_blockhash(200, [1u8; 32]);
+    // min_block_height = 200 - 150 = 50; height 40 is below the floor.
+    cache.note_slot_commitment(45, CommitmentLevel::Finalized);
+    cache.note_block_height(45, 40);
+    cache.note_blockhash(45, [2u8; 32]);
+    let state = test_state_with_head_cache(cache);
+
+    let blockhash = Hash::from([2u8; 32]).to_string();
+    let response = handle_is_blockhash_valid(state, json!(1), Some(vec![json!(blockhash)]))
+        .await
+        .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(
+        parsed.result,
+        Some(json!({ "context": { "slot": 200u64 }, "value": false }))
+    );
+}
+
 #[cfg(feature = "grpc-head-cache")]
 #[tokio::test]
 async fn get_latest_blockhash_finalized_uses_head_cache_when_clickhouse_unreachable() {
@@ -2984,6 +3171,77 @@ async fn get_first_available_block_rejects_params() {
     let err = parsed.error.expect("error present");
     assert_eq!(err.code, -32602);
     assert_eq!(err.message, "Invalid params: expected no parameters");
+}
+
+#[tokio::test]
+async fn get_epoch_schedule_returns_default_schedule() {
+    let state = test_state();
+
+    let response = handle_get_epoch_schedule(state, json!(1), None)
+        .await
+        .expect("response");
+
+    let (parts, body) = response.into_parts();
+    assert_eq!(parts.status, StatusCode::OK);
+
+    let body_bytes = to_bytes(body, usize::MAX).await.expect("body bytes");
+    let parsed: JsonRpcResponse = serde_json::from_slice(&body_bytes).expect("json parse");
+
+    assert_eq!(
+        parsed.result,
+        Some(json!({
+            "slotsPerEpoch": 432_000u64,
+            "leaderScheduleSlotOffset": 432_000u64,
+            "warmup": false,
+            "firstNormalEpoch": 0u64,
+            "firstNormalSlot": 0u64
+        }))
+    );
+}
+
+#[tokio::test]
+async fn get_epoch_schedule_rejects_params() {
+    let state = test_state();
+
+    let response = handle_get_epoch_schedule(state, json!(1), Some(vec![json!(1u64)]))
+        .await
+        .expect("response");
+
+    let (parts, body) = response.into_parts();
+    assert_eq!(parts.status, StatusCode::OK);
+
+    let body_bytes = to_bytes(body, usize::MAX).await.expect("body bytes");
+    let parsed: JsonRpcResponse = serde_json::from_slice(&body_bytes).expect("json parse");
+
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(err.message, "Invalid params: expected no parameters");
+}
+
+#[tokio::test]
+async fn get_epoch_schedule_accepts_empty_params() {
+    let state = test_state();
+
+    let response = handle_get_epoch_schedule(state, json!(1), Some(vec![]))
+        .await
+        .expect("response");
+
+    let (parts, body) = response.into_parts();
+    assert_eq!(parts.status, StatusCode::OK);
+
+    let body_bytes = to_bytes(body, usize::MAX).await.expect("body bytes");
+    let parsed: JsonRpcResponse = serde_json::from_slice(&body_bytes).expect("json parse");
+
+    assert_eq!(
+        parsed.result,
+        Some(json!({
+            "slotsPerEpoch": 432_000u64,
+            "leaderScheduleSlotOffset": 432_000u64,
+            "warmup": false,
+            "firstNormalEpoch": 0u64,
+            "firstNormalSlot": 0u64
+        }))
+    );
 }
 
 #[tokio::test]
@@ -5685,7 +5943,7 @@ fn build_transaction_status_meta_emits_null_lists_when_absent_before_boundary() 
 
     assert!(meta.pre_token_balances.is_none());
     assert!(meta.post_token_balances.is_none());
-    assert!(meta.rewards.is_none());
+    assert!(meta.rewards.as_ref().expect("rewards").is_empty());
 }
 
 #[test]
@@ -5701,7 +5959,7 @@ fn build_transaction_status_meta_emits_null_lists_when_absent_after_boundary() {
 
     assert!(meta.pre_token_balances.is_none());
     assert!(meta.post_token_balances.is_none());
-    assert!(meta.rewards.is_none());
+    assert!(meta.rewards.as_ref().expect("rewards").is_empty());
 }
 
 #[test]
@@ -6146,7 +6404,10 @@ mod disk_cache_tier {
         let response = handle_get_signature_statuses(
             state,
             json!(1),
-            Some(vec![json!([signatures[0], signatures[1]])]),
+            Some(vec![
+                json!([signatures[0], signatures[1]]),
+                json!({ "searchTransactionHistory": true }),
+            ]),
         )
         .await
         .expect("response");
@@ -6164,6 +6425,40 @@ mod disk_cache_tier {
                 Some("finalized")
             );
             assert_eq!(status.get("slot").and_then(Value::as_u64), Some(100));
+        }
+    }
+
+    #[tokio::test]
+    async fn get_signature_statuses_skips_disk_without_search_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let signatures = write_block(&disk, 100, 99, 2);
+        let state = state_with_disk_cache(disk);
+
+        for (case, config) in [
+            ("omitted", None),
+            ("false", Some(json!({ "searchTransactionHistory": false }))),
+        ] {
+            let mut params = vec![json!([signatures[0].clone(), signatures[1].clone()])];
+            if let Some(config) = config {
+                params.push(config);
+            }
+
+            let response = handle_get_signature_statuses(state.clone(), json!(1), Some(params))
+                .await
+                .expect("response");
+            let parsed = parse_json_rpc_response(response).await;
+            assert!(parsed.error.is_none(), "{case}: {:?}", parsed.error);
+            let value = parsed
+                .result
+                .and_then(|mut result| result.get_mut("value").map(Value::take))
+                .expect("statuses");
+            let statuses = value.as_array().expect("array");
+            assert_eq!(statuses.len(), 2);
+            assert!(
+                statuses.iter().all(Value::is_null),
+                "{case}: expected no historical lookup, got {statuses:?}"
+            );
         }
     }
 
@@ -6550,7 +6845,29 @@ mod disk_cache_tier {
     }
 
     #[tokio::test]
-    async fn get_signature_statuses_unknown_signature_consults_clickhouse() {
+    async fn get_signature_statuses_unknown_signature_with_search_history_consults_clickhouse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        write_block(&disk, 100, 99, 1);
+        let state = state_with_disk_cache(disk);
+
+        let unknown = bs58::encode([7u8; 64]).into_string();
+        let response = handle_get_signature_statuses(
+            state,
+            json!(1),
+            Some(vec![
+                json!([unknown]),
+                json!({ "searchTransactionHistory": true }),
+            ]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_some(), "fallthrough should hit ClickHouse");
+    }
+
+    #[tokio::test]
+    async fn get_signature_statuses_unknown_signature_without_search_history_returns_null() {
         let dir = tempfile::tempdir().expect("tempdir");
         let disk = open_disk_cache(&dir);
         write_block(&disk, 100, 99, 1);
@@ -6561,6 +6878,13 @@ mod disk_cache_tier {
             .await
             .expect("response");
         let parsed = parse_json_rpc_response(response).await;
-        assert!(parsed.error.is_some(), "fallthrough should hit ClickHouse");
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let value = parsed
+            .result
+            .and_then(|mut result| result.get_mut("value").map(Value::take))
+            .expect("statuses");
+        let statuses = value.as_array().expect("array");
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].is_null());
     }
 }

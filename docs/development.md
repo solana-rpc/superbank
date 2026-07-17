@@ -242,6 +242,20 @@ If you do not have Tilt installed globally, run it via Nix:
 nix develop -c tilt up --stream
 ```
 
+### Tilt with Docker Compose
+
+Use the Compose shim when you want Tilt's dashboard and resource controls without creating a Kind
+cluster:
+
+```bash
+tilt up -f Tiltfile.compose
+```
+
+This loads `docker-compose.yaml` through Tilt's Docker Compose support. The default run starts
+ClickHouse, applies the local DDL, and runs `superbank-rpc`. To include the optional RPC ingestor,
+start Tilt with `COMPOSE_PROFILES=ingest-rpc`; `superbank-ingest-rpc` is manual in Tilt so it behaves
+like the optional Compose profile.
+
 ### Tilt E2E CI profile
 
 The E2E workflow uses `../scripts/ci/release-e2e.sh` to run the same Tilt stack in GitHub CI.

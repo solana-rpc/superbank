@@ -196,6 +196,36 @@ impl HeadCache {
         best
     }
 
+    pub(crate) fn blockhash_valid_at_least(
+        &self,
+        blockhash: [u8; 32],
+        min_block_height: u64,
+        min_commitment: CommitmentLevel,
+    ) -> Option<bool> {
+        let mut found_at_commitment = false;
+        for entry in self.slot_blockhash.iter() {
+            if *entry.value() != blockhash {
+                continue;
+            }
+            let slot = *entry.key();
+            if !commitment_meets(self.slot_commitment(slot), min_commitment) {
+                continue;
+            }
+            let Some(height) = self.slot_block_height.get(&slot).map(|h| *h.value()) else {
+                continue;
+            };
+            found_at_commitment = true;
+            if height >= min_block_height {
+                return Some(true);
+            }
+        }
+        if found_at_commitment {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn tx_entries(&self) -> usize {
         self.tx_by_signature.len()
     }

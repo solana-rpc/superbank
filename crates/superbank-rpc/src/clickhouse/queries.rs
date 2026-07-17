@@ -644,10 +644,7 @@ pub(crate) fn build_transactions_for_address_query(
     query: &TransactionsForAddressQuery,
     settings_clause: &str,
 ) -> ProcessingResult<String> {
-    let address_literal = format!(
-        "CAST(base58Decode('{}') AS FixedString(32))",
-        &query.address
-    );
+    let address_literal = format!("CAST(base58Decode('{}') AS FixedString(32))", query.address);
     let gsfa_addr_bucket = format!(
         "cityHash64({}) % {}",
         address_literal, tables.gsfa_bucket_modulus
@@ -786,10 +783,7 @@ pub(crate) fn build_transactions_for_address_hot_query(
         ));
     }
 
-    let address_literal = format!(
-        "CAST(base58Decode('{}') AS FixedString(32))",
-        &query.address
-    );
+    let address_literal = format!("CAST(base58Decode('{}') AS FixedString(32))", query.address);
     let gsfa_addr_bucket = format!("cityHash64({}) % {}", address_literal, gsfa_bucket_modulus);
 
     let mut conditions = Vec::new();

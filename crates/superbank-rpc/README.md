@@ -13,6 +13,7 @@ writer that matches the same schemas).
 - `getSlot`
 - `getTransactionCount`
 - `getLatestBlockhash`
+- `isBlockhashValid`
 - `getBlockTime`
 - `getBlocks`
 - `getBlocksWithLimit`
@@ -20,6 +21,7 @@ writer that matches the same schemas).
 - `getFirstAvailableBlock`
 - `minimumLedgerSlot`
 - `getInflationReward`
+- `getEpochSchedule`
 - `getTransactionsForAddress` (custom)
 
 Notes:
@@ -161,6 +163,7 @@ qualifying slot.
 - `getSlot`
 - `getTransactionCount`
 - `getLatestBlockhash`
+- `isBlockhashValid`
 - `getBlocks`
 - `getBlocksWithLimit`
 

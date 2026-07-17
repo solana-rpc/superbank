@@ -185,9 +185,9 @@ pub(crate) async fn fetch_latest_slot_from_blocks(
 }
 
 /// Distinct slots already present in the blocks table within the inclusive
-/// `[start, end]` range. Used by RPC gap-fill discovery to skip slots that have
-/// already been ingested.
-pub(crate) async fn fetch_present_slots(
+/// `[start, end]` range. Used by RPC discovery to skip slots that have already
+/// been ingested.
+pub(crate) async fn fetch_present_slots_in_range(
     clickhouse: &ClickHouseClient,
     blocks_table: &str,
     start: u64,
@@ -543,7 +543,7 @@ mod tests {
             rpc_flush_every_slots: 500,
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
-            rpc_fill_gaps: false,
+            rpc_skip_ingested_slots: false,
             rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,

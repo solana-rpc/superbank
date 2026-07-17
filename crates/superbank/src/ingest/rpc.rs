@@ -42,7 +42,7 @@ use tracing::{info, warn};
 use crate::cli::{Args, FromSlotSpec};
 use crate::clickhouse::{
     BlockMetadataRow, InsertTables, ProgressSnapshot, RetryConfig, TransactionRow,
-    build_clickhouse_client, fetch_latest_slot_from_blocks, fetch_present_slots,
+    build_clickhouse_client, fetch_latest_slot_from_blocks, fetch_present_slots_in_range,
     flush_buffers_with_retry,
 };
 use crate::commitment::parse_commitment_config;
@@ -56,13 +56,6 @@ use crate::utils::{bytes_to_array, decode_base58_32};
 struct RpcRange {
     start: u64,
     end: u64,
-}
-
-/// Gap-fill discovery: skip slots already present in the blocks table so
-/// getBlock is only issued for slots missing from ClickHouse.
-struct GapFill {
-    clickhouse: Arc<clickhouse::Client>,
-    blocks_table: String,
 }
 
 struct RpcBlockBatch {
@@ -205,30 +198,18 @@ pub(crate) async fn run_rpc_ingest(args: &Args) -> Result<()> {
             );
             tokio::spawn(enqueue_slot_list(slots, slot_tx, progress_tx))
         }
-        None => {
-            let gap_fill = args.rpc_fill_gaps.then(|| GapFill {
-                clickhouse: clickhouse.clone(),
-                blocks_table: args.blocks_table.clone(),
-            });
-            if gap_fill.is_some() {
-                info!(
-                    from_slot = range.start,
-                    to_slot = range.end,
-                    blocks_table = %args.blocks_table,
-                    "rpc gap-fill enabled; discovery will skip slots already present in ClickHouse"
-                );
-            }
-            tokio::spawn(discover_slots(
-                discovery_client.clone(),
-                range,
-                commitment,
-                args.rpc_discovery_chunk_slots,
-                discovery_backoff,
-                gap_fill,
-                slot_tx,
-                progress_tx,
-            ))
-        }
+        None => tokio::spawn(discover_slots(DiscoverSlotsArgs {
+            rpc_client: discovery_client.clone(),
+            clickhouse: clickhouse.clone(),
+            blocks_table: args.blocks_table.clone(),
+            range,
+            commitment,
+            chunk_slots: args.rpc_discovery_chunk_slots,
+            skip_ingested: args.rpc_skip_ingested_slots,
+            backoff: discovery_backoff,
+            slot_tx,
+            progress_tx,
+        })),
     };
 
     let mut worker_txs = Vec::with_capacity(worker_count);
@@ -812,28 +793,32 @@ async fn enqueue_slot_list(
     Ok(())
 }
 
-/// Filter a discovered (ascending, getBlocks) slot list down to slots inside
-/// the target range that are not already present in ClickHouse. `present` is
-/// empty when gap-fill is disabled, so every in-range slot is enqueued.
-fn slots_to_enqueue(slots: &[u64], present: &HashSet<u64>, range: RpcRange) -> Vec<u64> {
-    slots
-        .iter()
-        .copied()
-        .filter(|slot| *slot >= range.start && *slot <= range.end && !present.contains(slot))
-        .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn discover_slots(
+struct DiscoverSlotsArgs {
     rpc_client: Arc<RpcClient>,
+    clickhouse: Arc<clickhouse::Client>,
+    blocks_table: String,
     range: RpcRange,
     commitment: CommitmentConfig,
     chunk_slots: u64,
+    skip_ingested: bool,
     backoff: Duration,
-    gap_fill: Option<GapFill>,
     slot_tx: mpsc::Sender<u64>,
     progress_tx: watch::Sender<u64>,
-) -> Result<()> {
+}
+
+async fn discover_slots(args: DiscoverSlotsArgs) -> Result<()> {
+    let DiscoverSlotsArgs {
+        rpc_client,
+        clickhouse,
+        blocks_table,
+        range,
+        commitment,
+        chunk_slots,
+        skip_ingested,
+        backoff,
+        slot_tx,
+        progress_tx,
+    } = args;
     let mut cursor = range.start;
     let commitment = rpc_discovery_commitment(commitment);
 
@@ -864,31 +849,33 @@ async fn discover_slots(
             }
         };
 
-        // When gap-filling, drop slots already ingested so getBlock only runs
-        // for the missing ones. Discovery already excludes leader-skipped slots
-        // (getBlocks omits them), so the remainder are genuine gaps.
-        let present = match gap_fill.as_ref() {
-            Some(gap_fill) => {
-                fetch_present_slots(&gap_fill.clickhouse, &gap_fill.blocks_table, cursor, end)
-                    .await?
-                    .into_iter()
-                    .collect::<HashSet<u64>>()
+        let present: HashSet<u64> = if skip_ingested {
+            match fetch_present_slots_in_range(clickhouse.as_ref(), &blocks_table, cursor, end)
+                .await
+            {
+                Ok(present) => present.into_iter().collect(),
+                Err(err) => {
+                    metrics::observe_source_error("rpc_slot_presence", "retryable");
+                    warn!(
+                        start_slot = cursor,
+                        end_slot = end,
+                        error = %err,
+                        "rpc slot presence check failed; fetching full window"
+                    );
+                    HashSet::new()
+                }
             }
-            None => HashSet::new(),
+        } else {
+            HashSet::new()
         };
-        let to_enqueue = slots_to_enqueue(&slots, &present, range);
-        if gap_fill.is_some() {
-            info!(
-                start_slot = cursor,
-                end_slot = end,
-                blocks_with_data = slots.len(),
-                already_present = present.len(),
-                missing = to_enqueue.len(),
-                "rpc gap-fill discovery chunk"
-            );
-        }
 
-        for slot in to_enqueue {
+        for slot in uningested_slots(slots, &present) {
+            if slot > range.end {
+                break;
+            }
+            if slot < range.start {
+                continue;
+            }
             if slot_tx.send(slot).await.is_err() {
                 return Ok(());
             }
@@ -899,6 +886,13 @@ async fn discover_slots(
     }
 
     Ok(())
+}
+
+fn uningested_slots(discovered: Vec<u64>, present: &HashSet<u64>) -> Vec<u64> {
+    discovered
+        .into_iter()
+        .filter(|slot| !present.contains(slot))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2321,7 +2315,7 @@ mod tests {
             rpc_flush_every_slots: 500,
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
-            rpc_fill_gaps: false,
+            rpc_skip_ingested_slots: false,
             rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,
@@ -2410,6 +2404,21 @@ mod tests {
     }
 
     #[test]
+    fn uningested_slots_drops_present_and_preserves_order() {
+        let present: HashSet<u64> = [101, 106].into_iter().collect();
+        assert_eq!(
+            uningested_slots(vec![100, 101, 103, 106], &present),
+            vec![100, 103]
+        );
+        assert_eq!(
+            uningested_slots(vec![1, 2, 3], &HashSet::new()),
+            vec![1, 2, 3]
+        );
+        let all: HashSet<u64> = [5, 6].into_iter().collect();
+        assert!(uningested_slots(vec![5, 6], &all).is_empty());
+    }
+
+    #[test]
     fn rpc_missing_meta_creates_empty_fields() {
         let tx = build_test_transaction();
         let tx_bytes = crate::message_wire::serialize_versioned_transaction(&tx)
@@ -2435,43 +2444,6 @@ mod tests {
         assert_eq!(row.meta_rewards_present, 0);
         assert!(row.meta_compute_units_consumed.is_none());
         assert!(row.meta_cost_units.is_none());
-    }
-
-    #[test]
-    fn slots_to_enqueue_passes_all_in_range_when_present_is_empty() {
-        let range = RpcRange {
-            start: 100,
-            end: 200,
-        };
-        let discovered = vec![100, 150, 200];
-        let present = HashSet::new();
-        assert_eq!(
-            slots_to_enqueue(&discovered, &present, range),
-            vec![100, 150, 200]
-        );
-    }
-
-    #[test]
-    fn slots_to_enqueue_skips_present_and_out_of_range_slots() {
-        let range = RpcRange {
-            start: 100,
-            end: 200,
-        };
-        // 99 is below range, 201 is above range, 150 is already ingested.
-        let discovered = vec![99, 100, 150, 175, 200, 201];
-        let present = HashSet::from([150, 200]);
-        assert_eq!(
-            slots_to_enqueue(&discovered, &present, range),
-            vec![100, 175]
-        );
-    }
-
-    #[test]
-    fn slots_to_enqueue_returns_empty_when_all_present() {
-        let range = RpcRange { start: 10, end: 12 };
-        let discovered = vec![10, 11, 12];
-        let present = HashSet::from([10, 11, 12]);
-        assert!(slots_to_enqueue(&discovered, &present, range).is_empty());
     }
 
     #[tokio::test]

@@ -111,18 +111,18 @@ fetches each with `getBlock`, and exits. Because the tables are
 `ReplacingMergeTree(slot)`, re-ingesting existing slots is idempotent, so a
 backfill can run alongside the live ingestor.
 
-To avoid re-fetching blocks you already have, add `--rpc-fill-gaps`. During
-discovery it subtracts the slots already present in `blocks_metadata` for each
-chunk, so `getBlock` is only issued for the genuinely missing slots. This keeps
-RPC request volume proportional to the size of the gaps, not the size of the
-window — important when the RPC endpoint is rate-limited.
+To avoid re-fetching blocks you already have, add `--rpc-skip-ingested-slots`.
+During discovery it subtracts the slots already present in `blocks_metadata` for
+each chunk, so `getBlock` is only issued for the genuinely missing slots. This
+keeps RPC request volume proportional to the size of the gaps, not the size of
+the window — important when the RPC endpoint is rate-limited.
 
 ```bash
 SUPERBANK_SOURCE=rpc \
 RPC_URL=https://api.mainnet-beta.solana.com \
 RPC_FROM_SLOT=200000000 \
 RPC_TO_SLOT=200100000 \
-RPC_FILL_GAPS=true \
+RPC_SKIP_INGESTED_SLOTS=true \
 CLICKHOUSE_URL=http://localhost:8123 \
 CLICKHOUSE_DATABASE=default \
 cargo run -p superbank --
@@ -136,15 +136,16 @@ Notes:
   a gap.
 - Run it as a one-shot job (e.g. a periodic sweep of the recent range) while
   Fumarole/gRPC handle live ingest.
-- Each discovery chunk logs `blocks_with_data`, `already_present`, and `missing`
-  so you can see how much is actually being backfilled.
+- If the presence check against ClickHouse fails for a chunk, discovery logs a
+  warning and falls back to fetching the full window for that chunk.
 
 ### When the missing slots are already known: `--rpc-slot-list`
 
 If a caller already knows exactly which slots to fetch, pass them in a
 whitespace-separated file with `--rpc-slot-list`. This skips `getBlocks`
 discovery entirely and issues one `getBlock` per listed slot — the most
-RPC-frugal mode. It is mutually exclusive with the range/gap-fill flags.
+RPC-frugal mode. It is mutually exclusive with the range and
+`--rpc-skip-ingested-slots` flags.
 
 ```bash
 SUPERBANK_SOURCE=rpc \
@@ -278,7 +279,11 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--grpc-slot-notifications[=true|false]` / `GRPC_SLOT_NOTIFICATIONS` (default: true; subscribe to slot notifications on the gRPC stream to populate `superbank_ingest_chain_tip_lag`)
 - `--rpc-url` / `RPC_URL` (required for rpc source)
 - `--rpc-from-slot` / `RPC_FROM_SLOT` (required for rpc source; use `*` for latest slot in
-  `blocks_metadata`, `0` to start from earliest available slot)
+  `blocks_metadata`, `0` to start from earliest available slot). To resume an interrupted
+  backfill, re-run with the same range and `--rpc-skip-ingested-slots`: discovery then skips
+  slots already in `blocks_metadata` and re-fetches only the gaps. Without the flag, discovery
+  re-fetches the whole range. `*` resumes from the highest stored slot and won't refill earlier
+  gaps, so use the range form with the flag to recover.
 - `--rpc-to-slot` / `RPC_TO_SLOT` (required for rpc source if `--rpc-slot-count` not set)
 - `--rpc-slot-count` / `RPC_SLOT_COUNT` (required for rpc source if `--rpc-to-slot` not set)
 - `--rpc-timeout-secs` / `RPC_TIMEOUT_SECS` (default: 30)
@@ -288,11 +293,10 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-flush-every-slots` / `RPC_FLUSH_EVERY_SLOTS` (default: 500)
 - `--rpc-progress-every-slots` / `RPC_PROGRESS_EVERY_SLOTS` (default: 100)
 - `--rpc-discovery-chunk-slots` / `RPC_DISCOVERY_CHUNK_SLOTS` (default: 10000)
-- `--rpc-fill-gaps` / `RPC_FILL_GAPS` (default: false; backfill only slots missing from
-  `blocks_metadata` in the `[from,to]` range — see [Backfilling gaps with RPC](#backfilling-gaps-with-rpc))
 - `--rpc-slot-list` / `RPC_SLOT_LIST` (optional; whitespace-separated slot list file — fetch
   exactly those slots with no `getBlocks` discovery; mutually exclusive with `--rpc-from-slot`,
-  `--rpc-to-slot`, `--rpc-slot-count`, and `--rpc-fill-gaps`)
+  `--rpc-to-slot`, `--rpc-slot-count`, and `--rpc-skip-ingested-slots`)
+- `--rpc-skip-ingested-slots` / `RPC_SKIP_INGESTED_SLOTS` (default: false; when set, rpc discovery skips slots already in `blocks_metadata` so a re-run backfills only the gaps — see [Backfilling gaps with RPC](#backfilling-gaps-with-rpc))
 - `--bigtable-range` / `BIGTABLE_RANGE` (required unless using `BIGTABLE_SLOT_FILE`; `123:456` slots, `1-10` epochs, or `5` epoch)
 - `--bigtable-slot-file` / `BIGTABLE_SLOT_FILE` (optional; whitespace-separated slot list, mutually exclusive with `BIGTABLE_RANGE`)
 - `--bigtable-instance` / `BIGTABLE_INSTANCE` (default: `solana-ledger`)

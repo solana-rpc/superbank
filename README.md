@@ -56,6 +56,8 @@ flowchart LR
   - [4) Run the ingestor](#4-run-the-ingestor)
   - [5) Run the RPC server](#5-run-the-rpc-server)
 - [Configuration](#configuration)
+- [Docker local development](#docker-local-development)
+- [Production image](#production-image)
 - [Load testing](#load-testing)
 - [Repository layout](#repository-layout)
 - [Development](#development)
@@ -129,7 +131,7 @@ Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
-  (add `rpc-fill-gaps` to backfill only slots missing from ClickHouse in that range)
+  (add `rpc-skip-ingested-slots` to backfill only slots missing from ClickHouse in that range)
 - Bigtable: `source: bigtable` plus range/slot file and GCP credentials
 - solparq restore: `source: solparq`, `solparq-archive-location` (`local`/`s3`) plus
   `solparq-archive-path` or the `solparq-archive-s3-*` settings — loads Parquet
@@ -183,6 +185,108 @@ curl -sS http://localhost:8899 \
   `fumarole-memory-soft-limit-bytes: 0` only if you want to disable it.
 - `superbank-rpc` is configured via CLI flags and environment variables.
   See `crates/superbank-rpc/README.md`.
+
+## Docker local development
+
+Use Compose when you want the local ClickHouse + DDL + RPC stack without setting up Kubernetes/Tilt:
+
+```bash
+docker compose up --build
+```
+
+If you prefer the Tilt dashboard for the same Docker Compose stack, use the Compose shim:
+
+```bash
+tilt up -f Tiltfile.compose
+```
+
+This starts ClickHouse, applies `ddl/local/*.sql`, builds the Superbank image, and runs
+`superbank-rpc` on `http://localhost:8899`. ClickHouse stays on the internal Compose network by
+default to avoid conflicts with local ClickHouse instances.
+
+To ingest a small bounded range through the Solana JSON-RPC source, enable the `ingest-rpc` profile:
+
+```bash
+SUPERBANK_INGEST_RPC_URL=https://api.mainnet-beta.solana.com \
+SUPERBANK_INGEST_RPC_FROM_SLOT=350918000 \
+SUPERBANK_INGEST_SLOT_COUNT=64 \
+docker compose --profile ingest-rpc up --build
+```
+
+To expose the optional ingestor in the Tilt UI, enable the same Compose profile before starting the
+shim:
+
+```bash
+COMPOSE_PROFILES=ingest-rpc tilt up -f Tiltfile.compose
+```
+
+`superbank-ingest-rpc` is manual in `Tiltfile.compose`, so trigger it from the Tilt UI when you want
+the optional ingest container.
+
+The ingestor still requires an external data source. For larger or credentialed sources, set the
+same environment variables documented in `crates/superbank/README.md`.
+
+Useful local commands:
+
+```bash
+docker compose exec clickhouse clickhouse-client \
+  --user default --password superbank \
+  --query "SHOW TABLES"
+
+curl -sS http://localhost:8899 \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getFirstAvailableBlock"}'
+```
+
+If you change DDL files after the first run, recreate the one-shot DDL container:
+
+```bash
+docker compose up --force-recreate clickhouse-ddl
+```
+
+## Production image
+
+Build the production image from the repo root:
+
+```bash
+docker build -t superbank:0.5.0 .
+```
+
+The image contains both binaries. It runs `superbank-rpc` by default:
+
+```bash
+docker run --rm -p 8899:8899 \
+  -e RPC_HOST=0.0.0.0 \
+  -e RPC_PORT=8899 \
+  -e CLICKHOUSE_URL=http://clickhouse:8123 \
+  -e CLICKHOUSE_DATABASE=default \
+  -e CLICKHOUSE_USER=default \
+  -e CLICKHOUSE_PASSWORD=superbank \
+  superbank:0.5.0
+```
+
+Run the ingestor from the same image by overriding the entrypoint:
+
+```bash
+docker run --rm --entrypoint /usr/local/bin/superbank \
+  -e SUPERBANK_SOURCE=rpc \
+  -e RPC_URL=https://api.mainnet-beta.solana.com \
+  -e RPC_FROM_SLOT=350918000 \
+  -e RPC_SLOT_COUNT=64 \
+  -e CLICKHOUSE_URL=http://clickhouse:8123 \
+  -e CLICKHOUSE_DATABASE=default \
+  -e CLICKHOUSE_USER=default \
+  -e CLICKHOUSE_PASSWORD=superbank \
+  superbank:0.5.0
+```
+
+Optional `superbank-rpc` features can be enabled at build time:
+
+```bash
+docker build \
+  --build-arg SUPERBANK_RPC_FEATURES=grpc-head-cache \
+  -t superbank:grpc-head-cache .
+```
 
 ## Load testing
 

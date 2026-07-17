@@ -305,14 +305,14 @@ struct CliArgs {
     #[arg(long, env = "RPC_DISCOVERY_CHUNK_SLOTS", default_value_t = 10_000)]
     rpc_discovery_chunk_slots: u64,
 
-    /// Backfill only slots missing from ClickHouse: discovery subtracts slots
-    /// already present in the blocks table, so getBlock is only called for gaps.
-    #[arg(long, env = "RPC_FILL_GAPS", default_value_t = false)]
-    rpc_fill_gaps: bool,
+    /// Skip slots already ingested into ClickHouse during RPC discovery (re-run to backfill gaps)
+    #[arg(long, env = "RPC_SKIP_INGESTED_SLOTS", default_value_t = false)]
+    rpc_skip_ingested_slots: bool,
 
     /// Fetch exactly the slots in this whitespace-separated file (getBlock per
-    /// slot, no getBlocks discovery). Mutually exclusive with --rpc-fill-gaps,
-    /// --rpc-from-slot, --rpc-to-slot, and --rpc-slot-count.
+    /// slot, no getBlocks discovery). Mutually exclusive with
+    /// --rpc-skip-ingested-slots, --rpc-from-slot, --rpc-to-slot, and
+    /// --rpc-slot-count.
     #[arg(long, env = "RPC_SLOT_LIST", value_name = "PATH")]
     rpc_slot_list: Option<PathBuf>,
 
@@ -581,7 +581,7 @@ pub(crate) struct Args {
     pub(crate) rpc_flush_every_slots: u64,
     pub(crate) rpc_progress_every_slots: u64,
     pub(crate) rpc_discovery_chunk_slots: u64,
-    pub(crate) rpc_fill_gaps: bool,
+    pub(crate) rpc_skip_ingested_slots: bool,
     pub(crate) rpc_slot_list: Option<PathBuf>,
     pub(crate) bigtable_range: Option<String>,
     pub(crate) bigtable_slot_file: Option<PathBuf>,
@@ -696,8 +696,8 @@ struct FileConfig {
     rpc_progress_every_slots: Option<u64>,
     #[serde(alias = "rpc_discovery_chunk_slots")]
     rpc_discovery_chunk_slots: Option<u64>,
-    #[serde(alias = "rpc_fill_gaps")]
-    rpc_fill_gaps: Option<bool>,
+    #[serde(alias = "rpc_skip_ingested_slots")]
+    rpc_skip_ingested_slots: Option<bool>,
     #[serde(alias = "rpc_slot_list")]
     rpc_slot_list: Option<PathBuf>,
     #[serde(alias = "bigtable_range")]
@@ -976,11 +976,11 @@ pub(crate) fn resolve_args() -> Result<Args> {
             cli.rpc_discovery_chunk_slots,
             file_config.rpc_discovery_chunk_slots,
         ),
-        rpc_fill_gaps: merge_value(
+        rpc_skip_ingested_slots: merge_value(
             &matches,
-            "rpc_fill_gaps",
-            cli.rpc_fill_gaps,
-            file_config.rpc_fill_gaps,
+            "rpc_skip_ingested_slots",
+            cli.rpc_skip_ingested_slots,
+            file_config.rpc_skip_ingested_slots,
         ),
         rpc_slot_list: merge_option(
             &matches,
@@ -1338,14 +1338,14 @@ fn validate_args(args: &Args) -> Result<()> {
             }
             if args.rpc_slot_list.is_some() {
                 // Slot-list mode fetches exactly the listed slots; range and
-                // gap-fill flags do not apply and must not be combined with it.
+                // skip-ingested flags do not apply and must not be combined with it.
                 if args.rpc_from_slot.is_some()
                     || args.rpc_to_slot.is_some()
                     || args.rpc_slot_count.is_some()
-                    || args.rpc_fill_gaps
+                    || args.rpc_skip_ingested_slots
                 {
                     return Err(anyhow!(
-                        "rpc-slot-list is mutually exclusive with rpc-from-slot, rpc-to-slot, rpc-slot-count, and rpc-fill-gaps"
+                        "rpc-slot-list is mutually exclusive with rpc-from-slot, rpc-to-slot, rpc-slot-count, and rpc-skip-ingested-slots"
                     ));
                 }
             } else {
@@ -2098,7 +2098,7 @@ rpc-from-slot: 456
             rpc_flush_every_slots: 500,
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
-            rpc_fill_gaps: false,
+            rpc_skip_ingested_slots: false,
             rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,

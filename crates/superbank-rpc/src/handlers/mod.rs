@@ -537,11 +537,13 @@ fn metrics_method_label(method: &str) -> &'static str {
         "getSlot" => "getSlot",
         "getTransactionCount" => "getTransactionCount",
         "getLatestBlockhash" => "getLatestBlockhash",
+        "isBlockhashValid" => "isBlockhashValid",
         "getBlockTime" => "getBlockTime",
         "getBlocks" => "getBlocks",
         "getBlocksWithLimit" => "getBlocksWithLimit",
         "getHealth" => "getHealth",
         "getInflationReward" => "getInflationReward",
+        "getEpochSchedule" => "getEpochSchedule",
         "getFirstAvailableBlock" => "getFirstAvailableBlock",
         "minimumLedgerSlot" => "minimumLedgerSlot",
         "getTransaction" => "getTransaction",
@@ -867,6 +869,9 @@ async fn dispatch_json_rpc_request(
             "getLatestBlockhash" => {
                 blocks::handle_get_latest_blockhash(state, id_for_dispatch, params).await
             }
+            "isBlockhashValid" => {
+                blocks::handle_is_blockhash_valid(state, id_for_dispatch, params).await
+            }
             "getBlockTime" => blocks::handle_get_block_time(state, id_for_dispatch, params).await,
             "getBlocks" => blocks::handle_get_blocks(state, id_for_dispatch, params).await,
             "getBlocksWithLimit" => {
@@ -875,6 +880,9 @@ async fn dispatch_json_rpc_request(
             "getHealth" => blocks::handle_get_health(state, id_for_dispatch, params).await,
             "getInflationReward" => {
                 blocks::handle_get_inflation_reward(state, id_for_dispatch, params).await
+            }
+            "getEpochSchedule" => {
+                blocks::handle_get_epoch_schedule(state, id_for_dispatch, params).await
             }
             "getFirstAvailableBlock" => {
                 blocks::handle_get_first_available_block(state, id_for_dispatch, params).await
