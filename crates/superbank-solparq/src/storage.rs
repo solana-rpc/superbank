@@ -68,14 +68,6 @@ pub async fn latest_archive_name(config: &Config, kind: ArchiveKind) -> Result<O
     Ok(archives.pop())
 }
 
-pub async fn latest_archive_names(config: &Config) -> Result<Vec<(ArchiveKind, Option<String>)>> {
-    let mut latest = Vec::with_capacity(config.archive_kinds.len());
-    for kind in config.archive_kinds.iter().copied() {
-        latest.push((kind, latest_archive_name(config, kind).await?));
-    }
-    Ok(latest)
-}
-
 pub async fn cleanup_archives(config: &Config, kind: ArchiveKind) -> Result<Vec<String>> {
     if config.archives_to_keep == 0 {
         return Ok(Vec::new());

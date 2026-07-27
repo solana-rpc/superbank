@@ -82,7 +82,6 @@ pub struct Config {
     /// Also backfill slots flagged as transaction undercounts (block present but
     /// fewer archived rows than declared); re-ingest re-inserts and dedups.
     pub backfill_include_undercounts: bool,
-    pub delete_archived_data_range: bool,
     pub server_mode: bool,
     pub ops_port: u16,
     pub metrics_port: u16,
@@ -133,6 +132,11 @@ impl Config {
         if cli.server_mode && cli.archive_slot_range.is_some() {
             return Err(anyhow!(
                 "--archive-slot-range is only supported for one-shot archives and cannot be used with --server-mode"
+            ));
+        }
+        if cli.delete_archived_data_range {
+            return Err(anyhow!(
+                "--delete-archived-data-range is disabled because archive exports and ClickHouse mutations cannot fence concurrent ingestion or backfill writes; stop ingestion and use an operator-reviewed offline cleanup procedure until a writer fence is implemented"
             ));
         }
 
@@ -207,7 +211,6 @@ impl Config {
             backfill_gaps: cli.backfill_gaps,
             backfill_superbank_bin: cli.backfill_superbank_bin,
             backfill_include_undercounts: cli.backfill_include_undercounts,
-            delete_archived_data_range: cli.delete_archived_data_range,
             server_mode: cli.server_mode,
             ops_port: cli.ops_port,
             metrics_port: cli.metrics_port,
@@ -492,6 +495,9 @@ struct Cli {
     )]
     backfill_include_undercounts: bool,
 
+    /// Reserved for a future writer-fenced cleanup workflow. Currently rejected
+    /// because archive exports and ClickHouse mutations cannot exclude concurrent
+    /// ingestion or backfill writes from the range being deleted.
     #[arg(
         long = "delete-archived-data-range",
         env = "SOLPARQ_DELETE_ARCHIVED_DATA_RANGE",

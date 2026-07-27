@@ -1,15 +1,15 @@
 use std::{fs, process::Command, str::FromStr};
 
+use axum::{Router, extract::State, http::StatusCode, routing::post};
 use superbank_solparq::{
     archive::{
         ArchiveKind, ArchiveReportDocument, ArchiveRunMetrics, ArchiveRunReport, ArchiveRunTable,
         ArchiveSlotRange, ArchivedTableRows, ClickHouseBounds, GapBackfill, MismatchRepair,
         PhaseDuration, epoch_partitions, plan_archive_slot_range, plan_next_archive,
-        safe_delete_archived_data_range,
     },
     clickhouse::{
-        ArchiveTableKind, DbTables, DiskUsage, MismatchDirection, S3ArchiveSql, SlotRange,
-        TableSize, TransactionMismatch, ValidationReport, build_count_query, build_delete_sql,
+        ArchiveTableKind, ClickHouseClient, DbTables, DiskUsage, MismatchDirection, S3ArchiveSql,
+        SlotRange, TableSize, TransactionMismatch, ValidationReport, build_count_query,
         build_local_parquet_query, build_s3_archive_sql, build_s3_table_archive_sql,
     },
     config::{ArchiveLocation, Config},
@@ -20,6 +20,75 @@ use superbank_solparq::{
         write_local_sha256sums,
     },
 };
+use tokio::{net::TcpListener, task::JoinHandle};
+
+#[derive(Clone, Copy)]
+enum TableProbeMode {
+    OptionalMissing,
+    OptionalFailure,
+    OptionalReadFailure,
+    RequiredMissing,
+}
+
+async fn spawn_table_probe_server(mode: TableProbeMode) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock ClickHouse server");
+    let address = listener.local_addr().expect("mock server address");
+    let app = Router::new()
+        .route("/", post(table_probe_response))
+        .with_state(mode);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve mock ClickHouse responses");
+    });
+    (format!("http://{address}"), server)
+}
+
+async fn table_probe_response(
+    State(mode): State<TableProbeMode>,
+    body: String,
+) -> (StatusCode, &'static str) {
+    let is_transactions = body.contains("EXISTS TABLE transactions ");
+    let is_blocks = body.contains("EXISTS TABLE blocks_metadata ");
+    let is_entries = body.contains("EXISTS TABLE entries ");
+    let is_entries_read = body.contains("SELECT count() FROM entries WHERE 0");
+
+    match mode {
+        TableProbeMode::OptionalMissing if is_transactions || is_blocks => {
+            (StatusCode::OK, "{\"result\":1}")
+        }
+        TableProbeMode::OptionalMissing => (StatusCode::OK, "{\"result\":0}"),
+        TableProbeMode::OptionalFailure if is_entries => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporary ClickHouse failure",
+        ),
+        TableProbeMode::OptionalFailure => (StatusCode::OK, "{\"result\":1}"),
+        TableProbeMode::OptionalReadFailure if is_entries_read => (
+            StatusCode::FORBIDDEN,
+            "insufficient privileges to read ClickHouse table",
+        ),
+        TableProbeMode::OptionalReadFailure => (StatusCode::OK, "{\"result\":1}"),
+        TableProbeMode::RequiredMissing if is_transactions => (StatusCode::OK, "{\"result\":0}"),
+        TableProbeMode::RequiredMissing => (StatusCode::OK, "{\"result\":1}"),
+    }
+}
+
+fn clickhouse_test_config(url: &str) -> Config {
+    Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        url,
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "hourly",
+    ])
+    .expect("valid ClickHouse test config")
+}
 
 #[test]
 fn hourly_plan_uses_prompt_filename_convention() {
@@ -484,6 +553,30 @@ fn config_accepts_dry_run_flag_in_one_shot_and_server_mode() {
 }
 
 #[test]
+fn config_rejects_clickhouse_deletion_until_writers_can_be_fenced() {
+    for mode_args in [Vec::new(), vec!["--server-mode"]] {
+        let mut args = vec![
+            "superbank-solparq",
+            "--db-server",
+            "127.0.0.1",
+            "--db-user",
+            "admin",
+            "--db-password",
+            "secret",
+            "--archive-range-type",
+            "hourly",
+            "--delete-archived-data-range",
+        ];
+        args.extend(mode_args);
+
+        let error = Config::try_parse_from(args).expect_err("unsafe deletion must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("--delete-archived-data-range is disabled"));
+        assert!(message.contains("cannot fence concurrent ingestion or backfill writes"));
+    }
+}
+
+#[test]
 fn db_archive_tables_cover_superbank_base_and_index_tables() {
     let config = Config::try_parse_from([
         "superbank-solparq",
@@ -565,6 +658,76 @@ fn db_archive_tables_cover_superbank_base_and_index_tables() {
                 false
             ),
         ]
+    );
+}
+
+#[tokio::test]
+async fn optional_clickhouse_tables_are_skipped_only_when_exists_returns_false() {
+    let (url, server) = spawn_table_probe_server(TableProbeMode::OptionalMissing).await;
+    let config = clickhouse_test_config(&url);
+
+    let tables = ClickHouseClient::from_config(&config)
+        .expect("ClickHouse client")
+        .check_tables(&DbTables::from_config(&config))
+        .await
+        .expect("known-missing optional tables should be skipped");
+
+    server.abort();
+    assert_eq!(
+        tables.iter().map(|table| table.kind).collect::<Vec<_>>(),
+        vec![
+            ArchiveTableKind::Transactions,
+            ArchiveTableKind::BlocksMetadata,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn optional_clickhouse_table_probe_errors_fail_the_archive() {
+    let (url, server) = spawn_table_probe_server(TableProbeMode::OptionalFailure).await;
+    let config = clickhouse_test_config(&url);
+
+    let error = ClickHouseClient::from_config(&config)
+        .expect("ClickHouse client")
+        .check_tables(&DbTables::from_config(&config))
+        .await
+        .expect_err("transient optional-table failures must not be treated as absence");
+
+    server.abort();
+    assert!(error.to_string().contains("check ClickHouse table entries"));
+}
+
+#[tokio::test]
+async fn existing_optional_clickhouse_table_must_be_readable() {
+    let (url, server) = spawn_table_probe_server(TableProbeMode::OptionalReadFailure).await;
+    let config = clickhouse_test_config(&url);
+
+    let error = ClickHouseClient::from_config(&config)
+        .expect("ClickHouse client")
+        .check_tables(&DbTables::from_config(&config))
+        .await
+        .expect_err("unreadable optional tables must fail before archive writes start");
+
+    server.abort();
+    assert!(error.to_string().contains("check ClickHouse table entries"));
+}
+
+#[tokio::test]
+async fn missing_required_clickhouse_table_fails_the_archive() {
+    let (url, server) = spawn_table_probe_server(TableProbeMode::RequiredMissing).await;
+    let config = clickhouse_test_config(&url);
+
+    let error = ClickHouseClient::from_config(&config)
+        .expect("ClickHouse client")
+        .check_tables(&DbTables::from_config(&config))
+        .await
+        .expect_err("required tables must exist");
+
+    server.abort();
+    assert!(
+        error
+            .to_string()
+            .contains("required ClickHouse archive table transactions does not exist")
     );
 }
 
@@ -771,33 +934,6 @@ fn count_query_appends_settings_clause_when_set() {
 }
 
 #[test]
-fn delete_sql_covers_all_configured_tables() {
-    let tables = DbTables {
-        transactions_table: "transactions".to_string(),
-        blocks_table: "blocks_metadata".to_string(),
-        entries_table: "entries".to_string(),
-        gsfa_table: "gsfa".to_string(),
-        gsfa_hot_table: "gsfa_hot".to_string(),
-        signatures_table: "signatures".to_string(),
-        token_owner_activity_table: "token_owner_activity".to_string(),
-    };
-    let statements = build_delete_sql(&tables, 100, 123);
-
-    assert_eq!(
-        statements,
-        vec![
-            "ALTER TABLE transactions DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-            "ALTER TABLE blocks_metadata DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-            "ALTER TABLE entries DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-            "ALTER TABLE gsfa DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-            "ALTER TABLE gsfa_hot DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-            "ALTER TABLE signatures DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-            "ALTER TABLE token_owner_activity DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-        ]
-    );
-}
-
-#[test]
 fn validation_report_groups_legit_and_backfill_gap_ranges() {
     let report = ValidationReport::from_observed_slots(
         10,
@@ -822,147 +958,6 @@ fn validation_report_groups_legit_and_backfill_gap_ranges() {
         vec![SlotRange::new(20, 20)]
     );
     assert!(report.has_warnings());
-}
-
-#[test]
-fn clickhouse_cleanup_waits_until_all_archive_types_cover_range() {
-    let config = Config::try_parse_from([
-        "superbank-solparq",
-        "--db-server",
-        "127.0.0.1",
-        "--db-user",
-        "admin",
-        "--db-password",
-        "secret",
-        "--archive-range-type",
-        "custom:500",
-        "--archive-range-type",
-        "hourly",
-        "--server-mode",
-        "--delete-archived-data-range",
-    ])
-    .expect("valid config");
-
-    let delete_range = safe_delete_archived_data_range(
-        &config,
-        499,
-        &[
-            (
-                ArchiveKind::Custom { slots: 500 },
-                Some("custom_0_0-499".to_string()),
-            ),
-            (ArchiveKind::Hourly, None),
-        ],
-    )
-    .expect("safe delete check");
-
-    assert_eq!(delete_range, None);
-}
-
-#[test]
-fn clickhouse_cleanup_allows_smaller_kind_after_larger_kind_covers_range() {
-    let config = Config::try_parse_from([
-        "superbank-solparq",
-        "--db-server",
-        "127.0.0.1",
-        "--db-user",
-        "admin",
-        "--db-password",
-        "secret",
-        "--archive-range-type",
-        "custom:500",
-        "--archive-range-type",
-        "hourly",
-        "--server-mode",
-        "--delete-archived-data-range",
-    ])
-    .expect("valid config");
-
-    let delete_range = safe_delete_archived_data_range(
-        &config,
-        499,
-        &[
-            (
-                ArchiveKind::Custom { slots: 500 },
-                Some("custom_0_0-499".to_string()),
-            ),
-            (ArchiveKind::Hourly, Some("hourly_0_0-8999".to_string())),
-        ],
-    )
-    .expect("safe delete check");
-
-    assert_eq!(delete_range, Some(SlotRange::new(0, 499)));
-}
-
-#[test]
-fn clickhouse_cleanup_deletes_only_safe_prefix_when_other_kinds_lag() {
-    let config = Config::try_parse_from([
-        "superbank-solparq",
-        "--db-server",
-        "127.0.0.1",
-        "--db-user",
-        "admin",
-        "--db-password",
-        "secret",
-        "--archive-range-type",
-        "custom:500",
-        "--archive-range-type",
-        "hourly",
-        "--archive-range-type",
-        "epoch",
-        "--server-mode",
-        "--delete-archived-data-range",
-    ])
-    .expect("valid config");
-
-    let delete_range = safe_delete_archived_data_range(
-        &config,
-        431_999,
-        &[
-            (
-                ArchiveKind::Custom { slots: 500 },
-                Some("custom_0_0-999".to_string()),
-            ),
-            (ArchiveKind::Hourly, Some("hourly_0_0-8999".to_string())),
-            (ArchiveKind::Epoch, Some("epoch_0_0-431999".to_string())),
-        ],
-    )
-    .expect("safe delete check");
-
-    assert_eq!(delete_range, Some(SlotRange::new(0, 999)));
-}
-
-#[test]
-fn clickhouse_cleanup_removes_slots_before_current_archive_start() {
-    let config = Config::try_parse_from([
-        "superbank-solparq",
-        "--db-server",
-        "127.0.0.1",
-        "--db-user",
-        "admin",
-        "--db-password",
-        "secret",
-        "--archive-range-type",
-        "epoch",
-        "--server-mode",
-        "--delete-archived-data-range",
-    ])
-    .expect("valid config");
-
-    // A continuation archive covering the second epoch (432000-863999). Older
-    // slots from the first epoch (0-431999) must still be swept even though this
-    // archive does not start at slot 0.
-    let delete_range = safe_delete_archived_data_range(
-        &config,
-        863_999,
-        &[(
-            ArchiveKind::Epoch,
-            Some("epoch_1_432000-863999".to_string()),
-        )],
-    )
-    .expect("safe delete check");
-
-    assert_eq!(delete_range, Some(SlotRange::new(0, 863_999)));
 }
 
 #[test]
@@ -1869,7 +1864,7 @@ fn metrics_endpoint_exposes_labeled_series() {
         destination: "./archives".to_string(),
         archive_tables: Vec::new(),
         validation: Some(validation),
-        deleted_clickhouse_range: true,
+        deleted_clickhouse_range: false,
         cleaned_archives: vec!["epoch_999_431568000-431999999.parquet".to_string()],
         run_metrics: ArchiveRunMetrics {
             phase_durations: vec![
@@ -1911,7 +1906,6 @@ fn metrics_endpoint_exposes_labeled_series() {
     assert!(text.contains("solparq_db_lag_slots{archive_kind=\"epoch\"} 50"));
     // Counters (suffix handling left to the encoder; assert base name + labels).
     assert!(text.contains("solparq_archives_created") && text.contains("archive_kind=\"epoch\""));
-    assert!(text.contains("solparq_clickhouse_range_deleted"));
     assert!(text.contains("solparq_archives_cleaned"));
     assert!(text.contains("solparq_archive_rows") && text.contains("table=\"transactions\""));
     // Phase-duration histogram.

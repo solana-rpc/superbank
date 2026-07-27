@@ -175,23 +175,46 @@ impl ClickHouseClient {
     pub async fn check_tables(&self, tables: &DbTables) -> Result<Vec<ArchiveDbTable>> {
         let mut available = Vec::new();
         for table in tables.archive_tables() {
-            let sql = format!("SELECT count() FROM {} WHERE 0", table.table_name);
-            match self.execute(&sql).await {
-                Ok(()) => available.push(table),
-                Err(err) if table.required => {
-                    return Err(err)
-                        .with_context(|| format!("check ClickHouse table {}", table.table_name));
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        archive_table = table.kind.as_str(),
-                        table_name = table.table_name,
-                        "optional ClickHouse archive table is not available"
-                    );
-                }
+            let exists = self
+                .table_exists(&table.table_name)
+                .await
+                .with_context(|| format!("check ClickHouse table {}", table.table_name))?;
+            if exists {
+                let sql = format!("SELECT count() FROM {} WHERE 0", table.table_name);
+                self.execute(&sql)
+                    .await
+                    .with_context(|| format!("check ClickHouse table {}", table.table_name))?;
+                available.push(table);
+            } else if table.required {
+                return Err(anyhow!(
+                    "required ClickHouse archive table {} does not exist",
+                    table.table_name
+                ));
+            } else {
+                tracing::debug!(
+                    archive_table = table.kind.as_str(),
+                    table_name = table.table_name,
+                    "optional ClickHouse archive table is not available"
+                );
             }
         }
         Ok(available)
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        #[derive(Debug, Deserialize)]
+        struct ExistsRow {
+            result: u8,
+        }
+
+        let rows = self
+            .query_json_rows::<ExistsRow>(&format!("EXISTS TABLE {table}"))
+            .await?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("ClickHouse EXISTS TABLE returned no result for {table}"))?;
+        Ok(row.result != 0)
     }
 
     pub async fn fetch_bounds(&self, transactions_table: &str) -> Result<Option<ClickHouseBounds>> {
@@ -333,35 +356,6 @@ impl ClickHouseClient {
 
     pub async fn execute(&self, sql: &str) -> Result<()> {
         self.post_sql(sql).await?;
-        Ok(())
-    }
-
-    pub async fn delete_archived_range(
-        &self,
-        tables: &DbTables,
-        start_slot: u64,
-        end_slot: u64,
-    ) -> Result<()> {
-        for sql in build_delete_sql(tables, start_slot, end_slot) {
-            self.execute(&sql).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn delete_archived_range_for_tables(
-        &self,
-        tables: &[ArchiveDbTable],
-        start_slot: u64,
-        end_slot: u64,
-    ) -> Result<()> {
-        for table in tables {
-            self.execute(&build_delete_table_sql(
-                &table.table_name,
-                start_slot,
-                end_slot,
-            ))
-            .await?;
-        }
         Ok(())
     }
 
@@ -951,18 +945,6 @@ fn settings_suffix(settings: &str, separator: &str) -> String {
     } else {
         format!("{separator}SETTINGS {settings}")
     }
-}
-
-pub fn build_delete_sql(tables: &DbTables, start_slot: u64, end_slot: u64) -> Vec<String> {
-    tables
-        .archive_tables()
-        .into_iter()
-        .map(|table| build_delete_table_sql(&table.table_name, start_slot, end_slot))
-        .collect()
-}
-
-fn build_delete_table_sql(table: &str, start_slot: u64, end_slot: u64) -> String {
-    format!("ALTER TABLE {table} DELETE WHERE slot BETWEEN {start_slot} AND {end_slot}")
 }
 
 async fn fetch_solana_produced_slots(
