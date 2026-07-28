@@ -35,6 +35,8 @@ pub(crate) struct AppState {
     pub(crate) max_signatures_limit: u64,
     pub(crate) rpc_max_batch_size: usize,
     pub(crate) rpc_batch_concurrency_limit: usize,
+    pub(crate) get_inflation_reward_max_addresses: Option<usize>,
+    pub(crate) get_inflation_reward_sem: Option<Arc<Semaphore>>,
     pub(crate) latest_slot_cache: LatestSlotCache,
     pub(crate) latest_block_height_cache: LatestBlockHeightCache,
     pub(crate) rpc_request_timeout: Duration,

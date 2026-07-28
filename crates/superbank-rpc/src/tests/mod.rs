@@ -30,6 +30,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+use crate::clickhouse::StoredAccountsTransactionRecord;
 use crate::clickhouse::{
     BlockMetadataRecord, ClickHouseClient, ClickHouseClientOptions, RoutingPolicy, RoutingScope,
     RoutingTransport, SignatureSlot, StoredBlockPayload, StoredBlockRecord,
@@ -49,6 +50,7 @@ use crate::handlers::transactions::handle_get_transactions_for_address;
 use crate::handlers::types::MAX_GET_BLOCKS_RANGE;
 use crate::hydration::BlockHydrationError;
 use crate::hydration::build_transaction_status_meta;
+use crate::hydration::build_transaction_status_meta_for_accounts;
 use crate::hydration::{
     TransactionHydrationError, build_versioned_transaction, hydrate_block_payload,
     hydrate_block_record, hydrate_transaction_record, parse_instruction_error_display,
@@ -156,6 +158,8 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -236,6 +240,8 @@ fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -292,6 +298,8 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -340,6 +348,8 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -390,6 +400,8 @@ fn test_state_with_head_cache_and_clickhouse_url(
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -447,6 +459,8 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -2524,6 +2538,75 @@ async fn get_inflation_reward_rejects_invalid_address() {
     let err = parsed.error.expect("error present");
     assert_eq!(err.code, -32602);
     assert_eq!(err.message, "Invalid param: Invalid");
+}
+
+#[tokio::test]
+async fn get_inflation_reward_rejects_more_than_configured_address_limit() {
+    let state = test_state();
+    let address = Hash::new_unique().to_string();
+    let addresses = vec![address; 101];
+
+    let response = handle_get_inflation_reward(
+        state,
+        json!(1),
+        Some(vec![json!(addresses), json!({ "epoch": 0u64 })]),
+    )
+    .await
+    .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: too many addresses; maximum is 100"
+    );
+}
+
+#[tokio::test]
+async fn get_inflation_reward_sheds_when_method_concurrency_is_exhausted() {
+    let state = test_state();
+    let _permit = state
+        .get_inflation_reward_sem
+        .as_ref()
+        .expect("concurrency admission enabled")
+        .clone()
+        .try_acquire_owned()
+        .expect("test permit");
+    let address = Hash::new_unique().to_string();
+
+    let response = handle_get_inflation_reward(
+        state,
+        json!(1),
+        Some(vec![json!([address]), json!({ "epoch": 0u64 })]),
+    )
+    .await
+    .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32005);
+    assert_eq!(err.message, "Node is unhealthy");
+}
+
+#[tokio::test]
+async fn get_inflation_reward_skips_method_admission_when_disabled() {
+    let mut state = test_state();
+    Arc::get_mut(&mut state)
+        .expect("test state should not be shared")
+        .get_inflation_reward_sem = None;
+
+    let response = handle_get_inflation_reward(
+        state,
+        json!(1),
+        Some(vec![json!([]), json!({ "epoch": 0u64 })]),
+    )
+    .await
+    .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(parsed.result, Some(json!([])));
 }
 
 #[tokio::test]
@@ -5998,6 +6081,20 @@ fn build_transaction_status_meta_emits_empty_lists_when_present() {
             .expect("post tokens")
             .is_empty()
     );
+    assert!(meta.rewards.as_ref().expect("rewards").is_empty());
+}
+
+#[test]
+fn build_transaction_status_meta_for_accounts_emits_empty_rewards_when_absent() {
+    let mut record = base_transaction_record();
+    record.meta_pre_balances = vec![1];
+    record.meta_post_balances = vec![1];
+    let record: StoredAccountsTransactionRecord = record.into();
+
+    let meta = build_transaction_status_meta_for_accounts(&record)
+        .expect("build meta")
+        .expect("meta present");
+
     assert!(meta.rewards.as_ref().expect("rewards").is_empty());
 }
 

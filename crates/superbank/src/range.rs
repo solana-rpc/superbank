@@ -3,7 +3,55 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use anyhow::{Result, anyhow};
+use std::path::Path;
+
+use anyhow::{Context, Result, anyhow};
+use tokio::{
+    fs::File,
+    io::{AsyncBufReadExt, BufReader},
+};
+
+/// Parse a whitespace-separated slot list file (`#` starts a line comment).
+/// Returns a sorted, de-duplicated list of slot numbers. Shared by the
+/// Bigtable (`--bigtable-slot-file`) and RPC (`--rpc-slot-list`) sources.
+pub(crate) async fn load_slot_list(path: &Path) -> Result<Vec<u64>> {
+    let file = File::open(path)
+        .await
+        .with_context(|| format!("open slot list {}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let mut slots = Vec::new();
+    let mut line_number = 0usize;
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .with_context(|| format!("read slot list {}", path.display()))?
+    {
+        line_number = line_number.saturating_add(1);
+        for token in line.split_whitespace() {
+            if token.starts_with('#') {
+                break;
+            }
+            let slot = token.parse::<u64>().with_context(|| {
+                format!(
+                    "invalid slot '{}' on line {} in {}",
+                    token,
+                    line_number,
+                    path.display()
+                )
+            })?;
+            slots.push(slot);
+        }
+    }
+
+    if slots.is_empty() {
+        return Err(anyhow!("slot list {} was empty", path.display()));
+    }
+
+    slots.sort_unstable();
+    slots.dedup();
+    Ok(slots)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RangeSpec {
