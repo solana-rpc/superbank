@@ -239,7 +239,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         }
         None => {
             warn!(
-                "no --genesis-path set; using the default no-warmup epoch schedule (matches mainnet/testnet/devnet); set --genesis-path for clusters with a warmup schedule"
+                "no --genesis-path set; using the default no-warmup epoch schedule (matches mainnet/devnet); set --genesis-path for clusters with a warmup schedule (e.g. testnet)"
             );
             EpochSchedule::without_warmup()
         }

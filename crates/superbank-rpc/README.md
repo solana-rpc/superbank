@@ -355,7 +355,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--port` | `RPC_PORT` | `8899` | — |
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
-| `--genesis-path` | `GENESIS_PATH` | empty | Path to the cluster's `genesis.bin`. When set, the epoch schedule is read from it for warmup-aware epoch math, and the server fails to start if the file can't be read or parsed. When empty, the default no-warmup schedule (432000 slots) is used, which matches mainnet, testnet, and devnet. |
+| `--genesis-path` | `GENESIS_PATH` | empty | Path to the cluster's `genesis.bin`. When set, the epoch schedule is read from it for warmup-aware epoch math, and the server fails to start if the file can't be read or parsed. When empty, the default no-warmup schedule (432000 slots) is used, which matches mainnet and devnet (testnet runs a warmup schedule, so set `--genesis-path` there). |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |
 | `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Only available with `--features grpc-streaming`; enables the gRPC endpoint at runtime. |
 | `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Only available with `--features grpc-streaming`. |
