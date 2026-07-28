@@ -509,6 +509,9 @@ pub struct Metrics {
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
 
     backend_errors: Family<OperationLabels, Counter>,
+    inflation_reward_rejections: Family<BatchRejectLabels, Counter>,
+    inflation_reward_lookups: Family<OperationOutcomeLabels, Counter>,
+    inflation_reward_selected_blocks: Histogram,
 
     route_total: Family<RouteLabels, Counter>,
     slot_source: Family<SlotSourceLabels, Counter>,
@@ -606,6 +609,9 @@ impl Metrics {
             Family::new_with_constructor(block_slot_count_histogram as fn() -> Histogram);
 
         let backend_errors = Family::default();
+        let inflation_reward_rejections = Family::default();
+        let inflation_reward_lookups = Family::default();
+        let inflation_reward_selected_blocks = block_slot_count_histogram();
 
         let route_total = Family::default();
         let slot_source = Family::default();
@@ -740,6 +746,21 @@ impl Metrics {
             "rpc_backend_errors",
             "Backend (ClickHouse) errors encountered while serving RPC",
             backend_errors.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_rejections_total",
+            "getInflationReward requests rejected by reason",
+            inflation_reward_rejections.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_lookups_total",
+            "getInflationReward lookup outcomes by lookup path",
+            inflation_reward_lookups.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_selected_blocks",
+            "Distribution of exact reward blocks selected by getInflationReward",
+            inflation_reward_selected_blocks.clone(),
         );
         registry.register(
             "rpc_route_total",
@@ -974,6 +995,9 @@ impl Metrics {
             rpc_response_overhead_seconds,
             rpc_blocks_slots_returned,
             backend_errors,
+            inflation_reward_rejections,
+            inflation_reward_lookups,
+            inflation_reward_selected_blocks,
             route_total,
             slot_source,
             clickhouse_latency_seconds,
@@ -1269,6 +1293,22 @@ impl Metrics {
         self.backend_errors.get_or_create(&labels).inc();
     }
 
+    pub fn inflation_reward_rejection(&self, reason: &str) {
+        let labels = Self::current_batch_reject_labels(reason);
+        self.inflation_reward_rejections
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    pub fn inflation_reward_lookup(&self, path: &'static str, outcome: &'static str) {
+        let labels = Self::current_operation_outcome_labels(path, outcome);
+        self.inflation_reward_lookups.get_or_create(&labels).inc();
+    }
+
+    pub fn inflation_reward_selected_blocks(&self, blocks: usize) {
+        self.inflation_reward_selected_blocks.observe(blocks as f64);
+    }
+
     pub fn rpc_timeout(&self, method: &str) {
         let labels = Self::current_method_labels(method);
         self.rpc_timeouts.get_or_create(&labels).inc();
@@ -1491,6 +1531,24 @@ pub(crate) fn track_request(method: &str) -> Option<RequestTracker<'static>> {
 pub(crate) fn backend_error(operation: &str) {
     if let Some(metrics) = metrics() {
         metrics.backend_error(operation);
+    }
+}
+
+pub(crate) fn inflation_reward_rejection(reason: &str) {
+    if let Some(metrics) = metrics() {
+        metrics.inflation_reward_rejection(reason);
+    }
+}
+
+pub(crate) fn inflation_reward_lookup(path: &'static str, outcome: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics.inflation_reward_lookup(path, outcome);
+    }
+}
+
+pub(crate) fn inflation_reward_selected_blocks(blocks: usize) {
+    if let Some(metrics) = metrics() {
+        metrics.inflation_reward_selected_blocks(blocks);
     }
 }
 

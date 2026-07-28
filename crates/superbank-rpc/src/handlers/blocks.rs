@@ -24,9 +24,10 @@ use crate::clickhouse::{QueryTimings, StoredBlockPayload, StoredBlockRecord};
 use crate::handlers::{
     RouteMetric,
     types::{
-        GetBlockHeightConfig, GetBlocksConfig, GetInflationRewardConfig, GetLatestBlockhashConfig,
-        GetLatestBlockhashResult, GetLatestBlockhashValue, GetSlotConfig, InflationRewardInfo,
-        IsBlockhashValidResult, MAX_GET_BLOCKS_RANGE, RpcContextSlot, reject_unknown_fields,
+        EpochSchedule, GetBlockHeightConfig, GetBlocksConfig, GetInflationRewardConfig,
+        GetLatestBlockhashConfig, GetLatestBlockhashResult, GetLatestBlockhashValue, GetSlotConfig,
+        InflationRewardInfo, IsBlockhashValidResult, MAX_GET_BLOCKS_RANGE, RpcContextSlot,
+        reject_unknown_fields,
     },
 };
 use crate::hydration::{BlockHydrationError, hydrate_block_payload};
@@ -2062,6 +2063,13 @@ pub(crate) async fn handle_get_blocks_with_limit(
     .await
 }
 
+fn inflation_reward_address_limit_exceeded(
+    max_addresses: Option<usize>,
+    address_count: usize,
+) -> bool {
+    max_addresses.is_some_and(|max_addresses| address_count > max_addresses)
+}
+
 pub(crate) async fn handle_get_inflation_reward(
     state: Arc<AppState>,
     id: Value,
@@ -2099,6 +2107,26 @@ pub(crate) async fn handle_get_inflation_reward(
             None,
         ));
     };
+
+    if inflation_reward_address_limit_exceeded(
+        state.get_inflation_reward_max_addresses,
+        addresses.len(),
+    ) {
+        let max_addresses = state
+            .get_inflation_reward_max_addresses
+            .expect("exceeded address limit must be enabled");
+        metrics::inflation_reward_rejection("address_limit");
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            format!(
+                "Invalid params: too many addresses; maximum is {}",
+                max_addresses
+            ),
+            None,
+        ));
+    }
 
     let mut requested_pubkeys = Vec::with_capacity(addresses.len());
     for value in addresses {
@@ -2192,6 +2220,19 @@ pub(crate) async fn handle_get_inflation_reward(
         }
     };
 
+    let _inflation_reward_permit = if let Some(semaphore) = &state.get_inflation_reward_sem {
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                metrics::inflation_reward_rejection("concurrency");
+                route.rpc_error();
+                return Ok(json_rpc_node_unhealthy_response(id));
+            }
+        }
+    } else {
+        None
+    };
+
     route.source_clickhouse();
     let (reward_rows, timings) = match state
         .clickhouse
@@ -2278,6 +2319,35 @@ pub(crate) async fn handle_get_first_available_block(
     Ok(resp)
 }
 
+pub(crate) async fn handle_get_epoch_schedule(
+    state: Arc<AppState>,
+    id: Value,
+    params: Option<Vec<Value>>,
+) -> Result<Response, StatusCode> {
+    let mut route = RouteMetric::for_state("getEpochSchedule", state.as_ref());
+
+    if params.filter(|v| !v.is_empty()).is_some() {
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            "Invalid params: expected no parameters",
+            None,
+        ));
+    }
+
+    let epoch_schedule = EpochSchedule {
+        slots_per_epoch: DEFAULT_SLOTS_PER_EPOCH,
+        leader_schedule_slot_offset: DEFAULT_SLOTS_PER_EPOCH,
+        warmup: false,
+        first_normal_epoch: 0,
+        first_normal_slot: 0,
+    };
+
+    route.success();
+    Ok(json_rpc_success_response(id, json!(epoch_schedule)))
+}
+
 pub(crate) async fn handle_get_health(
     state: Arc<AppState>,
     id: Value,
@@ -2358,7 +2428,9 @@ pub(crate) async fn handle_minimum_ledger_slot(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_get_block_miss, merge_sorted_block_slots};
+    use super::{
+        classify_get_block_miss, inflation_reward_address_limit_exceeded, merge_sorted_block_slots,
+    };
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
 
@@ -2382,6 +2454,13 @@ mod tests {
     fn merge_sorted_block_slots_deduplicates_overlap() {
         let merged = merge_sorted_block_slots(vec![1, 2, 2, 3, 6], vec![2, 3, 4, 6, 7]);
         assert_eq!(merged, vec![1, 2, 3, 4, 6, 7]);
+    }
+
+    #[test]
+    fn inflation_reward_address_limit_can_be_disabled() {
+        assert!(!inflation_reward_address_limit_exceeded(None, usize::MAX));
+        assert!(!inflation_reward_address_limit_exceeded(Some(100), 100));
+        assert!(inflation_reward_address_limit_exceeded(Some(100), 101));
     }
 
     #[test]

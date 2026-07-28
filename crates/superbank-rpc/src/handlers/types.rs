@@ -256,6 +256,16 @@ pub(crate) struct InflationRewardInfo {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EpochSchedule {
+    pub(crate) slots_per_epoch: u64,
+    pub(crate) leader_schedule_slot_offset: u64,
+    pub(crate) warmup: bool,
+    pub(crate) first_normal_epoch: u64,
+    pub(crate) first_normal_slot: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct GetLatestBlockhashResult {
     pub(crate) context: RpcContextSlot,
     pub(crate) value: GetLatestBlockhashValue,

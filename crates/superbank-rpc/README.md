@@ -21,6 +21,7 @@ writer that matches the same schemas).
 - `getFirstAvailableBlock`
 - `minimumLedgerSlot`
 - `getInflationReward`
+- `getEpochSchedule`
 - `getTransactionsForAddress` (custom)
 
 Notes:
@@ -29,6 +30,9 @@ Notes:
 - Requests without an `id` are normalized to `id: null` and still return
   JSON-RPC response bodies (compatibility behavior; not strict notification semantics).
 - `processed` commitment is rejected by default; use `confirmed` or `finalized`.
+- `getInflationReward` reads the payout epoch boundary and only the reward partitions selected by
+  the requested addresses. It never expands reward arrays across a complete epoch; dedicated
+  address, concurrency, timeout, thread, memory, and read-byte limits are enabled by default.
 - `processed` commitment is supported for a subset of methods when compiled with
   `--features grpc-head-cache` and enabled at runtime with `HEAD_CACHE_ENABLED=true`
   (see "Optional gRPC head cache" below).
@@ -47,6 +51,11 @@ Notes:
 - Methods that need a latest finalized context return a backend/internal JSON-RPC error when
   ClickHouse has no finalized slot available. This includes `getSlot`, `getBlockHeight`,
   `getTransactionCount`, `getLatestBlockhash`, `getSignatureStatuses`, and min-context checks.
+- `getSignatureStatuses` only looks up historical (ClickHouse-backed) statuses when the second
+  param sets `searchTransactionHistory: true`. Without it, only the short-lived head-cache tier
+  (when compiled with `--features grpc-head-cache` and enabled) is checked, so a signature that is
+  known to exist and is already indexed can still return `null`. This matches standard Solana
+  JSON-RPC semantics, not a Superbank-specific limitation.
 - `getTransaction` accepts the standard Solana config fields plus an optional Superbank extension:
   - `slot`: optional `u64`; when supplied, ClickHouse is queried directly for that exact slot and
     the response is `null` if the signature is not present in that slot.
@@ -335,6 +344,12 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--rpc-concurrency-limit` | `RPC_CONCURRENCY_LIMIT` | `512` | Maximum number of in-flight HTTP JSON-RPC envelopes. |
 | `--rpc-max-batch-size` | `RPC_MAX_BATCH_SIZE` | `64` | Maximum number of JSON-RPC calls in a single batch envelope. |
 | `--rpc-batch-concurrency-limit` | `RPC_BATCH_CONCURRENCY_LIMIT` | `8` | Max concurrent item execution within one batch envelope. |
+| `--get-inflation-reward-max-addresses` | `GET_INFLATION_REWARD_MAX_ADDRESSES` | `100` | Maximum addresses accepted by one `getInflationReward` call. `0` disables this admission check; values above 100 are rejected at startup. |
+| `--get-inflation-reward-max-concurrency` | `GET_INFLATION_REWARD_MAX_CONCURRENCY` | `20` | Maximum active `getInflationReward` ClickHouse workflows per RPC instance. Excess calls fail fast with node-unhealthy (`-32005`); `0` disables this method-level admission check. |
+| `--get-inflation-reward-query-timeout-ms` | `GET_INFLATION_REWARD_QUERY_TIMEOUT_MS` | `5000` | End-to-end ClickHouse budget for the targeted boundary and partition lookup. Must be below `RPC_REQUEST_TIMEOUT_MS`. |
+| `--get-inflation-reward-max-threads` | `GET_INFLATION_REWARD_MAX_THREADS` | `2` | ClickHouse `max_threads` applied to every reward lookup query. |
+| `--get-inflation-reward-max-memory-bytes` | `GET_INFLATION_REWARD_MAX_MEMORY_BYTES` | `536870912` | ClickHouse `max_memory_usage` applied to every reward lookup query. |
+| `--get-inflation-reward-max-bytes-to-read` | `GET_INFLATION_REWARD_MAX_BYTES_TO_READ` | `536870912` | ClickHouse `max_bytes_to_read` applied to every reward lookup query. |
 | `--emit-http-errors` | `SUPERBANK_RPC_EMIT_HTTP_ERRORS` | `false` | Return HTTP `503 Service Unavailable` for selected server-side JSON-RPC failures; response bodies are unchanged. |
 | `--host` | `RPC_HOST` | `0.0.0.0` | — |
 | `--port` | `RPC_PORT` | `8899` | — |
@@ -434,7 +449,7 @@ Additional env flags:
 | `CLICKHOUSE_QUERY_ID_PREFIX` | `superbank` | `auto` or `off`/`0`/`false` disables. |
 | `CLICKHOUSE_GSFA_STRICT_PAGINATION` | `true` | — |
 | `CLICKHOUSE_GSFA_FALLBACK_TRANSACTIONS` | disabled | `empty`/`true` for empty-only fallback; `force`/`always` for incomplete fallback. |
-| `CLICKHOUSE_DISABLE_QUERY_SETTINGS` | `false` | Disables per-query ClickHouse `SETTINGS` overrides (including shard optimization, query-cache, and query-condition-cache settings) when truthy. |
+| `CLICKHOUSE_DISABLE_QUERY_SETTINGS` | `false` | Disables per-query ClickHouse `SETTINGS` overrides (including `getInflationReward` thread, memory, read-byte, and execution-time caps) when truthy. The targeted query shape and RPC admission limits remain active. |
 
 ### ClickHouse query cache (read queries)
 

@@ -543,6 +543,7 @@ fn metrics_method_label(method: &str) -> &'static str {
         "getBlocksWithLimit" => "getBlocksWithLimit",
         "getHealth" => "getHealth",
         "getInflationReward" => "getInflationReward",
+        "getEpochSchedule" => "getEpochSchedule",
         "getFirstAvailableBlock" => "getFirstAvailableBlock",
         "minimumLedgerSlot" => "minimumLedgerSlot",
         "getTransaction" => "getTransaction",
@@ -879,6 +880,9 @@ async fn dispatch_json_rpc_request(
             "getHealth" => blocks::handle_get_health(state, id_for_dispatch, params).await,
             "getInflationReward" => {
                 blocks::handle_get_inflation_reward(state, id_for_dispatch, params).await
+            }
+            "getEpochSchedule" => {
+                blocks::handle_get_epoch_schedule(state, id_for_dispatch, params).await
             }
             "getFirstAvailableBlock" => {
                 blocks::handle_get_first_available_block(state, id_for_dispatch, params).await

@@ -74,6 +74,50 @@ pub struct RpcConfig {
     #[arg(long, env = "RPC_BATCH_CONCURRENCY_LIMIT", default_value_t = 8)]
     pub(crate) rpc_batch_concurrency_limit: usize,
 
+    /// Maximum number of addresses accepted by getInflationReward; zero disables the limit.
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_MAX_ADDRESSES",
+        default_value_t = 100
+    )]
+    pub(crate) get_inflation_reward_max_addresses: usize,
+
+    /// Maximum concurrent getInflationReward workflows; zero disables method admission control.
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_MAX_CONCURRENCY",
+        default_value_t = 20
+    )]
+    pub(crate) get_inflation_reward_max_concurrency: usize,
+
+    /// End-to-end ClickHouse budget for one getInflationReward lookup (milliseconds).
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_QUERY_TIMEOUT_MS",
+        default_value_t = 5_000
+    )]
+    pub(crate) get_inflation_reward_query_timeout_ms: u64,
+
+    /// Per-query ClickHouse thread cap for getInflationReward.
+    #[arg(long, env = "GET_INFLATION_REWARD_MAX_THREADS", default_value_t = 2)]
+    pub(crate) get_inflation_reward_max_threads: usize,
+
+    /// Per-query ClickHouse memory cap for getInflationReward (bytes).
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_MAX_MEMORY_BYTES",
+        default_value_t = 536_870_912
+    )]
+    pub(crate) get_inflation_reward_max_memory_bytes: u64,
+
+    /// Per-query ClickHouse read cap for getInflationReward (bytes).
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_MAX_BYTES_TO_READ",
+        default_value_t = 536_870_912
+    )]
+    pub(crate) get_inflation_reward_max_bytes_to_read: u64,
+
     /// Emit HTTP 503 for JSON-RPC server-side failures while keeping response bodies unchanged.
     #[arg(long, env = "SUPERBANK_RPC_EMIT_HTTP_ERRORS", default_value_t = false)]
     pub(crate) emit_http_errors: bool,
@@ -690,6 +734,52 @@ mod config_tests {
         assert!(!cfg.metrics_capture_x_rpc_node());
         assert!(!cfg.metrics_capture_x_subscription_id());
         assert!(!cfg.metrics_capture_x_account_id());
+        assert_eq!(cfg.get_inflation_reward_max_addresses, 100);
+        assert_eq!(cfg.get_inflation_reward_max_concurrency, 20);
+        assert_eq!(cfg.get_inflation_reward_query_timeout_ms, 5_000);
+        assert_eq!(cfg.get_inflation_reward_max_threads, 2);
+        assert_eq!(cfg.get_inflation_reward_max_memory_bytes, 536_870_912);
+        assert_eq!(cfg.get_inflation_reward_max_bytes_to_read, 536_870_912);
+    }
+
+    #[test]
+    fn inflation_reward_limits_parse() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-inflation-reward-max-addresses",
+            "50",
+            "--get-inflation-reward-max-concurrency",
+            "3",
+            "--get-inflation-reward-query-timeout-ms",
+            "4000",
+            "--get-inflation-reward-max-threads",
+            "4",
+            "--get-inflation-reward-max-memory-bytes",
+            "268435456",
+            "--get-inflation-reward-max-bytes-to-read",
+            "1073741824",
+        ]);
+
+        assert_eq!(cfg.get_inflation_reward_max_addresses, 50);
+        assert_eq!(cfg.get_inflation_reward_max_concurrency, 3);
+        assert_eq!(cfg.get_inflation_reward_query_timeout_ms, 4_000);
+        assert_eq!(cfg.get_inflation_reward_max_threads, 4);
+        assert_eq!(cfg.get_inflation_reward_max_memory_bytes, 268_435_456);
+        assert_eq!(cfg.get_inflation_reward_max_bytes_to_read, 1_073_741_824);
+    }
+
+    #[test]
+    fn inflation_reward_admission_limits_accept_zero_as_disabled() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-inflation-reward-max-addresses",
+            "0",
+            "--get-inflation-reward-max-concurrency",
+            "0",
+        ]);
+
+        assert_eq!(cfg.get_inflation_reward_max_addresses, 0);
+        assert_eq!(cfg.get_inflation_reward_max_concurrency, 0);
     }
 
     #[test]
