@@ -631,7 +631,7 @@ pub(crate) struct Args {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 struct FileConfig {
     source: Option<IngestSource>,
     endpoint: Option<String>,
@@ -1677,6 +1677,14 @@ mod tests {
             serde_yaml::from_str("clickhouse-async-insert: true\n").expect("parse config");
 
         assert_eq!(config.clickhouse_async_insert, Some(true));
+    }
+
+    #[test]
+    fn file_config_rejects_unknown_keys() {
+        let err = serde_yaml::from_str::<FileConfig>("fumarole-creat-consumer-group: true\n")
+            .expect_err("typo'd key should not silently parse");
+
+        assert!(err.to_string().contains("fumarole-creat-consumer-group"));
     }
 
     #[test]

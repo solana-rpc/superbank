@@ -6830,6 +6830,7 @@ dependencies = [
  "solana-account-decoder-client-types",
  "solana-clock",
  "solana-commitment-config",
+ "solana-epoch-rewards-hasher",
  "solana-rpc-client-api",
  "solana-rpc-client-types",
  "solana-sdk",
