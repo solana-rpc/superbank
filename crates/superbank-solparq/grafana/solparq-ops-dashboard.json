@@ -1123,7 +1123,7 @@
           "refId": "A"
         }
       ],
-      "title": "ClickHouse ranges deleted (legacy; disabled)",
+      "title": "ClickHouse ranges deleted",
       "type": "timeseries"
     },
     {

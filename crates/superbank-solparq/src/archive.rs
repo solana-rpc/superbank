@@ -295,6 +295,55 @@ pub fn plan_archive_slot_range(
     }))
 }
 
+/// Compute the ClickHouse slot range that is safe to delete after an archive is
+/// created.
+///
+/// Deletion always starts from slot `0`, not from the current archive's start
+/// slot: once every configured archive type has archived a slot, that slot (and
+/// everything before it) is redundant in ClickHouse regardless of which archive
+/// run first covered it. Starting from the current archive's start slot would
+/// strand older slots that were left behind when another archive type was
+/// lagging.
+///
+/// The range end (`safe_end_slot`) is the highest slot that *every* configured
+/// archive type has archived — the minimum of each type's latest archive end
+/// slot, capped at the current archive's end slot. This preserves the rule that
+/// data is only deleted once no archive type still needs it in ClickHouse. If
+/// any configured type has not produced an archive yet, nothing is safe to
+/// delete.
+pub fn safe_delete_archived_data_range(
+    config: &Config,
+    current_end_slot: u64,
+    latest_archive_names: &[(ArchiveKind, Option<String>)],
+) -> Result<Option<crate::clickhouse::SlotRange>> {
+    if !config.delete_archived_data_range {
+        return Ok(None);
+    }
+
+    let mut safe_end_slot = current_end_slot;
+    for kind in config.archive_kinds.iter().copied() {
+        let Some(latest_archive_name) = latest_archive_names
+            .iter()
+            .find(|(latest_kind, _)| *latest_kind == kind)
+            .and_then(|(_, latest_archive_name)| latest_archive_name.as_deref())
+        else {
+            return Ok(None);
+        };
+        let parsed = parse_archive_name(latest_archive_name).ok_or_else(|| {
+            anyhow!("unable to parse latest archive name '{latest_archive_name}'")
+        })?;
+        if parsed.kind_label != kind.label() {
+            return Err(anyhow!(
+                "latest archive name '{latest_archive_name}' does not match archive type '{}'",
+                kind.label()
+            ));
+        }
+        safe_end_slot = safe_end_slot.min(parsed.end_slot);
+    }
+
+    Ok(Some(crate::clickhouse::SlotRange::new(0, safe_end_slot)))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveRunReport {
     pub timestamp_unix: u64,
@@ -309,8 +358,6 @@ pub struct ArchiveRunReport {
     pub destination: String,
     pub archive_tables: Vec<ArchiveRunTable>,
     pub validation: Option<ValidationReport>,
-    /// Reserved for report/metrics compatibility. Production archive runs always
-    /// set this to `false` while automatic ClickHouse deletion is disabled.
     pub deleted_clickhouse_range: bool,
     pub cleaned_archives: Vec<String>,
     /// Operational measurements captured during the run, surfaced as Prometheus
@@ -794,14 +841,24 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             archive_kind = kind.to_string(),
             archive_name, "archive already has done marker; treating as successful"
         );
-        let cleaned_archives = if config.dry_run {
+        let (deleted_clickhouse_range, cleaned_archives) = if config.dry_run {
             info!(
                 archive_kind = kind.to_string(),
-                archive_name, "dry-run: skipping archive cleanup for already-done archive"
+                archive_name,
+                "dry-run: skipping ClickHouse range deletion and archive cleanup for already-done archive"
             );
-            Vec::new()
+            (false, Vec::new())
         } else {
-            storage::cleanup_archives(config, kind).await?
+            let deleted_clickhouse_range = maybe_delete_archived_data_range(
+                config,
+                kind,
+                &client,
+                &available_archive_tables,
+                &plan,
+            )
+            .await?;
+            let cleaned_archives = storage::cleanup_archives(config, kind).await?;
+            (deleted_clickhouse_range, cleaned_archives)
         };
         let report = ArchiveRunReport {
             timestamp_unix: unix_timestamp(),
@@ -816,7 +873,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             destination: destination.describe(),
             archive_tables,
             validation: None,
-            deleted_clickhouse_range: false,
+            deleted_clickhouse_range,
             cleaned_archives,
             run_metrics: ArchiveRunMetrics::default(),
         };
@@ -1178,6 +1235,12 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
     )
     .await?;
 
+    let delete_started = Instant::now();
+    let deleted_clickhouse_range =
+        maybe_delete_archived_data_range(config, kind, &client, &available_archive_tables, &plan)
+            .await?;
+    phase_durations.push(PhaseDuration::new("delete_range", delete_started.elapsed()));
+
     let cleanup_started = Instant::now();
     let cleaned_archives = storage::cleanup_archives(config, kind).await?;
     phase_durations.push(PhaseDuration::new("cleanup", cleanup_started.elapsed()));
@@ -1202,7 +1265,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         destination: destination.describe(),
         archive_tables,
         validation: Some(validation),
-        deleted_clickhouse_range: false,
+        deleted_clickhouse_range,
         cleaned_archives,
         run_metrics: ArchiveRunMetrics {
             phase_durations,
@@ -1224,6 +1287,48 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         "archive task completed"
     );
     Ok(report)
+}
+
+async fn maybe_delete_archived_data_range(
+    config: &Config,
+    kind: ArchiveKind,
+    client: &ClickHouseClient,
+    available_archive_tables: &[ArchiveDbTable],
+    plan: &ArchivePlan,
+) -> Result<bool> {
+    if !config.delete_archived_data_range {
+        return Ok(false);
+    }
+
+    let latest_archive_names = storage::latest_archive_names(config).await?;
+    let safe_delete_range =
+        safe_delete_archived_data_range(config, plan.end_slot, &latest_archive_names)?;
+    if let Some(range) = safe_delete_range {
+        info!(
+            archive_kind = kind.to_string(),
+            start_slot = range.start_slot,
+            end_slot = range.end_slot,
+            current_archive_start_slot = plan.start_slot,
+            current_archive_end_slot = plan.end_slot,
+            "deleting archived ClickHouse data range covered by all configured archive types"
+        );
+        client
+            .delete_archived_range_for_tables(
+                available_archive_tables,
+                range.start_slot,
+                range.end_slot,
+            )
+            .await?;
+        Ok(true)
+    } else {
+        info!(
+            archive_kind = kind.to_string(),
+            start_slot = plan.start_slot,
+            end_slot = plan.end_slot,
+            "deferring ClickHouse data cleanup until all configured archive types cover this range"
+        );
+        Ok(false)
+    }
 }
 
 fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {

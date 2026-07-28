@@ -52,9 +52,10 @@ validation results, and `run_metrics` (per-phase durations, per-table row
 counts, mismatch-repair and gap-backfill outcomes, disk/table sizes). A
 `.done.<hostname>.txt` marker is written after the archive data
 and manifest exist; if a later run sees an archive with any `.done*` marker, it
-treats that archive as already successful and still performs archive-retention
-cleanup. If the target archive bundle already exists without a `.done*` marker,
-the incomplete bundle is removed before the archive is recreated.
+treats that archive as already successful and still performs any safe
+ClickHouse cleanup that is due. If the target archive bundle already exists
+without a `.done*` marker, the incomplete bundle is removed before the archive
+is recreated.
 
 `manifest.json` carries a `format_version` (bump on schema changes) and a
 `producer` block recording the build identity of the `superbank-solparq`
@@ -379,7 +380,7 @@ Throughput and outcomes:
 | `solparq_archives_skipped_total` | counter | `archive_kind`, `reason` | Planning runs skipped, by skip reason (`not-enough-slots`, `no-data`, `user-declined`, `data-gap`, `validation-warning`, `dry-run`, `skipped`) |
 | `solparq_archive_errors_total` | counter | `archive_kind` | Archive loop errors |
 | `solparq_archives_cleaned_total` | counter | `archive_kind` | Old archive bundles pruned by retention |
-| `solparq_clickhouse_range_deleted_total` | counter | `archive_kind` | Reserved compatibility metric; automatic deletion is disabled |
+| `solparq_clickhouse_range_deleted_total` | counter | `archive_kind` | Archived ClickHouse ranges deleted |
 | `solparq_archive_rows_total` | counter | `archive_kind`, `table` | Rows archived per source table |
 | `solparq_last_archive_rows` | gauge | `archive_kind` | Rows written in the most recent archive |
 | `solparq_last_archive_bytes` | gauge | `archive_kind` | Bytes written in the most recent archive (local destinations only) |
@@ -388,7 +389,7 @@ Latency (histograms, seconds):
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
-| `solparq_phase_duration_seconds` | histogram | `archive_kind`, `phase` | Per-phase archive latency. Phases: `validate`, `repair`, `backfill`, `write`, `dry_run_count`, `cleanup`, `total` |
+| `solparq_phase_duration_seconds` | histogram | `archive_kind`, `phase` | Per-phase archive latency. Phases: `validate`, `repair`, `backfill`, `write`, `dry_run_count`, `delete_range`, `cleanup`, `total` |
 
 Data quality — validation issues are split by `category` so a dashboard can
 separate actionable gaps from expected leader gaps and other problems:
@@ -568,8 +569,9 @@ timeline. The `/status` JSON endpoint also reports `version` and `git_sha`.
 On shutdown, `superbank-solparq` handles `Ctrl+C` and `SIGTERM` gracefully. The first
 shutdown signal stops new archive tasks from starting and waits for any archive
 currently being written to finish, including parallel archive tasks, their
-reports, and cleanup. Press `Ctrl+C` again, or send another `SIGTERM`, to abort
-immediately without waiting for active archive tasks.
+reports, cleanup, and optional ClickHouse delete steps. Press `Ctrl+C` again,
+or send another `SIGTERM`, to abort immediately without waiting for active
+archive tasks.
 
 ## Archive Ranges
 
@@ -605,7 +607,8 @@ boundaries. Notes:
 - Aligning skips any leading partial window: if the earliest slot is `10_500`, the
   first `custom:1000` archive is `11000-11999` and slots `10_500–10_999` are not
   archived by this kind — the same trade-off `epoch` already makes for a partial
-  leading epoch.
+  leading epoch. Take care when `custom` is the only configured kind combined with
+  `--delete-archived-data-range`.
 - Enabling it on an existing unaligned custom history realigns forward from the
   next boundary after the last archive.
 
@@ -716,6 +719,7 @@ normally, but a dry run never:
 - writes Parquet files, `manifest.json`, `SHA256SUMS.txt`, or a `.done*` marker
 - runs the `--repair-mismatches` `OPTIMIZE ... DEDUPLICATE` step
 - runs the `--backfill-gaps` RPC backfill subprocess
+- deletes the archived ClickHouse range (`--delete-archived-data-range`)
 - prunes old archives (`--archives-to-keep`)
 
 The one-shot report (and, in `--server-mode`, the ops dashboard/metrics) shows
@@ -734,16 +738,35 @@ non-interactive real run would require: `--force-archive`).
 --archives-to-keep 10
 ```
 
-Automatic ClickHouse deletion is currently disabled. Passing
-`--delete-archived-data-range` fails during configuration with an actionable
-error. Archive export and ClickHouse mutation queries cannot share a writer
-fence, so concurrent ingestion or backfill could otherwise insert a row after
-its table was exported and have that unarchived row deleted.
+To delete the archived ClickHouse data range after a successful archive:
 
-Until every writer can honor a durable archive watermark, reclaim ClickHouse
-space only through an operator-reviewed offline procedure: stop all ingestion
-and backfill writers, verify the completed archive bundles, and target the
-shard-local tables explicitly on clustered deployments.
+```bash
+--delete-archived-data-range
+```
+
+When multiple archive types are configured, ClickHouse data deletion is gated by
+the completed archive high-watermark for every configured type. After any
+archive succeeds, `superbank-solparq` checks the latest completed archive for each type
+and deletes everything from the beginning of the table up to the highest slot
+that all configured types have already covered. Sweeping from slot `0` (rather
+than only the current archive's range) ensures no older slots are stranded when
+one archive type was lagging while an earlier range was written. For example, if
+`custom:500` and `hourly` are both configured, early `custom:500` archives will
+defer deletion until an `hourly` archive covers the same slots. Once the
+`hourly` archive exists, later `custom:500` completions can delete every slot up
+to their safe high-watermark without waiting for another hourly cycle.
+
+That deletes matching slots from:
+
+- `transactions`
+- `blocks_metadata`
+- `entries`
+- `gsfa`
+- `gsfa_hot`
+- `signatures`
+- `token_owner_activity`
+
+Optional tables are deleted only when they were available for the archive run.
 
 ## Options
 

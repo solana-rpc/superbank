@@ -535,7 +535,7 @@ impl Metrics {
         );
         registry.register(
             "clickhouse_range_deleted",
-            "Reserved compatibility metric for ClickHouse archive-range deletion by archive kind",
+            "Archived ClickHouse slot ranges deleted after archiving by archive kind",
             clickhouse_range_deleted_total.clone(),
         );
         registry.register(
