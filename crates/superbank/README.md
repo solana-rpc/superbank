@@ -65,6 +65,11 @@ has occurred within `HEALTH_STALE_SECS` seconds (default: 120). Set `HEALTH_STAL
 disable staleness checking. Set `METRICS_CLUSTER_LABEL` to attach a static `cluster="..."` label
 to every ingestor metric.
 
+For a portable Grafana view of these metrics, import the
+[`Superbank Ingest` dashboard](../../deploy/grafana/dashboards/superbank-ingest.json). It supports
+all four ingest sources, an optional Fumarole backpressure tab, and an optional ClickHouse server
+tab when the selected Prometheus datasource also contains ClickHouse metrics.
+
 Minimal example (RPC source):
 
 ```bash
@@ -215,7 +220,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
   `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
   `superbank_ingest_fumarole_rss_bytes`, and
-  `superbank_ingest_fumarole_pressure_flushes_total`.
+  `superbank_ingest_fumarole_pressure_flushes_total_total`.
 - The ingestor writes **distributed** tables by default. Set table names if you want shard-local writes.
 - Fumarole ingest commits consumer-group progress only after pending ClickHouse rows have been flushed. Set `fumarole-no-commit: true` only for diagnostics.
 - Fumarole ingest applies a memory soft limit guard by default. When sampled RSS or Superbank's
