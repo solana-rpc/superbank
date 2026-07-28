@@ -238,6 +238,5 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - RPC and Bigtable modes do not currently populate the `entries` table because those sources do not expose the per-entry payload Superbank needs.
 - Bigtable epoch ranges use the RPC epoch schedule to resolve epochs to slots; provide `RPC_URL` when using `1-10` or single-epoch ranges.
 - Bigtable slot lists do not require `RPC_URL` because slots are explicit.
-- When `RPC_URL` is set, the ingestor also fetches the cluster's epoch schedule at startup and stores it in the `epoch_schedule` table, so the RPC can compute epoch fields correctly on non-mainnet (warmup) clusters. Without an RPC URL, no schedule is stored and the RPC falls back to the mainnet schedule.
 - Superbank forces `async_insert=0` by default for ClickHouse writes; enable `--clickhouse-async-insert`
   only when your ClickHouse profile and dependent materialized views support it.

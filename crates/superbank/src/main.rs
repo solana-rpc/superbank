@@ -55,10 +55,6 @@ async fn main() -> Result<()> {
         axum::serve(metrics_listener, app).await
     });
 
-    if let Err(err) = clickhouse::ingest_epoch_schedule(&args).await {
-        warn!("failed to ingest epoch schedule: {err}");
-    }
-
     let ingest_result = match args.source {
         cli::IngestSource::Fumarole => ingest::fumarole::run_fumarole_ingest(&args).await,
         cli::IngestSource::Grpc => ingest::grpc::run_grpc_ingest(&args).await,

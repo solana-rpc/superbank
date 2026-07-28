@@ -81,16 +81,10 @@ Required files in the chosen set:
 Optional:
 - `gsfa_hot.sql` when using hot-address routing.
 - `token_owner_activity.sql` when using token-owner filters in `getTransactionsForAddress`.
-- `epoch_schedule.sql` for warmup-aware epoch math on non-mainnet clusters (see the note below).
 
 Apply `transactions.sql` before the materialized-view schemas (`gsfa*.sql`, `signatures.sql`, and
 `token_owner_activity.sql`) because those views read from the transactions table. If you use
 `gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then apply `gsfa_hot.sql`.
-
-The RPC reads the cluster's epoch schedule from the `epoch_schedule` table at startup for
-warmup-aware epoch math (currently `getInflationReward`). If the table is absent or empty, it
-defaults to the mainnet schedule (no warmup). Non-mainnet clusters must run the ingestor with
-`RPC_URL` set so the real schedule gets stored.
 
 ## Run
 
@@ -347,6 +341,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--port` | `RPC_PORT` | `8899` | — |
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
+| `--genesis-path` | `GENESIS_PATH` | empty | Path to the cluster's `genesis.bin`. When set, the epoch schedule is read from it for warmup-aware epoch math, and the server fails to start if the file can't be read or parsed. When empty, the default no-warmup schedule (432000 slots) is used, which matches mainnet, testnet, and devnet. |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |
 | `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Only available with `--features grpc-streaming`; enables the gRPC endpoint at runtime. |
 | `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Only available with `--features grpc-streaming`. |

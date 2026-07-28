@@ -13,9 +13,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::cli::Args;
-use crate::commitment::parse_commitment_config;
 use crate::metrics;
-use crate::rpc_client::build_rpc_client;
 
 #[derive(Row, Serialize)]
 pub(crate) struct TransactionRow {
@@ -115,15 +113,6 @@ pub(crate) struct EntryRow {
     pub(crate) hash: Array<u8, 32>,
 }
 
-#[derive(Row, Serialize)]
-struct EpochScheduleRow {
-    slots_per_epoch: u64,
-    leader_schedule_slot_offset: u64,
-    warmup: u8,
-    first_normal_epoch: u64,
-    first_normal_slot: u64,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct ProgressSnapshot {
     pub(crate) processed: u64,
@@ -150,42 +139,6 @@ impl InsertTables {
             entries_table: args.entries_table.clone(),
         }
     }
-}
-
-pub(crate) async fn ingest_epoch_schedule(args: &Args) -> Result<()> {
-    let Some(rpc_url) = &args.rpc_url else {
-        tracing::info!(
-            "RPC_URL not set, skipping epoch schedule ingest (RPC will fall back to the mainnet schedule)"
-        );
-        return Ok(());
-    };
-
-    let commitment = parse_commitment_config(&args.commitment)?;
-    let rpc = build_rpc_client(
-        rpc_url,
-        commitment,
-        args.rpc_timeout_secs,
-        args.rpc_max_inflight.max(1),
-    )?;
-    let schedule = rpc.get_epoch_schedule().await?;
-
-    let client = build_clickhouse_client(args);
-    let row = EpochScheduleRow {
-        slots_per_epoch: schedule.slots_per_epoch,
-        leader_schedule_slot_offset: schedule.leader_schedule_slot_offset,
-        warmup: schedule.warmup as u8,
-        first_normal_epoch: schedule.first_normal_epoch,
-        first_normal_slot: schedule.first_normal_slot,
-    };
-    insert_rows(&client, "epoch_schedule", &[row]).await?;
-
-    info!(
-        slots_per_epoch = schedule.slots_per_epoch,
-        warmup = schedule.warmup,
-        "ingested epoch schedule"
-    );
-
-    Ok(())
 }
 
 pub(crate) fn build_clickhouse_client(args: &Args) -> ClickHouseClient {

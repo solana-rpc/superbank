@@ -8,6 +8,8 @@ use axum::{
     routing::{get, post},
 };
 use hyper::Error as HyperError;
+use solana_epoch_schedule::EpochSchedule;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -23,6 +25,7 @@ use crate::clickhouse::{
 use crate::config::{
     ClickHouseScope, ClickHouseTransport, RpcConfig, has_usable_gsfa_hot_addresses,
 };
+use crate::genesis;
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::metrics;
 use crate::metrics::metrics_handler;
@@ -176,7 +179,32 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     // Verify ClickHouse connection
     clickhouse.create_tables().await?;
 
-    let epoch_schedule = clickhouse.load_epoch_schedule().await;
+    let epoch_schedule = match args
+        .genesis_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(path) => {
+            let schedule = genesis::load_epoch_schedule(Path::new(path)).map_err(|err| {
+                RpcError::Config(format!(
+                    "failed to load epoch schedule from genesis file '{path}': {err}"
+                ))
+            })?;
+            info!(
+                slots_per_epoch = schedule.slots_per_epoch,
+                warmup = schedule.warmup,
+                "loaded epoch schedule from genesis file"
+            );
+            schedule
+        }
+        None => {
+            warn!(
+                "no --genesis-path set; using the default no-warmup epoch schedule (matches mainnet/testnet/devnet); set --genesis-path for clusters with a warmup schedule"
+            );
+            EpochSchedule::without_warmup()
+        }
+    };
 
     if let Err(err) = metrics::force_init() {
         warn!("Metrics initialization failed; metrics disabled: {err}");

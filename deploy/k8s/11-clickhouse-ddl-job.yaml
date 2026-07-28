@@ -50,7 +50,6 @@ spec:
           clickhouse-client --host clickhouse --user "${CLICKHOUSE_USER}" --password "${CLICKHOUSE_PASSWORD}" --multiquery < /ddl/gsfa_hot.sql
           clickhouse-client --host clickhouse --user "${CLICKHOUSE_USER}" --password "${CLICKHOUSE_PASSWORD}" --multiquery < /ddl/signatures.sql
           clickhouse-client --host clickhouse --user "${CLICKHOUSE_USER}" --password "${CLICKHOUSE_PASSWORD}" --multiquery < /ddl/token_owner_activity.sql
-          clickhouse-client --host clickhouse --user "${CLICKHOUSE_USER}" --password "${CLICKHOUSE_PASSWORD}" --multiquery < /ddl/epoch_schedule.sql
           echo "DDL applied."
         volumeMounts:
         - name: ddl

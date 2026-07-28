@@ -92,6 +92,10 @@ pub struct RpcConfig {
     #[arg(long, env = "METRICS_PORT", default_value = "9900")]
     pub(crate) metrics_port: u16,
 
+    /// Path to the cluster's `genesis.bin`, read at startup for the epoch schedule
+    #[arg(long, env = "GENESIS_PATH")]
+    pub(crate) genesis_path: Option<String>,
+
     // --- Optional Superbank gRPC streaming API ---
     #[cfg(feature = "grpc-streaming")]
     /// Enable the Superbank gRPC streaming API.

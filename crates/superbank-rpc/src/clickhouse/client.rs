@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use clickhouse::{Client as HttpClient, Row};
+use clickhouse::Client as HttpClient;
 use clickhouse_rs::{
     Block as TcpBlock,
     types::{Complex as TcpComplex, Query as TcpQuery},
@@ -16,7 +16,6 @@ use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use reqwest::Url;
 use serde::Deserialize;
-use solana_epoch_schedule::EpochSchedule;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::Semaphore;
 
@@ -1890,58 +1889,6 @@ impl ClickHouseClient {
             topology.shards.len(),
             sample
         )))
-    }
-
-    pub async fn load_epoch_schedule(&self) -> EpochSchedule {
-        #[derive(Deserialize, Row)]
-        struct EpochScheduleRow {
-            slots_per_epoch: u64,
-            leader_schedule_slot_offset: u64,
-            warmup: u8,
-            first_normal_epoch: u64,
-            first_normal_slot: u64,
-        }
-
-        let query = "SELECT slots_per_epoch, leader_schedule_slot_offset, warmup, \
-                    first_normal_epoch, first_normal_slot FROM epoch_schedule LIMIT 1";
-        match self
-            .with_timeout("load_epoch_schedule", async {
-                self.client
-                    .query(query)
-                    .fetch_optional::<EpochScheduleRow>()
-                    .await
-                    .map_err(|e| ProcessingError::database(e.to_string(), e))
-            })
-            .await
-        {
-            Ok(Some(row)) => {
-                let schedule = EpochSchedule {
-                    slots_per_epoch: row.slots_per_epoch,
-                    leader_schedule_slot_offset: row.leader_schedule_slot_offset,
-                    warmup: row.warmup != 0,
-                    first_normal_epoch: row.first_normal_epoch,
-                    first_normal_slot: row.first_normal_slot,
-                };
-                tracing::info!(
-                    warmup = row.warmup,
-                    slots_per_epoch = row.slots_per_epoch,
-                    "loaded epoch schedule from ClickHouse"
-                );
-                schedule
-            }
-            Ok(None) => {
-                tracing::info!(
-                    "epoch_schedule table empty; defaulting to mainnet (without_warmup)"
-                );
-                EpochSchedule::without_warmup()
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to read epoch_schedule table: {e}; defaulting to mainnet (without_warmup)"
-                );
-                EpochSchedule::without_warmup()
-            }
-        }
     }
 }
 
