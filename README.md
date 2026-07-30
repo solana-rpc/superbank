@@ -184,6 +184,8 @@ curl -sS http://localhost:8899 \
   Fumarole ingest includes a default memory soft-limit backpressure guard; set
   `fumarole-memory-soft-limit-bytes: 0` only if you want to disable it.
 - `superbank-rpc` is configured via CLI flags and environment variables.
+  It can also read RPC parameter filters from the shared YAML file when started
+  with `--config superbank.yaml` / `SUPERBANK_CONFIG=superbank.yaml`.
   See `crates/superbank-rpc/README.md`.
 
 ## Docker local development

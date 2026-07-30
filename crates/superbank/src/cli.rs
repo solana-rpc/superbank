@@ -633,6 +633,8 @@ pub(crate) struct Args {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 struct FileConfig {
+    #[serde(rename = "rpc-parameter-filters")]
+    _rpc_parameter_filters: Option<Vec<Vec<serde_json::Value>>>,
     source: Option<IngestSource>,
     endpoint: Option<String>,
     #[serde(alias = "x_token")]
@@ -1685,6 +1687,25 @@ mod tests {
             .expect_err("typo'd key should not silently parse");
 
         assert!(err.to_string().contains("fumarole-creat-consumer-group"));
+    }
+
+    #[test]
+    fn file_config_accepts_rpc_parameter_filters() {
+        let config = serde_yaml::from_str::<FileConfig>(
+            r#"
+rpc-parameter-filters:
+  - [getTransactionsForAddress, So11111111111111111111111111111111111111112]
+"#,
+        )
+        .expect("parse shared config");
+
+        assert_eq!(
+            config
+                ._rpc_parameter_filters
+                .as_ref()
+                .map(|filters| filters.len()),
+            Some(1)
+        );
     }
 
     #[test]

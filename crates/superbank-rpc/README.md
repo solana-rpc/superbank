@@ -102,6 +102,29 @@ CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
 cargo run -p superbank-rpc --
 ```
 
+## Exact method and parameter filters
+
+`superbank-rpc` can reject configured method and parameter combinations before they enter handler
+dispatch or use any cache or ClickHouse resources. Pass the shared YAML configuration with
+`--config superbank.yaml` or `SUPERBANK_CONFIG=superbank.yaml` and add:
+
+```yaml
+rpc-parameter-filters:
+  - [getTransactionsForAddress, So11111111111111111111111111111111111111112]
+  - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
+```
+
+Each entry contains the case-sensitive method followed by its complete parameter array. Matching
+is structural and exact: parameter count, array order, JSON types, and values must match; mapping
+key order does not matter. Extra parameters do not match. A method-only entry matches an explicitly
+empty `params: []` array; omitted `params` is distinct.
+
+A matching call returns HTTP `405 Method Not Allowed` and preserves the request ID in a JSON-RPC
+error with code `-32601` and message `Method not allowed`. In a mixed batch, allowed calls still
+execute and matched calls receive individual errors in their original positions; the batch HTTP
+status is 405 if any item matched. Filters are validated and indexed once at startup, so changing
+the file requires restarting `superbank-rpc`.
+
 ## Optional Superbank gRPC streaming (`grpc-streaming`)
 
 When compiled with `--features grpc-streaming` and enabled at runtime, superbank-rpc serves a

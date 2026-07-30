@@ -56,6 +56,7 @@ use crate::hydration::{
     parse_transaction_error_display,
 };
 use crate::metrics;
+use crate::request_filter::RpcParameterFilterSet;
 use crate::rpc::json_rpc_error_response;
 use crate::rpc::types::{JsonRpcRequest, JsonRpcResponse as JsonRpcResponseGeneric};
 use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHeaderCaptureConfig};
@@ -154,6 +155,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
 
     Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
@@ -174,6 +176,16 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
 
 fn test_state() -> Arc<AppState> {
     test_state_with_token_owner_activity_available(true)
+}
+
+fn test_state_with_parameter_filters(entries: Vec<Vec<Value>>) -> Arc<AppState> {
+    let mut state = match Arc::try_unwrap(test_state()) {
+        Ok(state) => state,
+        Err(_) => panic!("test_state should have a single Arc owner"),
+    };
+    state.rpc_parameter_filters =
+        RpcParameterFilterSet::from_entries(entries, None).expect("valid test filters");
+    Arc::new(state)
 }
 
 fn test_state_with_metrics_header_capture(capture: MetricsHeaderCaptureConfig) -> Arc<AppState> {
@@ -235,6 +247,7 @@ fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
 
     Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
@@ -292,6 +305,7 @@ async fn test_state_with_clickhouse_cached_signature_slot(
 
     Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
@@ -341,6 +355,7 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
 
     Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
@@ -392,6 +407,7 @@ fn test_state_with_head_cache_and_clickhouse_url(
 
     Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
@@ -450,6 +466,7 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
 
     Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
@@ -3507,6 +3524,78 @@ async fn handle_json_rpc_method_not_found_returns_json_rpc_error() {
 }
 
 #[tokio::test]
+async fn parameter_filter_returns_http_405_before_handler_dispatch() {
+    let address = "So11111111111111111111111111111111111111112";
+    let state = test_state_with_parameter_filters(vec![vec![
+        json!("getTransactionsForAddress"),
+        json!(address),
+        json!({"transactionDetails": "signatures"}),
+    ]]);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "getTransactionsForAddress",
+        "params": [address, {"transactionDetails": "signatures"}]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.id, json!(42));
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32601);
+    assert_eq!(err.message, "Method not allowed");
+    assert!(err.data.is_none());
+}
+
+#[tokio::test]
+async fn parameter_filter_requires_complete_param_equality() {
+    let address = "So11111111111111111111111111111111111111112";
+    let state = test_state_with_parameter_filters(vec![vec![
+        json!("getTransactionsForAddress"),
+        json!(address),
+    ]]);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "getTransactionsForAddress",
+        "params": [address, {"transactionDetails": "signatures"}]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_ne!(
+        parsed
+            .error
+            .expect("handler error proves dispatch occurred")
+            .message,
+        "Method not allowed"
+    );
+}
+
+#[tokio::test]
+async fn parameter_filter_does_not_override_invalid_request_errors() {
+    let state = test_state_with_parameter_filters(vec![vec![json!("unknownMethod"), json!(1)]]);
+    let request = json!({
+        "jsonrpc": "1.0",
+        "id": 7,
+        "method": "unknownMethod",
+        "params": [1]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(response).await;
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32600);
+    assert_eq!(err.message, "Invalid JSON-RPC version");
+}
+
+#[tokio::test]
 async fn handle_json_rpc_minimum_ledger_slot_routes_to_handler() {
     let state = test_state_with_clickhouse_url("http://127.0.0.1:1");
 
@@ -3643,6 +3732,40 @@ async fn handle_json_rpc_batch_preserves_input_order() {
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].get("id"), Some(&json!(1)));
     assert_eq!(results[1].get("id"), Some(&json!(2)));
+}
+
+#[tokio::test]
+async fn parameter_filter_marks_mixed_batch_405_and_executes_allowed_items() {
+    let state =
+        test_state_with_parameter_filters(vec![vec![json!("blockedMethod"), json!("blocked")]]);
+    let request = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "blockedMethod",
+            "params": ["blocked"]
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "unknownMethod",
+            "params": []
+        }
+    ]);
+
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let parsed = parse_json_value_response(response).await;
+    let results = parsed.as_array().expect("batch response array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["id"], json!(1));
+    assert_eq!(results[0]["error"]["message"], json!("Method not allowed"));
+    assert_eq!(results[1]["id"], json!(2));
+    assert_eq!(
+        results[1]["error"]["message"],
+        json!("Method not found: unknownMethod")
+    );
 }
 
 #[tokio::test]

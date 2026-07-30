@@ -3,7 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::str::FromStr;
+use std::{path::PathBuf, str::FromStr};
 
 use clap::{ArgAction, Parser};
 use solana_sdk::pubkey::Pubkey;
@@ -54,6 +54,10 @@ pub enum PyroscopeCompression {
     about = "Solana RPC server serving data from ClickHouse"
 )]
 pub struct RpcConfig {
+    /// Path to the shared YAML configuration file.
+    #[arg(long, env = "SUPERBANK_CONFIG", value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
+
     /// Maximum accepted JSON-RPC request body size (bytes).
     #[arg(long, env = "RPC_MAX_BODY_BYTES", default_value_t = 1_048_576)]
     pub(crate) rpc_max_body_bytes: usize,
@@ -740,6 +744,17 @@ mod config_tests {
         assert_eq!(cfg.get_inflation_reward_max_threads, 2);
         assert_eq!(cfg.get_inflation_reward_max_memory_bytes, 536_870_912);
         assert_eq!(cfg.get_inflation_reward_max_bytes_to_read, 536_870_912);
+    }
+
+    #[test]
+    fn shared_config_path_flag_parses() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--config", "superbank.yaml"]);
+
+        assert_eq!(
+            cfg.config.as_deref(),
+            Some(std::path::Path::new("superbank.yaml"))
+        );
     }
 
     #[test]
