@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
         cli::IngestSource::Grpc => ingest::grpc::run_grpc_ingest(&args).await,
         cli::IngestSource::Rpc => ingest::rpc::run_rpc_ingest(&args).await,
         cli::IngestSource::Bigtable => ingest::bigtable::run_bigtable_ingest(&args).await,
+        cli::IngestSource::Solparq => ingest::solparq::run_solparq_ingest(&args).await,
     };
 
     metrics_server.abort();

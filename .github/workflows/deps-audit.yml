@@ -31,4 +31,8 @@ jobs:
           # solana-storage-bigtable 4.0.0-rc.0 -> tonic 0.9.2 -> rustls 0.21; no newer
           # solana-storage-bigtable release is available yet.
           # RUSTSEC-2026-0097 is inherited from upstream rand 0.8/0.9 dependency chains.
-          ignore: RUSTSEC-2024-0375,RUSTSEC-2025-0012,RUSTSEC-2025-0141,RUSTSEC-2024-0388,RUSTSEC-2024-0384,RUSTSEC-2024-0436,RUSTSEC-2025-0134,RUSTSEC-2021-0145,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0097
+          # RUSTSEC-2026-0194/RUSTSEC-2026-0195 are quick-xml 0.39 DoS/perf issues reached only
+          # through parquet 59 -> object_store 0.13 -> quick-xml 0.39. The fix (quick-xml >=0.41)
+          # requires object_store 0.14, which no released parquet depends on yet (latest is 59.1.0,
+          # still object_store ^0.13.2). Remove once parquet 60 / object_store 0.14 lands.
+          ignore: RUSTSEC-2024-0375,RUSTSEC-2025-0012,RUSTSEC-2025-0141,RUSTSEC-2024-0388,RUSTSEC-2024-0384,RUSTSEC-2024-0436,RUSTSEC-2025-0134,RUSTSEC-2021-0145,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0097,RUSTSEC-2026-0194,RUSTSEC-2026-0195
