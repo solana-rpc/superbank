@@ -520,7 +520,7 @@ Prometheus metrics are served at `/metrics` on `METRICS_HOST:METRICS_PORT`.
 
 Route normalization metric:
 
-- `superbank_rpc_route_total{method,transport,scope,source,head_cache_read,disk_cache_read,outcome,x_endpoint,x_rpc_node,x_subscription_id,x_account_id}`
+- `superbank_rpc_route_total_total{method,transport,scope,source,head_cache_read,disk_cache_read,outcome,x_endpoint,x_rpc_node,x_subscription_id,x_account_id}`
   - `method`: supported JSON-RPC method name.
   - `transport`: `tcp|http` (active ClickHouse routing transport policy).
   - `scope`: `distributed|shard_direct` (active ClickHouse routing scope policy).
