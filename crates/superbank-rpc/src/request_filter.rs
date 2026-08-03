@@ -22,6 +22,8 @@ struct RpcFileConfig {
 ///
 /// The first lookup excludes unfiltered methods. The arity lookup then excludes
 /// differently-shaped calls before any structural JSON comparisons are needed.
+/// Single-address filters for address-history methods also match requests with
+/// trailing configuration parameters.
 #[derive(Debug, Default)]
 pub(crate) struct RpcParameterFilterSet {
     by_method_and_arity: HashMap<String, HashMap<usize, Vec<Vec<Value>>>>,
@@ -48,10 +50,17 @@ impl RpcParameterFilterSet {
         let Some(params) = params else {
             return false;
         };
-        self.by_method_and_arity
-            .get(method)
-            .and_then(|by_arity| by_arity.get(&params.len()))
+        let Some(by_arity) = self.by_method_and_arity.get(method) else {
+            return false;
+        };
+        if by_arity
+            .get(&params.len())
             .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == params))
+        {
+            return true;
+        }
+
+        Self::matches_address_wide_filter(method, params, by_arity)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -103,6 +112,28 @@ impl RpcParameterFilterSet {
             source.display()
         )
     }
+
+    fn matches_address_wide_filter(
+        method: &str,
+        params: &[Value],
+        by_arity: &HashMap<usize, Vec<Vec<Value>>>,
+    ) -> bool {
+        if !matches!(
+            method,
+            "getSignaturesForAddress" | "getTransactionsForAddress"
+        ) {
+            return false;
+        }
+        let Some(address) = params.first().and_then(Value::as_str) else {
+            return false;
+        };
+
+        by_arity.get(&1).is_some_and(|candidates| {
+            candidates
+                .iter()
+                .any(|candidate| candidate.first().and_then(Value::as_str) == Some(address))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +180,32 @@ mod tests {
         ]]);
 
         assert!(filters.matches("getThing", Some(&[json!({"second": 2, "first": 1})])));
+    }
+
+    #[test]
+    fn address_only_filters_match_trailing_configs_for_address_history_methods() {
+        let address = "ComputeBudget111111111111111111111111111111";
+        let filters = filters(vec![
+            vec![json!("getSignaturesForAddress"), json!(address)],
+            vec![json!("getTransactionsForAddress"), json!(address)],
+        ]);
+
+        for method in ["getSignaturesForAddress", "getTransactionsForAddress"] {
+            assert!(filters.matches(method, Some(&[json!(address)])));
+            assert!(filters.matches(method, Some(&[json!(address), json!({"limit": 25})])));
+            assert!(!filters.matches(method, Some(&[json!("other-address"), json!({})])));
+        }
+    }
+
+    #[test]
+    fn address_wide_matching_requires_a_string_address() {
+        let filters = filters(vec![vec![json!("getSignaturesForAddress"), json!(42)]]);
+
+        assert!(filters.matches("getSignaturesForAddress", Some(&[json!(42)])));
+        assert!(!filters.matches(
+            "getSignaturesForAddress",
+            Some(&[json!(42), json!({"limit": 10})])
+        ));
     }
 
     #[test]

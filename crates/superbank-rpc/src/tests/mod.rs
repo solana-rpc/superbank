@@ -3550,8 +3550,8 @@ async fn parameter_filter_returns_http_405_before_handler_dispatch() {
 }
 
 #[tokio::test]
-async fn parameter_filter_requires_complete_param_equality() {
-    let address = "So11111111111111111111111111111111111111112";
+async fn address_only_parameter_filter_matches_trailing_config() {
+    let address = "ComputeBudget111111111111111111111111111111";
     let state = test_state_with_parameter_filters(vec![vec![
         json!("getTransactionsForAddress"),
         json!(address),
@@ -3565,13 +3565,11 @@ async fn parameter_filter_requires_complete_param_equality() {
 
     let response = handle_json_rpc_value(state, &request).await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     let parsed = parse_json_rpc_response(response).await;
-    assert_ne!(
-        parsed
-            .error
-            .expect("handler error proves dispatch occurred")
-            .message,
+    assert_eq!(parsed.id, json!(42));
+    assert_eq!(
+        parsed.error.expect("filter error present").message,
         "Method not allowed"
     );
 }

@@ -102,7 +102,7 @@ CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
 cargo run -p superbank-rpc --
 ```
 
-## Exact method and parameter filters
+## Method and parameter filters
 
 `superbank-rpc` can reject configured method and parameter combinations before they enter handler
 dispatch or use any cache or ClickHouse resources. Pass the shared YAML configuration with
@@ -110,14 +110,20 @@ dispatch or use any cache or ClickHouse resources. Pass the shared YAML configur
 
 ```yaml
 rpc-parameter-filters:
-  - [getTransactionsForAddress, So11111111111111111111111111111111111111112]
+  - [getSignaturesForAddress, ComputeBudget111111111111111111111111111111]
+  - [getTransactionsForAddress, ComputeBudget111111111111111111111111111111]
   - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
 ```
 
-Each entry contains the case-sensitive method followed by its complete parameter array. Matching
-is structural and exact: parameter count, array order, JSON types, and values must match; mapping
-key order does not matter. Extra parameters do not match. A method-only entry matches an explicitly
-empty `params: []` array; omitted `params` is distinct.
+Each entry contains the case-sensitive method followed by its complete parameter array. Except for
+the address-wide form below, matching is structural and exact: parameter count, array order, JSON
+types, and values must match; mapping key order does not matter. Extra parameters do not match. A
+method-only entry matches an explicitly empty `params: []` array; omitted `params` is distinct.
+
+There is one address-wide form: an entry containing only `getSignaturesForAddress` or
+`getTransactionsForAddress` and a string address matches that address as the first request
+parameter regardless of any trailing configuration object. Add one entry for each method to block
+both forms of address-history lookup. Full entries for these methods remain exact.
 
 A matching call returns HTTP `405 Method Not Allowed` and preserves the request ID in a JSON-RPC
 error with code `-32601` and message `Method not allowed`. In a mixed batch, allowed calls still
