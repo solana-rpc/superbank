@@ -3575,6 +3575,40 @@ async fn address_only_parameter_filter_matches_trailing_config() {
 }
 
 #[tokio::test]
+async fn cursor_parameter_filter_allows_null_pagination_token() {
+    let address = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+    let state = test_state_with_parameter_filters(vec![vec![
+        json!("getTransactionsForAddress"),
+        json!(address),
+        json!({"limit": 25, "paginationToken": "ignored"}),
+    ]]);
+    let blocked_request = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "getTransactionsForAddress",
+        "params": [address, {"limit": 0, "paginationToken": "present"}]
+    });
+    let null_cursor_request = json!({
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "getTransactionsForAddress",
+        "params": [address, {"limit": 0, "paginationToken": null}]
+    });
+
+    let blocked_response = handle_json_rpc_value(state.clone(), &blocked_request).await;
+    let null_cursor_response = handle_json_rpc_value(state, &null_cursor_request).await;
+
+    assert_eq!(blocked_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(null_cursor_response.status(), StatusCode::OK);
+    let parsed = parse_json_rpc_response(null_cursor_response).await;
+    assert_eq!(parsed.id, json!(43));
+    assert_ne!(
+        parsed.error.expect("invalid limit error present").message,
+        "Method not allowed"
+    );
+}
+
+#[tokio::test]
 async fn parameter_filter_does_not_override_invalid_request_errors() {
     let state = test_state_with_parameter_filters(vec![vec![json!("unknownMethod"), json!(1)]]);
     let request = json!({

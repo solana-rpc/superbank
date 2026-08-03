@@ -112,6 +112,8 @@ dispatch or use any cache or ClickHouse resources. Pass the shared YAML configur
 rpc-parameter-filters:
   - [getSignaturesForAddress, ComputeBudget111111111111111111111111111111]
   - [getTransactionsForAddress, ComputeBudget111111111111111111111111111111]
+  - [getSignaturesForAddress, Vote111111111111111111111111111111111111111, {before: any}]
+  - [getTransactionsForAddress, MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr, {paginationToken: any}]
   - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
 ```
 
@@ -123,7 +125,15 @@ method-only entry matches an explicitly empty `params: []` array; omitted `param
 There is one address-wide form: an entry containing only `getSignaturesForAddress` or
 `getTransactionsForAddress` and a string address matches that address as the first request
 parameter regardless of any trailing configuration object. Add one entry for each method to block
-both forms of address-history lookup. Full entries for these methods remain exact.
+both forms of address-history lookup. Entries with a config object use the exact or
+cursor-conditional behavior described below.
+
+There is also a cursor-conditional address form. A three-value `getSignaturesForAddress` entry
+whose config object contains `before` or `until` matches that address whenever either request
+cursor is present and non-null. A `getTransactionsForAddress` entry containing `paginationToken`
+does the same for a non-null pagination token. The values and all other fields in the filter's
+config object are markers only and are ignored, as are unrelated fields in the request config.
+Missing and JSON `null` cursors do not match. Full entries without these cursor keys remain exact.
 
 A matching call returns HTTP `405 Method Not Allowed` and preserves the request ID in a JSON-RPC
 error with code `-32601` and message `Method not allowed`. In a mixed batch, allowed calls still

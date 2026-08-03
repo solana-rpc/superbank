@@ -4,7 +4,7 @@
  */
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -24,9 +24,12 @@ struct RpcFileConfig {
 /// differently-shaped calls before any structural JSON comparisons are needed.
 /// Single-address filters for address-history methods also match requests with
 /// trailing configuration parameters.
+/// Cursor-conditional address filters are indexed separately so request config
+/// fields other than cursor presence do not require structural comparisons.
 #[derive(Debug, Default)]
 pub(crate) struct RpcParameterFilterSet {
     by_method_and_arity: HashMap<String, HashMap<usize, Vec<Vec<Value>>>>,
+    cursor_filtered_addresses: HashMap<String, HashSet<String>>,
     len: usize,
 }
 
@@ -50,6 +53,9 @@ impl RpcParameterFilterSet {
         let Some(params) = params else {
             return false;
         };
+        if self.matches_cursor_filtered_address(method, params) {
+            return true;
+        }
         let Some(by_arity) = self.by_method_and_arity.get(method) else {
             return false;
         };
@@ -86,6 +92,18 @@ impl RpcParameterFilterSet {
             };
             if method.trim().is_empty() {
                 return Err(Self::entry_error(path, index, "method must not be empty"));
+            }
+
+            if let Some(address) = Self::cursor_filter_address(&method, &entry) {
+                if filters
+                    .cursor_filtered_addresses
+                    .entry(method)
+                    .or_default()
+                    .insert(address.to_owned())
+                {
+                    filters.len += 1;
+                }
+                continue;
             }
 
             let candidates = filters
@@ -133,6 +151,43 @@ impl RpcParameterFilterSet {
                 .iter()
                 .any(|candidate| candidate.first().and_then(Value::as_str) == Some(address))
         })
+    }
+
+    fn cursor_filter_address<'a>(method: &str, params: &'a [Value]) -> Option<&'a str> {
+        let [Value::String(address), Value::Object(config)] = params else {
+            return None;
+        };
+        Self::cursor_keys(method)
+            .iter()
+            .any(|key| config.contains_key(*key))
+            .then_some(address.as_str())
+    }
+
+    fn matches_cursor_filtered_address(&self, method: &str, params: &[Value]) -> bool {
+        let Some(addresses) = self.cursor_filtered_addresses.get(method) else {
+            return false;
+        };
+        let Some(address) = params.first().and_then(Value::as_str) else {
+            return false;
+        };
+        if !addresses.contains(address) {
+            return false;
+        }
+        let Some(config) = params.get(1).and_then(Value::as_object) else {
+            return false;
+        };
+
+        Self::cursor_keys(method)
+            .iter()
+            .any(|key| config.get(*key).is_some_and(|value| !value.is_null()))
+    }
+
+    fn cursor_keys(method: &str) -> &'static [&'static str] {
+        match method {
+            "getSignaturesForAddress" => &["before", "until"],
+            "getTransactionsForAddress" => &["paginationToken"],
+            _ => &[],
+        }
     }
 }
 
@@ -205,6 +260,88 @@ mod tests {
         assert!(!filters.matches(
             "getSignaturesForAddress",
             Some(&[json!(42), json!({"limit": 10})])
+        ));
+    }
+
+    #[test]
+    fn cursor_filters_ignore_values_and_other_config_fields() {
+        let gsfa_address = "ComputeBudget111111111111111111111111111111";
+        let gtfa_address = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+        let filters = filters(vec![
+            vec![
+                json!("getSignaturesForAddress"),
+                json!(gsfa_address),
+                json!({"commitment": "confirmed", "limit": 10, "before": "ignored"}),
+            ],
+            vec![
+                json!("getTransactionsForAddress"),
+                json!(gtfa_address),
+                json!({"limit": 25, "paginationToken": "ignored"}),
+            ],
+        ]);
+
+        assert!(filters.matches(
+            "getSignaturesForAddress",
+            Some(&[json!(gsfa_address), json!({"before": "different"})])
+        ));
+        assert!(filters.matches(
+            "getSignaturesForAddress",
+            Some(&[
+                json!(gsfa_address),
+                json!({"commitment": "finalized", "limit": 100, "until": "different"})
+            ])
+        ));
+        assert!(filters.matches(
+            "getTransactionsForAddress",
+            Some(&[
+                json!(gtfa_address),
+                json!({"limit": 1, "paginationToken": "different", "sortOrder": "asc"})
+            ])
+        ));
+    }
+
+    #[test]
+    fn cursor_filters_require_a_non_null_cursor_for_the_same_address() {
+        let address = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+        let filters = filters(vec![vec![
+            json!("getTransactionsForAddress"),
+            json!(address),
+            json!({"paginationToken": "ignored"}),
+        ]]);
+
+        assert!(!filters.matches(
+            "getTransactionsForAddress",
+            Some(&[json!(address), json!({"paginationToken": null})])
+        ));
+        assert!(!filters.matches(
+            "getTransactionsForAddress",
+            Some(&[json!(address), json!({"limit": 25})])
+        ));
+        assert!(!filters.matches(
+            "getTransactionsForAddress",
+            Some(&[
+                json!("different-address"),
+                json!({"paginationToken": "present"})
+            ])
+        ));
+    }
+
+    #[test]
+    fn gsfa_cursor_filter_treats_null_before_and_until_as_absent() {
+        let address = "ComputeBudget111111111111111111111111111111";
+        let filters = filters(vec![vec![
+            json!("getSignaturesForAddress"),
+            json!(address),
+            json!({"before": "ignored"}),
+        ]]);
+
+        assert!(!filters.matches(
+            "getSignaturesForAddress",
+            Some(&[json!(address), json!({"before": null, "until": null})])
+        ));
+        assert!(filters.matches(
+            "getSignaturesForAddress",
+            Some(&[json!(address), json!({"before": null, "until": "present"})])
         ));
     }
 

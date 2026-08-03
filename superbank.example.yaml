@@ -2,13 +2,15 @@
 # Copy to superbank.yaml and pass via --config / SUPERBANK_CONFIG.
 #
 # Optional superbank-rpc request filters. Pass this same file to superbank-rpc
-# with --config / SUPERBANK_CONFIG. Entries are exact except that a gSFA/gTFA
-# method plus one string address matches any trailing config for that address.
-# Matching calls return HTTP 405 with a JSON-RPC "Method not allowed" error and
-# do not reach RPC handlers.
+# with --config / SUPERBANK_CONFIG. Entries are exact except for the documented
+# address-wide and cursor-conditional gSFA/gTFA forms. Cursor selector values
+# are ignored; missing or null request cursors do not match. Matching calls
+# return HTTP 405 and do not reach RPC handlers.
 # rpc-parameter-filters:
 #   - [getSignaturesForAddress, ComputeBudget111111111111111111111111111111]
 #   - [getTransactionsForAddress, ComputeBudget111111111111111111111111111111]
+#   - [getSignaturesForAddress, Vote111111111111111111111111111111111111111, {before: any}]
+#   - [getTransactionsForAddress, MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr, {paginationToken: any}]
 #   - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
 
 source: "grpc" # fumarole | grpc | rpc | bigtable | solparq
