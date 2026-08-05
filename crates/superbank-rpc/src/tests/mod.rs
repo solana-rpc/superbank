@@ -188,6 +188,16 @@ fn test_state_with_parameter_filters(entries: Vec<Vec<Value>>) -> Arc<AppState> 
     Arc::new(state)
 }
 
+fn test_state_with_method_filters(methods: Vec<String>) -> Arc<AppState> {
+    let mut state = match Arc::try_unwrap(test_state()) {
+        Ok(state) => state,
+        Err(_) => panic!("test_state should have a single Arc owner"),
+    };
+    state.rpc_parameter_filters =
+        RpcParameterFilterSet::from_config(methods, Vec::new(), None).expect("valid test filters");
+    Arc::new(state)
+}
+
 fn test_state_with_metrics_header_capture(capture: MetricsHeaderCaptureConfig) -> Arc<AppState> {
     let mut state = match Arc::try_unwrap(test_state()) {
         Ok(state) => state,
@@ -3547,6 +3557,30 @@ async fn parameter_filter_returns_http_405_before_handler_dispatch() {
     assert_eq!(err.code, -32601);
     assert_eq!(err.message, "Method not allowed");
     assert!(err.data.is_none());
+}
+
+#[tokio::test]
+async fn method_filter_returns_http_405_for_any_params() {
+    let state = test_state_with_method_filters(vec!["getTransactionsForAddress".to_string()]);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "getTransactionsForAddress",
+        "params": [
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            {"limit": 25, "paginationToken": null}
+        ]
+    });
+
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.id, json!(41));
+    assert_eq!(
+        parsed.error.expect("filter error present").message,
+        "Method not allowed"
+    );
 }
 
 #[tokio::test]

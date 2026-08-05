@@ -114,7 +114,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         RpcParameterFilterSet::load(args.config.as_deref()).map_err(RpcError::Config)?;
     info!(
         filters = rpc_parameter_filters.len(),
-        "RPC parameter filters loaded"
+        "RPC request filters loaded"
     );
     info!(
         transport = ?args.clickhouse_transport,

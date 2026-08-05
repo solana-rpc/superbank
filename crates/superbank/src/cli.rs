@@ -633,6 +633,8 @@ pub(crate) struct Args {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 struct FileConfig {
+    #[serde(rename = "rpc-method-filters")]
+    _rpc_method_filters: Option<Vec<String>>,
     #[serde(rename = "rpc-parameter-filters")]
     _rpc_parameter_filters: Option<Vec<Vec<serde_json::Value>>>,
     source: Option<IngestSource>,
@@ -1690,15 +1692,21 @@ mod tests {
     }
 
     #[test]
-    fn file_config_accepts_rpc_parameter_filters() {
+    fn file_config_accepts_rpc_request_filters() {
         let config = serde_yaml::from_str::<FileConfig>(
             r#"
+rpc-method-filters:
+  - getTransactionsForAddress
 rpc-parameter-filters:
   - [getTransactionsForAddress, So11111111111111111111111111111111111111112]
 "#,
         )
         .expect("parse shared config");
 
+        assert_eq!(
+            config._rpc_method_filters.as_deref(),
+            Some(&["getTransactionsForAddress".to_string()][..])
+        );
         assert_eq!(
             config
                 ._rpc_parameter_filters

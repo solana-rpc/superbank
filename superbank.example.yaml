@@ -6,6 +6,8 @@
 # address-wide and cursor-conditional gSFA/gTFA forms. Cursor selector values
 # are ignored; missing or null request cursors do not match. Matching calls
 # return HTTP 405 and do not reach RPC handlers.
+# rpc-method-filters:
+#   - getTransactionsForAddress
 # rpc-parameter-filters:
 #   - [getSignaturesForAddress, ComputeBudget111111111111111111111111111111]
 #   - [getTransactionsForAddress, ComputeBudget111111111111111111111111111111]

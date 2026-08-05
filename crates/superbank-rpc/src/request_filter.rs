@@ -15,6 +15,7 @@ use serde_json::Value;
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct RpcFileConfig {
+    rpc_method_filters: Vec<String>,
     rpc_parameter_filters: Vec<Vec<Value>>,
 }
 
@@ -28,6 +29,7 @@ struct RpcFileConfig {
 /// fields other than cursor presence do not require structural comparisons.
 #[derive(Debug, Default)]
 pub(crate) struct RpcParameterFilterSet {
+    blocked_methods: HashSet<String>,
     by_method_and_arity: HashMap<String, HashMap<usize, Vec<Vec<Value>>>>,
     cursor_filtered_addresses: HashMap<String, HashSet<String>>,
     len: usize,
@@ -43,12 +45,19 @@ impl RpcParameterFilterSet {
             .map_err(|err| format!("failed to read config file '{}': {err}", path.display()))?;
         let config: RpcFileConfig = serde_yaml::from_str(&contents)
             .map_err(|err| format!("failed to parse config file '{}': {err}", path.display()))?;
-        Self::from_entries(config.rpc_parameter_filters, Some(path))
+        Self::from_config(
+            config.rpc_method_filters,
+            config.rpc_parameter_filters,
+            Some(path),
+        )
     }
 
     pub(crate) fn matches(&self, method: &str, params: Option<&[Value]>) -> bool {
         if self.len == 0 {
             return false;
+        }
+        if self.blocked_methods.contains(method) {
+            return true;
         }
         let Some(params) = params else {
             return false;
@@ -73,11 +82,33 @@ impl RpcParameterFilterSet {
         self.len
     }
 
+    #[cfg(test)]
     pub(crate) fn from_entries(
         entries: Vec<Vec<Value>>,
         path: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::from_config(Vec::new(), entries, path)
+    }
+
+    pub(crate) fn from_config(
+        methods: Vec<String>,
+        entries: Vec<Vec<Value>>,
+        path: Option<&Path>,
+    ) -> Result<Self, String> {
         let mut filters = Self::default();
+        for (index, method) in methods.into_iter().enumerate() {
+            if method.trim().is_empty() {
+                return Err(Self::method_entry_error(
+                    path,
+                    index,
+                    "method must not be empty",
+                ));
+            }
+            if filters.blocked_methods.insert(method) {
+                filters.len += 1;
+            }
+        }
+
         for (index, mut entry) in entries.into_iter().enumerate() {
             if entry.is_empty() {
                 return Err(Self::entry_error(path, index, "entry must not be empty"));
@@ -118,6 +149,17 @@ impl RpcParameterFilterSet {
             }
         }
         Ok(filters)
+    }
+
+    fn method_entry_error(path: Option<&Path>, index: usize, message: &str) -> String {
+        let source = path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("<inline>"));
+        format!(
+            "invalid rpc-method-filters entry {} in '{}': {message}",
+            index + 1,
+            source.display()
+        )
     }
 
     fn entry_error(path: Option<&Path>, index: usize, message: &str) -> String {
@@ -201,6 +243,15 @@ mod tests {
         RpcParameterFilterSet::from_entries(entries, None).expect("valid filters")
     }
 
+    fn filters_with_methods(methods: Vec<&str>, entries: Vec<Vec<Value>>) -> RpcParameterFilterSet {
+        RpcParameterFilterSet::from_config(
+            methods.into_iter().map(str::to_owned).collect(),
+            entries,
+            None,
+        )
+        .expect("valid filters")
+    }
+
     use serde_json::Value;
 
     #[test]
@@ -225,6 +276,34 @@ mod tests {
             Some(&[json!("address"), json!({"mode": "full"}), json!(true)])
         ));
         assert!(!filters.matches("getThing", None));
+    }
+
+    #[test]
+    fn method_filters_match_any_parameter_shape() {
+        let filters = filters_with_methods(vec!["getTransactionsForAddress"], Vec::new());
+
+        assert!(filters.matches("getTransactionsForAddress", None));
+        assert!(filters.matches("getTransactionsForAddress", Some(&[])));
+        assert!(filters.matches(
+            "getTransactionsForAddress",
+            Some(&[json!("address"), json!({"limit": 25})])
+        ));
+        assert!(!filters.matches("gettransactionsforaddress", None));
+        assert!(!filters.matches("getSignaturesForAddress", None));
+    }
+
+    #[test]
+    fn method_filters_are_deduplicated_and_reject_blank_names() {
+        let filters = filters_with_methods(
+            vec!["getTransactionsForAddress", "getTransactionsForAddress"],
+            Vec::new(),
+        );
+        assert_eq!(filters.len(), 1);
+
+        let err = RpcParameterFilterSet::from_config(vec!["  ".to_string()], Vec::new(), None)
+            .expect_err("blank method must fail");
+        assert!(err.contains("rpc-method-filters entry 1"));
+        assert!(err.contains("method must not be empty"));
     }
 
     #[test]
@@ -378,11 +457,15 @@ source: grpc
 endpoint: https://example.invalid
 rpc-parameter-filters:
   - [getThing, address]
+rpc-method-filters:
+  - getTransactionsForAddress
 "#,
         )
         .expect("write config");
 
         let filters = RpcParameterFilterSet::load(Some(&path)).expect("load config");
         assert!(filters.matches("getThing", Some(&[json!("address")])));
+        assert!(filters.matches("getTransactionsForAddress", None));
+        assert_eq!(filters.len(), 2);
     }
 }

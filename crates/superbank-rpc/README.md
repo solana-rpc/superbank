@@ -109,6 +109,9 @@ dispatch or use any cache or ClickHouse resources. Pass the shared YAML configur
 `--config superbank.yaml` or `SUPERBANK_CONFIG=superbank.yaml` and add:
 
 ```yaml
+rpc-method-filters:
+  - getTransactionsForAddress
+
 rpc-parameter-filters:
   - [getSignaturesForAddress, ComputeBudget111111111111111111111111111111]
   - [getTransactionsForAddress, ComputeBudget111111111111111111111111111111]
@@ -117,10 +120,15 @@ rpc-parameter-filters:
   - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
 ```
 
-Each entry contains the case-sensitive method followed by its complete parameter array. Except for
-the address-wide form below, matching is structural and exact: parameter count, array order, JSON
-types, and values must match; mapping key order does not matter. Extra parameters do not match. A
-method-only entry matches an explicitly empty `params: []` array; omitted `params` is distinct.
+Each case-sensitive `rpc-method-filters` entry blocks every request for that method regardless of
+whether `params` is omitted, empty, or populated. Duplicate entries are removed and blank method
+names fail startup validation. This is the simplest way to disable a method temporarily.
+
+Each `rpc-parameter-filters` entry contains the case-sensitive method followed by its complete
+parameter array. Except for the address-wide form below, matching is structural and exact:
+parameter count, array order, JSON types, and values must match; mapping key order does not matter.
+Extra parameters do not match. A method-only parameter entry matches an explicitly empty
+`params: []` array; omitted `params` is distinct.
 
 There is one address-wide form: an entry containing only `getSignaturesForAddress` or
 `getTransactionsForAddress` and a string address matches that address as the first request
@@ -138,8 +146,8 @@ Missing and JSON `null` cursors do not match. Full entries without these cursor 
 A matching call returns HTTP `405 Method Not Allowed` and preserves the request ID in a JSON-RPC
 error with code `-32601` and message `Method not allowed`. In a mixed batch, allowed calls still
 execute and matched calls receive individual errors in their original positions; the batch HTTP
-status is 405 if any item matched. Filters are validated and indexed once at startup, so changing
-the file requires restarting `superbank-rpc`.
+status is 405 if any item matched. Method and parameter filters are validated and indexed once at
+startup, so changing the file requires restarting `superbank-rpc`.
 
 ## Optional Superbank gRPC streaming (`grpc-streaming`)
 
