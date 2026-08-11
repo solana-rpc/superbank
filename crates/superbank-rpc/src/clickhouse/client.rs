@@ -1110,9 +1110,7 @@ impl ClickHouseClient {
             None
         };
 
-        if self.scope_shard_direct()
-            && let Some(topology) = &self.shard_topology
-        {
+        if let Some(topology) = &self.shard_topology {
             if let Some(router) = &self.gsfa_router {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
@@ -1130,7 +1128,9 @@ impl ClickHouseClient {
                 )?;
             }
 
-            if let Some(local_table) = &self.signatures_local_table {
+            if self.scope_shard_direct()
+                && let Some(local_table) = &self.signatures_local_table
+            {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
                     local_table,
@@ -1526,65 +1526,62 @@ impl ClickHouseClient {
                     let topology = Arc::new(topology);
                     self.shard_topology = Some(topology.clone());
 
-                    if self.scope_shard_direct() {
-                        if let Some(local_table) = config.gsfa_local_table.clone() {
-                            if let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &GSFA_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "GSFA shard routing disabled; local table validation failed: {}",
-                                    e
-                                );
-                            } else {
-                                self.validate_gsfa_shard_layout(&local_table).await?;
-                                self.gsfa_router = Some(GsfaShardRouter {
-                                    local_table,
-                                    topology: topology.clone(),
-                                    query_timeout: self.shard_tcp_query_timeout(),
-                                });
-                            }
+                    if let Some(local_table) = config.gsfa_local_table.clone() {
+                        if let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &GSFA_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "GSFA shard routing disabled; local table validation failed: {}",
+                                e
+                            );
                         } else {
-                            tracing::warn!(
-                                "GSFA shard routing disabled; local table not configured"
-                            );
+                            self.validate_gsfa_shard_layout(&local_table).await?;
+                            self.gsfa_router = Some(GsfaShardRouter {
+                                local_table,
+                                topology: topology.clone(),
+                                query_timeout: self.shard_tcp_query_timeout(),
+                            });
                         }
+                    } else {
+                        tracing::warn!("GSFA shard routing disabled; local table not configured");
+                    }
 
-                        if let Some(local_table) = config.signatures_local_table.clone()
-                            && let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &SIGNATURES_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Signature shard routing disabled; local table validation failed: {}",
-                                e
-                            );
-                            self.signatures_local_table = None;
-                        }
+                    if self.scope_shard_direct()
+                        && let Some(local_table) = config.signatures_local_table.clone()
+                        && let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &SIGNATURES_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Signature shard routing disabled; local table validation failed: {}",
+                            e
+                        );
+                        self.signatures_local_table = None;
+                    }
 
-                        if let Some(local_table) = config.token_owner_activity_local_table.clone()
-                            && let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &TOKEN_OWNER_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Token owner shard routing disabled; local table validation failed: {}",
-                                e
-                            );
-                            self.token_owner_activity_local_table = None;
-                        }
+                    if let Some(local_table) = config.token_owner_activity_local_table.clone()
+                        && let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &TOKEN_OWNER_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Token owner shard routing disabled; local table validation failed: {}",
+                            e
+                        );
+                        self.token_owner_activity_local_table = None;
                     }
 
                     if hot_routing_configured {

@@ -348,12 +348,12 @@ pub struct RpcConfig {
     #[arg(long, env = "CLICKHOUSE_CLUSTER", default_value = "{cluster}")]
     pub(crate) clickhouse_cluster: String,
 
-    /// Optional authoritative YAML topology file for shard-direct ClickHouse connections.
+    /// Optional authoritative YAML topology file for shard-local ClickHouse connections.
     /// When set, superbank-rpc skips system.clusters discovery and uses the YAML mapping directly.
     #[arg(long, env = "CLICKHOUSE_TOPOLOGY_CONFIG")]
     pub(crate) clickhouse_topology_config: Option<String>,
 
-    /// Local gsfa table name on each shard (required for CLICKHOUSE_SCOPE=shard-direct).
+    /// Local gsfa table used by shard-direct and owner-shard address queries.
     #[arg(long, env = "CLICKHOUSE_GSFA_LOCAL_TABLE")]
     pub(crate) clickhouse_gsfa_local_table: Option<String>,
 
