@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS default.transactions_local ON CLUSTER '{cluster}'
     meta_reward_post_balance           Array(UInt64) CODEC(ZSTD(1)),
     meta_reward_type                   Array(Nullable(String)) CODEC(ZSTD(1)),
     meta_reward_commission             Array(Nullable(UInt8)),
+    meta_reward_commission_bps         Array(Nullable(UInt16)),
     meta_loaded_addresses_writable     Array(FixedString(32)),
     meta_loaded_addresses_readonly     Array(FixedString(32)),
     meta_return_data_present           UInt8,
@@ -135,6 +136,7 @@ CREATE TABLE IF NOT EXISTS default.transactions ON CLUSTER '{cluster}'
     meta_reward_post_balance           Array(UInt64) CODEC(ZSTD(1)),
     meta_reward_type                   Array(Nullable(String)) CODEC(ZSTD(1)),
     meta_reward_commission             Array(Nullable(UInt8)),
+    meta_reward_commission_bps         Array(Nullable(UInt16)),
     meta_loaded_addresses_writable     Array(FixedString(32)),
     meta_loaded_addresses_readonly     Array(FixedString(32)),
     meta_return_data_present           UInt8,
@@ -144,3 +146,8 @@ CREATE TABLE IF NOT EXISTS default.transactions ON CLUSTER '{cluster}'
     meta_cost_units                    Nullable(UInt64)
 )
 ENGINE = Distributed('{cluster}', 'default', 'transactions_local', intDiv(slot, 432000));
+
+ALTER TABLE default.transactions_local ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS meta_reward_commission_bps Array(Nullable(UInt16)) AFTER meta_reward_commission;
+ALTER TABLE default.transactions ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS meta_reward_commission_bps Array(Nullable(UInt16)) AFTER meta_reward_commission;

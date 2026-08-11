@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS default.transactions
     meta_reward_post_balance           Array(UInt64) CODEC(ZSTD(1)),
     meta_reward_type                   Array(Nullable(String)) CODEC(ZSTD(1)),
     meta_reward_commission             Array(Nullable(UInt8)),
+    meta_reward_commission_bps         Array(Nullable(UInt16)),
     meta_loaded_addresses_writable     Array(FixedString(32)),
     meta_loaded_addresses_readonly     Array(FixedString(32)),
     meta_return_data_present           UInt8,
@@ -75,3 +76,7 @@ CREATE TABLE IF NOT EXISTS default.transactions
 ENGINE = ReplacingMergeTree(slot)
 PARTITION BY intDiv(slot, 432000) -- Solana epoch (432k slots)
 ORDER BY (slot, slot_idx, signature);
+
+ALTER TABLE default.transactions
+    ADD COLUMN IF NOT EXISTS meta_reward_commission_bps Array(Nullable(UInt16))
+    AFTER meta_reward_commission;

@@ -130,6 +130,7 @@ pub(crate) fn build_transaction_status_meta(
             || !record.meta_reward_post_balance.is_empty()
             || !record.meta_reward_type.is_empty()
             || !record.meta_reward_commission.is_empty()
+            || !record.meta_reward_commission_bps.is_empty()
         {
             return Err(TransactionHydrationError::InvalidStoredMetadata(
                 "rewards populated without meta_rewards_present".to_string(),
@@ -276,6 +277,7 @@ pub(crate) fn build_transaction_status_meta_for_accounts(
             &record.meta_reward_post_balance,
             &record.meta_reward_type,
             &record.meta_reward_commission,
+            &record.meta_reward_commission_bps,
         )?)
     } else {
         if !record.meta_reward_pubkey.is_empty()
@@ -283,6 +285,7 @@ pub(crate) fn build_transaction_status_meta_for_accounts(
             || !record.meta_reward_post_balance.is_empty()
             || !record.meta_reward_type.is_empty()
             || !record.meta_reward_commission.is_empty()
+            || !record.meta_reward_commission_bps.is_empty()
         {
             return Err(TransactionHydrationError::InvalidStoredMetadata(
                 "rewards populated without meta_rewards_present".to_string(),
@@ -376,6 +379,7 @@ fn meta_is_missing(record: &StoredTransactionRecord) -> bool {
         || !record.meta_reward_post_balance.is_empty()
         || !record.meta_reward_type.is_empty()
         || !record.meta_reward_commission.is_empty()
+        || !record.meta_reward_commission_bps.is_empty()
     {
         return false;
     }
@@ -440,6 +444,7 @@ fn accounts_meta_is_missing(record: &StoredAccountsTransactionRecord) -> bool {
         || !record.meta_reward_post_balance.is_empty()
         || !record.meta_reward_type.is_empty()
         || !record.meta_reward_commission.is_empty()
+        || !record.meta_reward_commission_bps.is_empty()
     {
         return false;
     }
@@ -860,6 +865,7 @@ fn build_rewards(
         &record.meta_reward_post_balance,
         &record.meta_reward_type,
         &record.meta_reward_commission,
+        &record.meta_reward_commission_bps,
     )
 }
 
@@ -869,19 +875,22 @@ fn build_rewards_from_fields(
     post_balances: &[u64],
     reward_types: &[Option<String>],
     commissions: &[Option<u8>],
+    commission_bps: &[Option<u16>],
 ) -> Result<Vec<Reward>, TransactionHydrationError> {
     let len = pubkeys.len();
     if lamports.len() != len
         || post_balances.len() != len
         || reward_types.len() != len
         || commissions.len() != len
+        || (!commission_bps.is_empty() && commission_bps.len() != len)
     {
         return Err(TransactionHydrationError::InvalidStoredMetadata(format!(
-            "reward length mismatch (pubkey={len}, lamports={}, post_balance={}, reward_type={}, commission={})",
+            "reward length mismatch (pubkey={len}, lamports={}, post_balance={}, reward_type={}, commission={}, commission_bps={})",
             lamports.len(),
             post_balances.len(),
             reward_types.len(),
-            commissions.len()
+            commissions.len(),
+            commission_bps.len()
         )));
     }
 
@@ -893,7 +902,7 @@ fn build_rewards_from_fields(
             post_balance: post_balances[idx],
             reward_type: parse_reward_type(&reward_types[idx])?,
             commission: commissions[idx],
-            commission_bps: None,
+            commission_bps: commission_bps.get(idx).copied().flatten(),
         });
     }
 

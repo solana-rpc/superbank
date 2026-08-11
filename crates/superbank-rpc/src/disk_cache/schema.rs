@@ -21,7 +21,7 @@ use rocksdb::{
     Options, SliceTransform, compaction_filter::Decision,
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 pub(crate) const CF_META: &str = "meta";
 pub(crate) const CF_SLOT_COVERAGE: &str = "slot_coverage";
@@ -369,6 +369,7 @@ mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: vec![[11u8; 32]],
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: true,
@@ -384,7 +385,7 @@ mod tests {
         assert_eq!(decoded.tx_signatures, record.tx_signatures);
         assert_eq!(
             fingerprint(&tx_bytes),
-            0x7448_21a9_4fd3_d7bb,
+            0x89b0_a948_0cb6_929b,
             "tx layout drift"
         );
 
@@ -403,12 +404,13 @@ mod tests {
             rewards_post_balance: vec![99],
             rewards_type: vec![Some("Fee".to_string())],
             rewards_commission: vec![Some(7)],
+            rewards_commission_bps: vec![Some(725)],
             rewards_num_partitions: Some(4),
         };
         let meta_bytes = bincode::serialize(&meta).expect("serialize meta");
         assert_eq!(
             fingerprint(&meta_bytes),
-            0x3200_ea90_2cf4_50dc,
+            0xf372_e612_a68f_ed8f,
             "block-meta layout drift"
         );
     }

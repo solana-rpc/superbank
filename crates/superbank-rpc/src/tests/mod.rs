@@ -46,7 +46,7 @@ use crate::handlers::signatures::{
     handle_get_signature_statuses, handle_get_signatures_for_address,
 };
 use crate::handlers::transactions::handle_get_transactions_for_address;
-use crate::handlers::types::MAX_GET_BLOCKS_RANGE;
+use crate::handlers::types::{InflationRewardInfo, MAX_GET_BLOCKS_RANGE};
 use crate::hydration::BlockHydrationError;
 use crate::hydration::build_transaction_status_meta;
 use crate::hydration::build_transaction_status_meta_for_accounts;
@@ -571,6 +571,7 @@ fn base_transaction_record() -> StoredTransactionRecord {
         meta_reward_post_balance: Vec::new(),
         meta_reward_type: Vec::new(),
         meta_reward_commission: Vec::new(),
+        meta_reward_commission_bps: Vec::new(),
         meta_loaded_addresses_writable: Vec::new(),
         meta_loaded_addresses_readonly: Vec::new(),
         meta_return_data_present: false,
@@ -598,6 +599,7 @@ fn base_block_record(slot: u64) -> StoredBlockRecord {
             rewards_post_balance: Vec::new(),
             rewards_type: Vec::new(),
             rewards_commission: Vec::new(),
+            rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
         },
         transactions: Vec::new(),
@@ -782,6 +784,7 @@ fn hydrate_transaction_record_base64_round_trip() {
         meta_reward_post_balance: Vec::new(),
         meta_reward_type: Vec::new(),
         meta_reward_commission: Vec::new(),
+        meta_reward_commission_bps: Vec::new(),
         meta_loaded_addresses_writable: Vec::new(),
         meta_loaded_addresses_readonly: Vec::new(),
         meta_return_data_present: false,
@@ -3444,6 +3447,7 @@ fn build_v0_transaction_allows_missing_lookup_flag_when_empty() {
         meta_reward_post_balance: Vec::new(),
         meta_reward_type: Vec::new(),
         meta_reward_commission: Vec::new(),
+        meta_reward_commission_bps: Vec::new(),
         meta_loaded_addresses_writable: Vec::new(),
         meta_loaded_addresses_readonly: Vec::new(),
         meta_return_data_present: false,
@@ -6078,6 +6082,52 @@ fn build_transaction_status_meta_emits_empty_lists_when_present() {
 }
 
 #[test]
+fn build_transaction_status_meta_preserves_commission_bps() {
+    let mut record = base_transaction_record();
+    record.meta_rewards_present = true;
+    record.meta_reward_pubkey = vec![solana_sdk::pubkey::Pubkey::new_unique().to_string()];
+    record.meta_reward_lamports = vec![10];
+    record.meta_reward_post_balance = vec![20];
+    record.meta_reward_type = vec![Some("Staking".to_string())];
+    record.meta_reward_commission = vec![None];
+    record.meta_reward_commission_bps = vec![Some(300)];
+
+    let meta = build_transaction_status_meta(&record)
+        .expect("build meta")
+        .expect("meta present");
+    let reward = &meta.rewards.expect("rewards")[0];
+
+    assert_eq!(reward.commission, None);
+    assert_eq!(reward.commission_bps, Some(300));
+}
+
+#[test]
+fn inflation_reward_serialization_omits_unavailable_commission_bps() {
+    let reward = InflationRewardInfo {
+        epoch: 1005,
+        effective_slot: 434_592_000,
+        amount: 1,
+        post_balance: 2,
+        commission: None,
+        commission_bps: None,
+    };
+    let value = serde_json::to_value(&reward).expect("serialize reward");
+    assert!(
+        !value
+            .as_object()
+            .expect("object")
+            .contains_key("commissionBps")
+    );
+
+    let value = serde_json::to_value(InflationRewardInfo {
+        commission_bps: Some(300),
+        ..reward
+    })
+    .expect("serialize reward");
+    assert_eq!(value["commissionBps"], 300);
+}
+
+#[test]
 fn build_transaction_status_meta_for_accounts_emits_empty_rewards_when_absent() {
     let mut record = base_transaction_record();
     record.meta_pre_balances = vec![1];
@@ -6137,6 +6187,38 @@ fn hydrate_block_record_rejects_reward_length_mismatch() {
             assert!(msg.contains("reward length mismatch"));
         }
         other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn hydrate_block_record_supports_legacy_and_populated_commission_bps() {
+    for commission_bps in [Vec::new(), vec![Some(300)]] {
+        let mut record = base_block_record(10);
+        record.metadata.rewards_present = true;
+        record.metadata.rewards_pubkey.push([9u8; 32]);
+        record.metadata.rewards_lamports.push(1);
+        record.metadata.rewards_post_balance.push(2);
+        record
+            .metadata
+            .rewards_type
+            .push(Some("Staking".to_string()));
+        record.metadata.rewards_commission.push(None);
+        record.metadata.rewards_commission_bps = commission_bps.clone();
+
+        let block = hydrate_block_record(
+            record,
+            UiTransactionEncoding::Json,
+            TransactionDetails::Signatures,
+            true,
+            None,
+        )
+        .expect("hydrate block");
+        let reward = &block.rewards.expect("rewards")[0];
+
+        assert_eq!(
+            reward.commission_bps,
+            commission_bps.first().copied().flatten()
+        );
     }
 }
 

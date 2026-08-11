@@ -73,6 +73,7 @@ pub(crate) const TRANSACTION_SELECT_COLUMNS: &str = "signature,
                 meta_reward_post_balance,
                 meta_reward_type,
                 meta_reward_commission,
+                meta_reward_commission_bps,
                 meta_loaded_addresses_writable,
                 meta_loaded_addresses_readonly,
                 meta_return_data_present,
@@ -100,6 +101,7 @@ pub(crate) const BLOCK_METADATA_REWARD_COLUMNS: &[&str] = &[
     "rewards_post_balance",
     "rewards_type",
     "rewards_commission",
+    "rewards_commission_bps",
 ];
 
 pub(crate) const BLOCK_SIGNATURE_COLUMNS: &[&str] = &["signature"];
@@ -146,6 +148,7 @@ pub(crate) const BLOCK_TRANSACTION_REWARD_COLUMNS: &[&str] = &[
     "meta_reward_post_balance",
     "meta_reward_type",
     "meta_reward_commission",
+    "meta_reward_commission_bps",
 ];
 
 pub(crate) const BLOCK_FULL_BASE_COLUMNS: &[&str] = &[

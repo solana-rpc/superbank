@@ -33,6 +33,9 @@ Notes:
 - `getInflationReward` reads the payout epoch boundary and only the reward partitions selected by
   the requested addresses. It never expands reward arrays across a complete epoch; dedicated
   address, concurrency, timeout, thread, memory, and read-byte limits are enabled by default.
+- Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
+  it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
+  does not infer it from the legacy percentage `commission` value.
 - `processed` commitment is supported for a subset of methods when compiled with
   `--features grpc-head-cache` and enabled at runtime with `HEAD_CACHE_ENABLED=true`
   (see "Optional gRPC head cache" below).

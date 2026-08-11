@@ -69,6 +69,11 @@ function normalizeInflationRewardResponse(body) {
         entry.commission !== undefined
           ? entry.commission
           : null,
+      commissionBps:
+        Object.prototype.hasOwnProperty.call(entry, 'commissionBps') &&
+        entry.commissionBps !== undefined
+          ? entry.commissionBps
+          : null,
     };
   });
 

@@ -18,6 +18,9 @@ Each folder contains the same file basenames:
 - `token_owner_activity.sql`
 
 Pick one folder and apply the matching schema set consistently.
+The schema files include idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements for
+additive upgrades. Apply DDL before deploying binaries that write or query newly added columns;
+running these repository files never occurs automatically against an existing deployment.
 Apply `transactions.sql` before materialized-view files such as `gsfa*.sql`, `signatures.sql`, and
 `token_owner_activity.sql`; those views select from the transactions table and will fail if it does
 not exist yet.

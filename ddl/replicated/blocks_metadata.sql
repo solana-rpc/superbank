@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS default.blocks_metadata_local ON CLUSTER '{cluster}'
     rewards_post_balance         Array(UInt64),
     rewards_type                 Array(Nullable(String)),
     rewards_commission           Array(Nullable(UInt8)),
+    rewards_commission_bps       Array(Nullable(UInt16)),
     rewards_num_partitions       Nullable(UInt64)
 )
 ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{cluster}/{database}/{table}/{shard}', '{replica}', slot)
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS default.blocks_metadata ON CLUSTER '{cluster}'
     rewards_post_balance         Array(UInt64),
     rewards_type                 Array(Nullable(String)),
     rewards_commission           Array(Nullable(UInt8)),
+    rewards_commission_bps       Array(Nullable(UInt16)),
     rewards_num_partitions       Nullable(UInt64)
 )
 ENGINE = Distributed('{cluster}', 'default', 'blocks_metadata_local', intDiv(slot, 432000));
+
+ALTER TABLE default.blocks_metadata_local ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS rewards_commission_bps Array(Nullable(UInt16)) AFTER rewards_commission;
+ALTER TABLE default.blocks_metadata ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS rewards_commission_bps Array(Nullable(UInt16)) AFTER rewards_commission;

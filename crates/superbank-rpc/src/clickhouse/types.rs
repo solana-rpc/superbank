@@ -253,6 +253,7 @@ pub struct BlockMetadataRecord {
     pub rewards_post_balance: Vec<u64>,
     pub rewards_type: Vec<Option<String>>,
     pub rewards_commission: Vec<Option<u8>>,
+    pub rewards_commission_bps: Vec<Option<u16>>,
     pub rewards_num_partitions: Option<u64>,
 }
 
@@ -263,6 +264,7 @@ pub struct InflationRewardRecord {
     pub lamports: i64,
     pub post_balance: u64,
     pub commission: Option<u8>,
+    pub commission_bps: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +311,7 @@ pub struct StoredAccountsTransactionRecord {
     pub meta_reward_post_balance: Vec<u64>,
     pub meta_reward_type: Vec<Option<String>>,
     pub meta_reward_commission: Vec<Option<u8>>,
+    pub meta_reward_commission_bps: Vec<Option<u16>>,
     pub meta_loaded_addresses_writable: Vec<[u8; 32]>,
     pub meta_loaded_addresses_readonly: Vec<[u8; 32]>,
 }
@@ -352,6 +355,7 @@ impl From<StoredTransactionRecord> for StoredAccountsTransactionRecord {
             meta_reward_post_balance: record.meta_reward_post_balance,
             meta_reward_type: record.meta_reward_type,
             meta_reward_commission: record.meta_reward_commission,
+            meta_reward_commission_bps: record.meta_reward_commission_bps,
             meta_loaded_addresses_writable: record.meta_loaded_addresses_writable,
             meta_loaded_addresses_readonly: record.meta_loaded_addresses_readonly,
         }
@@ -462,6 +466,7 @@ pub struct StoredTransactionRecord {
     pub meta_reward_post_balance: Vec<u64>,
     pub meta_reward_type: Vec<Option<String>>,
     pub meta_reward_commission: Vec<Option<u8>>,
+    pub meta_reward_commission_bps: Vec<Option<u16>>,
     pub meta_loaded_addresses_writable: Vec<[u8; 32]>,
     pub meta_loaded_addresses_readonly: Vec<[u8; 32]>,
     pub meta_return_data_present: bool,

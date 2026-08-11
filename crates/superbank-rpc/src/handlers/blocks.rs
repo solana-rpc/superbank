@@ -2260,6 +2260,7 @@ pub(crate) async fn handle_get_inflation_reward(
                 amount: row.lamports.unsigned_abs(),
                 post_balance: row.post_balance,
                 commission: row.commission,
+                commission_bps: row.commission_bps,
             },
         );
     }
