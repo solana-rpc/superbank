@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "!v*-solparq.*"
 
 concurrency:
   group: release-${{ github.ref }}

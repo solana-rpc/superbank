@@ -288,7 +288,7 @@ pub(crate) fn build_transaction_status_meta_for_accounts(
                 "rewards populated without meta_rewards_present".to_string(),
             ));
         }
-        None
+        Some(Vec::new())
     };
 
     let loaded_addresses = solana_sdk::message::v0::LoadedAddresses {

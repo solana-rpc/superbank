@@ -17,8 +17,8 @@ use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
 use crate::clickhouse::{
-    ClickHouseClient, ClickHouseClientOptions, QueryCacheConfig, RoutingPolicy, RoutingScope,
-    RoutingTransport, ShardRoutingConfig,
+    ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, QueryCacheConfig,
+    RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig,
 };
 use crate::config::{
     ClickHouseScope, ClickHouseTransport, RpcConfig, has_usable_gsfa_hot_addresses,
@@ -131,6 +131,34 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             "CLICKHOUSE_QUERY_TIMEOUT_MS should remain below RPC_REQUEST_TIMEOUT_MS so the ClickHouse-side query cap fires before the outer RPC timeout"
         );
     }
+    if args.get_inflation_reward_max_addresses > 100 {
+        return Err(RpcError::Config(
+            "GET_INFLATION_REWARD_MAX_ADDRESSES must be 0 (disabled) or between 1 and 100"
+                .to_string(),
+        ));
+    }
+    if args.get_inflation_reward_max_threads == 0
+        || args.get_inflation_reward_max_memory_bytes == 0
+        || args.get_inflation_reward_max_bytes_to_read == 0
+        || args.get_inflation_reward_query_timeout_ms == 0
+    {
+        return Err(RpcError::Config(
+            "getInflationReward ClickHouse resource limits must all be greater than zero"
+                .to_string(),
+        ));
+    }
+    if args.get_inflation_reward_max_addresses == 0 {
+        warn!("getInflationReward address admission limit is disabled");
+    }
+    if args.get_inflation_reward_max_concurrency == 0 {
+        warn!("getInflationReward concurrency admission limit is disabled");
+    }
+    if args.get_inflation_reward_query_timeout_ms >= args.rpc_request_timeout_ms {
+        return Err(RpcError::Config(
+            "GET_INFLATION_REWARD_QUERY_TIMEOUT_MS must be below RPC_REQUEST_TIMEOUT_MS"
+                .to_string(),
+        ));
+    }
 
     // Initialize ClickHouse client
     let shard_routing = build_shard_routing_config(&args);
@@ -171,11 +199,22 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         ))
         .with_tcp_pool_sizing(args.clickhouse_tcp_pool_min, args.clickhouse_tcp_pool_max)
         .with_in_clause_chunk(args.clickhouse_in_clause_chunk)
-        .with_startup_table_check(args.clickhouse_startup_table_check),
+        .with_startup_table_check(args.clickhouse_startup_table_check)
+        .with_inflation_reward_limits(InflationRewardQueryLimits {
+            query_timeout: Duration::from_millis(args.get_inflation_reward_query_timeout_ms),
+            max_threads: args.get_inflation_reward_max_threads,
+            max_memory_bytes: args.get_inflation_reward_max_memory_bytes,
+            max_bytes_to_read: args.get_inflation_reward_max_bytes_to_read,
+        }),
     );
 
     // Verify ClickHouse connection
     clickhouse.create_tables().await?;
+    if !clickhouse.query_settings_enabled() {
+        warn!(
+            "ClickHouse query SETTINGS are disabled; getInflationReward query shape and RPC admission limits remain active, but ClickHouse-side thread, memory, read-byte, and execution-time caps cannot be applied"
+        );
+    }
 
     if let Err(err) = metrics::force_init() {
         warn!("Metrics initialization failed; metrics disabled: {err}");
@@ -284,6 +323,13 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         max_signatures_limit: args.max_signatures_limit,
         rpc_max_batch_size: args.rpc_max_batch_size.max(1),
         rpc_batch_concurrency_limit: args.rpc_batch_concurrency_limit.max(1),
+        get_inflation_reward_max_addresses: (args.get_inflation_reward_max_addresses > 0)
+            .then_some(args.get_inflation_reward_max_addresses),
+        get_inflation_reward_sem: (args.get_inflation_reward_max_concurrency > 0).then(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                args.get_inflation_reward_max_concurrency,
+            ))
+        }),
         latest_slot_cache: LatestSlotCache::new(Duration::from_millis(1000)),
         latest_block_height_cache: LatestBlockHeightCache::new(Duration::from_millis(1000)),
         rpc_request_timeout: Duration::from_millis(args.rpc_request_timeout_ms),

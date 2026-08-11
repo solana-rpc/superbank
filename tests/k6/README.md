@@ -366,6 +366,13 @@ k6 run tests/k6/scenarios/stress/stress-test-get-blocks.js \
 k6 run tests/k6/scenarios/stress/stress-test-get-first-available-block.js \
   -e RPC_URL=http://localhost:8899
 
+# getInflationReward (successful admitted calls plus expected -32005 shedding)
+k6 run tests/k6/scenarios/stress/stress-test-get-inflation-reward.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt \
+  -e INFLATION_REWARD_EPOCH=280 \
+  -e INFLATION_REWARD_ADDRESS_COUNT=18
+
 # getLatestBlockhash
 k6 run tests/k6/scenarios/stress/stress-test-get-latest-blockhash.js \
   -e RPC_URL=http://localhost:8899
@@ -824,6 +831,7 @@ tests/k6/
 │   │   └── superbank-rpc-validate-get-transfers-by-address.js # TBA endpoint comparison
 │   ├── stress/
 │   │   ├── stress-test.js          # Stress test (find breaking point)
+│   │   ├── stress-test-get-inflation-reward.js
 │   │   ├── stress-test-get-block.js
 │   │   ├── stress-test-get-block-height.js
 │   │   ├── stress-test-get-block-time.js

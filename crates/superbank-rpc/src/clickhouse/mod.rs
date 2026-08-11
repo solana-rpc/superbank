@@ -17,7 +17,7 @@ mod transfers;
 mod types;
 mod util;
 
-pub use client::{ClickHouseClient, ClickHouseClientOptions};
+pub use client::{ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits};
 #[allow(unused_imports)]
 pub use types::TransactionsForAddressRecord;
 pub use types::{
