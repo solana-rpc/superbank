@@ -113,6 +113,7 @@ type RewardsFields = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 type LoadedAddressFields = (Vec<Array<u8, 32>>, Vec<Array<u8, 32>>);
 type RpcInstructionFields = (Vec<u8>, Vec<Vec<u8>>, Vec<serde_bytes::ByteBuf>);
@@ -124,6 +125,7 @@ type RpcBlockRewardsFields = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 
 pub(crate) async fn run_rpc_ingest(args: &Args) -> Result<()> {
@@ -1007,6 +1009,7 @@ pub(crate) fn map_rpc_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
     ) = convert_rpc_block_rewards(block.rewards.as_ref())?;
 
     Ok(BlockMetadataRow {
@@ -1024,6 +1027,7 @@ pub(crate) fn map_rpc_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards_num_partitions: block.num_reward_partitions,
     })
 }
@@ -1163,6 +1167,7 @@ fn map_rpc_transaction(
         meta_reward_post_balance: meta_fields.meta_reward_post_balance,
         meta_reward_type: meta_fields.meta_reward_type,
         meta_reward_commission: meta_fields.meta_reward_commission,
+        meta_reward_commission_bps: meta_fields.meta_reward_commission_bps,
         meta_loaded_addresses_writable: meta_fields.meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly: meta_fields.meta_loaded_addresses_readonly,
         meta_return_data_present: meta_fields.meta_return_data_present,
@@ -1189,6 +1194,7 @@ pub(crate) fn map_bigtable_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
     ) = convert_rpc_block_rewards(Some(&block.rewards))?;
 
     Ok(BlockMetadataRow {
@@ -1206,6 +1212,7 @@ pub(crate) fn map_bigtable_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards_num_partitions: block.num_partitions,
     })
 }
@@ -1386,6 +1393,7 @@ fn map_versioned_transaction_with_meta(
         meta_reward_post_balance: meta_fields.meta_reward_post_balance,
         meta_reward_type: meta_fields.meta_reward_type,
         meta_reward_commission: meta_fields.meta_reward_commission,
+        meta_reward_commission_bps: meta_fields.meta_reward_commission_bps,
         meta_loaded_addresses_writable: meta_fields.meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly: meta_fields.meta_loaded_addresses_readonly,
         meta_return_data_present: meta_fields.meta_return_data_present,
@@ -1434,6 +1442,7 @@ struct RpcMetaFields {
     meta_reward_post_balance: Vec<u64>,
     meta_reward_type: Vec<Option<String>>,
     meta_reward_commission: Vec<Option<u8>>,
+    meta_reward_commission_bps: Vec<Option<u16>>,
     meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
     meta_return_data_present: u8,
@@ -1483,6 +1492,7 @@ impl RpcMetaFields {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: 0,
@@ -1548,6 +1558,7 @@ fn map_rpc_meta_fields(meta: Option<&UiTransactionStatusMeta>) -> Result<RpcMeta
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
     ) = convert_rpc_rewards(&meta.rewards)?;
 
     let (meta_loaded_addresses_writable, meta_loaded_addresses_readonly) =
@@ -1597,6 +1608,7 @@ fn map_rpc_meta_fields(meta: Option<&UiTransactionStatusMeta>) -> Result<RpcMeta
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
         meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly,
         meta_return_data_present,
@@ -1661,6 +1673,7 @@ fn map_native_meta_fields(meta: Option<&TransactionStatusMeta>) -> Result<RpcMet
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
     ) = convert_native_rewards(&meta.rewards)?;
 
     let (meta_loaded_addresses_writable, meta_loaded_addresses_readonly) =
@@ -1714,6 +1727,7 @@ fn map_native_meta_fields(meta: Option<&TransactionStatusMeta>) -> Result<RpcMet
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
         meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly,
         meta_return_data_present,
@@ -1873,6 +1887,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ));
     };
 
@@ -1881,6 +1896,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(reward.pubkey.clone());
@@ -1888,6 +1904,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
         post_balances.push(reward.post_balance);
         reward_types.push(reward.reward_type.map(|ty| ty.to_string()));
         commissions.push(reward.commission);
+        commission_bps.push(reward.commission_bps);
     }
 
     Ok((
@@ -1897,6 +1914,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
         post_balances,
         reward_types,
         commissions,
+        commission_bps,
     ))
 }
 
@@ -2099,6 +2117,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ));
     };
 
@@ -2107,6 +2126,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(reward.pubkey.clone());
@@ -2114,6 +2134,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
         post_balances.push(reward.post_balance);
         reward_types.push(reward.reward_type.map(|ty| ty.to_string()));
         commissions.push(reward.commission);
+        commission_bps.push(reward.commission_bps);
     }
 
     Ok((
@@ -2123,6 +2144,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
         post_balances,
         reward_types,
         commissions,
+        commission_bps,
     ))
 }
 
@@ -2177,6 +2199,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ));
     };
 
@@ -2185,6 +2208,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(decode_base58_32(&reward.pubkey).context("decode reward pubkey")?);
@@ -2192,6 +2216,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
         post_balances.push(reward.post_balance);
         reward_types.push(reward.reward_type.map(|ty| ty.to_string()));
         commissions.push(reward.commission);
+        commission_bps.push(reward.commission_bps);
     }
 
     Ok((
@@ -2201,6 +2226,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
         post_balances,
         reward_types,
         commissions,
+        commission_bps,
     ))
 }
 

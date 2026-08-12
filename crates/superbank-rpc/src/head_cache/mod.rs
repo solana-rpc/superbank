@@ -954,6 +954,7 @@ mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: false,
@@ -980,6 +981,7 @@ mod tests {
             rewards_post_balance: Vec::new(),
             rewards_type: Vec::new(),
             rewards_commission: Vec::new(),
+            rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
         }
     }

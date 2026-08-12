@@ -86,6 +86,7 @@ struct InflationRewardRow {
     lamports: i64,
     post_balance: u64,
     commission: Option<u8>,
+    commission_bps: Option<u16>,
 }
 
 fn build_inflation_boundary_query(
@@ -168,11 +169,12 @@ fn build_inflation_rewards_query(
             tupleElement(latest, 1) AS effective_slot,
             tupleElement(latest, 2) AS lamports,
             tupleElement(latest, 3) AS post_balance,
-            tupleElement(latest, 4) AS commission
+            tupleElement(latest, 4) AS commission,
+            tupleElement(latest, 5) AS commission_bps
          FROM (
             SELECT
                 reward.1 AS pubkey,
-                argMax(tuple(slot, reward.2, reward.3, reward.5), slot) AS latest
+                argMax(tuple(slot, reward.2, reward.3, reward.5, reward.6), slot) AS latest
             FROM (
                 SELECT
                     slot,
@@ -180,7 +182,12 @@ fn build_inflation_rewards_query(
                     rewards_lamports,
                     rewards_post_balance,
                     rewards_type,
-                    rewards_commission
+                    rewards_commission,
+                    if(
+                        empty(rewards_commission_bps),
+                        arrayMap(_ -> CAST(NULL, 'Nullable(UInt16)'), rewards_pubkey),
+                        rewards_commission_bps
+                    ) AS rewards_commission_bps
                 FROM {table}
                 PREWHERE slot IN ({slot_literals})
                 WHERE rewards_present = 1 AND hasAny(rewards_pubkey, target_pubkeys)
@@ -190,7 +197,8 @@ fn build_inflation_rewards_query(
                 rewards_lamports,
                 rewards_post_balance,
                 rewards_type,
-                rewards_commission
+                rewards_commission,
+                rewards_commission_bps
             ) AS reward
             WHERE has(target_pubkeys, reward.1) AND {reward_type_predicate}
             GROUP BY pubkey
@@ -1140,6 +1148,7 @@ impl ClickHouseClient {
                         lamports: row.lamports,
                         post_balance: row.post_balance,
                         commission: row.commission,
+                        commission_bps: row.commission_bps,
                     },
                 );
             }
@@ -1338,6 +1347,7 @@ impl ClickHouseClient {
                         lamports: row.lamports,
                         post_balance: row.post_balance,
                         commission: row.commission,
+                        commission_bps: row.commission_bps,
                     },
                 );
                 partition_reward_count = partition_reward_count.saturating_add(1);
@@ -2307,6 +2317,9 @@ mod tests {
         assert!(query.contains("PREWHERE slot IN (121392000, 121392017)"));
         assert!(!query.contains("PREWHERE slot >="));
         assert!(query.contains("ARRAY JOIN arrayZip"));
+        assert!(query.contains("AS rewards_commission_bps"));
+        assert!(query.contains("CAST(NULL, 'Nullable(UInt16)')"));
+        assert!(query.contains("tupleElement(latest, 5) AS commission_bps"));
         assert!(query.contains("= 'staking'"));
         assert!(query.contains("max_threads=2"));
         assert!(query.contains("max_memory_usage=536870912"));

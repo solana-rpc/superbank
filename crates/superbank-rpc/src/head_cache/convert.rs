@@ -90,6 +90,7 @@ type RewardsConversion = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 type ReturnDataConversion = (bool, Option<[u8; 32]>, Option<Vec<u8>>);
 
@@ -291,6 +292,7 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(reward.pubkey.clone());
@@ -298,9 +300,17 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
         post_balances.push(reward.post_balance);
         reward_types.push(reward_type_to_string(reward.reward_type));
         commissions.push(parse_commission(&reward.commission));
+        commission_bps.push(parse_commission_bps(&reward.commission_bps));
     }
 
-    (pubkeys, lamports, post_balances, reward_types, commissions)
+    (
+        pubkeys,
+        lamports,
+        post_balances,
+        reward_types,
+        commissions,
+        commission_bps,
+    )
 }
 
 fn reward_type_to_string(value: i32) -> Option<String> {
@@ -316,6 +326,13 @@ fn parse_commission(value: &str) -> Option<u8> {
         return None;
     }
     value.parse::<u8>().ok()
+}
+
+fn parse_commission_bps(value: &str) -> Option<u16> {
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<u16>().ok()
 }
 
 fn convert_pubkeys(keys: &[Vec<u8>], what: &'static str) -> Result<Vec<[u8; 32]>, ConvertError> {
@@ -441,6 +458,7 @@ pub(crate) fn stored_record_from_transaction_info(
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
     ) = convert_rewards(&meta.rewards);
 
     // gRPC does not distinguish between absent and empty rewards. Treat empty as present.
@@ -520,6 +538,7 @@ pub(crate) fn stored_record_from_transaction_info(
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
         meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly,
         meta_return_data_present,

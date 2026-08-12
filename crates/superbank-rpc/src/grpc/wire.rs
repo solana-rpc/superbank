@@ -280,6 +280,8 @@ fn encode_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<u8>, Status> {
         || metadata.rewards_post_balance.len() != len
         || metadata.rewards_type.len() != len
         || metadata.rewards_commission.len() != len
+        || (!metadata.rewards_commission_bps.is_empty()
+            && metadata.rewards_commission_bps.len() != len)
     {
         return Err(Status::new(
             Code::Internal,
@@ -301,6 +303,13 @@ fn encode_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<u8>, Status> {
                     reward_type: reward_type as i32,
                     commission: metadata.rewards_commission[idx]
                         .map(|commission| commission.to_string())
+                        .unwrap_or_default(),
+                    commission_bps: metadata
+                        .rewards_commission_bps
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                        .map(|commission_bps| commission_bps.to_string())
                         .unwrap_or_default(),
                 }
             })
@@ -325,6 +334,10 @@ fn encode_reward(reward: &Reward) -> storage_proto::Reward {
         commission: reward
             .commission
             .map(|commission| commission.to_string())
+            .unwrap_or_default(),
+        commission_bps: reward
+            .commission_bps
+            .map(|commission_bps| commission_bps.to_string())
             .unwrap_or_default(),
     }
 }
@@ -468,6 +481,7 @@ mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: false,

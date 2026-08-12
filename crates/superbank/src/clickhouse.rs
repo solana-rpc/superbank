@@ -74,6 +74,7 @@ pub(crate) struct TransactionRow {
     pub(crate) meta_reward_post_balance: Vec<u64>,
     pub(crate) meta_reward_type: Vec<Option<String>>,
     pub(crate) meta_reward_commission: Vec<Option<u8>>,
+    pub(crate) meta_reward_commission_bps: Vec<Option<u16>>,
     pub(crate) meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     pub(crate) meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
     pub(crate) meta_return_data_present: u8,
@@ -99,6 +100,7 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_post_balance: Vec<u64>,
     pub(crate) rewards_type: Vec<Option<String>>,
     pub(crate) rewards_commission: Vec<Option<u8>>,
+    pub(crate) rewards_commission_bps: Vec<Option<u16>>,
     pub(crate) rewards_num_partitions: Option<u64>,
 }
 
