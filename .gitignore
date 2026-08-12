@@ -62,5 +62,12 @@ superbank.yaml
 .bin
 dist/
 
+crates/superbank-solparq/archives/
+crates/superbank-solparq/*.log
+
+# Zig cross-compilation cache (created by cargo-zigbuild during GoReleaser builds)
+.zig-cache/
+**/.zig-cache/
+
 credentials.json
 clickhouse.sh

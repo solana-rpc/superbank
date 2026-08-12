@@ -47,6 +47,7 @@ use crate::clickhouse::{
 };
 use crate::commitment::parse_commitment_config;
 use crate::metrics;
+use crate::range::load_slot_list;
 use crate::rpc_client::build_rpc_client;
 use crate::shutdown::spawn_shutdown_watch;
 use crate::utils::{bytes_to_array, decode_base58_32};
@@ -149,7 +150,20 @@ pub(crate) async fn run_rpc_ingest(args: &Args) -> Result<()> {
         .cloned()
         .context("rpc client pool is empty")?;
 
-    let range = resolve_rpc_range(args, discovery_client.as_ref(), clickhouse.as_ref()).await?;
+    // Explicit slot-list mode fetches exactly the listed slots (no getBlocks
+    // discovery); otherwise resolve a contiguous [from, to] range to scan.
+    let slot_list = match args.rpc_slot_list.as_deref() {
+        Some(path) => Some(load_slot_list(path).await?),
+        None => None,
+    };
+    let range = match &slot_list {
+        // load_slot_list returns a sorted, de-duplicated, non-empty list.
+        Some(slots) => RpcRange {
+            start: *slots.first().expect("slot list is non-empty"),
+            end: *slots.last().expect("slot list is non-empty"),
+        },
+        None => resolve_rpc_range(args, discovery_client.as_ref(), clickhouse.as_ref()).await?,
+    };
     let block_config = build_rpc_block_config(args, commitment);
 
     info!(
@@ -157,6 +171,7 @@ pub(crate) async fn run_rpc_ingest(args: &Args) -> Result<()> {
         rpc_url = %rpc_url,
         from_slot = range.start,
         to_slot = range.end,
+        slot_list_len = slot_list.as_ref().map(Vec::len),
         transactions_table = %args.transactions_table,
         blocks_table = %args.blocks_table,
         "starting superbank ingest"
@@ -173,18 +188,29 @@ pub(crate) async fn run_rpc_ingest(args: &Args) -> Result<()> {
     let (fatal_tx, fatal_rx) = mpsc::channel(1);
 
     let discovery_backoff = Duration::from_millis(args.rpc_retry_backoff_ms);
-    let discovery_handle = tokio::spawn(discover_slots(DiscoverSlotsArgs {
-        rpc_client: discovery_client.clone(),
-        clickhouse: clickhouse.clone(),
-        blocks_table: args.blocks_table.clone(),
-        range,
-        commitment,
-        chunk_slots: args.rpc_discovery_chunk_slots,
-        skip_ingested: args.rpc_skip_ingested_slots,
-        backoff: discovery_backoff,
-        slot_tx,
-        progress_tx,
-    }));
+    let discovery_handle = match slot_list {
+        Some(slots) => {
+            info!(
+                slot_count = slots.len(),
+                from_slot = range.start,
+                to_slot = range.end,
+                "rpc slot-list mode; fetching exactly the listed slots (no discovery)"
+            );
+            tokio::spawn(enqueue_slot_list(slots, slot_tx, progress_tx))
+        }
+        None => tokio::spawn(discover_slots(DiscoverSlotsArgs {
+            rpc_client: discovery_client.clone(),
+            clickhouse: clickhouse.clone(),
+            blocks_table: args.blocks_table.clone(),
+            range,
+            commitment,
+            chunk_slots: args.rpc_discovery_chunk_slots,
+            skip_ingested: args.rpc_skip_ingested_slots,
+            backoff: discovery_backoff,
+            slot_tx,
+            progress_tx,
+        })),
+    };
 
     let mut worker_txs = Vec::with_capacity(worker_count);
     let mut worker_handles = Vec::with_capacity(worker_count);
@@ -748,6 +774,23 @@ fn rpc_discovery_commitment(commitment: CommitmentConfig) -> CommitmentConfig {
         return CommitmentConfig::confirmed();
     }
     commitment
+}
+
+/// Enqueue an explicit, pre-sorted slot list directly to the workers, skipping
+/// getBlocks discovery entirely. Used by `--rpc-slot-list` for targeted
+/// backfills where the caller already knows exactly which slots to fetch.
+async fn enqueue_slot_list(
+    slots: Vec<u64>,
+    slot_tx: mpsc::Sender<u64>,
+    progress_tx: watch::Sender<u64>,
+) -> Result<()> {
+    for slot in slots {
+        if slot_tx.send(slot).await.is_err() {
+            return Ok(());
+        }
+        let _ = progress_tx.send(slot);
+    }
+    Ok(())
 }
 
 struct DiscoverSlotsArgs {
@@ -2273,6 +2316,7 @@ mod tests {
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
             rpc_skip_ingested_slots: false,
+            rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),
@@ -2287,6 +2331,18 @@ mod tests {
             bigtable_insert_concurrency: 1,
             bigtable_decode_concurrency: 4,
             bigtable_progress_every_slots: 10_000,
+            solparq_archive_location: None,
+            solparq_archive_path: None,
+            solparq_archive_s3_endpoint: None,
+            solparq_archive_s3_bucket_name: None,
+            solparq_archive_s3_bucket_path: None,
+            solparq_archive_s3_auth_key: None,
+            solparq_archive_s3_auth_secret_key: None,
+            solparq_archive_s3_region: "us-east-1".to_string(),
+            solparq_from_slot: None,
+            solparq_to_slot: None,
+            solparq_tables: Vec::new(),
+            solparq_clickhouse_settings: String::new(),
             clickhouse_url: "http://localhost:8123".to_string(),
             metrics_host: "0.0.0.0".to_string(),
             metrics_port: 9901,
@@ -2388,5 +2444,19 @@ mod tests {
         assert_eq!(row.meta_rewards_present, 0);
         assert!(row.meta_compute_units_consumed.is_none());
         assert!(row.meta_cost_units.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_slot_list_forwards_exact_slots() {
+        let (slot_tx, mut slot_rx) = mpsc::channel(16);
+        let (progress_tx, _progress_rx) = watch::channel(0);
+        enqueue_slot_list(vec![7, 42, 99], slot_tx, progress_tx)
+            .await
+            .expect("enqueue");
+        let mut received = Vec::new();
+        while let Some(slot) = slot_rx.recv().await {
+            received.push(slot);
+        }
+        assert_eq!(received, vec![7, 42, 99]);
     }
 }

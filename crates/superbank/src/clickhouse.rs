@@ -184,25 +184,27 @@ pub(crate) async fn fetch_latest_slot_from_blocks(
     Ok(row.max_slot)
 }
 
+/// Distinct slots already present in the blocks table within the inclusive
+/// `[start, end]` range. Used by RPC discovery to skip slots that have already
+/// been ingested.
 pub(crate) async fn fetch_present_slots_in_range(
     clickhouse: &ClickHouseClient,
     blocks_table: &str,
     start: u64,
     end: u64,
 ) -> Result<Vec<u64>> {
-    #[derive(Debug, Deserialize, Row)]
-    struct SlotRow {
-        slot: u64,
-    }
-
-    let query = format!("SELECT slot FROM {blocks_table} WHERE slot >= {start} AND slot <= {end}");
-    let rows = clickhouse
+    let query = format!(
+        "SELECT DISTINCT slot FROM {blocks_table} WHERE slot BETWEEN ? AND ? ORDER BY slot"
+    );
+    clickhouse
         .query(&query)
-        .fetch_all::<SlotRow>()
+        .bind(start)
+        .bind(end)
+        .fetch_all::<u64>()
         .await
-        .with_context(|| format!("query present slots in [{start}, {end}] from {blocks_table}"))?;
-
-    Ok(rows.into_iter().map(|row| row.slot).collect())
+        .with_context(|| {
+            format!("query present slots from {blocks_table} between {start} and {end}")
+        })
 }
 
 pub(crate) async fn flush_buffers(
@@ -542,6 +544,7 @@ mod tests {
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
             rpc_skip_ingested_slots: false,
+            rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),
@@ -556,6 +559,18 @@ mod tests {
             bigtable_insert_concurrency: 1,
             bigtable_decode_concurrency: 4,
             bigtable_progress_every_slots: 10_000,
+            solparq_archive_location: None,
+            solparq_archive_path: None,
+            solparq_archive_s3_endpoint: None,
+            solparq_archive_s3_bucket_name: None,
+            solparq_archive_s3_bucket_path: None,
+            solparq_archive_s3_auth_key: None,
+            solparq_archive_s3_auth_secret_key: None,
+            solparq_archive_s3_region: "us-east-1".to_string(),
+            solparq_from_slot: None,
+            solparq_to_slot: None,
+            solparq_tables: Vec::new(),
+            solparq_clickhouse_settings: String::new(),
             clickhouse_url: "http://localhost:8123".to_string(),
             metrics_host: "0.0.0.0".to_string(),
             metrics_port: 9901,

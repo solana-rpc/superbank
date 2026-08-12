@@ -430,6 +430,7 @@ pub struct ClickHouseClient {
     pub(crate) routing_policy: RoutingPolicy,
 
     pub(crate) query_timeout: Duration,
+    pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) http_connect_timeout: Duration,
     pub(crate) fanout_sem: Arc<Semaphore>,
@@ -462,6 +463,26 @@ pub struct ClickHouseClientOptions {
     pub tcp_pool_max: usize,
     pub in_clause_chunk: usize,
     pub startup_table_check: ClickHouseStartupTableCheck,
+    pub inflation_reward_limits: InflationRewardQueryLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InflationRewardQueryLimits {
+    pub query_timeout: Duration,
+    pub max_threads: usize,
+    pub max_memory_bytes: u64,
+    pub max_bytes_to_read: u64,
+}
+
+impl Default for InflationRewardQueryLimits {
+    fn default() -> Self {
+        Self {
+            query_timeout: Duration::from_millis(5_000),
+            max_threads: 2,
+            max_memory_bytes: 536_870_912,
+            max_bytes_to_read: 536_870_912,
+        }
+    }
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -541,6 +562,7 @@ impl ClickHouseClientOptions {
             tcp_pool_max: 20,
             in_clause_chunk: 512,
             startup_table_check: ClickHouseStartupTableCheck::Exists,
+            inflation_reward_limits: InflationRewardQueryLimits::default(),
         }
     }
 
@@ -589,6 +611,11 @@ impl ClickHouseClientOptions {
         self.startup_table_check = mode;
         self
     }
+
+    pub fn with_inflation_reward_limits(mut self, limits: InflationRewardQueryLimits) -> Self {
+        self.inflation_reward_limits = limits;
+        self
+    }
 }
 
 impl ClickHouseClient {
@@ -615,7 +642,7 @@ impl ClickHouseClient {
             tcp_pool_max,
             in_clause_chunk,
             startup_table_check,
-            ..
+            inflation_reward_limits,
         } = options;
         let client =
             build_clickhouse_http_client(url, database, username, password, http_connect_timeout);
@@ -705,6 +732,7 @@ impl ClickHouseClient {
             routing_policy,
 
             query_timeout,
+            inflation_reward_limits,
             tcp_access_check_timeout,
             http_connect_timeout,
             fanout_sem: Arc::new(Semaphore::new(fanout_concurrency.max(1))),
@@ -768,6 +796,22 @@ impl ClickHouseClient {
         )
     }
 
+    pub(crate) fn http_query_cleanup_for_client(
+        &self,
+        client: HttpClient,
+        cluster: Option<String>,
+        operation: &'static str,
+        query_id: String,
+    ) -> HttpQueryCleanup {
+        HttpQueryCleanup::new(
+            client,
+            cluster,
+            operation,
+            self.inflation_reward_limits.query_timeout,
+            query_id,
+        )
+    }
+
     pub(crate) fn signatures_bucket_modulus(&self) -> u64 {
         self.bucket_moduli.signatures
     }
@@ -808,8 +852,7 @@ impl ClickHouseClient {
         timeout: Duration,
     ) -> String {
         // Bound the server-side query lifetime so a query ClickHouse keeps running after
-        // `with_http_query_timeout` drops the HTTP future so it does not linger and hold a
-        // connection.
+        // `with_http_query_timeout` drops the HTTP future does not linger and hold a connection.
         append_max_execution_time_setting(
             &build_select_settings_clause(
                 self.allow_query_settings,
@@ -855,6 +898,30 @@ impl ClickHouseClient {
             ),
             self.query_timeout,
         )
+    }
+
+    pub(crate) fn inflation_reward_settings_clause(&self, operation: &'static str) -> String {
+        let limits = self.inflation_reward_limits;
+        let base = self.select_settings_clause_with_timeout(
+            operation,
+            QueryFreshnessClass::Historical,
+            limits.query_timeout,
+        );
+        if base.is_empty() {
+            return base;
+        }
+
+        format!(
+            "{base}, max_threads={max_threads}, max_memory_usage={max_memory_bytes}, \
+             max_bytes_to_read={max_bytes_to_read}, read_overflow_mode='throw'",
+            max_threads = limits.max_threads,
+            max_memory_bytes = limits.max_memory_bytes,
+            max_bytes_to_read = limits.max_bytes_to_read,
+        )
+    }
+
+    pub(crate) fn query_settings_enabled(&self) -> bool {
+        self.allow_query_settings
     }
 
     pub(crate) async fn with_http_query_timeout<T>(
@@ -1072,9 +1139,7 @@ impl ClickHouseClient {
             None
         };
 
-        if self.scope_shard_direct()
-            && let Some(topology) = &self.shard_topology
-        {
+        if let Some(topology) = &self.shard_topology {
             if let Some(router) = &self.gsfa_router {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
@@ -1092,7 +1157,9 @@ impl ClickHouseClient {
                 )?;
             }
 
-            if let Some(local_table) = &self.signatures_local_table {
+            if self.scope_shard_direct()
+                && let Some(local_table) = &self.signatures_local_table
+            {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
                     local_table,
@@ -1488,65 +1555,62 @@ impl ClickHouseClient {
                     let topology = Arc::new(topology);
                     self.shard_topology = Some(topology.clone());
 
-                    if self.scope_shard_direct() {
-                        if let Some(local_table) = config.gsfa_local_table.clone() {
-                            if let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &GSFA_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "GSFA shard routing disabled; local table validation failed: {}",
-                                    e
-                                );
-                            } else {
-                                self.validate_gsfa_shard_layout(&local_table).await?;
-                                self.gsfa_router = Some(GsfaShardRouter {
-                                    local_table,
-                                    topology: topology.clone(),
-                                    query_timeout: self.shard_tcp_query_timeout(),
-                                });
-                            }
+                    if let Some(local_table) = config.gsfa_local_table.clone() {
+                        if let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &GSFA_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "GSFA shard routing disabled; local table validation failed: {}",
+                                e
+                            );
                         } else {
-                            tracing::warn!(
-                                "GSFA shard routing disabled; local table not configured"
-                            );
+                            self.validate_gsfa_shard_layout(&local_table).await?;
+                            self.gsfa_router = Some(GsfaShardRouter {
+                                local_table,
+                                topology: topology.clone(),
+                                query_timeout: self.shard_tcp_query_timeout(),
+                            });
                         }
+                    } else {
+                        tracing::warn!("GSFA shard routing disabled; local table not configured");
+                    }
 
-                        if let Some(local_table) = config.signatures_local_table.clone()
-                            && let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &SIGNATURES_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Signature shard routing disabled; local table validation failed: {}",
-                                e
-                            );
-                            self.signatures_local_table = None;
-                        }
+                    if self.scope_shard_direct()
+                        && let Some(local_table) = config.signatures_local_table.clone()
+                        && let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &SIGNATURES_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Signature shard routing disabled; local table validation failed: {}",
+                            e
+                        );
+                        self.signatures_local_table = None;
+                    }
 
-                        if let Some(local_table) = config.token_owner_activity_local_table.clone()
-                            && let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &TOKEN_OWNER_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Token owner shard routing disabled; local table validation failed: {}",
-                                e
-                            );
-                            self.token_owner_activity_local_table = None;
-                        }
+                    if let Some(local_table) = config.token_owner_activity_local_table.clone()
+                        && let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &TOKEN_OWNER_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Token owner shard routing disabled; local table validation failed: {}",
+                            e
+                        );
+                        self.token_owner_activity_local_table = None;
                     }
 
                     if hot_routing_configured {
@@ -1994,8 +2058,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        ClickHouseClient, ClickHouseClientOptions, kill_query_sql, shard_tcp_query_timeout_for,
-        split_table_reference, validate_gsfa_shard_layout_query,
+        ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, kill_query_sql,
+        shard_tcp_query_timeout_for, split_table_reference, validate_gsfa_shard_layout_query,
     };
     use crate::clickhouse::{
         QueryCacheConfig, QueryFreshnessClass, RoutingPolicy, RoutingScope, RoutingTransport,
@@ -2230,6 +2294,28 @@ mod tests {
         assert!(!clause.contains("query_cache_min_query_runs"));
         assert!(clause.contains("max_execution_time=30"));
         assert!(!clause.contains("max_execution_time=8"));
+    }
+
+    #[test]
+    fn inflation_reward_settings_clause_applies_method_limits() {
+        let client = test_client_with_query_cache();
+        let client = ClickHouseClient {
+            inflation_reward_limits: InflationRewardQueryLimits {
+                query_timeout: Duration::from_millis(4_500),
+                max_threads: 3,
+                max_memory_bytes: 123_456,
+                max_bytes_to_read: 654_321,
+            },
+            ..client
+        };
+
+        let clause = client.inflation_reward_settings_clause("get_inflation_reward_test");
+
+        assert!(clause.contains("max_execution_time=5"));
+        assert!(clause.contains("max_threads=3"));
+        assert!(clause.contains("max_memory_usage=123456"));
+        assert!(clause.contains("max_bytes_to_read=654321"));
+        assert!(clause.contains("read_overflow_mode='throw'"));
     }
 
     #[tokio::test]

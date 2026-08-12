@@ -63,3 +63,14 @@ jobs:
 
       - name: Build snapshot artifacts
         run: goreleaser build --snapshot --clean --config .goreleaser.yaml
+
+      - name: Upload snapshot artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: superbank-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            dist/superbank_*/superbank
+            dist/superbank-rpc_*/superbank-rpc
+            dist/superbank-solparq_*/superbank-solparq
+            dist/superbank-solparq-read_*/superbank-solparq-read

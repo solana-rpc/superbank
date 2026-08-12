@@ -7,7 +7,7 @@ authors.workspace = true
 publish = false
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.0-solparq.17"
 edition = "2024"
 license = "AGPL-3.0-only"
 authors = [
@@ -25,10 +25,12 @@ authors = [
 members = [
     "crates/superbank",
     "crates/superbank-rpc",
+    "crates/superbank-solparq",
 ]
 
 resolver = "2"
 default-members = [
     "crates/superbank",
     "crates/superbank-rpc",
+    "crates/superbank-solparq",
 ]

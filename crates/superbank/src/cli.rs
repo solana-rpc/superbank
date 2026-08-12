@@ -103,6 +103,7 @@ pub(crate) enum IngestSource {
     Grpc,
     Rpc,
     Bigtable,
+    Solparq,
 }
 
 impl IngestSource {
@@ -112,14 +113,23 @@ impl IngestSource {
             IngestSource::Grpc => "grpc",
             IngestSource::Rpc => "rpc",
             IngestSource::Bigtable => "bigtable",
+            IngestSource::Solparq => "solparq",
         }
     }
+}
+
+/// Where solparq archive bundles are read from when restoring into ClickHouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SolparqArchiveLocation {
+    Local,
+    S3,
 }
 
 #[derive(Parser, Debug)]
 #[command(about = "Superbank ingestor")]
 struct CliArgs {
-    /// Ingest source: fumarole | grpc | rpc | bigtable
+    /// Ingest source: fumarole | grpc | rpc | bigtable | solparq
     #[arg(long, env = "SUPERBANK_SOURCE", value_enum)]
     source: Option<IngestSource>,
 
@@ -299,6 +309,13 @@ struct CliArgs {
     #[arg(long, env = "RPC_SKIP_INGESTED_SLOTS", default_value_t = false)]
     rpc_skip_ingested_slots: bool,
 
+    /// Fetch exactly the slots in this whitespace-separated file (getBlock per
+    /// slot, no getBlocks discovery). Mutually exclusive with
+    /// --rpc-skip-ingested-slots, --rpc-from-slot, --rpc-to-slot, and
+    /// --rpc-slot-count.
+    #[arg(long, env = "RPC_SLOT_LIST", value_name = "PATH")]
+    rpc_slot_list: Option<PathBuf>,
+
     /// Bigtable range spec: slots "123:456", epochs "1-10", or single epoch "5"
     #[arg(long, env = "BIGTABLE_RANGE")]
     bigtable_range: Option<String>,
@@ -358,6 +375,88 @@ struct CliArgs {
     /// Log Bigtable progress every N slots
     #[arg(long, env = "BIGTABLE_PROGRESS_EVERY_SLOTS", default_value_t = 10_000)]
     bigtable_progress_every_slots: u64,
+
+    /// solparq archive location to restore from: local | s3
+    #[arg(
+        long = "solparq-archive-location",
+        env = "SOLPARQ_ARCHIVE_LOCATION",
+        value_enum
+    )]
+    solparq_archive_location: Option<SolparqArchiveLocation>,
+
+    /// Path to a solparq bundle directory, or a directory containing bundles
+    /// (local archive location only)
+    #[arg(
+        long = "solparq-archive-path",
+        env = "SOLPARQ_ARCHIVE_PATH",
+        value_name = "PATH"
+    )]
+    solparq_archive_path: Option<PathBuf>,
+
+    /// S3 endpoint for solparq archives (s3 archive location only)
+    #[arg(
+        long = "solparq-archive-s3-endpoint",
+        env = "SOLPARQ_ARCHIVE_S3_ENDPOINT"
+    )]
+    solparq_archive_s3_endpoint: Option<String>,
+
+    /// S3 bucket name for solparq archives (s3 archive location only)
+    #[arg(
+        long = "solparq-archive-s3-bucket-name",
+        env = "SOLPARQ_ARCHIVE_S3_BUCKET_NAME"
+    )]
+    solparq_archive_s3_bucket_name: Option<String>,
+
+    /// S3 bucket path/prefix for solparq archives (s3 archive location only)
+    #[arg(
+        long = "solparq-archive-s3-bucket-path",
+        env = "SOLPARQ_ARCHIVE_S3_BUCKET_PATH"
+    )]
+    solparq_archive_s3_bucket_path: Option<String>,
+
+    /// S3 access key for solparq archives (s3 archive location only)
+    #[arg(
+        long = "solparq-archive-s3-auth-key",
+        env = "SOLPARQ_ARCHIVE_S3_AUTH_KEY"
+    )]
+    solparq_archive_s3_auth_key: Option<String>,
+
+    /// S3 secret key for solparq archives (s3 archive location only)
+    #[arg(
+        long = "solparq-archive-s3-auth-secret-key",
+        env = "SOLPARQ_ARCHIVE_S3_AUTH_SECRET_KEY"
+    )]
+    solparq_archive_s3_auth_secret_key: Option<String>,
+
+    /// S3 region for solparq archives (s3 archive location only)
+    #[arg(
+        long = "solparq-archive-s3-region",
+        env = "SOLPARQ_ARCHIVE_S3_REGION",
+        default_value = "us-east-1"
+    )]
+    solparq_archive_s3_region: String,
+
+    /// Restore only bundles/rows at or after this slot (inclusive)
+    #[arg(long = "solparq-from-slot", env = "SOLPARQ_FROM_SLOT")]
+    solparq_from_slot: Option<u64>,
+
+    /// Restore only bundles/rows at or before this slot (inclusive)
+    #[arg(long = "solparq-to-slot", env = "SOLPARQ_TO_SLOT")]
+    solparq_to_slot: Option<u64>,
+
+    /// Restrict the restore to these archived table kinds (comma-separated,
+    /// e.g. transactions,blocks_metadata). Defaults to every table in the bundle.
+    #[arg(long = "solparq-tables", env = "SOLPARQ_TABLES", value_delimiter = ',')]
+    solparq_tables: Vec<String>,
+
+    /// Raw ClickHouse `SETTINGS` clause body appended to solparq restore
+    /// statements to bound insert memory (empty omits the clause)
+    #[arg(
+        long = "solparq-clickhouse-settings",
+        env = "SOLPARQ_CLICKHOUSE_SETTINGS",
+        default_value = ""
+    )]
+    solparq_clickhouse_settings: String,
 
     /// ClickHouse HTTP URL
     #[arg(long, env = "CLICKHOUSE_URL", default_value = "http://localhost:8123")]
@@ -483,6 +582,7 @@ pub(crate) struct Args {
     pub(crate) rpc_progress_every_slots: u64,
     pub(crate) rpc_discovery_chunk_slots: u64,
     pub(crate) rpc_skip_ingested_slots: bool,
+    pub(crate) rpc_slot_list: Option<PathBuf>,
     pub(crate) bigtable_range: Option<String>,
     pub(crate) bigtable_slot_file: Option<PathBuf>,
     pub(crate) bigtable_instance: String,
@@ -497,6 +597,18 @@ pub(crate) struct Args {
     pub(crate) bigtable_insert_concurrency: usize,
     pub(crate) bigtable_decode_concurrency: usize,
     pub(crate) bigtable_progress_every_slots: u64,
+    pub(crate) solparq_archive_location: Option<SolparqArchiveLocation>,
+    pub(crate) solparq_archive_path: Option<PathBuf>,
+    pub(crate) solparq_archive_s3_endpoint: Option<String>,
+    pub(crate) solparq_archive_s3_bucket_name: Option<String>,
+    pub(crate) solparq_archive_s3_bucket_path: Option<String>,
+    pub(crate) solparq_archive_s3_auth_key: Option<String>,
+    pub(crate) solparq_archive_s3_auth_secret_key: Option<String>,
+    pub(crate) solparq_archive_s3_region: String,
+    pub(crate) solparq_from_slot: Option<u64>,
+    pub(crate) solparq_to_slot: Option<u64>,
+    pub(crate) solparq_tables: Vec<String>,
+    pub(crate) solparq_clickhouse_settings: String,
     pub(crate) clickhouse_url: String,
     pub(crate) metrics_host: String,
     pub(crate) metrics_port: u16,
@@ -586,6 +698,8 @@ struct FileConfig {
     rpc_discovery_chunk_slots: Option<u64>,
     #[serde(alias = "rpc_skip_ingested_slots")]
     rpc_skip_ingested_slots: Option<bool>,
+    #[serde(alias = "rpc_slot_list")]
+    rpc_slot_list: Option<PathBuf>,
     #[serde(alias = "bigtable_range")]
     bigtable_range: Option<String>,
     #[serde(alias = "bigtable_slot_file")]
@@ -614,6 +728,30 @@ struct FileConfig {
     bigtable_decode_concurrency: Option<usize>,
     #[serde(alias = "bigtable_progress_every_slots")]
     bigtable_progress_every_slots: Option<u64>,
+    #[serde(alias = "solparq_archive_location")]
+    solparq_archive_location: Option<SolparqArchiveLocation>,
+    #[serde(alias = "solparq_archive_path")]
+    solparq_archive_path: Option<PathBuf>,
+    #[serde(alias = "solparq_archive_s3_endpoint")]
+    solparq_archive_s3_endpoint: Option<String>,
+    #[serde(alias = "solparq_archive_s3_bucket_name")]
+    solparq_archive_s3_bucket_name: Option<String>,
+    #[serde(alias = "solparq_archive_s3_bucket_path")]
+    solparq_archive_s3_bucket_path: Option<String>,
+    #[serde(alias = "solparq_archive_s3_auth_key")]
+    solparq_archive_s3_auth_key: Option<String>,
+    #[serde(alias = "solparq_archive_s3_auth_secret_key")]
+    solparq_archive_s3_auth_secret_key: Option<String>,
+    #[serde(alias = "solparq_archive_s3_region")]
+    solparq_archive_s3_region: Option<String>,
+    #[serde(alias = "solparq_from_slot")]
+    solparq_from_slot: Option<u64>,
+    #[serde(alias = "solparq_to_slot")]
+    solparq_to_slot: Option<u64>,
+    #[serde(alias = "solparq_tables")]
+    solparq_tables: Option<Vec<String>>,
+    #[serde(alias = "solparq_clickhouse_settings")]
+    solparq_clickhouse_settings: Option<String>,
     #[serde(alias = "clickhouse_url")]
     clickhouse_url: Option<String>,
     #[serde(alias = "metrics_host")]
@@ -844,6 +982,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             cli.rpc_skip_ingested_slots,
             file_config.rpc_skip_ingested_slots,
         ),
+        rpc_slot_list: merge_option(
+            &matches,
+            "rpc_slot_list",
+            cli.rpc_slot_list,
+            file_config.rpc_slot_list,
+        ),
         bigtable_range: merge_option(
             &matches,
             "bigtable_range",
@@ -927,6 +1071,78 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "bigtable_progress_every_slots",
             cli.bigtable_progress_every_slots,
             file_config.bigtable_progress_every_slots,
+        ),
+        solparq_archive_location: merge_option(
+            &matches,
+            "solparq_archive_location",
+            cli.solparq_archive_location,
+            file_config.solparq_archive_location,
+        ),
+        solparq_archive_path: merge_option(
+            &matches,
+            "solparq_archive_path",
+            cli.solparq_archive_path,
+            file_config.solparq_archive_path,
+        ),
+        solparq_archive_s3_endpoint: merge_option(
+            &matches,
+            "solparq_archive_s3_endpoint",
+            cli.solparq_archive_s3_endpoint,
+            file_config.solparq_archive_s3_endpoint,
+        ),
+        solparq_archive_s3_bucket_name: merge_option(
+            &matches,
+            "solparq_archive_s3_bucket_name",
+            cli.solparq_archive_s3_bucket_name,
+            file_config.solparq_archive_s3_bucket_name,
+        ),
+        solparq_archive_s3_bucket_path: merge_option(
+            &matches,
+            "solparq_archive_s3_bucket_path",
+            cli.solparq_archive_s3_bucket_path,
+            file_config.solparq_archive_s3_bucket_path,
+        ),
+        solparq_archive_s3_auth_key: merge_option(
+            &matches,
+            "solparq_archive_s3_auth_key",
+            cli.solparq_archive_s3_auth_key,
+            file_config.solparq_archive_s3_auth_key,
+        ),
+        solparq_archive_s3_auth_secret_key: merge_option(
+            &matches,
+            "solparq_archive_s3_auth_secret_key",
+            cli.solparq_archive_s3_auth_secret_key,
+            file_config.solparq_archive_s3_auth_secret_key,
+        ),
+        solparq_archive_s3_region: merge_value(
+            &matches,
+            "solparq_archive_s3_region",
+            cli.solparq_archive_s3_region,
+            file_config.solparq_archive_s3_region,
+        ),
+        solparq_from_slot: merge_option(
+            &matches,
+            "solparq_from_slot",
+            cli.solparq_from_slot,
+            file_config.solparq_from_slot,
+        ),
+        solparq_to_slot: merge_option(
+            &matches,
+            "solparq_to_slot",
+            cli.solparq_to_slot,
+            file_config.solparq_to_slot,
+        ),
+        solparq_tables: merge_value(
+            &matches,
+            "solparq_tables",
+            cli.solparq_tables,
+            file_config.solparq_tables,
+        ),
+        solparq_clickhouse_settings: merge_value(
+            &matches,
+            "solparq_clickhouse_settings",
+            cli.solparq_clickhouse_settings,
+            file_config.solparq_clickhouse_settings,
         ),
         clickhouse_url: merge_value(
             &matches,
@@ -1120,25 +1336,39 @@ fn validate_args(args: &Args) -> Result<()> {
                     "rpc source requires --rpc-url / RPC_URL / config rpc_url"
                 ));
             }
-            if args.rpc_from_slot.is_none() {
-                return Err(anyhow!(
-                    "rpc source requires --rpc-from-slot / RPC_FROM_SLOT / config rpc-from-slot"
-                ));
-            }
-            if args.rpc_to_slot.is_some() && args.rpc_slot_count.is_some() {
-                return Err(anyhow!(
-                    "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
-                ));
-            }
-            if args.rpc_to_slot.is_none() && args.rpc_slot_count.is_none() {
-                return Err(anyhow!(
-                    "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
-                ));
-            }
-            if let Some(count) = args.rpc_slot_count
-                && count == 0
-            {
-                return Err(anyhow!("rpc-slot-count must be greater than 0"));
+            if args.rpc_slot_list.is_some() {
+                // Slot-list mode fetches exactly the listed slots; range and
+                // skip-ingested flags do not apply and must not be combined with it.
+                if args.rpc_from_slot.is_some()
+                    || args.rpc_to_slot.is_some()
+                    || args.rpc_slot_count.is_some()
+                    || args.rpc_skip_ingested_slots
+                {
+                    return Err(anyhow!(
+                        "rpc-slot-list is mutually exclusive with rpc-from-slot, rpc-to-slot, rpc-slot-count, and rpc-skip-ingested-slots"
+                    ));
+                }
+            } else {
+                if args.rpc_from_slot.is_none() {
+                    return Err(anyhow!(
+                        "rpc source requires --rpc-from-slot / RPC_FROM_SLOT / config rpc-from-slot"
+                    ));
+                }
+                if args.rpc_to_slot.is_some() && args.rpc_slot_count.is_some() {
+                    return Err(anyhow!(
+                        "rpc source requires either --rpc-to-slot or --rpc-slot-count (not both)"
+                    ));
+                }
+                if args.rpc_to_slot.is_none() && args.rpc_slot_count.is_none() {
+                    return Err(anyhow!(
+                        "rpc source requires --rpc-to-slot or --rpc-slot-count to define a range"
+                    ));
+                }
+                if let Some(count) = args.rpc_slot_count
+                    && count == 0
+                {
+                    return Err(anyhow!("rpc-slot-count must be greater than 0"));
+                }
             }
             if args.rpc_max_inflight == 0 {
                 return Err(anyhow!("rpc max-inflight must be greater than 0"));
@@ -1207,6 +1437,57 @@ fn validate_args(args: &Args) -> Result<()> {
                 }
             }
         }
+        IngestSource::Solparq => match args.solparq_archive_location {
+            None => {
+                return Err(anyhow!(
+                    "solparq source requires --solparq-archive-location / SOLPARQ_ARCHIVE_LOCATION (local | s3)"
+                ));
+            }
+            Some(SolparqArchiveLocation::Local) => {
+                if args
+                    .solparq_archive_path
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
+                {
+                    return Err(anyhow!(
+                        "solparq local archive requires --solparq-archive-path / SOLPARQ_ARCHIVE_PATH"
+                    ));
+                }
+            }
+            Some(SolparqArchiveLocation::S3) => {
+                let required = [
+                    (
+                        &args.solparq_archive_s3_endpoint,
+                        "--solparq-archive-s3-endpoint / SOLPARQ_ARCHIVE_S3_ENDPOINT",
+                    ),
+                    (
+                        &args.solparq_archive_s3_bucket_name,
+                        "--solparq-archive-s3-bucket-name / SOLPARQ_ARCHIVE_S3_BUCKET_NAME",
+                    ),
+                    (
+                        &args.solparq_archive_s3_auth_key,
+                        "--solparq-archive-s3-auth-key / SOLPARQ_ARCHIVE_S3_AUTH_KEY",
+                    ),
+                    (
+                        &args.solparq_archive_s3_auth_secret_key,
+                        "--solparq-archive-s3-auth-secret-key / SOLPARQ_ARCHIVE_S3_AUTH_SECRET_KEY",
+                    ),
+                ];
+                for (value, label) in required {
+                    if value.as_deref().is_none_or(str::is_empty) {
+                        return Err(anyhow!("solparq s3 archive requires {label}"));
+                    }
+                }
+            }
+        },
+    }
+
+    if let (Some(from), Some(to)) = (args.solparq_from_slot, args.solparq_to_slot)
+        && from > to
+    {
+        return Err(anyhow!(
+            "solparq-from-slot ({from}) must be less than or equal to solparq-to-slot ({to})"
+        ));
     }
     Ok(())
 }
@@ -1293,6 +1574,28 @@ fn validate_start_slot_ownership(args: &Args) -> Result<()> {
                 args.source,
                 RPC_FROM_SLOT_LABEL,
                 bigtable_range_label,
+            )?;
+        }
+        IngestSource::Solparq => {
+            let solparq_range_label =
+                "--solparq-from-slot / SOLPARQ_FROM_SLOT and --solparq-to-slot / SOLPARQ_TO_SLOT";
+            reject_start_slot_for_source(
+                args.dragonsmouth_from_slot,
+                args.source,
+                DRAGONSMOUTH_FROM_SLOT_LABEL,
+                solparq_range_label,
+            )?;
+            reject_start_slot_for_source(
+                args.fumarole_from_slot,
+                args.source,
+                FUMAROLE_FROM_SLOT_LABEL,
+                solparq_range_label,
+            )?;
+            reject_start_slot_for_source(
+                args.rpc_from_slot,
+                args.source,
+                RPC_FROM_SLOT_LABEL,
+                solparq_range_label,
             )?;
         }
     }
@@ -1632,6 +1935,33 @@ rpc-from-slot: 456
     }
 
     #[test]
+    fn validate_accepts_rpc_slot_list_without_range() {
+        let mut args = fumarole_args();
+        args.source = IngestSource::Rpc;
+        args.rpc_url = Some("https://api.mainnet-beta.solana.com".to_string());
+        args.rpc_slot_list = Some(PathBuf::from("/tmp/slots.txt"));
+
+        validate_args(&args).expect("valid rpc slot-list args");
+    }
+
+    #[test]
+    fn validate_rejects_rpc_slot_list_with_range() {
+        let mut args = fumarole_args();
+        args.source = IngestSource::Rpc;
+        args.rpc_url = Some("https://api.mainnet-beta.solana.com".to_string());
+        args.rpc_slot_list = Some(PathBuf::from("/tmp/slots.txt"));
+        args.rpc_from_slot = Some(FromSlotSpec::Slot(200_000_000));
+        args.rpc_slot_count = Some(100);
+
+        let err = validate_args(&args).expect_err("slot-list with range");
+
+        assert!(
+            err.to_string()
+                .contains("rpc-slot-list is mutually exclusive")
+        );
+    }
+
+    #[test]
     fn validate_rejects_rpc_without_rpc_from_slot() {
         let mut args = fumarole_args();
         args.source = IngestSource::Rpc;
@@ -1777,6 +2107,7 @@ rpc-from-slot: 456
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
             rpc_skip_ingested_slots: false,
+            rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),
@@ -1791,6 +2122,18 @@ rpc-from-slot: 456
             bigtable_insert_concurrency: 1,
             bigtable_decode_concurrency: default_bigtable_decode_concurrency(),
             bigtable_progress_every_slots: 10_000,
+            solparq_archive_location: None,
+            solparq_archive_path: None,
+            solparq_archive_s3_endpoint: None,
+            solparq_archive_s3_bucket_name: None,
+            solparq_archive_s3_bucket_path: None,
+            solparq_archive_s3_auth_key: None,
+            solparq_archive_s3_auth_secret_key: None,
+            solparq_archive_s3_region: "us-east-1".to_string(),
+            solparq_from_slot: None,
+            solparq_to_slot: None,
+            solparq_tables: Vec::new(),
+            solparq_clickhouse_settings: String::new(),
             clickhouse_url: "http://localhost:8123".to_string(),
             metrics_host: "0.0.0.0".to_string(),
             metrics_port: 9901,

@@ -387,10 +387,7 @@ impl DiskCache {
         let count = signatures.len();
         let results: Vec<Option<DiskSigStatus>> = self
             .run_read("get_sig_statuses", move |inner| {
-                Ok(signatures
-                    .iter()
-                    .map(|signature| inner.get_sig_status_sync(signature))
-                    .collect())
+                Ok(inner.get_sig_statuses_sync(&signatures))
             })
             .await
             .unwrap_or_else(|| vec![None; count]);

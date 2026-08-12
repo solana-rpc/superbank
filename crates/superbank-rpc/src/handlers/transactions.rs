@@ -912,8 +912,6 @@ pub(crate) async fn handle_get_transactions_for_address(
     });
 
     let address_pubkey = Pubkey::from_str(address).expect("validated address");
-    let hot_fanout_eligible = state.clickhouse.is_gsfa_hot_address(&address_pubkey)
-        && token_accounts == TokenAccountsFilter::None;
 
     let mut query = TransactionsForAddressQuery {
         address: address.to_string(),
@@ -935,61 +933,64 @@ pub(crate) async fn handle_get_transactions_for_address(
     let disk_candidate = false;
 
     let mut prequery_timings = QueryTimings::zero();
-    if hot_fanout_eligible || disk_candidate {
-        match query.pagination.as_ref() {
-            Some(PaginationToken::SlotIndex { slot, idx }) => {
-                query.resolved_pagination = Some(SignatureSlot {
-                    slot: *slot,
-                    slot_idx: *idx,
-                });
-            }
-            Some(PaginationToken::Signature(signature)) => {
-                let (position, timings) =
-                    match resolve_signature_slot_for_bounds(state.as_ref(), signature).await {
-                        Ok(result) => result,
-                        Err(e) => {
-                            metrics::backend_error("get_signature_slot");
-                            error!(
-                                "Failed to resolve hot pagination signature {signature}: {}",
-                                e
-                            );
-                            return Ok(json_rpc_internal_error_response(id));
-                        }
-                    };
-                prequery_timings.add(timings);
-                query.resolved_pagination = position;
-            }
-            None => {}
+    match query.pagination.clone() {
+        Some(PaginationToken::SlotIndex { slot, idx }) => {
+            query.resolved_pagination = Some(SignatureSlot {
+                slot,
+                slot_idx: idx,
+            });
         }
-
-        if let Some(signature_filter) = query.signature_filter.as_ref() {
-            let mut resolved = ResolvedSignatureFilter::default();
-            for (label, maybe_signature, slot_ref) in [
-                ("gte", signature_filter.gte.as_deref(), &mut resolved.gte),
-                ("gt", signature_filter.gt.as_deref(), &mut resolved.gt),
-                ("lte", signature_filter.lte.as_deref(), &mut resolved.lte),
-                ("lt", signature_filter.lt.as_deref(), &mut resolved.lt),
-            ] {
-                let Some(signature) = maybe_signature else {
-                    continue;
+        Some(PaginationToken::Signature(signature)) => {
+            let (position, timings) =
+                match resolve_signature_slot_for_bounds(state.as_ref(), &signature).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        metrics::backend_error("get_signature_slot");
+                        error!("Failed to resolve pagination signature {signature}: {}", e);
+                        return Ok(json_rpc_internal_error_response(id));
+                    }
                 };
-                let (position, timings) =
-                    match resolve_signature_slot_for_bounds(state.as_ref(), signature).await {
-                        Ok(result) => result,
-                        Err(e) => {
-                            metrics::backend_error("get_signature_slot");
-                            error!(
-                                "Failed to resolve hot signature filter {label}={signature}: {}",
-                                e
-                            );
-                            return Ok(json_rpc_internal_error_response(id));
-                        }
-                    };
-                prequery_timings.add(timings);
-                *slot_ref = position;
-            }
-            query.resolved_signature_filter = Some(resolved);
+            prequery_timings.add(timings);
+            query.resolved_pagination = position;
+            query.pagination = position.map(|position| PaginationToken::SlotIndex {
+                slot: position.slot,
+                idx: position.slot_idx,
+            });
         }
+        None => {}
+    }
+
+    let hot_fanout_eligible = state.clickhouse.is_gsfa_hot_address(&address_pubkey)
+        && token_accounts == TokenAccountsFilter::None;
+    if (hot_fanout_eligible || disk_candidate)
+        && let Some(signature_filter) = query.signature_filter.as_ref()
+    {
+        let mut resolved = ResolvedSignatureFilter::default();
+        for (label, maybe_signature, slot_ref) in [
+            ("gte", signature_filter.gte.as_deref(), &mut resolved.gte),
+            ("gt", signature_filter.gt.as_deref(), &mut resolved.gt),
+            ("lte", signature_filter.lte.as_deref(), &mut resolved.lte),
+            ("lt", signature_filter.lt.as_deref(), &mut resolved.lt),
+        ] {
+            let Some(signature) = maybe_signature else {
+                continue;
+            };
+            let (position, timings) =
+                match resolve_signature_slot_for_bounds(state.as_ref(), signature).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        metrics::backend_error("get_signature_slot");
+                        error!(
+                            "Failed to resolve hot signature filter {label}={signature}: {}",
+                            e
+                        );
+                        return Ok(json_rpc_internal_error_response(id));
+                    }
+                };
+            prequery_timings.add(timings);
+            *slot_ref = position;
+        }
+        query.resolved_signature_filter = Some(resolved);
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
