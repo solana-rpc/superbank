@@ -187,7 +187,7 @@ impl ClickHouseClient {
         &self,
         query: &TransactionsForAddressQuery,
     ) -> ProcessingResult<(Vec<TransactionsForAddressRecord>, QueryTimings)> {
-        self.with_timeout("get_transactions_for_address_signatures", async {
+        self.with_http_query_timeout("get_transactions_for_address_signatures", async {
             let pubkey = Pubkey::from_str(&query.address)
                 .map_err(|e| ProcessingError::deserialization("Invalid address", e))?;
 
@@ -420,7 +420,7 @@ impl ClickHouseClient {
         signatures: &[(u64, String)],
         max_supported_transaction_version: Option<u8>,
     ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_transactions_by_slot_signatures", async {
+        self.with_http_query_timeout("get_transactions_by_slot_signatures", async {
             if signatures.is_empty() {
                 return Ok((
                     Vec::new(),
@@ -521,7 +521,7 @@ impl ClickHouseClient {
         &self,
         signature: &str,
     ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_transaction_by_signature", async {
+        self.with_operation_timeout("get_transaction_by_signature", async {
             let (signature_bytes, signature_literal) = decode_transaction_signature(signature)?;
             let (slot_opt, mut timings) = self
                 .get_signature_slot_by_signature_bytes(signature_bytes)
@@ -532,6 +532,7 @@ impl ClickHouseClient {
             };
             let slot = position.slot;
             let slot_idx = position.slot_idx;
+            let _http_permit = self.acquire_http_query_permit().await?;
 
             let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
                 build_get_transaction_by_signature_query(
@@ -627,7 +628,7 @@ impl ClickHouseClient {
         signature: &str,
         slot: u64,
     ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_transaction_by_signature_and_slot", async {
+        self.with_http_query_timeout("get_transaction_by_signature_and_slot", async {
             let (_signature_bytes, signature_literal) = decode_transaction_signature(signature)?;
             let build_query = |table: &str, settings_clause: &str| {
                 build_get_transaction_by_signature_query(
