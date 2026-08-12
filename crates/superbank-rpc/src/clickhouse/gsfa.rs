@@ -606,7 +606,7 @@ impl ClickHouseClient {
         before_pos: Option<SlotBoundary>,
         until_pos: Option<SlotBoundary>,
     ) -> ProcessingResult<(Vec<SignatureRecord>, QueryTimings)> {
-        self.with_timeout("get_signatures_for_address_with_positions", async {
+        self.with_http_query_timeout("get_signatures_for_address_with_positions", async {
             let pubkey = Pubkey::from_str(address)
                 .map_err(|e| ProcessingError::deserialization("Invalid address", e))?;
 

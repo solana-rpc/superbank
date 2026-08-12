@@ -525,7 +525,7 @@ impl ClickHouseClient {
             return Ok(latest_slot);
         }
 
-        self.with_timeout("get_latest_finalized_slot", async {
+        self.with_http_query_timeout("get_latest_finalized_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct MaxSlotRow {
                 max_slot: Option<u64>,
@@ -560,7 +560,7 @@ impl ClickHouseClient {
         context_slot: u64,
         min_block_height: u64,
     ) -> ProcessingResult<(bool, QueryTimings)> {
-        self.with_timeout("is_blockhash_valid", async {
+        self.with_http_query_timeout("is_blockhash_valid", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct PresentRow {
                 present: u8,
@@ -610,7 +610,7 @@ impl ClickHouseClient {
     }
 
     pub async fn get_first_available_block(&self) -> ProcessingResult<(Option<u64>, QueryTimings)> {
-        self.with_timeout("get_first_available_block", async {
+        self.with_http_query_timeout("get_first_available_block", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct MinSlotRow {
                 min_slot: Option<u64>,
@@ -654,7 +654,7 @@ impl ClickHouseClient {
     }
 
     pub async fn minimum_ledger_slot(&self) -> ProcessingResult<(Option<u64>, QueryTimings)> {
-        self.with_timeout("minimum_ledger_slot", async {
+        self.with_http_query_timeout("minimum_ledger_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct MinSlotRow {
                 min_slot: Option<u64>,
@@ -700,7 +700,7 @@ impl ClickHouseClient {
         operation: &'static str,
         query: String,
     ) -> ProcessingResult<(u64, QueryTimings)> {
-        self.with_timeout(operation, async move {
+        self.with_http_query_timeout(operation, async move {
             #[derive(Deserialize, clickhouse::Row)]
             struct TransactionCountRow {
                 transaction_count: u64,
@@ -769,7 +769,7 @@ impl ClickHouseClient {
         start_slot: u64,
         end_slot: u64,
     ) -> ProcessingResult<(Vec<u64>, QueryTimings)> {
-        self.with_timeout("get_block_slots_by_range", async {
+        self.with_http_query_timeout("get_block_slots_by_range", async {
             let start_bucket = start_slot / SLOT_SHARD_DIVISOR;
             let end_bucket = end_slot / SLOT_SHARD_DIVISOR;
             let settings_clause = self.select_settings_clause(
@@ -914,6 +914,23 @@ impl ClickHouseClient {
             settings_clause = settings_clause
         );
         let (query, query_id) = annotate_required_query(query, OPERATION);
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        let _http_permit =
+            match tokio::time::timeout_at(deadline, self.http_query_sem.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return Err(ProcessingError::database_msg(
+                        "ClickHouse HTTP query semaphore closed",
+                    ));
+                }
+                Err(_) => {
+                    crate::metrics::clickhouse_timeout(OPERATION);
+                    return Err(ProcessingError::timeout_msg(format!(
+                        "ClickHouse operation '{OPERATION}' timed out after {:?}",
+                        self.query_timeout
+                    )));
+                }
+            };
         let mut cleanup = self.http_query_cleanup(OPERATION, query_id.clone());
 
         let execute = async {
@@ -949,13 +966,11 @@ impl ClickHouseClient {
             Ok((rewards, timings))
         };
 
-        // Gate on the global HTTP-query permit like `with_timeout` does (this path uses a manual
-        // timeout for KILL-on-timeout cleanup, so it cannot reuse `with_timeout` directly).
-        // Acquire up front and box `execute` rather than wrapping it in another async block, to
-        // keep this future small (see the note in `with_timeout` about stack overflow).
-        let _http_permit = self.http_query_sem.acquire().await.ok();
+        // This path keeps a manual timeout so it can distinguish admission timeout (no query was
+        // started) from execution timeout (the query needs best-effort cleanup). Both phases share
+        // one deadline.
         let execute = Box::pin(execute);
-        match tokio::time::timeout(self.query_timeout, execute).await {
+        match tokio::time::timeout_at(deadline, execute).await {
             Ok(Ok(result)) => {
                 cleanup.disarm();
                 Ok(result)
@@ -979,7 +994,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Option<Option<i64>>, QueryTimings)> {
-        self.with_timeout("get_block_time_by_slot", async {
+        self.with_http_query_timeout("get_block_time_by_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct BlockTimeRow {
                 block_time: Option<i64>,
@@ -1152,7 +1167,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Option<([u8; 32], Option<u64>)>, QueryTimings)> {
-        self.with_timeout("get_blockhash_height_by_slot", async {
+        self.with_http_query_timeout("get_blockhash_height_by_slot", async {
             let (mut row_opt, timings, used_local) = if self.scope_shard_direct()
                 && self.transport_http()
                 && let (Some(topology), Some(local_table)) =
@@ -1264,7 +1279,7 @@ impl ClickHouseClient {
         slot: u64,
         include_rewards: bool,
     ) -> ProcessingResult<(Option<BlockMetadataRecord>, QueryTimings)> {
-        self.with_timeout("get_block_metadata_by_slot", async {
+        self.with_http_query_timeout("get_block_metadata_by_slot", async {
             let (mut metadata_opt, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
                     (&self.shard_topology, &self.blocks_metadata_local_table)
@@ -1350,7 +1365,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Vec<String>, QueryTimings)> {
-        self.with_timeout("get_block_signatures_by_slot", async {
+        self.with_http_query_timeout("get_block_signatures_by_slot", async {
             let projection = BlockTransactionProjection::Signatures;
             let (mut signatures, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -1429,7 +1444,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Vec<StoredAccountsTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_block_accounts_by_slot", async {
+        self.with_http_query_timeout("get_block_accounts_by_slot", async {
             let projection = BlockTransactionProjection::Accounts;
             let (mut records, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -1507,7 +1522,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_block_full_transactions_by_slot", async {
+        self.with_http_query_timeout("get_block_full_transactions_by_slot", async {
             let projection = BlockTransactionProjection::Full;
             let (mut records, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -1594,7 +1609,7 @@ impl ClickHouseClient {
         end_slot: u64,
         timeout: std::time::Duration,
     ) -> ProcessingResult<(Vec<BlockMetadataRecord>, QueryTimings)> {
-        self.with_timeout_duration("get_block_metadata_by_slot_range", timeout, async {
+        self.with_http_query_timeout_duration("get_block_metadata_by_slot_range", timeout, async {
             if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
                     (&self.shard_topology, &self.blocks_metadata_local_table)
@@ -1673,7 +1688,7 @@ impl ClickHouseClient {
         end_slot: u64,
         timeout: std::time::Duration,
     ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout_duration(
+        self.with_http_query_timeout_duration(
             "get_block_full_transactions_by_slot_range",
             timeout,
             async {
