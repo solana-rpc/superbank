@@ -80,6 +80,32 @@ fn compare_transactions_for_address_records(
     }
 }
 
+enum GsfaOwnerRoute<'a> {
+    ShardLocal { token_owner_table: &'a str },
+    Distributed,
+}
+
+fn gsfa_owner_route<'a>(
+    use_owner_shard_routing: bool,
+    router_configured: bool,
+    has_token_account_filter: bool,
+    token_owner_shard_local_table: Option<&'a str>,
+    token_owner_table: &'a str,
+) -> GsfaOwnerRoute<'a> {
+    if !use_owner_shard_routing || !router_configured {
+        return GsfaOwnerRoute::Distributed;
+    }
+    let token_owner_table = if has_token_account_filter {
+        match token_owner_shard_local_table {
+            Some(table) => table,
+            None => return GsfaOwnerRoute::Distributed,
+        }
+    } else {
+        token_owner_table
+    };
+    GsfaOwnerRoute::ShardLocal { token_owner_table }
+}
+
 const TRANSACTIONS_FOR_ADDRESS_MIN_BATCH_SIZE: u64 = 64;
 const TRANSACTIONS_FOR_ADDRESS_MAX_BATCH_SIZE: u64 = 2_000;
 
@@ -268,33 +294,25 @@ impl ClickHouseClient {
                 .await;
         }
 
-        if self.should_use_gsfa_shard_routing(pubkey) && self.shard_topology.is_some() {
-            let router = self.gsfa_router.as_ref().ok_or_else(|| {
-                ProcessingError::database_msg(
-                    "Shard topology is configured but GSFA owner-shard routing is unavailable",
-                )
-            })?;
-            let token_owner_local_table = if query.token_accounts != TokenAccountsFilter::None {
-                Some(
-                    self.token_owner_activity_local_table
-                        .as_deref()
-                        .ok_or_else(|| {
-                            ProcessingError::database_msg(
-                                "Shard topology is configured but token-owner shard routing is unavailable",
-                            )
-                        })?,
-                )
-            } else {
-                Some(self.token_owner_activity_table.as_str())
-            };
-
+        if let GsfaOwnerRoute::ShardLocal { token_owner_table } = gsfa_owner_route(
+            self.should_use_gsfa_shard_routing(pubkey),
+            self.gsfa_router.is_some(),
+            query.token_accounts != TokenAccountsFilter::None,
+            self.token_owner_activity_local_table.as_deref(),
+            &self.token_owner_activity_table,
+        ) {
+            // `gsfa_owner_route` returns `ShardLocal` only when the router is configured.
+            let router = self
+                .gsfa_router
+                .as_ref()
+                .expect("owner-shard router configured when routing shard-local");
             let mut allow_local_http = self.transport_http();
 
             if self.transport_tcp() {
                 match self
                     .try_get_transactions_for_address_signatures_tcp(
                         router,
-                        token_owner_local_table,
+                        Some(token_owner_table),
                         query,
                         pubkey,
                     )
@@ -309,7 +327,7 @@ impl ClickHouseClient {
                 return self
                     .try_get_transactions_for_address_signatures_http(
                         router,
-                        token_owner_local_table,
+                        Some(token_owner_table),
                         query,
                         pubkey,
                     )
@@ -1282,6 +1300,46 @@ mod tests {
             memo: None,
             block_time: None,
         }
+    }
+
+    #[test]
+    fn gsfa_owner_route_falls_back_to_distributed_when_router_absent() {
+        assert!(matches!(
+            gsfa_owner_route(true, false, false, None, "token_owner"),
+            GsfaOwnerRoute::Distributed
+        ));
+    }
+
+    #[test]
+    fn gsfa_owner_route_falls_back_when_token_owner_shard_local_absent() {
+        assert!(matches!(
+            gsfa_owner_route(true, true, true, None, "token_owner"),
+            GsfaOwnerRoute::Distributed
+        ));
+    }
+
+    #[test]
+    fn gsfa_owner_route_uses_shard_local_when_configured() {
+        assert!(matches!(
+            gsfa_owner_route(true, true, false, None, "token_owner"),
+            GsfaOwnerRoute::ShardLocal {
+                token_owner_table: "token_owner"
+            }
+        ));
+        assert!(matches!(
+            gsfa_owner_route(true, true, true, Some("token_owner_local"), "token_owner"),
+            GsfaOwnerRoute::ShardLocal {
+                token_owner_table: "token_owner_local"
+            }
+        ));
+    }
+
+    #[test]
+    fn gsfa_owner_route_distributed_for_hot_address() {
+        assert!(matches!(
+            gsfa_owner_route(false, true, true, Some("token_owner_local"), "token_owner"),
+            GsfaOwnerRoute::Distributed
+        ));
     }
 
     #[test]
