@@ -170,12 +170,16 @@ its validation step already computes the exact missing slots.
 The `solparq` source is the inverse of the `superbank-solparq` archiver: it reads
 archive bundles and loads every table in each bundle's `manifest.json` back into
 ClickHouse. Loading is ClickHouse-native and schema-symmetric with the export —
-no rows are decoded in-process:
+no rows are decoded in-process. Both paths match columns by **name** (not
+position), so a destination table whose column order has drifted from the
+archive still restores correctly instead of silently landing in the wrong
+columns:
 
-- **S3** — `INSERT INTO <table> SELECT * FROM s3(<url>, <key>, <secret>, 'Parquet')`,
-  so ClickHouse pulls each object directly.
+- **S3** — `INSERT INTO <table> (<cols>) SELECT <cols> FROM s3(<url>, <key>, <secret>, 'Parquet')`,
+  where `<cols>` is read from the archived file's own schema (`DESCRIBE`), so
+  ClickHouse pulls each object directly and maps columns by name.
 - **Local** — `INSERT INTO <table> FORMAT Parquet` with the bundle's parquet file
-  streamed as the request body.
+  streamed as the request body (name-matched by ClickHouse's Parquet reader).
 
 Each table is restored into the configured `CLICKHOUSE_DATABASE` under the bare
 table name recorded in the manifest, regardless of where the archive was

@@ -9,12 +9,16 @@
 //! This is the inverse of the `superbank-solparq` archiver, which exports each
 //! ClickHouse table with `SELECT * ... FORMAT Parquet`. Loading is done
 //! ClickHouse-natively so it is schema-symmetric by construction and needs no
-//! in-process Arrow decoding:
+//! in-process Arrow decoding. Both paths match columns by *name* so a
+//! destination whose column order has drifted from the archive still restores
+//! correctly (rather than silently landing in the wrong columns):
 //!
-//! * **S3** — `INSERT INTO <table> SELECT * FROM s3(<url>, <key>, <secret>,
-//!   'Parquet')`, letting ClickHouse pull the object directly.
+//! * **S3** — `INSERT INTO <table> (<cols>) SELECT <cols> FROM s3(<url>, <key>,
+//!   <secret>, 'Parquet')`, where `<cols>` is read from the archived file's own
+//!   schema, letting ClickHouse pull the object directly.
 //! * **Local** — `INSERT INTO <table> FORMAT Parquet` with the bundle's parquet
-//!   file streamed as the HTTP request body.
+//!   file streamed as the HTTP request body (name-matched by ClickHouse's
+//!   Parquet reader).
 //!
 //! Every bundle is version-gated against [`MANIFEST_FORMAT_VERSION`]: archives
 //! written by a newer producer are refused rather than misread.
@@ -328,22 +332,37 @@ async fn restore_s3(
             }
             let object = object_join(&bundle.prefix, &table.file_name);
             let url = s3_object_url(&config.endpoint, &config.bucket_name, object.as_ref());
+            let s3_object = S3Object {
+                url: &url,
+                access_key: &config.auth_key,
+                secret_key: &config.auth_secret_key,
+            };
             let dest = resolve_dest_table(&args.clickhouse_database, &table.table_name);
-            let sql = build_s3_restore_sql(
-                &dest,
-                &url,
-                &config.auth_key,
-                &config.auth_secret_key,
-                args.solparq_from_slot,
-                args.solparq_to_slot,
-                &args.solparq_clickhouse_settings,
-            );
             eprint!(
                 "  - {:<20} {} rows ... ",
                 table.kind,
                 fmt_thousands(table.row_count)
             );
             let started = Instant::now();
+            // Read the archive's own column order so the INSERT matches by name,
+            // not position — a destination whose column order has drifted from
+            // the archive would otherwise be silently mis-columned.
+            let columns = match client.describe_s3_columns(&s3_object).await {
+                Ok(columns) => columns,
+                Err(err) => {
+                    eprintln!("FAILED");
+                    return Err(err)
+                        .with_context(|| format!("describe {} schema from {url}", table.kind));
+                }
+            };
+            let sql = build_s3_restore_sql(
+                &dest,
+                &columns,
+                &s3_object,
+                args.solparq_from_slot,
+                args.solparq_to_slot,
+                &args.solparq_clickhouse_settings,
+            );
             match client.execute_sql(&sql).await {
                 Ok(()) => eprintln!("done ({})", fmt_duration(started.elapsed())),
                 Err(err) => {
@@ -466,8 +485,8 @@ impl ChRestClient {
         })
     }
 
-    /// Run a statement that carries no input data (e.g. `INSERT INTO ... SELECT
-    /// * FROM s3(...)`). The SQL travels in the request body.
+    /// Run a statement that carries no input data (e.g. `INSERT INTO ... (cols)
+    /// SELECT cols FROM s3(...)`). The SQL travels in the request body.
     async fn execute_sql(&self, sql: &str) -> Result<()> {
         let mut request = self
             .http
@@ -482,6 +501,50 @@ impl ChRestClient {
             .await
             .with_context(|| format!("send ClickHouse query to {}", self.url))?;
         ensure_success(response).await
+    }
+
+    /// Read the ordered column names of an archived Parquet object from its own
+    /// schema via `DESCRIBE TABLE s3(...)`. ClickHouse only reads the Parquet
+    /// footer for this, so it is cheap. The names drive a name-matched restore
+    /// INSERT (see [`build_s3_restore_sql`]).
+    async fn describe_s3_columns(&self, object: &S3Object<'_>) -> Result<Vec<String>> {
+        let sql = format!(
+            "DESCRIBE TABLE {table_fn} FORMAT TabSeparated",
+            table_fn = object.table_function(),
+        );
+        let body = self.query_text(&sql).await?;
+        let columns = parse_describe_columns(&body);
+        if columns.is_empty() {
+            bail!(
+                "DESCRIBE returned no columns for archived object {}",
+                object.url
+            );
+        }
+        Ok(columns)
+    }
+
+    /// Run a statement that returns a result set and collect its response body as
+    /// text (mirrors [`Self::execute_sql`], but keeps the body).
+    async fn query_text(&self, sql: &str) -> Result<String> {
+        let mut request = self
+            .http
+            .post(&self.url)
+            .query(&[("database", self.database.as_str())])
+            .body(sql.to_string());
+        if !self.user.is_empty() {
+            request = request.basic_auth(&self.user, Some(&self.password));
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("send ClickHouse query to {}", self.url))?;
+        if !response.status().is_success() {
+            return ensure_success(response).await.map(|()| String::new());
+        }
+        response
+            .text()
+            .await
+            .with_context(|| format!("read ClickHouse response from {}", self.url))
     }
 
     /// Stream a local Parquet file into `dest` via `INSERT INTO <dest> FORMAT
@@ -699,25 +762,75 @@ fn slot_where_clause(from: Option<u64>, to: Option<u64>) -> String {
     }
 }
 
+/// An archived Parquet object addressed by ClickHouse's `s3` table function:
+/// the object URL plus the credentials to read it. Grouped so restore helpers
+/// pass one value instead of three parallel strings.
+struct S3Object<'a> {
+    url: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+}
+
+impl S3Object<'_> {
+    /// Render the `s3('url', 'key', 'secret', 'Parquet')` table-function call,
+    /// SQL-escaping each argument.
+    fn table_function(&self) -> String {
+        format!(
+            "s3('{url}', '{key}', '{secret}', 'Parquet')",
+            url = escape_sql_literal(self.url),
+            key = escape_sql_literal(self.access_key),
+            secret = escape_sql_literal(self.secret_key),
+        )
+    }
+}
+
 /// Inverse of `superbank-solparq`'s `build_s3_table_archive_sql`: pull the
 /// archived object back into `dest` with ClickHouse's `s3` table function.
+///
+/// `columns` is the ordered column list read from the archived file's own schema
+/// (see [`ChRestClient::describe_s3_columns`]). Emitting it explicitly on both
+/// sides — `INSERT INTO dest (cols) SELECT cols FROM s3(...)` — makes the S3 path
+/// match columns by *name*, mirroring the local `FORMAT Parquet` path. A bare
+/// `SELECT *` matches by position, so if the destination's column order ever
+/// drifts from the archive's, a restore would silently write into the wrong
+/// columns (or error on a type mismatch); the explicit list prevents that.
 fn build_s3_restore_sql(
     dest: &str,
-    url: &str,
-    access_key: &str,
-    secret_key: &str,
+    columns: &[String],
+    object: &S3Object,
     from: Option<u64>,
     to: Option<u64>,
     settings: &str,
 ) -> String {
+    let column_list = columns
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "INSERT INTO {dest} SELECT * FROM s3('{url}', '{key}', '{secret}', 'Parquet'){where_clause}{settings}",
-        url = escape_sql_literal(url),
-        key = escape_sql_literal(access_key),
-        secret = escape_sql_literal(secret_key),
+        "INSERT INTO {dest} ({column_list}) SELECT {column_list} FROM {table_fn}{where_clause}{settings}",
+        table_fn = object.table_function(),
         where_clause = slot_where_clause(from, to),
         settings = settings_suffix(settings),
     )
+}
+
+/// Backtick-quote a ClickHouse identifier, escaping embedded backticks, so
+/// archived column names survive intact in an explicit column list.
+fn quote_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// Extract column names from a `DESCRIBE ... FORMAT TabSeparated` response. Each
+/// row is `name<TAB>type<TAB>...`; only the leading name field is kept, in the
+/// file's declared order.
+fn parse_describe_columns(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| line.split('\t').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn build_local_insert_sql(dest: &str, settings: &str) -> String {
@@ -811,16 +924,26 @@ mod tests {
 
     #[test]
     fn s3_restore_sql_is_inverse_of_export() {
+        let columns = vec!["slot".to_string(), "signature".to_string()];
+        let object = S3Object {
+            url: "http://minio:9000/bucket/hourly/id/transactions.parquet",
+            access_key: "ak",
+            secret_key: "sk",
+        };
         let sql = build_s3_restore_sql(
             "db.transactions",
-            "http://minio:9000/bucket/hourly/id/transactions.parquet",
-            "ak",
-            "sk",
+            &columns,
+            &object,
             Some(10),
             Some(20),
             "max_insert_threads = 4",
         );
-        assert!(sql.starts_with("INSERT INTO db.transactions SELECT * FROM s3("));
+        // Explicit, name-matched column list on both the INSERT and SELECT so a
+        // drifted destination column order can't silently mis-column the data.
+        assert!(sql.starts_with(
+            "INSERT INTO db.transactions (`slot`, `signature`) SELECT `slot`, `signature` FROM s3("
+        ));
+        assert!(!sql.contains("SELECT * FROM"));
         assert!(sql.contains("'Parquet')"));
         assert!(sql.contains("WHERE slot BETWEEN 10 AND 20"));
         assert!(sql.ends_with("SETTINGS max_insert_threads = 4"));
@@ -828,10 +951,37 @@ mod tests {
 
     #[test]
     fn s3_restore_sql_escapes_quotes() {
-        let sql = build_s3_restore_sql("db.t", "u", "a'b", "s", None, None, "");
+        let columns = vec!["slot".to_string()];
+        let object = S3Object {
+            url: "u",
+            access_key: "a'b",
+            secret_key: "s",
+        };
+        let sql = build_s3_restore_sql("db.t", &columns, &object, None, None, "");
         assert!(sql.contains("'a\\'b'"));
         assert!(!sql.contains("WHERE"));
         assert!(!sql.contains("SETTINGS"));
+    }
+
+    #[test]
+    fn quote_identifier_backticks_and_escapes() {
+        assert_eq!(quote_identifier("slot"), "`slot`");
+        assert_eq!(quote_identifier("odd`name"), "`odd``name`");
+    }
+
+    #[test]
+    fn parse_describe_columns_keeps_names_in_order() {
+        // `DESCRIBE ... FORMAT TabSeparated` rows: name<TAB>type<TAB>...
+        let body = "slot\tUInt64\t\t\t\t\t\nsignature\tString\t\t\t\t\t\ndata\tString\t\t\t\t\t\n";
+        assert_eq!(
+            parse_describe_columns(body),
+            vec![
+                "slot".to_string(),
+                "signature".to_string(),
+                "data".to_string()
+            ]
+        );
+        assert!(parse_describe_columns("").is_empty());
     }
 
     #[test]
