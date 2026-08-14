@@ -298,12 +298,18 @@ pub fn plan_archive_slot_range(
 /// Compute the ClickHouse slot range that is safe to delete after an archive is
 /// created.
 ///
-/// Deletion always starts from slot `0`, not from the current archive's start
-/// slot: once every configured archive type has archived a slot, that slot (and
-/// everything before it) is redundant in ClickHouse regardless of which archive
-/// run first covered it. Starting from the current archive's start slot would
-/// strand older slots that were left behind when another archive type was
-/// lagging.
+/// Deletion starts from the **lowest archived start slot** across the configured
+/// archive types, not from slot `0`. Aligned kinds do not archive from the
+/// earliest ingested slot: `epoch` (and `custom` with `--custom-aligned`) begins
+/// its first archive at an `align_up` boundary, so the window between the
+/// earliest ingested slot and that boundary is never captured by any archive.
+/// Flooring the delete start at the lowest archived start slot keeps that
+/// never-archived prefix in ClickHouse; any slot at or above it exists in at
+/// least one archive and can be safely reclaimed.
+///
+/// `--delete-archived-data-from-slot-zero` (server mode only) opts back into the
+/// original behaviour of sweeping from slot `0`, for setups that intentionally
+/// want the leading, never-archived window purged too.
 ///
 /// The range end (`safe_end_slot`) is the highest slot that *every* configured
 /// archive type has archived — the minimum of each type's latest archive end
@@ -321,6 +327,7 @@ pub fn safe_delete_archived_data_range(
     }
 
     let mut safe_end_slot = current_end_slot;
+    let mut floor_start_slot = u64::MAX;
     for kind in config.archive_kinds.iter().copied() {
         let Some(latest_archive_name) = latest_archive_names
             .iter()
@@ -339,9 +346,25 @@ pub fn safe_delete_archived_data_range(
             ));
         }
         safe_end_slot = safe_end_slot.min(parsed.end_slot);
+        floor_start_slot = floor_start_slot.min(parsed.start_slot);
     }
 
-    Ok(Some(crate::clickhouse::SlotRange::new(0, safe_end_slot)))
+    // Floor the delete start at the lowest archived start slot so slots that no
+    // archive type ever captured (the pre-`align_up` leading window) are kept,
+    // unless the operator explicitly opts into sweeping from slot 0. Clamp to
+    // `safe_end_slot` so the range is never inverted. `floor_start_slot` is set
+    // at least once here: the loop returns early for any kind without an archive,
+    // so reaching this point means every configured kind contributed a start.
+    let start_slot = if config.delete_archived_data_from_slot_zero {
+        0
+    } else {
+        floor_start_slot.min(safe_end_slot)
+    };
+
+    Ok(Some(crate::clickhouse::SlotRange::new(
+        start_slot,
+        safe_end_slot,
+    )))
 }
 
 #[derive(Debug, Clone, Serialize)]
