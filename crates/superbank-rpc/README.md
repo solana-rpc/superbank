@@ -36,6 +36,11 @@ Notes:
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
+- Transaction v1 (SIMD-0385) is supported. Requests must set
+  `maxSupportedTransactionVersion: 1`; JSON encodings report `version: 1` and expose the inline
+  `message.transactionConfig`, while binary encodings preserve the signed v1 wire bytes.
+- Rewards accept both `DeactivatedStake` and the historical producer spelling
+  `deactivated-stake`, and are emitted as Agave's typed `DeactivatedStake` JSON value.
 - `processed` commitment is supported for a subset of methods when compiled with
   `--features grpc-head-cache` and enabled at runtime with `HEAD_CACHE_ENABLED=true`
   (see "Optional gRPC head cache" below).
@@ -96,6 +101,11 @@ Optional:
 Apply `transactions.sql` before the materialized-view schemas (`gsfa*.sql`, `signatures.sql`, and
 `token_owner_activity.sql`) because those views read from the transactions table. If you use
 `gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then apply `gsfa_hot.sql`.
+
+For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL first, deploy
+`superbank-rpc` next (disk-cache schema 3 intentionally rebuilds existing caches), and only then
+deploy ingestion with transaction version 1 enabled. Rolling back the RPC binary is safe only
+before v1 or `DeactivatedStake` rows have arrived.
 
 ## Run
 

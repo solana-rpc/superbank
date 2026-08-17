@@ -7,6 +7,14 @@ Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
 default. The `solparq` source runs in reverse: it restores `superbank-solparq`
 Parquet archive bundles (local or S3) back into ClickHouse.
 
+The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer workspaces
+under `ingest/` remain on their upstream Agave 3 line and must not be used for post-v1 Old
+Faithful backfills until they are migrated and added to root CI.
+
+Agave 4.2 also adds the `DeactivatedStake` reward type and changes confidential-transfer parsed
+JSON from `source`/`destination` keys to `account`; consumers of parsed RPC responses should treat
+that JSON-key correction as a compatibility break.
+
 ## Prereqs
 
 - ClickHouse with the matching schema set under `ddl/`: use `ddl/local/transactions.sql` +
@@ -298,7 +306,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-timeout-secs` / `RPC_TIMEOUT_SECS` (default: 30)
 - `--rpc-retry-backoff-ms` / `RPC_RETRY_BACKOFF_MS` (default: 500)
 - `--rpc-max-inflight` / `RPC_MAX_INFLIGHT` (default: 64)
-- `--rpc-max-supported-tx-version` / `RPC_MAX_SUPPORTED_TX_VERSION` (default: 0)
+- `--rpc-max-supported-tx-version` / `RPC_MAX_SUPPORTED_TX_VERSION` (default: 1)
 - `--rpc-flush-every-slots` / `RPC_FLUSH_EVERY_SLOTS` (default: 500)
 - `--rpc-progress-every-slots` / `RPC_PROGRESS_EVERY_SLOTS` (default: 100)
 - `--rpc-discovery-chunk-slots` / `RPC_DISCOVERY_CHUNK_SLOTS` (default: 10000)
