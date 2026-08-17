@@ -9,9 +9,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use ch_cityhash102::cityhash64;
 use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
 use tokio::task::JoinSet;
 
 use crate::processing::{ProcessingError, ProcessingResult};

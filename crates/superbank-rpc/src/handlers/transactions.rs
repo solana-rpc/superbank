@@ -3,6 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::solana_sdk::pubkey::Pubkey;
+use crate::solana_sdk::signature::Signature;
 use axum::{http::StatusCode, response::Response};
 use serde_json::{Value, json};
 use solana_commitment_config::CommitmentConfig;
@@ -12,8 +14,6 @@ use solana_rpc_client_api::custom_error::{
     JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
 };
 use solana_rpc_client_types::config::{RpcEncodingConfigWrapper, RpcTransactionConfig};
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
 use solana_transaction_status::{EncodeError, UiTransactionEncoding};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -1213,6 +1213,22 @@ pub(crate) async fn handle_get_transactions_for_address(
                 .await
                 {
                     Ok(Ok(result)) => result,
+                    Ok(Err(HeadHydrationFailure {
+                        error:
+                            TransactionHydrationError::Encode(
+                                EncodeError::UnsupportedTransactionVersion(version),
+                            ),
+                        ..
+                    })) => {
+                        route.rpc_error();
+                        let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
+                        return Ok(json_rpc_error_response(
+                            id,
+                            code,
+                            unsupported_transaction_version_message(version),
+                            None,
+                        ));
+                    }
                     Ok(Err(failure)) => {
                         error!(
                             "Failed to hydrate head-cache transaction {} in slot {}: {}",
@@ -1788,6 +1804,22 @@ pub(crate) async fn handle_get_transactions_for_address(
     .await
     {
         Ok(Ok(output)) => output,
+        Ok(Err(HydrationFailure {
+            error:
+                TransactionHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(version)),
+            ..
+        })) => {
+            route.rpc_error();
+            let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
+            let mut resp = json_rpc_error_response(
+                id,
+                code,
+                unsupported_transaction_version_message(version),
+                None,
+            );
+            add_downstream_header(&mut resp, &timings);
+            return Ok(resp);
+        }
         Ok(Err(failure)) => {
             error!(
                 "Failed to hydrate transaction {} in slot {}: {}",

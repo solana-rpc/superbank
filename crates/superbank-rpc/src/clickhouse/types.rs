@@ -415,6 +415,10 @@ pub struct StoredTransactionRecord {
     #[cfg_attr(not(feature = "grpc-streaming"), allow(dead_code))]
     pub is_vote: bool,
     pub tx_version: Option<u8>,
+    pub tx_config_priority_fee: Option<u64>,
+    pub tx_config_compute_unit_limit: Option<u32>,
+    pub tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    pub tx_config_heap_size: Option<u32>,
     #[cfg_attr(feature = "disk-cache", serde(with = "serde_sig_vec"))]
     pub tx_signatures: Vec<[u8; 64]>,
     pub tx_num_required_signatures: u8,

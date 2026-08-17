@@ -290,7 +290,7 @@ struct CliArgs {
     rpc_max_inflight: usize,
 
     /// Max supported transaction version for getBlock (default: 0)
-    #[arg(long, env = "RPC_MAX_SUPPORTED_TX_VERSION", default_value_t = 0)]
+    #[arg(long, env = "RPC_MAX_SUPPORTED_TX_VERSION", default_value_t = 1)]
     rpc_max_supported_tx_version: u8,
 
     /// Flush RPC inserts every N slots

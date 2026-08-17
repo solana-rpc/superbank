@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use clickhouse::Client as HttpClient;
 use clickhouse_rs::{
     Block as TcpBlock,
@@ -16,7 +17,6 @@ use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use reqwest::Url;
 use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
 use tokio::sync::Semaphore;
 
 use crate::config::{ClickHouseStartupTableCheck, has_usable_gsfa_hot_addresses};
@@ -232,7 +232,7 @@ async fn kill_http_query(
         cleanup_timeout,
         client
             .query(&kill_sql)
-            .with_option("query_id", cleanup_query_id)
+            .with_setting("query_id", cleanup_query_id)
             .execute(),
     )
     .await
@@ -282,7 +282,7 @@ async fn kill_shard_tcp_query(
         shard
             .http_client
             .query(&kill_sql)
-            .with_option("query_id", cleanup_query_id)
+            .with_setting("query_id", cleanup_query_id)
             .execute(),
     )
     .await
