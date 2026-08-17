@@ -45,7 +45,62 @@ AS
 WITH
     [
         CAST(base58Decode('Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo') AS FixedString(32)),
-        CAST(base58Decode('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr') AS FixedString(32))
+        CAST(base58Decode('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr') AS FixedString(32)),
+        CAST(base58Decode('Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH') AS FixedString(32))
+    ] AS memo_program_ids,
+    [
+        CAST(base58Decode('11111111111111111111111111111111') AS FixedString(32)),
+        CAST(base58Decode('Vote111111111111111111111111111111111111111') AS FixedString(32)),
+        CAST(base58Decode('SysvarC1ock11111111111111111111111111111111') AS FixedString(32)),
+        CAST(base58Decode('SysvarS1otHashes111111111111111111111111111') AS FixedString(32))
+    ] AS gsfa_ignored_addresses
+SELECT
+    address,
+    signature,
+    slot,
+    slot_idx,
+    memo,
+    if(meta_status_ok = 1, NULL, meta_err) AS err,
+    block_time
+FROM
+(
+    WITH arrayConcat(tx_account_keys, meta_loaded_addresses_writable, meta_loaded_addresses_readonly) AS account_keys_all
+    SELECT
+        signature,
+        slot,
+        slot_idx,
+        block_time,
+        meta_status_ok,
+        meta_err,
+        tx_instructions_program_id_index,
+        tx_instructions_data,
+        arrayDistinct(account_keys_all) AS addresses,
+        nullIf(
+            arrayStringConcat(
+                arrayMap(x -> x.2,
+                    arrayFilter(
+                        x -> has(memo_program_ids, x.1) AND isValidUTF8(x.2),
+                        arrayZip(
+                            arrayMap(idx -> arrayElement(account_keys_all, idx + 1), tx_instructions_program_id_index),
+                            tx_instructions_data
+                        )
+                    )
+                ),
+                '; '
+            ),
+            ''
+        ) AS memo
+    FROM default.transactions_local
+)
+ARRAY JOIN arrayFilter(addr -> NOT has(gsfa_ignored_addresses, addr), addresses) AS address;
+
+-- Update the query of an existing materialized view without replacing its stored data.
+ALTER TABLE default.gsfa ON CLUSTER '{cluster}' MODIFY QUERY
+WITH
+    [
+        CAST(base58Decode('Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo') AS FixedString(32)),
+        CAST(base58Decode('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr') AS FixedString(32)),
+        CAST(base58Decode('Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH') AS FixedString(32))
     ] AS memo_program_ids,
     [
         CAST(base58Decode('11111111111111111111111111111111') AS FixedString(32)),
