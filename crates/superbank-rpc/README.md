@@ -30,9 +30,16 @@ Notes:
 - Requests without an `id` are normalized to `id: null` and still return
   JSON-RPC response bodies (compatibility behavior; not strict notification semantics).
 - `processed` commitment is rejected by default; use `confirmed` or `finalized`.
-- `getInflationReward` reads the payout epoch boundary and only the reward partitions selected by
-  the requested addresses. It never expands reward arrays across a complete epoch; dedicated
-  address, concurrency, timeout, thread, memory, and read-byte limits are enabled by default.
+- `getInflationReward` reads the payout epoch boundary, serves boundary vote rewards immediately,
+  and queries only the partition block heights required by unresolved requested addresses. A stake
+  reward becomes available as soon as that address's partition block lands; the method does not
+  wait for later partitions or expand reward arrays across a complete epoch. If the payout boundary
+  does not exist yet, it returns `-32004` (`Block not available`) over HTTP `200`. If a requested
+  partition is still pending, it returns `-32017` (`Epoch rewards period still active`) over HTTP
+  `200`, with `slot`, `currentBlockHeight`, and `rewardsCompleteBlockHeight` in `error.data`.
+  Missing rewards are returned as `null` only after the address's required partition is available.
+  Dedicated address, concurrency, timeout, thread, memory, and read-byte limits are enabled by
+  default.
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
@@ -163,6 +170,9 @@ Only internal error (`-32603`), server-generated request timeout (`-32000`), nod
 (`-32005`), and long-term storage unreachable (`-32019`) are promoted to HTTP `503`.
 Client, malformed-request, and data-condition errors remain HTTP `200 OK`. For batches, any
 eligible item promotes the whole HTTP response to `503`.
+For `getInflationReward`, both boundary-unavailable (`-32004`) and rewards-period-active (`-32017`)
+are data-condition errors and remain HTTP `200`; ClickHouse query, metadata, and integrity failures
+continue to use internal error (`-32603`) and are eligible for HTTP `503`.
 
 ## Optional gRPC head cache (`grpc-head-cache`)
 
