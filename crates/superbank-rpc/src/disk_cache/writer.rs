@@ -251,8 +251,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
     use solana_commitment_config::CommitmentLevel;
-    use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use solana_transaction_status::TransactionDetails;
 
     use crate::disk_cache::ingest::{DiskIngestSink, RepairQueue};

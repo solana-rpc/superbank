@@ -29,6 +29,7 @@ use crate::clickhouse::{
     BlockMetadataRecord, StoredAccountsTransactionRecord, StoredBlockPayload, StoredBlockRecord,
     StoredTransactionRecord,
 };
+use crate::solana_sdk;
 
 pub(crate) mod codec;
 pub(crate) mod coverage;
@@ -1121,6 +1122,10 @@ pub(crate) mod tests {
             block_time: Some(1_700_000_000 + slot as i64),
             is_vote: false,
             tx_version: None,
+            tx_config_priority_fee: None,
+            tx_config_compute_unit_limit: None,
+            tx_config_loaded_accounts_data_size_limit: None,
+            tx_config_heap_size: None,
             tx_signatures: vec![signature],
             tx_num_required_signatures: 1,
             tx_num_readonly_signed_accounts: 0,

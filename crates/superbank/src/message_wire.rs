@@ -3,107 +3,27 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use solana_message::{self, MESSAGE_VERSION_PREFIX, VersionedMessage, legacy, v0};
-use solana_signature::Signature;
+use solana_message::VersionedMessage;
+#[cfg(test)]
 use solana_transaction::versioned;
-use wincode::{
-    SchemaWrite, Serialize, WriteResult,
-    containers::{self, Pod},
-    io::Writer,
-    len::short_vec::ShortU16Len,
-};
-
-#[derive(SchemaWrite)]
-#[wincode(from = "solana_message::MessageHeader", struct_extensions)]
-struct MessageHeader {
-    num_required_signatures: u8,
-    num_readonly_signed_accounts: u8,
-    num_readonly_unsigned_accounts: u8,
-}
-
-#[derive(SchemaWrite)]
-#[wincode(from = "solana_message::compiled_instruction::CompiledInstruction")]
-struct CompiledInstruction {
-    program_id_index: u8,
-    accounts: containers::Vec<Pod<u8>, ShortU16Len>,
-    data: containers::Vec<Pod<u8>, ShortU16Len>,
-}
-
-#[derive(SchemaWrite)]
-#[wincode(from = "legacy::Message")]
-struct LegacyMessage {
-    header: MessageHeader,
-    account_keys: containers::Vec<Pod<solana_message::Address>, ShortU16Len>,
-    recent_blockhash: Pod<solana_message::Hash>,
-    instructions: containers::Vec<CompiledInstruction, ShortU16Len>,
-}
-
-#[derive(SchemaWrite)]
-#[wincode(from = "v0::MessageAddressTableLookup")]
-struct MessageAddressTableLookup {
-    account_key: Pod<solana_message::Address>,
-    writable_indexes: containers::Vec<Pod<u8>, ShortU16Len>,
-    readonly_indexes: containers::Vec<Pod<u8>, ShortU16Len>,
-}
-
-#[derive(SchemaWrite)]
-#[wincode(from = "v0::Message")]
-struct V0Message {
-    header: MessageHeader,
-    account_keys: containers::Vec<Pod<solana_message::Address>, ShortU16Len>,
-    recent_blockhash: Pod<solana_message::Hash>,
-    instructions: containers::Vec<CompiledInstruction, ShortU16Len>,
-    address_table_lookups: containers::Vec<MessageAddressTableLookup, ShortU16Len>,
-}
-
-#[derive(SchemaWrite)]
-#[wincode(from = "versioned::VersionedTransaction")]
-struct VersionedTransactionSchema {
-    signatures: containers::Vec<Pod<Signature>, ShortU16Len>,
-    message: VersionedMessageSchema,
-}
-
-struct VersionedMessageSchema;
-
-impl SchemaWrite for VersionedMessageSchema {
-    type Src = VersionedMessage;
-
-    #[inline(always)]
-    fn size_of(src: &Self::Src) -> WriteResult<usize> {
-        match src {
-            VersionedMessage::Legacy(message) => LegacyMessage::size_of(message),
-            VersionedMessage::V0(message) => Ok(1 + V0Message::size_of(message)?),
-        }
-    }
-
-    #[inline(always)]
-    fn write(writer: &mut impl Writer, src: &Self::Src) -> WriteResult<()> {
-        match src {
-            VersionedMessage::Legacy(message) => LegacyMessage::write(writer, message),
-            VersionedMessage::V0(message) => {
-                u8::write(writer, &MESSAGE_VERSION_PREFIX)?;
-                V0Message::write(writer, message)
-            }
-        }
-    }
-}
+use wincode::WriteResult;
 
 pub(crate) fn serialize_versioned_message(message: &VersionedMessage) -> WriteResult<Vec<u8>> {
-    VersionedMessageSchema::serialize(message)
+    Ok(message.serialize())
 }
 
 #[cfg(test)]
 pub(crate) fn serialize_versioned_transaction(
     transaction: &versioned::VersionedTransaction,
-) -> WriteResult<Vec<u8>> {
-    VersionedTransactionSchema::serialize(transaction)
+) -> wincode05::WriteResult<Vec<u8>> {
+    wincode05::serialize(transaction)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use solana_message::{
-        Address, Hash, MessageHeader, VersionedMessage,
+        Address, Hash, MESSAGE_VERSION_PREFIX, MessageHeader, VersionedMessage,
         compiled_instruction::CompiledInstruction,
         legacy::Message,
         v0::{Message as V0Message, MessageAddressTableLookup},
@@ -166,5 +86,29 @@ mod tests {
         expected.extend([2, 4, 5, 1, 6]);
 
         assert_eq!(serialize_versioned_message(&message).unwrap(), expected);
+    }
+
+    #[test]
+    fn serializes_v1_message_with_version_prefix_and_all_config_fields() {
+        let message = VersionedMessage::V1(solana_message::v1::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            config: solana_message::v1::TransactionConfig {
+                priority_fee: Some(42),
+                compute_unit_limit: Some(1_000_000),
+                loaded_accounts_data_size_limit: Some(65_536),
+                heap_size: Some(32_768),
+            },
+            lifetime_specifier: Hash::new_from_array([9; 32]),
+            account_keys: vec![Address::from([1; 32])],
+            instructions: Vec::new(),
+        });
+
+        let bytes = serialize_versioned_message(&message).unwrap();
+        assert_eq!(bytes[0], solana_message::v1::V1_PREFIX);
+        assert_eq!(bytes, message.serialize());
     }
 }

@@ -6,11 +6,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
 use serde::Deserialize;
 use serde_big_array::Array;
 use solana_clock::DEFAULT_SLOTS_PER_EPOCH;
 use solana_epoch_rewards_hasher::EpochRewardsHasher;
-use solana_sdk::{hash::Hash, pubkey::Pubkey};
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
@@ -2442,6 +2442,7 @@ mod tests {
         assert!(query.contains("tx_account_keys"));
         assert!(query.contains("tx_instructions_program_id_index"));
         assert!(query.contains("meta_loaded_addresses_writable"));
+        assert!(!query.contains("tx_config_priority_fee"));
         assert!(!query.contains("meta_log_messages"));
         assert!(!query.contains("meta_return_data_data"));
         assert!(!query.contains("meta_compute_units_consumed"));
@@ -2458,6 +2459,10 @@ mod tests {
         );
 
         assert!(query.contains("tx_recent_blockhash"));
+        assert!(query.contains("tx_config_priority_fee"));
+        assert!(query.contains("tx_config_compute_unit_limit"));
+        assert!(query.contains("tx_config_loaded_accounts_data_size_limit"));
+        assert!(query.contains("tx_config_heap_size"));
         assert!(query.contains("meta_return_data_data"));
         assert!(!query.contains("\n                slot,"));
         assert!(!query.contains("\n                block_time,"));

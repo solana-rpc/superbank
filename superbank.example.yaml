@@ -36,7 +36,7 @@ grpc-slot-notifications: true
 # rpc-timeout-secs: 30
 # rpc-retry-backoff-ms: 500
 # rpc-max-inflight: 64
-# rpc-max-supported-tx-version: 0
+# rpc-max-supported-tx-version: 1
 # rpc-flush-every-slots: 500
 # rpc-progress-every-slots: 100
 # rpc-discovery-chunk-slots: 10000

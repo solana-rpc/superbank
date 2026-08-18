@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
 use futures_util::StreamExt;
 use solana_commitment_config::CommitmentLevel;
-use solana_sdk::{hash::Hash, pubkey::Pubkey};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yellowstone_block_machine::dragonsmouth::{
@@ -412,6 +412,9 @@ fn parse_block_rewards(
                 }
                 Ok(yellowstone_grpc_proto::prelude::RewardType::Voting) => {
                     Some("Voting".to_string())
+                }
+                Ok(yellowstone_grpc_proto::prelude::RewardType::DeactivatedStake) => {
+                    Some("DeactivatedStake".to_string())
                 }
                 Err(_) => {
                     warn!(

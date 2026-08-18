@@ -3,9 +3,12 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use solana_account_decoder_client_types::token::UiTokenAmount;
 #[allow(deprecated)]
-use solana_sdk::{instruction::InstructionError, pubkey::Pubkey, transaction::TransactionError};
+use crate::solana_sdk;
+use crate::solana_sdk::{
+    instruction::InstructionError, pubkey::Pubkey, transaction::TransactionError,
+};
+use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_transaction_context::transaction::TransactionReturnData;
 use solana_transaction_status::{
     InnerInstruction, InnerInstructions, Reward, RewardType, TransactionStatusMeta,
@@ -927,6 +930,10 @@ pub(crate) fn parse_reward_type(
         Ok(Some(RewardType::Staking))
     } else if value.eq_ignore_ascii_case("voting") {
         Ok(Some(RewardType::Voting))
+    } else if value.eq_ignore_ascii_case("deactivatedstake")
+        || value.eq_ignore_ascii_case("deactivated-stake")
+    {
+        Ok(Some(RewardType::DeactivatedStake))
     } else {
         Err(TransactionHydrationError::InvalidStoredMetadata(format!(
             "unknown reward type '{value}'"
@@ -954,6 +961,8 @@ mod tests {
             ("voting", RewardType::Voting),
             ("Voting", RewardType::Voting),
             ("VOTING", RewardType::Voting),
+            ("DeactivatedStake", RewardType::DeactivatedStake),
+            ("deactivated-stake", RewardType::DeactivatedStake),
         ];
 
         for (input, expected) in cases {

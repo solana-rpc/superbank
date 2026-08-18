@@ -1100,6 +1100,21 @@ fn map_rpc_transaction(
     let tx_version = match decoded.message {
         VersionedMessage::Legacy(_) => None,
         VersionedMessage::V0(_) => Some(0),
+        VersionedMessage::V1(_) => Some(1),
+    };
+    let (
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
+    ) = match &decoded.message {
+        VersionedMessage::V1(message) => (
+            message.config.priority_fee,
+            message.config.compute_unit_limit,
+            message.config.loaded_accounts_data_size_limit,
+            message.config.heap_size,
+        ),
+        _ => (None, None, None, None),
     };
 
     let meta_fields = map_rpc_meta_fields(tx.meta.as_ref())?;
@@ -1112,6 +1127,10 @@ fn map_rpc_transaction(
         message_hash,
         is_vote,
         tx_version,
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
         tx_signatures,
         tx_num_required_signatures: header.num_required_signatures,
         tx_num_readonly_signed_accounts: header.num_readonly_signed_accounts,
@@ -1327,6 +1346,20 @@ fn map_versioned_transaction_with_meta(
             Some(version)
         }
     };
+    let (
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
+    ) = match &tx.message {
+        VersionedMessage::V1(message) => (
+            message.config.priority_fee,
+            message.config.compute_unit_limit,
+            message.config.loaded_accounts_data_size_limit,
+            message.config.heap_size,
+        ),
+        _ => (None, None, None, None),
+    };
 
     let meta_fields = map_native_meta_fields(meta)?;
 
@@ -1338,6 +1371,10 @@ fn map_versioned_transaction_with_meta(
         message_hash,
         is_vote,
         tx_version,
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
         tx_signatures,
         tx_num_required_signatures: header.num_required_signatures,
         tx_num_readonly_signed_accounts: header.num_readonly_signed_accounts,
@@ -2279,7 +2316,10 @@ mod tests {
     use solana_address::Address;
     use solana_hash::Hash;
     use solana_message::{
-        MessageHeader, compiled_instruction::CompiledInstruction, legacy::Message,
+        MessageHeader,
+        compiled_instruction::CompiledInstruction,
+        legacy::Message,
+        v1::{Message as V1Message, TransactionConfig},
     };
     use solana_transaction_status_client_types::{EncodedTransaction, TransactionBinaryEncoding};
 
@@ -2304,6 +2344,27 @@ mod tests {
         VersionedTransaction {
             signatures: vec![Default::default()],
             message: VersionedMessage::Legacy(message),
+        }
+    }
+
+    fn build_test_v1_transaction(config: TransactionConfig) -> VersionedTransaction {
+        VersionedTransaction {
+            signatures: vec![Default::default()],
+            message: VersionedMessage::V1(V1Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                config,
+                lifetime_specifier: Hash::new_from_array([9; 32]),
+                account_keys: vec![Address::from([1; 32]), Address::from([2; 32])],
+                instructions: vec![CompiledInstruction {
+                    program_id_index: 1,
+                    accounts: vec![0],
+                    data: vec![1, 2, 3],
+                }],
+            }),
         }
     }
 
@@ -2470,6 +2531,75 @@ mod tests {
         assert_eq!(row.meta_rewards_present, 0);
         assert!(row.meta_compute_units_consumed.is_none());
         assert!(row.meta_cost_units.is_none());
+    }
+
+    #[test]
+    fn rpc_v1_round_trip_preserves_all_config_fields_and_hash() {
+        let tx = build_test_v1_transaction(TransactionConfig {
+            priority_fee: Some(42),
+            compute_unit_limit: Some(1_000_000),
+            loaded_accounts_data_size_limit: Some(65_536),
+            heap_size: Some(32_768),
+        });
+        let tx_bytes = wincode05::serialize(&tx).expect("serialize v1 transaction");
+        assert_eq!(
+            crate::message_wire::serialize_versioned_transaction(&tx)
+                .expect("serialize with Superbank schema"),
+            tx_bytes
+        );
+        let tx_with_meta = EncodedTransactionWithStatusMeta {
+            transaction: EncodedTransaction::Binary(
+                BASE64_STANDARD.encode(&tx_bytes),
+                TransactionBinaryEncoding::Base64,
+            ),
+            meta: None,
+            version: Some(TransactionVersion::Number(1)),
+        };
+
+        let row = map_rpc_transaction(42, Some(123), 0, &tx_with_meta).expect("map RPC v1");
+        assert_eq!(row.tx_version, Some(1));
+        assert_eq!(row.tx_recent_blockhash.0, [9; 32]);
+        assert_eq!(row.tx_config_priority_fee, Some(42));
+        assert_eq!(row.tx_config_compute_unit_limit, Some(1_000_000));
+        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, Some(65_536));
+        assert_eq!(row.tx_config_heap_size, Some(32_768));
+        assert_eq!(
+            row.message_hash.0,
+            *compute_message_hash_versioned(&tx.message)
+                .expect("message hash")
+                .as_ref()
+        );
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(match &tx_with_meta.transaction {
+                    EncodedTransaction::Binary(value, _) => value,
+                    _ => unreachable!(),
+                })
+                .expect("decode fixture"),
+            tx_bytes
+        );
+    }
+
+    #[test]
+    fn bigtable_v1_mapping_preserves_empty_config_and_enforces_max_version() {
+        let tx = build_test_v1_transaction(TransactionConfig::empty());
+        let row = map_versioned_transaction_with_meta(42, None, 0, &tx, None, 1)
+            .expect("map Bigtable v1");
+        assert_eq!(row.tx_version, Some(1));
+        assert_eq!(row.tx_recent_blockhash.0, [9; 32]);
+        assert_eq!(row.tx_config_priority_fee, None);
+        assert_eq!(row.tx_config_compute_unit_limit, None);
+        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, None);
+        assert_eq!(row.tx_config_heap_size, None);
+
+        let err = match map_versioned_transaction_with_meta(42, None, 0, &tx, None, 0) {
+            Ok(_) => panic!("v1 must be rejected at max version 0"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("unsupported transaction version 1")
+        );
     }
 
     #[tokio::test]

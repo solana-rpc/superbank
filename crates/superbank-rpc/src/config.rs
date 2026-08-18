@@ -5,8 +5,8 @@
 
 use std::str::FromStr;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use clap::{ArgAction, Parser};
-use solana_sdk::pubkey::Pubkey;
 
 const METRICS_CAPTURE_HEADER_X_ENDPOINT: &str = "X-Endpoint";
 const METRICS_CAPTURE_HEADER_X_RPC_NODE: &str = "X-RPC-Node";
