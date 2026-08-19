@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use solana_clock::{DEFAULT_SLOTS_PER_EPOCH, MAX_PROCESSING_AGE};
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
+use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION;
@@ -20,7 +21,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::clickhouse::{QueryTimings, StoredBlockPayload, StoredBlockRecord};
+use crate::clickhouse::{
+    InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings, StoredBlockPayload,
+    StoredBlockRecord,
+};
 use crate::handlers::{
     RouteMetric,
     types::{
@@ -2070,6 +2074,76 @@ fn inflation_reward_address_limit_exceeded(
     max_addresses.is_some_and(|max_addresses| address_count > max_addresses)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InflationRewardAvailabilityRoute {
+    NotFound,
+    RpcError,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InflationRewardAvailabilityError {
+    route: InflationRewardAvailabilityRoute,
+    code: i32,
+    message: String,
+    data: Option<Value>,
+}
+
+fn inflation_reward_availability_error(
+    outcome: &InflationRewardLookupOutcome,
+) -> Option<InflationRewardAvailabilityError> {
+    match outcome {
+        InflationRewardLookupOutcome::Complete(_) => None,
+        InflationRewardLookupOutcome::BoundaryUnavailable { slot } => {
+            Some(InflationRewardAvailabilityError {
+                route: InflationRewardAvailabilityRoute::NotFound,
+                code: JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32,
+                message: format!("Block not available for slot {slot}"),
+                data: None,
+            })
+        }
+        InflationRewardLookupOutcome::RewardsPeriodActive {
+            slot,
+            current_block_height,
+            rewards_complete_block_height,
+        } => Some(InflationRewardAvailabilityError {
+            route: InflationRewardAvailabilityRoute::RpcError,
+            code: JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE as i32,
+            message: format!("Epoch rewards period still active at slot {slot}"),
+            data: Some(json!({
+                "slot": slot,
+                "currentBlockHeight": current_block_height,
+                "rewardsCompleteBlockHeight": rewards_complete_block_height,
+            })),
+        }),
+    }
+}
+
+fn inflation_reward_result(
+    requested_pubkeys: &[[u8; 32]],
+    epoch: u64,
+    reward_rows: Vec<InflationRewardRecord>,
+) -> Vec<Option<InflationRewardInfo>> {
+    let mut rewards_by_pubkey = HashMap::with_capacity(reward_rows.len());
+    for row in reward_rows {
+        rewards_by_pubkey.insert(
+            row.pubkey,
+            InflationRewardInfo {
+                epoch,
+                effective_slot: row.effective_slot,
+                amount: row.lamports.unsigned_abs(),
+                post_balance: row.post_balance,
+                commission: row.commission,
+                commission_bps: row.commission_bps,
+            },
+        );
+    }
+
+    requested_pubkeys
+        .iter()
+        .map(|pubkey| rewards_by_pubkey.get(pubkey).cloned())
+        .collect()
+}
+
 pub(crate) async fn handle_get_inflation_reward(
     state: Arc<AppState>,
     id: Value,
@@ -2234,7 +2308,7 @@ pub(crate) async fn handle_get_inflation_reward(
     };
 
     route.source_clickhouse();
-    let (reward_rows, timings) = match state
+    let (lookup_outcome, timings) = match state
         .clickhouse
         .get_inflation_rewards_for_epoch(&requested_pubkeys, epoch)
         .await
@@ -2250,25 +2324,25 @@ pub(crate) async fn handle_get_inflation_reward(
         }
     };
 
-    let mut rewards_by_pubkey = HashMap::with_capacity(reward_rows.len());
-    for row in reward_rows {
-        rewards_by_pubkey.insert(
-            row.pubkey,
-            InflationRewardInfo {
-                epoch,
-                effective_slot: row.effective_slot,
-                amount: row.lamports.unsigned_abs(),
-                post_balance: row.post_balance,
-                commission: row.commission,
-                commission_bps: row.commission_bps,
-            },
+    if let Some(availability_error) = inflation_reward_availability_error(&lookup_outcome) {
+        match availability_error.route {
+            InflationRewardAvailabilityRoute::NotFound => route.not_found(),
+            InflationRewardAvailabilityRoute::RpcError => route.rpc_error(),
+        }
+        let mut resp = json_rpc_error_response(
+            id,
+            availability_error.code,
+            availability_error.message,
+            availability_error.data,
         );
+        add_downstream_header(&mut resp, &timings);
+        return Ok(resp);
     }
+    let InflationRewardLookupOutcome::Complete(reward_rows) = lookup_outcome else {
+        unreachable!("availability outcomes return before reward mapping")
+    };
 
-    let rewards = requested_pubkeys
-        .iter()
-        .map(|pubkey| rewards_by_pubkey.get(pubkey).cloned())
-        .collect::<Vec<_>>();
+    let rewards = inflation_reward_result(&requested_pubkeys, epoch, reward_rows);
 
     route.success();
     let mut resp = json_rpc_success_response(id, json!(rewards));
@@ -2430,9 +2504,14 @@ pub(crate) async fn handle_minimum_ledger_slot(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_get_block_miss, inflation_reward_address_limit_exceeded, merge_sorted_block_slots,
+        InflationRewardAvailabilityRoute, classify_get_block_miss,
+        inflation_reward_address_limit_exceeded, inflation_reward_availability_error,
+        inflation_reward_result, merge_sorted_block_slots,
     };
+    use crate::clickhouse::InflationRewardLookupOutcome;
+    use crate::clickhouse::InflationRewardRecord;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
+    use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
 
     #[test]
@@ -2462,6 +2541,78 @@ mod tests {
         assert!(!inflation_reward_address_limit_exceeded(None, usize::MAX));
         assert!(!inflation_reward_address_limit_exceeded(Some(100), 100));
         assert!(inflation_reward_address_limit_exceeded(Some(100), 101));
+    }
+
+    #[test]
+    fn inflation_reward_boundary_unavailable_uses_agave_error_contract() {
+        let error = inflation_reward_availability_error(
+            &InflationRewardLookupOutcome::BoundaryUnavailable { slot: 440_208_000 },
+        )
+        .expect("boundary absence must produce an RPC error");
+
+        assert_eq!(error.route, InflationRewardAvailabilityRoute::NotFound);
+        assert_eq!(error.code, JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32);
+        assert_eq!(error.message, "Block not available for slot 440208000");
+        assert_eq!(error.data, None);
+    }
+
+    #[test]
+    fn inflation_reward_active_period_uses_agave_error_contract() {
+        let error = inflation_reward_availability_error(
+            &InflationRewardLookupOutcome::RewardsPeriodActive {
+                slot: 440_208_021,
+                current_block_height: 420_000_020,
+                rewards_complete_block_height: 420_000_294,
+            },
+        )
+        .expect("active reward period must produce an RPC error");
+
+        assert_eq!(error.route, InflationRewardAvailabilityRoute::RpcError);
+        assert_eq!(
+            error.code,
+            JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE as i32
+        );
+        assert_eq!(
+            error.message,
+            "Epoch rewards period still active at slot 440208021"
+        );
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "slot": 440_208_021,
+                "currentBlockHeight": 420_000_020,
+                "rewardsCompleteBlockHeight": 420_000_294,
+            }))
+        );
+    }
+
+    #[test]
+    fn inflation_reward_result_preserves_order_duplicates_and_nulls() {
+        let rewarded = [1u8; 32];
+        let missing = [2u8; 32];
+        let result = inflation_reward_result(
+            &[rewarded, missing, rewarded],
+            1_018,
+            vec![InflationRewardRecord {
+                pubkey: rewarded,
+                effective_slot: 440_208_017,
+                lamports: 42,
+                post_balance: 1_000,
+                commission: Some(5),
+                commission_bps: Some(500),
+            }],
+        );
+
+        assert_eq!(result.len(), 3);
+        assert!(result[1].is_none());
+        for index in [0, 2] {
+            let reward = result[index]
+                .as_ref()
+                .expect("rewarded address must be present");
+            assert_eq!(reward.epoch, 1_018);
+            assert_eq!(reward.effective_slot, 440_208_017);
+            assert_eq!(reward.amount, 42);
+        }
     }
 
     #[test]
