@@ -268,6 +268,19 @@ pub struct InflationRewardRecord {
 }
 
 #[derive(Debug, Clone)]
+pub enum InflationRewardLookupOutcome {
+    Complete(Vec<InflationRewardRecord>),
+    BoundaryUnavailable {
+        slot: u64,
+    },
+    RewardsPeriodActive {
+        slot: u64,
+        current_block_height: u64,
+        rewards_complete_block_height: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct StoredBlockRecord {
     pub metadata: BlockMetadataRecord,
     pub transactions: Vec<StoredTransactionRecord>,
