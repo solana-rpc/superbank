@@ -7033,7 +7033,7 @@ mod disk_cache_tier {
     }
 
     #[tokio::test]
-    async fn get_signature_statuses_skips_disk_without_search_history() {
+    async fn get_signature_statuses_served_from_disk_without_search_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let disk = open_disk_cache(&dir);
         let signatures = write_block(&disk, 100, 99, 2);
@@ -7059,10 +7059,18 @@ mod disk_cache_tier {
                 .expect("statuses");
             let statuses = value.as_array().expect("array");
             assert_eq!(statuses.len(), 2);
-            assert!(
-                statuses.iter().all(Value::is_null),
-                "{case}: expected no historical lookup, got {statuses:?}"
-            );
+            for status in statuses {
+                assert_eq!(
+                    status.get("confirmationStatus").and_then(Value::as_str),
+                    Some("finalized"),
+                    "{case}: {status:?}"
+                );
+                assert_eq!(
+                    status.get("slot").and_then(Value::as_u64),
+                    Some(100),
+                    "{case}: {status:?}"
+                );
+            }
         }
     }
 
@@ -7106,6 +7114,57 @@ mod disk_cache_tier {
 
     fn empty_head_cache() -> Arc<HeadCache> {
         Arc::new(HeadCache::new(64, TEST_MAX_LIMIT as usize))
+    }
+
+    fn head_cache_with_finalized_tip(slot: u64) -> Arc<HeadCache> {
+        let cache = empty_head_cache();
+        let address = Pubkey::new_from_array([91u8; 32]);
+        let signature_bytes = [92u8; 64];
+        let signature = Signature::from(signature_bytes);
+        let mut record = base_transaction_record();
+        record.slot = slot;
+        record.signature = signature_bytes;
+        record.tx_signatures = vec![signature_bytes];
+        record.tx_account_keys = vec![address.to_bytes()];
+        cache.insert_for_tests(signature, record, 0, &[address], CommitmentLevel::Finalized);
+        cache
+    }
+
+    #[tokio::test]
+    async fn get_signature_statuses_disk_hit_marks_response_source_without_history_search() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let signatures = write_block(&disk, 100, 99, 1);
+        let state = state_with_head_and_disk(head_cache_with_finalized_tip(101), disk);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signatures[0].clone()]]
+        });
+
+        let response = handle_json_rpc_value(state, &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("X-Superbank-Sources")
+                .and_then(|value| value.to_str().ok()),
+            Some("head-cache,disk-cache")
+        );
+
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let status = parsed
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/value/0"))
+            .expect("disk status");
+        assert_eq!(status.get("slot").and_then(Value::as_u64), Some(100));
+        assert_eq!(
+            status.get("confirmationStatus").and_then(Value::as_str),
+            Some("finalized")
+        );
     }
 
     #[tokio::test]

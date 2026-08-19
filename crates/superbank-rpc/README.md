@@ -59,11 +59,11 @@ Notes:
 - Methods that need a latest finalized context return a backend/internal JSON-RPC error when
   ClickHouse has no finalized slot available. This includes `getSlot`, `getBlockHeight`,
   `getTransactionCount`, `getLatestBlockhash`, `getSignatureStatuses`, and min-context checks.
-- `getSignatureStatuses` only looks up historical (ClickHouse-backed) statuses when the second
-  param sets `searchTransactionHistory: true`. Without it, only the short-lived head-cache tier
-  (when compiled with `--features grpc-head-cache` and enabled) is checked, so a signature that is
-  known to exist and is already indexed can still return `null`. This matches standard Solana
-  JSON-RPC semantics, not a Superbank-specific limitation.
+- `getSignatureStatuses` looks up recent statuses in the enabled cache tiers: the short-lived head
+  cache and, when compiled with `--features disk-cache` and enabled, the finalized disk cache. The
+  ClickHouse-backed history tier is searched only when the second param sets
+  `searchTransactionHistory: true`; without it, a signature outside the enabled cache retention
+  still returns `null`.
 - `getTransaction` accepts the standard Solana config fields plus an optional Superbank extension:
   - `slot`: optional `u64`; when supplied, ClickHouse is queried directly for that exact slot and
     the response is `null` if the signature is not present in that slot.
