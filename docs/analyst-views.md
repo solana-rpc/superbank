@@ -1,7 +1,7 @@
 # Analyst-friendly views
 
 Plain (non-materialized) SQL views over `default.transactions`
-(the `view_*.sql` files in each `ddl/` schema folder) that make the
+(the `view_*.sql` files under `ddl/additional/`) that make the
 raw schema directly usable for ad-hoc analytics, without knowing its storage
 conventions. They encapsulate three pitfalls of the raw table:
 
@@ -25,16 +25,16 @@ conventions. They encapsulate three pitfalls of the raw table:
 
 ## Applying
 
-The view files live alongside each deployment-mode schema set (`ddl/local/`,
-`ddl/cluster/`, `ddl/replicated/`); the clustered variants add
+These views are **opt-in**. They live under `ddl/additional/`
+(`local/`, `cluster/`, `replicated/`) and are **not** applied by Docker
+Compose, Tilt, or the k8s DDL job. Clustered variants add
 `ON CLUSTER '{cluster}'`. Apply them after `transactions.sql` — the only
-object they require. The Docker Compose stack applies the `ddl/local/`
-variants automatically.
+object they require.
 
-To apply manually (single-node example):
+To apply (single-node example):
 
 ```bash
-for f in ddl/local/view_*.sql; do
+for f in ddl/additional/local/view_*.sql; do
   clickhouse-client --multiquery < "$f"
 done
 ```

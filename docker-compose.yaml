@@ -43,11 +43,7 @@ services:
           gsfa.sql \
           gsfa_hot.sql \
           signatures.sql \
-          token_owner_activity.sql \
-          view_tx_summary.sql \
-          view_sol_transfers.sql \
-          view_token_transfers.sql \
-          view_transactions_decoded.sql
+          token_owner_activity.sql
         do
           echo "Applying /ddl/local/$${file}"
           clickhouse-client \
