@@ -196,11 +196,11 @@ pub(crate) async fn handle_get_signature_statuses(
         }
     };
 
-    // Disk tier: finalized statuses for signatures the head cache does not hold.
-    // Per getSignatureStatuses semantics, historical tiers are searched only
-    // when searchTransactionHistory is set.
+    // Disk tier: finalized recent statuses for signatures the head cache does not hold.
+    // This is part of the default status-cache lookup; searchTransactionHistory
+    // only controls the ClickHouse fallback below.
     #[cfg(feature = "disk-cache")]
-    let disk_statuses: HashMap<String, (u64, Option<Value>)> = if search_transaction_history {
+    let disk_statuses: HashMap<String, (u64, Option<Value>)> =
         if let Some(disk) = state.disk_cache.as_ref() {
             let pending: Vec<(String, Signature)> = unique_valid
                 .iter()
@@ -232,10 +232,7 @@ pub(crate) async fn handle_get_signature_statuses(
             }
         } else {
             HashMap::new()
-        }
-    } else {
-        HashMap::new()
-    };
+        };
 
     #[cfg(feature = "disk-cache")]
     let in_disk = |sig: &String| disk_statuses.contains_key(sig);
