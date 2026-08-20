@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use clickhouse::Client as HttpClient;
 use clickhouse_rs::{
     Block as TcpBlock,
@@ -16,7 +17,6 @@ use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use reqwest::Url;
 use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
 use tokio::sync::Semaphore;
 
 use crate::config::{ClickHouseStartupTableCheck, has_usable_gsfa_hot_addresses};
@@ -232,7 +232,7 @@ async fn kill_http_query(
         cleanup_timeout,
         client
             .query(&kill_sql)
-            .with_option("query_id", cleanup_query_id)
+            .with_setting("query_id", cleanup_query_id)
             .execute(),
     )
     .await
@@ -282,7 +282,7 @@ async fn kill_shard_tcp_query(
         shard
             .http_client
             .query(&kill_sql)
-            .with_option("query_id", cleanup_query_id)
+            .with_setting("query_id", cleanup_query_id)
             .execute(),
     )
     .await
@@ -430,11 +430,13 @@ pub struct ClickHouseClient {
     pub(crate) routing_policy: RoutingPolicy,
 
     pub(crate) query_timeout: Duration,
+    pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) http_connect_timeout: Duration,
     pub(crate) fanout_sem: Arc<Semaphore>,
     // Bounds concurrent direct (scalar/lookup) ClickHouse HTTP queries server-wide so HTTP
-    // connection demand does not track raw request/batch concurrency. Acquired in `with_timeout`.
+    // connection demand does not track raw request/batch concurrency. Acquired only by explicitly
+    // HTTP-permitted query stages.
     pub(crate) http_query_sem: Arc<Semaphore>,
     pub(crate) tcp_pool_min: usize,
     pub(crate) tcp_pool_max: usize,
@@ -461,6 +463,26 @@ pub struct ClickHouseClientOptions {
     pub tcp_pool_max: usize,
     pub in_clause_chunk: usize,
     pub startup_table_check: ClickHouseStartupTableCheck,
+    pub inflation_reward_limits: InflationRewardQueryLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InflationRewardQueryLimits {
+    pub query_timeout: Duration,
+    pub max_threads: usize,
+    pub max_memory_bytes: u64,
+    pub max_bytes_to_read: u64,
+}
+
+impl Default for InflationRewardQueryLimits {
+    fn default() -> Self {
+        Self {
+            query_timeout: Duration::from_millis(5_000),
+            max_threads: 2,
+            max_memory_bytes: 536_870_912,
+            max_bytes_to_read: 536_870_912,
+        }
+    }
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -540,6 +562,7 @@ impl ClickHouseClientOptions {
             tcp_pool_max: 20,
             in_clause_chunk: 512,
             startup_table_check: ClickHouseStartupTableCheck::Exists,
+            inflation_reward_limits: InflationRewardQueryLimits::default(),
         }
     }
 
@@ -588,6 +611,11 @@ impl ClickHouseClientOptions {
         self.startup_table_check = mode;
         self
     }
+
+    pub fn with_inflation_reward_limits(mut self, limits: InflationRewardQueryLimits) -> Self {
+        self.inflation_reward_limits = limits;
+        self
+    }
 }
 
 impl ClickHouseClient {
@@ -614,7 +642,7 @@ impl ClickHouseClient {
             tcp_pool_max,
             in_clause_chunk,
             startup_table_check,
-            ..
+            inflation_reward_limits,
         } = options;
         let client =
             build_clickhouse_http_client(url, database, username, password, http_connect_timeout);
@@ -704,6 +732,7 @@ impl ClickHouseClient {
             routing_policy,
 
             query_timeout,
+            inflation_reward_limits,
             tcp_access_check_timeout,
             http_connect_timeout,
             fanout_sem: Arc::new(Semaphore::new(fanout_concurrency.max(1))),
@@ -767,6 +796,22 @@ impl ClickHouseClient {
         )
     }
 
+    pub(crate) fn http_query_cleanup_for_client(
+        &self,
+        client: HttpClient,
+        cluster: Option<String>,
+        operation: &'static str,
+        query_id: String,
+    ) -> HttpQueryCleanup {
+        HttpQueryCleanup::new(
+            client,
+            cluster,
+            operation,
+            self.inflation_reward_limits.query_timeout,
+            query_id,
+        )
+    }
+
     pub(crate) fn signatures_bucket_modulus(&self) -> u64 {
         self.bucket_moduli.signatures
     }
@@ -807,7 +852,7 @@ impl ClickHouseClient {
         timeout: Duration,
     ) -> String {
         // Bound the server-side query lifetime so a query ClickHouse keeps running after
-        // `with_timeout` drops the HTTP future does not linger and hold a connection.
+        // `with_http_query_timeout` drops the HTTP future does not linger and hold a connection.
         append_max_execution_time_setting(
             &build_select_settings_clause(
                 self.allow_query_settings,
@@ -855,35 +900,76 @@ impl ClickHouseClient {
         )
     }
 
-    pub(crate) async fn with_timeout<T>(
+    pub(crate) fn inflation_reward_settings_clause(&self, operation: &'static str) -> String {
+        let limits = self.inflation_reward_limits;
+        let base = self.select_settings_clause_with_timeout(
+            operation,
+            QueryFreshnessClass::Historical,
+            limits.query_timeout,
+        );
+        if base.is_empty() {
+            return base;
+        }
+
+        format!(
+            "{base}, max_threads={max_threads}, max_memory_usage={max_memory_bytes}, \
+             max_bytes_to_read={max_bytes_to_read}, read_overflow_mode='throw'",
+            max_threads = limits.max_threads,
+            max_memory_bytes = limits.max_memory_bytes,
+            max_bytes_to_read = limits.max_bytes_to_read,
+        )
+    }
+
+    pub(crate) fn query_settings_enabled(&self) -> bool {
+        self.allow_query_settings
+    }
+
+    pub(crate) async fn with_http_query_timeout<T>(
         &self,
         operation: &'static str,
         fut: impl std::future::Future<Output = ProcessingResult<T>>,
     ) -> ProcessingResult<T> {
-        self.with_timeout_duration(operation, self.query_timeout, fut)
+        self.with_http_query_timeout_duration(operation, self.query_timeout, fut)
             .await
     }
 
-    /// [`Self::with_timeout`] with an explicit deadline, for operations whose
+    /// [`Self::with_http_query_timeout`] with an explicit deadline, for operations whose
     /// budget differs from the interactive query timeout (e.g. disk-cache
     /// backfill range scans).
-    pub(crate) async fn with_timeout_duration<T>(
+    pub(crate) async fn with_http_query_timeout_duration<T>(
         &self,
         operation: &'static str,
         timeout: std::time::Duration,
         fut: impl std::future::Future<Output = ProcessingResult<T>>,
     ) -> ProcessingResult<T> {
-        // Gate every direct (non-fanout) ClickHouse HTTP query on a global permit so concurrent
-        // HTTP connections do not track raw request/batch concurrency. Fanout paths use
-        // `fanout_sem` and are not gated here; the surrounding request timeout bounds the wait for
-        // a permit under saturation.
-        let _permit = self.http_query_sem.acquire().await.ok();
+        self.with_operation_timeout_duration(operation, timeout, async {
+            let _permit = self.acquire_http_query_permit().await?;
+            fut.await
+        })
+        .await
+    }
+
+    pub(crate) async fn with_operation_timeout<T>(
+        &self,
+        operation: &'static str,
+        fut: impl std::future::Future<Output = ProcessingResult<T>>,
+    ) -> ProcessingResult<T> {
+        self.with_operation_timeout_duration(operation, self.query_timeout, fut)
+            .await
+    }
+
+    pub(crate) async fn with_operation_timeout_duration<T>(
+        &self,
+        operation: &'static str,
+        timeout: std::time::Duration,
+        fut: impl std::future::Future<Output = ProcessingResult<T>>,
+    ) -> ProcessingResult<T> {
         // Box the query future onto the heap. `fut` (a ClickHouse query state machine) is large in
-        // debug builds, and `with_timeout` is composed deeply on some request paths (a JSON-RPC
+        // debug builds, and timeout wrappers are composed deeply on some request paths (a JSON-RPC
         // batch sub-request chains several queries plus hydration, and `dispatch_json_rpc_request`
         // is sized to its largest method arm). Keeping `fut` inline lets those sizes compound up
         // the call tree and overflow the (2 MiB) worker/test thread stack; boxing keeps each
-        // `with_timeout` future pointer-sized in its caller.
+        // timeout future pointer-sized in its caller.
         let fut = Box::pin(fut);
         match tokio::time::timeout(timeout, fut).await {
             Ok(result) => result,
@@ -896,8 +982,19 @@ impl ClickHouseClient {
         }
     }
 
+    /// Acquires one global HTTP-query permit. Callers must acquire it inside an operation timeout
+    /// so admission and execution share the same bounded budget.
+    pub(crate) async fn acquire_http_query_permit(
+        &self,
+    ) -> ProcessingResult<tokio::sync::SemaphorePermit<'_>> {
+        self.http_query_sem
+            .acquire()
+            .await
+            .map_err(|_| ProcessingError::database_msg("ClickHouse HTTP query semaphore closed"))
+    }
+
     async fn describe_table_http(&self, table: &str) -> ProcessingResult<Vec<DescribeTableRow>> {
-        self.with_timeout("describe_table_http", async {
+        self.with_http_query_timeout("describe_table_http", async {
             let (database, table_name) = split_table_reference(&self.database, table);
             let database = escape_clickhouse_string(database);
             let table_name = escape_clickhouse_string(table_name);
@@ -957,7 +1054,7 @@ impl ClickHouseClient {
         &self,
         table: &str,
     ) -> ProcessingResult<TableDefinitionRow> {
-        self.with_timeout("fetch_table_definition_http", async {
+        self.with_http_query_timeout("fetch_table_definition_http", async {
             let (database, table_name) = split_table_reference(&self.database, table);
             let database = escape_clickhouse_string(database);
             let table_name = escape_clickhouse_string(table_name);
@@ -1042,9 +1139,7 @@ impl ClickHouseClient {
             None
         };
 
-        if self.scope_shard_direct()
-            && let Some(topology) = &self.shard_topology
-        {
+        if let Some(topology) = &self.shard_topology {
             if let Some(router) = &self.gsfa_router {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
@@ -1062,7 +1157,9 @@ impl ClickHouseClient {
                 )?;
             }
 
-            if let Some(local_table) = &self.signatures_local_table {
+            if self.scope_shard_direct()
+                && let Some(local_table) = &self.signatures_local_table
+            {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
                     local_table,
@@ -1152,7 +1249,7 @@ impl ClickHouseClient {
         }
 
         let row = self
-            .with_timeout("detect_readonly_setting", async {
+            .with_http_query_timeout("detect_readonly_setting", async {
                 self.client
                     .query("SELECT toUInt8(getSetting('readonly')) AS readonly")
                     .fetch_one::<ReadonlyRow>()
@@ -1175,7 +1272,7 @@ impl ClickHouseClient {
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
                 let row_count = self
-                    .with_timeout("startup_gsfa_count", async {
+                    .with_http_query_timeout("startup_gsfa_count", async {
                         self.client
                             .query(&format!("SELECT COUNT(*) FROM {}", gsfa_table))
                             .fetch_one::<u64>()
@@ -1193,7 +1290,7 @@ impl ClickHouseClient {
                 );
             }
             ClickHouseStartupTableCheck::Exists => {
-                self.with_timeout("startup_gsfa_exists", async {
+                self.with_http_query_timeout("startup_gsfa_exists", async {
                     self.client
                         .query(&format!("SELECT count() FROM {} WHERE 0", gsfa_table))
                         .fetch_one::<u64>()
@@ -1210,7 +1307,7 @@ impl ClickHouseClient {
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
                 let signature_row_count = self
-                    .with_timeout("startup_signatures_count", async {
+                    .with_http_query_timeout("startup_signatures_count", async {
                         self.client
                             .query(&format!(
                                 "SELECT COUNT(*) FROM {}",
@@ -1234,7 +1331,7 @@ impl ClickHouseClient {
                 );
             }
             ClickHouseStartupTableCheck::Exists => {
-                self.with_timeout("startup_signatures_exists", async {
+                self.with_http_query_timeout("startup_signatures_exists", async {
                     self.client
                         .query(&format!(
                             "SELECT count() FROM {} WHERE 0",
@@ -1262,7 +1359,7 @@ impl ClickHouseClient {
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
                 match self
-                    .with_timeout("startup_token_owner_activity_count", async {
+                    .with_http_query_timeout("startup_token_owner_activity_count", async {
                         self.client
                             .query(&format!(
                                 "SELECT COUNT(*) FROM {}",
@@ -1294,7 +1391,7 @@ impl ClickHouseClient {
             }
             ClickHouseStartupTableCheck::Exists => {
                 match self
-                    .with_timeout("startup_token_owner_activity_exists", async {
+                    .with_http_query_timeout("startup_token_owner_activity_exists", async {
                         self.client
                             .query(&format!(
                                 "SELECT count() FROM {} WHERE 0",
@@ -1330,7 +1427,7 @@ impl ClickHouseClient {
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
                 let blocks_row_count = self
-                    .with_timeout("startup_blocks_metadata_count", async {
+                    .with_http_query_timeout("startup_blocks_metadata_count", async {
                         self.client
                             .query(&format!("SELECT COUNT(*) FROM {}", blocks_metadata_table))
                             .fetch_one::<u64>()
@@ -1351,7 +1448,7 @@ impl ClickHouseClient {
                 );
             }
             ClickHouseStartupTableCheck::Exists => {
-                self.with_timeout("startup_blocks_metadata_exists", async {
+                self.with_http_query_timeout("startup_blocks_metadata_exists", async {
                     self.client
                         .query(&format!(
                             "SELECT count() FROM {} WHERE 0",
@@ -1379,7 +1476,7 @@ impl ClickHouseClient {
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
                 let tx_row_count = self
-                    .with_timeout("startup_transactions_count", async {
+                    .with_http_query_timeout("startup_transactions_count", async {
                         self.client
                             .query(&format!("SELECT COUNT(*) FROM {}", transaction_table))
                             .fetch_one::<u64>()
@@ -1400,7 +1497,7 @@ impl ClickHouseClient {
                 );
             }
             ClickHouseStartupTableCheck::Exists => {
-                self.with_timeout("startup_transactions_exists", async {
+                self.with_http_query_timeout("startup_transactions_exists", async {
                     self.client
                         .query(&format!(
                             "SELECT count() FROM {} WHERE 0",
@@ -1458,65 +1555,62 @@ impl ClickHouseClient {
                     let topology = Arc::new(topology);
                     self.shard_topology = Some(topology.clone());
 
-                    if self.scope_shard_direct() {
-                        if let Some(local_table) = config.gsfa_local_table.clone() {
-                            if let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &GSFA_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "GSFA shard routing disabled; local table validation failed: {}",
-                                    e
-                                );
-                            } else {
-                                self.validate_gsfa_shard_layout(&local_table).await?;
-                                self.gsfa_router = Some(GsfaShardRouter {
-                                    local_table,
-                                    topology: topology.clone(),
-                                    query_timeout: self.shard_tcp_query_timeout(),
-                                });
-                            }
+                    if let Some(local_table) = config.gsfa_local_table.clone() {
+                        if let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &GSFA_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "GSFA shard routing disabled; local table validation failed: {}",
+                                e
+                            );
                         } else {
-                            tracing::warn!(
-                                "GSFA shard routing disabled; local table not configured"
-                            );
+                            self.validate_gsfa_shard_layout(&local_table).await?;
+                            self.gsfa_router = Some(GsfaShardRouter {
+                                local_table,
+                                topology: topology.clone(),
+                                query_timeout: self.shard_tcp_query_timeout(),
+                            });
                         }
+                    } else {
+                        tracing::warn!("GSFA shard routing disabled; local table not configured");
+                    }
 
-                        if let Some(local_table) = config.signatures_local_table.clone()
-                            && let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &SIGNATURES_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Signature shard routing disabled; local table validation failed: {}",
-                                e
-                            );
-                            self.signatures_local_table = None;
-                        }
+                    if self.scope_shard_direct()
+                        && let Some(local_table) = config.signatures_local_table.clone()
+                        && let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &SIGNATURES_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Signature shard routing disabled; local table validation failed: {}",
+                            e
+                        );
+                        self.signatures_local_table = None;
+                    }
 
-                        if let Some(local_table) = config.token_owner_activity_local_table.clone()
-                            && let Err(e) = validate_table_schema_on_shards(
-                                topology.as_ref(),
-                                &local_table,
-                                &TOKEN_OWNER_REQUIRED_COLUMNS,
-                                self.query_timeout,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Token owner shard routing disabled; local table validation failed: {}",
-                                e
-                            );
-                            self.token_owner_activity_local_table = None;
-                        }
+                    if let Some(local_table) = config.token_owner_activity_local_table.clone()
+                        && let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &TOKEN_OWNER_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Token owner shard routing disabled; local table validation failed: {}",
+                            e
+                        );
+                        self.token_owner_activity_local_table = None;
                     }
 
                     if hot_routing_configured {
@@ -1704,7 +1798,7 @@ impl ClickHouseClient {
         );
 
         let rows: Vec<ClusterRow> = self
-            .with_timeout("build_shard_topology", async {
+            .with_http_query_timeout("build_shard_topology", async {
                 self.client
                     .query(&cluster_query)
                     .fetch_all()
@@ -1959,16 +2053,19 @@ fn split_table_reference<'a>(default_database: &'a str, table: &'a str) -> (&'a 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        ClickHouseClient, ClickHouseClientOptions, kill_query_sql, shard_tcp_query_timeout_for,
-        split_table_reference, validate_gsfa_shard_layout_query,
+        ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, kill_query_sql,
+        shard_tcp_query_timeout_for, split_table_reference, validate_gsfa_shard_layout_query,
     };
     use crate::clickhouse::{
         QueryCacheConfig, QueryFreshnessClass, RoutingPolicy, RoutingScope, RoutingTransport,
         ShardRoutingConfig,
     };
+    use crate::processing::ProcessingError;
 
     struct TempTopologyConfig {
         path: PathBuf,
@@ -2040,6 +2137,97 @@ mod tests {
         )
     }
 
+    fn test_client_with_http_limit(query_timeout: Duration) -> ClickHouseClient {
+        ClickHouseClient::new(
+            "http://localhost:8123",
+            "default",
+            "default",
+            "",
+            ClickHouseClientOptions::new(
+                RoutingPolicy {
+                    transport: RoutingTransport::Http,
+                    scope: RoutingScope::Distributed,
+                },
+                None,
+                Vec::new(),
+                "default.gsfa_hot".to_string(),
+                "default.gsfa_hot_local".to_string(),
+            )
+            .with_http_concurrency(1)
+            .with_query_timeout(query_timeout),
+        )
+    }
+
+    #[tokio::test]
+    async fn http_query_timeout_bounds_permit_wait() {
+        let client = test_client_with_http_limit(Duration::from_millis(25));
+        let held_permit = client
+            .http_query_sem
+            .acquire()
+            .await
+            .expect("test semaphore should remain open");
+        let query_started = Arc::new(AtomicBool::new(false));
+        let query_started_for_future = query_started.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.with_http_query_timeout("permit_wait_test", async move {
+                query_started_for_future.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await
+        .expect("bounded permit wait should not hang");
+
+        assert!(matches!(result, Err(ProcessingError::Timeout { .. })));
+        assert!(!query_started.load(Ordering::SeqCst));
+
+        drop(held_permit);
+        client
+            .with_http_query_timeout("permit_wait_recovery_test", async { Ok(()) })
+            .await
+            .expect("query should acquire the released permit");
+    }
+
+    #[tokio::test]
+    async fn operation_timeout_allows_sequential_nested_http_stages() {
+        let client = test_client_with_http_limit(Duration::from_millis(100));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.with_operation_timeout("composite_test", async {
+                client
+                    .with_http_query_timeout("signature_lookup_test", async { Ok(()) })
+                    .await?;
+                client.acquire_http_query_permit().await.map(drop)
+            }),
+        )
+        .await
+        .expect("composite operation should not deadlock");
+
+        result.expect("both HTTP stages should complete");
+        assert_eq!(client.http_query_sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_timeout_releases_acquired_http_permit() {
+        let client = test_client_with_http_limit(Duration::from_millis(25));
+
+        let result = client
+            .with_http_query_timeout("query_cancellation_test", async {
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(result, Err(ProcessingError::Timeout { .. })));
+        assert_eq!(client.http_query_sem.available_permits(), 1);
+        client
+            .with_http_query_timeout("query_cancellation_recovery_test", async { Ok(()) })
+            .await
+            .expect("query should acquire the permit released by cancellation");
+    }
+
     #[test]
     fn gsfa_hot_routing_is_disabled_for_blank_addresses() {
         let client = test_client_with_hot_addresses(vec!["   ".to_string()]);
@@ -2106,6 +2294,28 @@ mod tests {
         assert!(!clause.contains("query_cache_min_query_runs"));
         assert!(clause.contains("max_execution_time=30"));
         assert!(!clause.contains("max_execution_time=8"));
+    }
+
+    #[test]
+    fn inflation_reward_settings_clause_applies_method_limits() {
+        let client = test_client_with_query_cache();
+        let client = ClickHouseClient {
+            inflation_reward_limits: InflationRewardQueryLimits {
+                query_timeout: Duration::from_millis(4_500),
+                max_threads: 3,
+                max_memory_bytes: 123_456,
+                max_bytes_to_read: 654_321,
+            },
+            ..client
+        };
+
+        let clause = client.inflation_reward_settings_clause("get_inflation_reward_test");
+
+        assert!(clause.contains("max_execution_time=5"));
+        assert!(clause.contains("max_threads=3"));
+        assert!(clause.contains("max_memory_usage=123456"));
+        assert!(clause.contains("max_bytes_to_read=654321"));
+        assert!(clause.contains("read_overflow_mode='throw'"));
     }
 
     #[tokio::test]

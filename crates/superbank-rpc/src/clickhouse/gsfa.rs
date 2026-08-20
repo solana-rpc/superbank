@@ -9,9 +9,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::solana_sdk::pubkey::Pubkey;
 use ch_cityhash102::cityhash64;
 use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
 use tokio::task::JoinSet;
 
 use crate::processing::{ProcessingError, ProcessingResult};
@@ -606,7 +606,7 @@ impl ClickHouseClient {
         before_pos: Option<SlotBoundary>,
         until_pos: Option<SlotBoundary>,
     ) -> ProcessingResult<(Vec<SignatureRecord>, QueryTimings)> {
-        self.with_timeout("get_signatures_for_address_with_positions", async {
+        self.with_http_query_timeout("get_signatures_for_address_with_positions", async {
             let pubkey = Pubkey::from_str(address)
                 .map_err(|e| ProcessingError::deserialization("Invalid address", e))?;
 
@@ -776,7 +776,8 @@ impl ClickHouseClient {
 
         let memo_with = "memo_program_ids AS [\
             CAST(base58Decode('Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo') AS FixedString(32)),\
-            CAST(base58Decode('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr') AS FixedString(32))\
+            CAST(base58Decode('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr') AS FixedString(32)),\
+            CAST(base58Decode('Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH') AS FixedString(32))\
         ]";
 
         let pagination_with = pagination_with.strip_prefix("WITH ").unwrap_or("").trim();

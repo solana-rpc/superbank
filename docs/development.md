@@ -301,6 +301,12 @@ then runs the Tilt E2E profile before GoReleaser builds both binaries for Linux 
 arm64, publishes GitHub release notes, uploads `.tar.gz` archives, and generates
 `SHA256SUMS.txt`.
 
+The same `vX.Y.Z` release tag also publishes the `superbank-solparq` and
+`superbank-solparq-read` Linux amd64 and Linux arm64 archives via the main
+release workflow and `.goreleaser.yaml`. Both binaries are built from the
+`superbank-solparq` crate, so its version moves in lockstep with the main
+release tag.
+
 ### Key environment variables
 
 Setup script (`../scripts/dev/setup-tilt.sh`):

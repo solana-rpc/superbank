@@ -4,7 +4,16 @@ Ingest Solana blocks from Yellowstone Fumarole, a Yellowstone gRPC stream
 (DragonsMouth), Solana JSON-RPC `getBlock`, or Solana Bigtable and write to
 ClickHouse `transactions` + `blocks_metadata` tables. When using Yellowstone
 Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
-default.
+default. The `solparq` source runs in reverse: it restores `superbank-solparq`
+Parquet archive bundles (local or S3) back into ClickHouse.
+
+The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer workspaces
+under `ingest/` remain on their upstream Agave 3 line and must not be used for post-v1 Old
+Faithful backfills until they are migrated and added to root CI.
+
+Agave 4.2 also adds the `DeactivatedStake` reward type and changes confidential-transfer parsed
+JSON from `source`/`destination` keys to `account`; consumers of parsed RPC responses should treat
+that JSON-key correction as a compatibility break.
 
 ## Prereqs
 
@@ -65,6 +74,11 @@ has occurred within `HEALTH_STALE_SECS` seconds (default: 120). Set `HEALTH_STAL
 disable staleness checking. Set `METRICS_CLUSTER_LABEL` to attach a static `cluster="..."` label
 to every ingestor metric.
 
+For a portable Grafana view of these metrics, import the
+[`Superbank Ingest` dashboard](../../deploy/grafana/dashboards/superbank-ingest.json). It supports
+all four ingest sources, an optional Fumarole backpressure tab, and an optional ClickHouse server
+tab when the selected Prometheus datasource also contains ClickHouse metrics.
+
 Minimal example (RPC source):
 
 ```bash
@@ -100,6 +114,130 @@ CLICKHOUSE_DATABASE=default \
 cargo run -p superbank --
 ```
 
+## Backfilling gaps with RPC
+
+If a crash, ClickHouse downtime, or a failed flush leaves holes in the ingested
+data, the RPC source can repair them. The RPC source is already a bounded,
+one-shot backfiller: it discovers the blocks in a `[--rpc-from-slot,
+--rpc-to-slot]` window via `getBlocks` (which excludes leader-skipped slots),
+fetches each with `getBlock`, and exits. Because the tables are
+`ReplacingMergeTree(slot)`, re-ingesting existing slots is idempotent, so a
+backfill can run alongside the live ingestor.
+
+To avoid re-fetching blocks you already have, add `--rpc-skip-ingested-slots`.
+During discovery it subtracts the slots already present in `blocks_metadata` for
+each chunk, so `getBlock` is only issued for the genuinely missing slots. This
+keeps RPC request volume proportional to the size of the gaps, not the size of
+the window — important when the RPC endpoint is rate-limited.
+
+```bash
+SUPERBANK_SOURCE=rpc \
+RPC_URL=https://api.mainnet-beta.solana.com \
+RPC_FROM_SLOT=200000000 \
+RPC_TO_SLOT=200100000 \
+RPC_SKIP_INGESTED_SLOTS=true \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+Notes:
+
+- You still supply the range to scan (`--rpc-to-slot` or `--rpc-slot-count`).
+  Gap detection is authoritative because `getBlocks` reports exactly which slots
+  produced blocks; a missing slot number that Solana skipped is never counted as
+  a gap.
+- Run it as a one-shot job (e.g. a periodic sweep of the recent range) while
+  Fumarole/gRPC handle live ingest.
+- If the presence check against ClickHouse fails for a chunk, discovery logs a
+  warning and falls back to fetching the full window for that chunk.
+
+### When the missing slots are already known: `--rpc-slot-list`
+
+If a caller already knows exactly which slots to fetch, pass them in a
+whitespace-separated file with `--rpc-slot-list`. This skips `getBlocks`
+discovery entirely and issues one `getBlock` per listed slot — the most
+RPC-frugal mode. It is mutually exclusive with the range and
+`--rpc-skip-ingested-slots` flags.
+
+```bash
+SUPERBANK_SOURCE=rpc \
+RPC_URL=https://api.mainnet-beta.solana.com \
+RPC_SLOT_LIST=/path/to/slots.txt \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+The file accepts one or more slot numbers per line; `#` starts a comment. This
+is the mode `superbank-solparq --backfill-gaps` invokes as a subprocess, since
+its validation step already computes the exact missing slots.
+
+## Restoring from solparq Parquet archives
+
+The `solparq` source is the inverse of the `superbank-solparq` archiver: it reads
+archive bundles and loads every table in each bundle's `manifest.json` back into
+ClickHouse. Loading is ClickHouse-native and schema-symmetric with the export —
+no rows are decoded in-process. Both paths match columns by **name** (not
+position), so a destination table whose column order has drifted from the
+archive still restores correctly instead of silently landing in the wrong
+columns:
+
+- **S3** — `INSERT INTO <table> (<cols>) SELECT <cols> FROM s3(<url>, <key>, <secret>, 'Parquet')`,
+  where `<cols>` is read from the archived file's own schema (`DESCRIBE`), so
+  ClickHouse pulls each object directly and maps columns by name.
+- **Local** — `INSERT INTO <table> FORMAT Parquet` with the bundle's parquet file
+  streamed as the request body (name-matched by ClickHouse's Parquet reader).
+
+Each table is restored into the configured `CLICKHOUSE_DATABASE` under the bare
+table name recorded in the manifest, regardless of where the archive was
+produced. Because the destination tables are `ReplacingMergeTree(slot)`,
+re-restoring a range is idempotent once background merges run (duplicates may be
+visible transiently until then).
+
+**Version support:** every bundle is gated on its manifest `format_version`.
+Archives at or below the version this build understands (and legacy bundles with
+no version field) are restored; a bundle written by a newer producer is refused
+with an error rather than misread.
+
+Restore from a local archive directory:
+
+```bash
+SUPERBANK_SOURCE=solparq \
+SOLPARQ_ARCHIVE_LOCATION=local \
+SOLPARQ_ARCHIVE_PATH=/var/lib/superbank/archives \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+Restore from S3 (env var names match `superbank-solparq`):
+
+```bash
+SUPERBANK_SOURCE=solparq \
+SOLPARQ_ARCHIVE_LOCATION=s3 \
+SOLPARQ_ARCHIVE_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+SOLPARQ_ARCHIVE_S3_BUCKET_NAME=my-bucket \
+SOLPARQ_ARCHIVE_S3_BUCKET_PATH=solana/mainnet \
+SOLPARQ_ARCHIVE_S3_AUTH_KEY=... \
+SOLPARQ_ARCHIVE_S3_AUTH_SECRET_KEY=... \
+CLICKHOUSE_URL=http://localhost:8123 \
+CLICKHOUSE_DATABASE=default \
+cargo run -p superbank --
+```
+
+Notes:
+
+- Restrict the restore to a slot window with `--solparq-from-slot` /
+  `--solparq-to-slot`. Bundles outside the window are skipped; for S3 the window
+  is also applied as a `WHERE slot BETWEEN ...` row filter. (Local restore filters
+  at bundle granularity only, since it streams whole files.)
+- Restrict which tables are restored with `--solparq-tables`
+  (e.g. `transactions,blocks_metadata`).
+- The `superbank` binary depends on `superbank-solparq` only to reuse the archive
+  manifest format (single source of truth for the version gate); the restore path
+  itself does no in-process Parquet decoding.
+
 ## Configuration (config file, env, flags)
 
 All options can be passed via YAML config file, `--flag`, or environment variable.
@@ -133,7 +271,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 ### Options
 
 - `--config` / `SUPERBANK_CONFIG` (optional YAML config path)
-- `--source` / `SUPERBANK_SOURCE` (required: `fumarole`, `grpc`, `rpc`, or `bigtable`)
+- `--source` / `SUPERBANK_SOURCE` (required: `fumarole`, `grpc`, `rpc`, `bigtable`, or `solparq`)
 - `--fumarole-endpoint` / `FUMAROLE_ENDPOINT` (required for fumarole source)
 - `--fumarole-x-token` / `FUMAROLE_X_TOKEN` (optional)
 - `--fumarole-consumer-group` / `FUMAROLE_CONSUMER_GROUP` (required for fumarole source)
@@ -168,11 +306,14 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-timeout-secs` / `RPC_TIMEOUT_SECS` (default: 30)
 - `--rpc-retry-backoff-ms` / `RPC_RETRY_BACKOFF_MS` (default: 500)
 - `--rpc-max-inflight` / `RPC_MAX_INFLIGHT` (default: 64)
-- `--rpc-max-supported-tx-version` / `RPC_MAX_SUPPORTED_TX_VERSION` (default: 0)
+- `--rpc-max-supported-tx-version` / `RPC_MAX_SUPPORTED_TX_VERSION` (default: 1)
 - `--rpc-flush-every-slots` / `RPC_FLUSH_EVERY_SLOTS` (default: 500)
 - `--rpc-progress-every-slots` / `RPC_PROGRESS_EVERY_SLOTS` (default: 100)
 - `--rpc-discovery-chunk-slots` / `RPC_DISCOVERY_CHUNK_SLOTS` (default: 10000)
-- `--rpc-skip-ingested-slots` / `RPC_SKIP_INGESTED_SLOTS` (default: false; when set, rpc discovery skips slots already in `blocks_metadata` so a re-run backfills only the gaps)
+- `--rpc-slot-list` / `RPC_SLOT_LIST` (optional; whitespace-separated slot list file — fetch
+  exactly those slots with no `getBlocks` discovery; mutually exclusive with `--rpc-from-slot`,
+  `--rpc-to-slot`, `--rpc-slot-count`, and `--rpc-skip-ingested-slots`)
+- `--rpc-skip-ingested-slots` / `RPC_SKIP_INGESTED_SLOTS` (default: false; when set, rpc discovery skips slots already in `blocks_metadata` so a re-run backfills only the gaps — see [Backfilling gaps with RPC](#backfilling-gaps-with-rpc))
 - `--bigtable-range` / `BIGTABLE_RANGE` (required unless using `BIGTABLE_SLOT_FILE`; `123:456` slots, `1-10` epochs, or `5` epoch)
 - `--bigtable-slot-file` / `BIGTABLE_SLOT_FILE` (optional; whitespace-separated slot list, mutually exclusive with `BIGTABLE_RANGE`)
 - `--bigtable-instance` / `BIGTABLE_INSTANCE` (default: `solana-ledger`)
@@ -187,6 +328,18 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--bigtable-insert-concurrency` / `BIGTABLE_INSERT_CONCURRENCY` (default: 1)
 - `--bigtable-decode-concurrency` / `BIGTABLE_DECODE_CONCURRENCY` (default: available CPU threads)
 - `--bigtable-progress-every-slots` / `BIGTABLE_PROGRESS_EVERY_SLOTS` (default: 10000)
+- `--solparq-archive-location` / `SOLPARQ_ARCHIVE_LOCATION` (required for solparq source: `local` or `s3`)
+- `--solparq-archive-path` / `SOLPARQ_ARCHIVE_PATH` (required for local solparq restore; a bundle dir or a dir of bundles)
+- `--solparq-archive-s3-endpoint` / `SOLPARQ_ARCHIVE_S3_ENDPOINT` (required for s3 solparq restore)
+- `--solparq-archive-s3-bucket-name` / `SOLPARQ_ARCHIVE_S3_BUCKET_NAME` (required for s3 solparq restore)
+- `--solparq-archive-s3-bucket-path` / `SOLPARQ_ARCHIVE_S3_BUCKET_PATH` (optional prefix within the bucket)
+- `--solparq-archive-s3-auth-key` / `SOLPARQ_ARCHIVE_S3_AUTH_KEY` (required for s3 solparq restore)
+- `--solparq-archive-s3-auth-secret-key` / `SOLPARQ_ARCHIVE_S3_AUTH_SECRET_KEY` (required for s3 solparq restore)
+- `--solparq-archive-s3-region` / `SOLPARQ_ARCHIVE_S3_REGION` (default: `us-east-1`)
+- `--solparq-from-slot` / `SOLPARQ_FROM_SLOT` (optional; skip bundles below this slot, filter rows for S3)
+- `--solparq-to-slot` / `SOLPARQ_TO_SLOT` (optional; skip bundles above this slot, filter rows for S3)
+- `--solparq-tables` / `SOLPARQ_TABLES` (optional comma-separated table kinds; default: every table in the bundle)
+- `--solparq-clickhouse-settings` / `SOLPARQ_CLICKHOUSE_SETTINGS` (optional raw ClickHouse `SETTINGS` clause for restore statements)
 - `--clickhouse-url` / `CLICKHOUSE_URL` (default: `http://localhost:8123`)
 - `--metrics-host` / `METRICS_HOST` (default: `0.0.0.0`)
 - `--metrics-port` / `METRICS_PORT` (default: `9901`)
@@ -215,7 +368,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
   `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
   `superbank_ingest_fumarole_rss_bytes`, and
-  `superbank_ingest_fumarole_pressure_flushes_total`.
+  `superbank_ingest_fumarole_pressure_flushes_total_total`.
 - The ingestor writes **distributed** tables by default. Set table names if you want shard-local writes.
 - Fumarole ingest commits consumer-group progress only after pending ClickHouse rows have been flushed. Set `fumarole-no-commit: true` only for diagnostics.
 - Fumarole ingest applies a memory soft limit guard by default. When sampled RSS or Superbank's

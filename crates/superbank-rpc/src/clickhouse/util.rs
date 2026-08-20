@@ -9,9 +9,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use clickhouse::Client as HttpClient;
 use clickhouse_rs::errors::{DriverError as TcpDriverError, Error as TcpError};
-use solana_sdk::pubkey::Pubkey;
 
 #[cfg(feature = "grpc-head-cache")]
 use crate::clickhouse::StoredTransactionRecord;
@@ -195,7 +195,7 @@ pub(crate) fn http_query_with_id(
 ) -> clickhouse::query::Query {
     let mut query = client.query(sql);
     if let Some(query_id) = query_id {
-        query = query.with_option("query_id", query_id);
+        query = query.with_setting("query_id", query_id);
     }
     query
 }
@@ -330,7 +330,7 @@ pub(crate) fn parse_err_json(signature: &str, err_str: String) -> Option<serde_j
 /// values read from ClickHouse render identically.
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) fn extract_memo(record: &StoredTransactionRecord) -> Option<String> {
-    static MEMO_PROGRAM_IDS: once_cell::sync::Lazy<[Pubkey; 2]> =
+    static MEMO_PROGRAM_IDS: once_cell::sync::Lazy<[Pubkey; 3]> =
         once_cell::sync::Lazy::new(|| {
             use std::str::FromStr;
             [
@@ -338,6 +338,8 @@ pub(crate) fn extract_memo(record: &StoredTransactionRecord) -> Option<String> {
                     .expect("memo program id"),
                 Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
                     .expect("memo program id"),
+                Pubkey::from_str("Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH")
+                    .expect("memo-v4 program id"),
             ]
         });
 

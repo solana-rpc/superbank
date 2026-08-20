@@ -16,7 +16,7 @@ mod transactions;
 mod types;
 mod util;
 
-pub use client::{ClickHouseClient, ClickHouseClientOptions};
+pub use client::{ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits};
 #[allow(unused_imports)]
 pub use types::TransactionsForAddressRecord;
 pub use types::{
@@ -26,7 +26,10 @@ pub use types::{
     TransactionStatusFilter, TransactionsForAddressQuery,
 };
 
-pub(crate) use types::{ResolvedSignatureFilter, SignatureSlot, SlotBoundary};
+pub(crate) use types::{
+    InflationRewardLookupOutcome, InflationRewardRecord, ResolvedSignatureFilter, SignatureSlot,
+    SlotBoundary,
+};
 
 pub(crate) use sharding::{RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig};
 pub(crate) use util::{QueryCacheConfig, QueryFreshnessClass};

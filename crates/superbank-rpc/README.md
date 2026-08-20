@@ -21,6 +21,7 @@ writer that matches the same schemas).
 - `getFirstAvailableBlock`
 - `minimumLedgerSlot`
 - `getInflationReward`
+- `getEpochSchedule`
 - `getTransactionsForAddress` (custom)
 
 Notes:
@@ -29,6 +30,24 @@ Notes:
 - Requests without an `id` are normalized to `id: null` and still return
   JSON-RPC response bodies (compatibility behavior; not strict notification semantics).
 - `processed` commitment is rejected by default; use `confirmed` or `finalized`.
+- `getInflationReward` reads the payout epoch boundary, serves boundary vote rewards immediately,
+  and queries only the partition block heights required by unresolved requested addresses. A stake
+  reward becomes available as soon as that address's partition block lands; the method does not
+  wait for later partitions or expand reward arrays across a complete epoch. If the payout boundary
+  does not exist yet, it returns `-32004` (`Block not available`) over HTTP `200`. If a requested
+  partition is still pending, it returns `-32017` (`Epoch rewards period still active`) over HTTP
+  `200`, with `slot`, `currentBlockHeight`, and `rewardsCompleteBlockHeight` in `error.data`.
+  Missing rewards are returned as `null` only after the address's required partition is available.
+  Dedicated address, concurrency, timeout, thread, memory, and read-byte limits are enabled by
+  default.
+- Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
+  it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
+  does not infer it from the legacy percentage `commission` value.
+- Transaction v1 (SIMD-0385) is supported. Requests must set
+  `maxSupportedTransactionVersion: 1`; JSON encodings report `version: 1` and expose the inline
+  `message.transactionConfig`, while binary encodings preserve the signed v1 wire bytes.
+- Rewards accept both `DeactivatedStake` and the historical producer spelling
+  `deactivated-stake`, and are emitted as Agave's typed `DeactivatedStake` JSON value.
 - `processed` commitment is supported for a subset of methods when compiled with
   `--features grpc-head-cache` and enabled at runtime with `HEAD_CACHE_ENABLED=true`
   (see "Optional gRPC head cache" below).
@@ -47,6 +66,11 @@ Notes:
 - Methods that need a latest finalized context return a backend/internal JSON-RPC error when
   ClickHouse has no finalized slot available. This includes `getSlot`, `getBlockHeight`,
   `getTransactionCount`, `getLatestBlockhash`, `getSignatureStatuses`, and min-context checks.
+- `getSignatureStatuses` looks up recent statuses in the enabled cache tiers: the short-lived head
+  cache and, when compiled with `--features disk-cache` and enabled, the finalized disk cache. The
+  ClickHouse-backed history tier is searched only when the second param sets
+  `searchTransactionHistory: true`; without it, a signature outside the enabled cache retention
+  still returns `null`.
 - `getTransaction` accepts the standard Solana config fields plus an optional Superbank extension:
   - `slot`: optional `u64`; when supplied, ClickHouse is queried directly for that exact slot and
     the response is `null` if the signature is not present in that slot.
@@ -84,6 +108,11 @@ Optional:
 Apply `transactions.sql` before the materialized-view schemas (`gsfa*.sql`, `signatures.sql`, and
 `token_owner_activity.sql`) because those views read from the transactions table. If you use
 `gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then apply `gsfa_hot.sql`.
+
+For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL first, deploy
+`superbank-rpc` next (disk-cache schema 3 intentionally rebuilds existing caches), and only then
+deploy ingestion with transaction version 1 enabled. Rolling back the RPC binary is safe only
+before v1 or `DeactivatedStake` rows have arrived.
 
 ## Run
 
@@ -141,6 +170,9 @@ Only internal error (`-32603`), server-generated request timeout (`-32000`), nod
 (`-32005`), and long-term storage unreachable (`-32019`) are promoted to HTTP `503`.
 Client, malformed-request, and data-condition errors remain HTTP `200 OK`. For batches, any
 eligible item promotes the whole HTTP response to `503`.
+For `getInflationReward`, both boundary-unavailable (`-32004`) and rewards-period-active (`-32017`)
+are data-condition errors and remain HTTP `200`; ClickHouse query, metadata, and integrity failures
+continue to use internal error (`-32603`) and are eligible for HTTP `503`.
 
 ## Optional gRPC head cache (`grpc-head-cache`)
 
@@ -335,6 +367,12 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--rpc-concurrency-limit` | `RPC_CONCURRENCY_LIMIT` | `512` | Maximum number of in-flight HTTP JSON-RPC envelopes. |
 | `--rpc-max-batch-size` | `RPC_MAX_BATCH_SIZE` | `64` | Maximum number of JSON-RPC calls in a single batch envelope. |
 | `--rpc-batch-concurrency-limit` | `RPC_BATCH_CONCURRENCY_LIMIT` | `8` | Max concurrent item execution within one batch envelope. |
+| `--get-inflation-reward-max-addresses` | `GET_INFLATION_REWARD_MAX_ADDRESSES` | `100` | Maximum addresses accepted by one `getInflationReward` call. `0` disables this admission check; values above 100 are rejected at startup. |
+| `--get-inflation-reward-max-concurrency` | `GET_INFLATION_REWARD_MAX_CONCURRENCY` | `20` | Maximum active `getInflationReward` ClickHouse workflows per RPC instance. Excess calls fail fast with node-unhealthy (`-32005`); `0` disables this method-level admission check. |
+| `--get-inflation-reward-query-timeout-ms` | `GET_INFLATION_REWARD_QUERY_TIMEOUT_MS` | `5000` | End-to-end ClickHouse budget for HTTP-permit admission plus the targeted boundary and partition lookup. Must be below `RPC_REQUEST_TIMEOUT_MS`. |
+| `--get-inflation-reward-max-threads` | `GET_INFLATION_REWARD_MAX_THREADS` | `2` | ClickHouse `max_threads` applied to every reward lookup query. |
+| `--get-inflation-reward-max-memory-bytes` | `GET_INFLATION_REWARD_MAX_MEMORY_BYTES` | `536870912` | ClickHouse `max_memory_usage` applied to every reward lookup query. |
+| `--get-inflation-reward-max-bytes-to-read` | `GET_INFLATION_REWARD_MAX_BYTES_TO_READ` | `536870912` | ClickHouse `max_bytes_to_read` applied to every reward lookup query. |
 | `--emit-http-errors` | `SUPERBANK_RPC_EMIT_HTTP_ERRORS` | `false` | Return HTTP `503 Service Unavailable` for selected server-side JSON-RPC failures; response bodies are unchanged. |
 | `--host` | `RPC_HOST` | `0.0.0.0` | — |
 | `--port` | `RPC_PORT` | `8899` | — |
@@ -354,8 +392,8 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-user` | `CLICKHOUSE_USER` | `default` | — |
 | `--clickhouse-password` | `CLICKHOUSE_PASSWORD` | empty | — |
 | `--max-signatures-limit` | `MAX_SIGNATURES_LIMIT` | `1000` | — |
-| `--clickhouse-query-timeout-ms` | `CLICKHOUSE_QUERY_TIMEOUT_MS` | `8000` | Per-query ClickHouse timeout (ms). When query `SETTINGS` are enabled, superbank-rpc injects this budget as `max_execution_time` on read queries so ClickHouse abandons a query (instead of leaving it running and holding a connection) once superbank-rpc stops awaiting it. In shard-direct TCP mode it additionally uses a shorter internal TCP-attempt timeout inside this budget to trigger best-effort cleanup of abandoned shard-local TCP reads. Keep the parent value below `RPC_REQUEST_TIMEOUT_MS`. |
-| `--clickhouse-http-max-concurrency` | `CLICKHOUSE_HTTP_MAX_CONCURRENCY` | `512` | Max concurrent direct (scalar/lookup) ClickHouse HTTP queries in flight server-wide. Bounds HTTP connections to ClickHouse independently of shard fanout and JSON-RPC batching; excess queries wait (and may time out, shedding load) rather than opening more connections. Set at or below the ClickHouse per-user connection/query budget. |
+| `--clickhouse-query-timeout-ms` | `CLICKHOUSE_QUERY_TIMEOUT_MS` | `8000` | ClickHouse operation timeout (ms), including any wait for a direct-HTTP concurrency permit. When query `SETTINGS` are enabled, superbank-rpc injects this budget as `max_execution_time` on read queries so ClickHouse abandons a query (instead of leaving it running and holding a connection) once superbank-rpc stops awaiting it. In shard-direct TCP mode it additionally uses a shorter internal TCP-attempt timeout inside this budget to trigger best-effort cleanup of abandoned shard-local TCP reads. Keep the parent value below `RPC_REQUEST_TIMEOUT_MS`. |
+| `--clickhouse-http-max-concurrency` | `CLICKHOUSE_HTTP_MAX_CONCURRENCY` | `512` | Max concurrent direct (scalar/lookup) ClickHouse HTTP queries in flight server-wide. Bounds HTTP connections to ClickHouse independently of shard fanout and JSON-RPC batching; excess queries wait within the applicable operation timeout (`CLICKHOUSE_QUERY_TIMEOUT_MS`, or the method-specific budget for `getInflationReward`) and time out rather than opening more connections. Set at or below the ClickHouse per-user connection/query budget. |
 | `--clickhouse-http-connect-timeout-ms` | `CLICKHOUSE_HTTP_CONNECT_TIMEOUT_MS` | `2000` | TCP connect timeout (ms) for ClickHouse HTTP connections, so a new connection attempt fails fast during ClickHouse backpressure instead of hanging. |
 | `--clickhouse-query-cache-enabled` | `CLICKHOUSE_QUERY_CACHE_ENABLED` | `false` | Enables ClickHouse query cache settings for historical read queries. |
 | `--clickhouse-query-cache-ttl-seconds` | `CLICKHOUSE_QUERY_CACHE_TTL_SECONDS` | `1` | TTL for cached historical read query results (seconds). |
@@ -369,8 +407,8 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-tcp-pool-min` | `CLICKHOUSE_TCP_POOL_MIN` | `10` | Minimum connections retained per shard in each ClickHouse native (TCP) connection pool. |
 | `--clickhouse-tcp-pool-max` | `CLICKHOUSE_TCP_POOL_MAX` | `20` | Maximum connections per shard in each ClickHouse native (TCP) connection pool. Total native connections per instance are bounded by this value times the number of shards, so size it against the ClickHouse connection budget. |
 | `--clickhouse-cluster` | `CLICKHOUSE_CLUSTER` | `{cluster}` | — |
-| `--clickhouse-topology-config` | `CLICKHOUSE_TOPOLOGY_CONFIG` | — | Optional authoritative YAML shard topology. When set, superbank-rpc skips `system.clusters` discovery at startup and uses the YAML shard/IP/port mapping directly for shard-local connections. |
-| `--clickhouse-gsfa-local-table` | `CLICKHOUSE_GSFA_LOCAL_TABLE` | — | Required for shard-direct GSFA routing. |
+| `--clickhouse-topology-config` | `CLICKHOUSE_TOPOLOGY_CONFIG` | — | Optional authoritative YAML shard topology. When set, superbank-rpc skips `system.clusters` discovery, uses the YAML shard/IP/port mapping for shard-local connections, and routes `getTransactionsForAddress` to the address-owner shard. |
+| `--clickhouse-gsfa-local-table` | `CLICKHOUSE_GSFA_LOCAL_TABLE` | — | Local GSFA table used by shard-direct reads and owner-shard `getTransactionsForAddress` routing. |
 | `--clickhouse-hot-address` | `CLICKHOUSE_GSFA_HOT_ADDRESSES` | empty | Repeatable; env accepts comma-separated values. |
 | `--clickhouse-gsfa-hot-table` | `CLICKHOUSE_GSFA_HOT_TABLE` | `default.gsfa_hot` | Distributed hot table used for active hot-address reads. |
 | `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-local backing table behind `CLICKHOUSE_GSFA_HOT_TABLE`. |
@@ -395,7 +433,10 @@ Table selection (environment variables, read at startup):
 Shard routing:
 When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and
 validates local table schemas. Local tables default to `{table}_local` when not provided
-explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`).
+explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`). When a
+topology is available in distributed scope, `getTransactionsForAddress` also uses the address
+hash to query the owner shard's local GSFA table; a failed owner-shard query is returned as an
+error instead of being retried against the distributed table.
 Set `CLICKHOUSE_TOPOLOGY_CONFIG` (or `--clickhouse-topology-config`) to make a YAML topology file
 authoritative for shard-local connection targets and skip `system.clusters` discovery at startup.
 When multiple YAML nodes are listed for the same shard, the first node listed for that shard is
@@ -434,7 +475,7 @@ Additional env flags:
 | `CLICKHOUSE_QUERY_ID_PREFIX` | `superbank` | `auto` or `off`/`0`/`false` disables. |
 | `CLICKHOUSE_GSFA_STRICT_PAGINATION` | `true` | — |
 | `CLICKHOUSE_GSFA_FALLBACK_TRANSACTIONS` | disabled | `empty`/`true` for empty-only fallback; `force`/`always` for incomplete fallback. |
-| `CLICKHOUSE_DISABLE_QUERY_SETTINGS` | `false` | Disables per-query ClickHouse `SETTINGS` overrides (including shard optimization, query-cache, and query-condition-cache settings) when truthy. |
+| `CLICKHOUSE_DISABLE_QUERY_SETTINGS` | `false` | Disables per-query ClickHouse `SETTINGS` overrides (including `getInflationReward` thread, memory, read-byte, and execution-time caps) when truthy. The targeted query shape and RPC admission limits remain active. |
 
 ### ClickHouse query cache (read queries)
 
@@ -505,7 +546,7 @@ Prometheus metrics are served at `/metrics` on `METRICS_HOST:METRICS_PORT`.
 
 Route normalization metric:
 
-- `superbank_rpc_route_total{method,transport,scope,source,head_cache_read,disk_cache_read,outcome,x_endpoint,x_rpc_node,x_subscription_id,x_account_id}`
+- `superbank_rpc_route_total_total{method,transport,scope,source,head_cache_read,disk_cache_read,outcome,x_endpoint,x_rpc_node,x_subscription_id,x_account_id}`
   - `method`: supported JSON-RPC method name.
   - `transport`: `tcp|http` (active ClickHouse routing transport policy).
   - `scope`: `distributed|shard_direct` (active ClickHouse routing scope policy).

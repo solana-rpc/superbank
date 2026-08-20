@@ -23,6 +23,10 @@ pub(crate) const TRANSACTION_SELECT_COLUMNS: &str = "signature,
                 block_time,
                 is_vote,
                 tx_version,
+                tx_config_priority_fee,
+                tx_config_compute_unit_limit,
+                tx_config_loaded_accounts_data_size_limit,
+                tx_config_heap_size,
                 tx_signatures,
                 tx_num_required_signatures,
                 tx_num_readonly_signed_accounts,
@@ -73,6 +77,7 @@ pub(crate) const TRANSACTION_SELECT_COLUMNS: &str = "signature,
                 meta_reward_post_balance,
                 meta_reward_type,
                 meta_reward_commission,
+                meta_reward_commission_bps,
                 meta_loaded_addresses_writable,
                 meta_loaded_addresses_readonly,
                 meta_return_data_present,
@@ -100,6 +105,7 @@ pub(crate) const BLOCK_METADATA_REWARD_COLUMNS: &[&str] = &[
     "rewards_post_balance",
     "rewards_type",
     "rewards_commission",
+    "rewards_commission_bps",
 ];
 
 pub(crate) const BLOCK_SIGNATURE_COLUMNS: &[&str] = &["signature"];
@@ -146,12 +152,17 @@ pub(crate) const BLOCK_TRANSACTION_REWARD_COLUMNS: &[&str] = &[
     "meta_reward_post_balance",
     "meta_reward_type",
     "meta_reward_commission",
+    "meta_reward_commission_bps",
 ];
 
 pub(crate) const BLOCK_FULL_BASE_COLUMNS: &[&str] = &[
     "slot_idx",
     "is_vote",
     "tx_version",
+    "tx_config_priority_fee",
+    "tx_config_compute_unit_limit",
+    "tx_config_loaded_accounts_data_size_limit",
+    "tx_config_heap_size",
     "tx_signatures",
     "tx_num_required_signatures",
     "tx_num_readonly_signed_accounts",
@@ -302,15 +313,6 @@ fn append_transactions_for_address_slot_filter_conditions(
     }
     if let Some(value) = filter.lt {
         conditions.push(format!("{slot_expr} < {value}"));
-    }
-}
-
-fn signature_position_for_token(slot: u64, idx: u32) -> SignaturePositionExpr {
-    SignaturePositionExpr {
-        slot_expr: slot.to_string(),
-        idx_expr: idx.to_string(),
-        nullable: false,
-        with_parts: Vec::new(),
     }
 }
 
@@ -493,23 +495,33 @@ fn apply_pagination_token(
     with_parts: &mut Vec<String>,
     conditions: &mut Vec<String>,
 ) -> ProcessingResult<()> {
-    let expr = match pagination {
-        PaginationToken::SlotIndex { slot, idx } => signature_position_for_token(*slot, *idx),
-        PaginationToken::Signature(sig) => signature_position_for_signature(
-            signatures_table,
-            signature_bucket_modulus,
-            sig,
-            "page",
-        )?,
-    };
-
     let comparison = match sort_order {
         SortOrder::Desc => SlotIdxComparison::Lt,
         SortOrder::Asc => SlotIdxComparison::Gt,
     };
-    let condition = slot_idx_condition(&expr, comparison);
-    with_parts.extend(expr.with_parts);
-    conditions.push(condition);
+
+    match pagination {
+        PaginationToken::SlotIndex { slot, idx } => {
+            conditions.push(slot_idx_condition_for_position(
+                SignatureSlot {
+                    slot: *slot,
+                    slot_idx: *idx,
+                },
+                comparison,
+            ));
+        }
+        PaginationToken::Signature(sig) => {
+            let expr = signature_position_for_signature(
+                signatures_table,
+                signature_bucket_modulus,
+                sig,
+                "page",
+            )?;
+            let condition = slot_idx_condition(&expr, comparison);
+            with_parts.extend(expr.with_parts);
+            conditions.push(condition);
+        }
+    }
 
     Ok(())
 }
@@ -644,10 +656,7 @@ pub(crate) fn build_transactions_for_address_query(
     query: &TransactionsForAddressQuery,
     settings_clause: &str,
 ) -> ProcessingResult<String> {
-    let address_literal = format!(
-        "CAST(base58Decode('{}') AS FixedString(32))",
-        &query.address
-    );
+    let address_literal = format!("CAST(base58Decode('{}') AS FixedString(32))", query.address);
     let gsfa_addr_bucket = format!(
         "cityHash64({}) % {}",
         address_literal, tables.gsfa_bucket_modulus
@@ -734,40 +743,54 @@ pub(crate) fn build_transactions_for_address_query(
         union_parts.push(token_subquery);
     }
 
-    let union_sql = if union_parts.len() == 1 {
-        union_parts[0].clone()
-    } else {
-        union_parts.join("\nUNION ALL\n")
-    };
-
     let order_dir = match query.sort_order {
         SortOrder::Asc => "ASC",
         SortOrder::Desc => "DESC",
     };
 
-    Ok(format!(
-        "{with_clause}SELECT
+    let select = if union_parts.len() == 1 {
+        format!(
+            "{with_clause}SELECT
             base58Encode(signature) AS signature,
             slot,
             slot_idx,
             err,
             memo,
             block_time
-         FROM (
-            SELECT signature, slot, slot_idx, err, memo, block_time
-            FROM (
+         FROM {gsfa_table}
+         PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}
+         WHERE {where_clause}",
+            with_clause = with_clause,
+            gsfa_table = tables.gsfa_table,
+            addr_bucket = gsfa_addr_bucket,
+            address_literal = address_literal,
+            where_clause = where_clause,
+        )
+    } else {
+        format!(
+            "{with_clause}SELECT
+                base58Encode(signature) AS signature,
+                slot,
+                slot_idx,
+                err,
+                memo,
+                block_time
+             FROM (
                 {union_sql}
-            )
-            WHERE {where_clause}
-            ORDER BY slot {order_dir}, slot_idx {order_dir}, signature {order_dir}
-            LIMIT 1 BY signature
-         )
+             )
+             WHERE {where_clause}",
+            with_clause = with_clause,
+            union_sql = union_parts.join("\nUNION ALL\n"),
+            where_clause = where_clause,
+        )
+    };
+
+    Ok(format!(
+        "{select}
          ORDER BY slot {order_dir}, slot_idx {order_dir}, signature {order_dir}
          LIMIT {limit}
          {settings_clause}",
-        with_clause = with_clause,
-        union_sql = union_sql,
-        where_clause = where_clause,
+        select = select,
         order_dir = order_dir,
         limit = query.limit,
         settings_clause = settings_clause
@@ -786,10 +809,7 @@ pub(crate) fn build_transactions_for_address_hot_query(
         ));
     }
 
-    let address_literal = format!(
-        "CAST(base58Decode('{}') AS FixedString(32))",
-        &query.address
-    );
+    let address_literal = format!("CAST(base58Decode('{}') AS FixedString(32))", query.address);
     let gsfa_addr_bucket = format!("cityHash64({}) % {}", address_literal, gsfa_bucket_modulus);
 
     let mut conditions = Vec::new();
@@ -835,14 +855,9 @@ pub(crate) fn build_transactions_for_address_hot_query(
             err,
             memo,
             block_time
-         FROM (
-            SELECT signature, slot, slot_idx, err, memo, block_time
-            FROM {gsfa_table}
-            PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}
-            WHERE {where_clause}
-            ORDER BY slot {order_dir}, slot_idx {order_dir}, signature {order_dir}
-            LIMIT 1 BY signature
-         )
+         FROM {gsfa_table}
+         PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}
+         WHERE {where_clause}
          ORDER BY slot {order_dir}, slot_idx {order_dir}, signature {order_dir}
          LIMIT {limit}
          {settings_clause}",
@@ -1057,6 +1072,85 @@ mod tests {
     }
 
     #[test]
+    fn transactions_for_address_query_uses_raw_cursor_and_no_limit_by() {
+        let query = TransactionsForAddressQuery {
+            address: bs58::encode([9_u8; 32]).into_string(),
+            limit: 64,
+            sort_order: SortOrder::Desc,
+            pagination: Some(crate::clickhouse::PaginationToken::SlotIndex {
+                slot: 436_663_495,
+                idx: 1_387,
+            }),
+            resolved_pagination: Some(SignatureSlot {
+                slot: 436_663_495,
+                slot_idx: 1_387,
+            }),
+            slot_filter: None,
+            block_time_filter: None,
+            signature_filter: None,
+            resolved_signature_filter: None,
+            status: TransactionStatusFilter::Any,
+            token_accounts: TokenAccountsFilter::None,
+        };
+        let tables = TransactionsForAddressTables {
+            gsfa_table: "default.gsfa_local",
+            gsfa_bucket_modulus: 32,
+            token_owner_table: "default.token_owner_activity_local",
+            token_owner_bucket_modulus: 32,
+            signatures_table: "default.signatures",
+            signature_bucket_modulus: 32,
+        };
+
+        let sql = normalize_sql(
+            &build_transactions_for_address_query(&tables, &query, "").expect("query"),
+        );
+
+        assert!(sql.contains("WHERE (slot < 436663495 OR (slot = 436663495 AND slot_idx < 1387))"));
+        assert!(!sql.contains("slot + toUInt64(0) < 436663495"));
+        assert!(!sql.contains("LIMIT BY"));
+        assert!(sql.contains("ORDER BY slot DESC, slot_idx DESC, signature DESC LIMIT 64"));
+        assert!(!sql.contains("FROM ( SELECT signature"));
+    }
+
+    #[test]
+    fn transactions_for_address_ascending_cursor_uses_raw_key_predicate() {
+        let query = TransactionsForAddressQuery {
+            address: bs58::encode([9_u8; 32]).into_string(),
+            limit: 64,
+            sort_order: SortOrder::Asc,
+            pagination: Some(crate::clickhouse::PaginationToken::SlotIndex {
+                slot: 436_663_495,
+                idx: 1_387,
+            }),
+            resolved_pagination: Some(SignatureSlot {
+                slot: 436_663_495,
+                slot_idx: 1_387,
+            }),
+            slot_filter: None,
+            block_time_filter: None,
+            signature_filter: None,
+            resolved_signature_filter: None,
+            status: TransactionStatusFilter::Any,
+            token_accounts: TokenAccountsFilter::None,
+        };
+        let tables = TransactionsForAddressTables {
+            gsfa_table: "default.gsfa_local",
+            gsfa_bucket_modulus: 32,
+            token_owner_table: "default.token_owner_activity_local",
+            token_owner_bucket_modulus: 32,
+            signatures_table: "default.signatures",
+            signature_bucket_modulus: 32,
+        };
+
+        let sql = normalize_sql(
+            &build_transactions_for_address_query(&tables, &query, "").expect("query"),
+        );
+
+        assert!(sql.contains("WHERE (slot > 436663495 OR (slot = 436663495 AND slot_idx > 1387))"));
+        assert!(sql.contains("ORDER BY slot ASC, slot_idx ASC, signature ASC LIMIT 64"));
+    }
+
+    #[test]
     fn hot_transactions_for_address_query_uses_resolved_numeric_bounds() {
         let query = TransactionsForAddressQuery {
             address: bs58::encode([9_u8; 32]).into_string(),
@@ -1102,6 +1196,7 @@ mod tests {
         assert!(!sql.contains("slot_idx + toUInt32(0) < 678"));
         assert!(!sql.contains("FROM default.signatures"));
         assert!(!sql.contains("ignored"));
+        assert!(!sql.contains("LIMIT BY"));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 Ingest Solana ledger data into ClickHouse and serve Solana-compatible JSON-RPC from that data.
 
-[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md)
+[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [superbank-solparq](crates/superbank-solparq/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md)
 
 </div>
 
@@ -28,6 +28,9 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Ingest from Yellowstone Fumarole, Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable
 - Store blocks + transactions in ClickHouse (`ddl/`)
 - Serve Solana-compatible JSON-RPC backed by ClickHouse (`crates/superbank-rpc`)
+- Archive Superbank ClickHouse table bundles to Parquet (`crates/superbank-solparq`)
+- Inspect and read superbank-solparq Parquet archives from local files or S3 (`superbank-solparq-read` binary in `crates/superbank-solparq`)
+- Restore superbank-solparq Parquet archives (local or S3) back into ClickHouse (`source: solparq`)
 - Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
@@ -38,6 +41,7 @@ flowchart LR
   Source[Fumarole / gRPC / RPC / Bigtable] --> Ingest[superbank]
   Ingest --> CH[ClickHouse]
   CH --> RPC[superbank-rpc]
+  CH --> Archive[superbank-solparq Parquet archives]
 ```
 
 ## Table of contents
@@ -127,7 +131,11 @@ Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
+  (add `rpc-skip-ingested-slots` to backfill only slots missing from ClickHouse in that range)
 - Bigtable: `source: bigtable` plus range/slot file and GCP credentials
+- solparq restore: `source: solparq`, `solparq-archive-location` (`local`/`s3`) plus
+  `solparq-archive-path` or the `solparq-archive-s3-*` settings — loads Parquet
+  archive bundles back into ClickHouse
 - Prometheus metrics and health: `metrics-host` / `metrics-port` (default `0.0.0.0:9901`,
   exposed at `/metrics` and `/health`) plus `health-stale-secs`
 - Optional static metrics label: `metrics-cluster-label`
@@ -341,8 +349,9 @@ rows already present on the target by exact table key instead of failing the run
 
 ## Repository layout
 
-- `crates/superbank` ingestor binary (Yellowstone Fumarole, Yellowstone gRPC, Solana JSON-RPC, or Solana Bigtable sources)
+- `crates/superbank` ingestor binary (Yellowstone Fumarole, Yellowstone gRPC, Solana JSON-RPC, or Solana Bigtable sources, plus the `solparq` source that restores Parquet archives back into ClickHouse)
 - `crates/superbank-rpc` Solana-compatible JSON-RPC server backed by ClickHouse
+- `crates/superbank-solparq` ClickHouse table archiver that writes Parquet bundles locally or to S3-compatible storage
 - `ddl/` ClickHouse schemas (transactions, block metadata, optional PoH entries, GSFA/signatures, token owner activity)
 - `tests/k6/` load/validation tests for `superbank-rpc`
 - `scripts/` helper scripts (local runs, analysis, k6 orchestration)
@@ -352,7 +361,7 @@ rows already present on the target by exact table key instead of failing the run
 ## Development
 
 ```bash
-cargo build -p superbank -p superbank-rpc
+cargo build -p superbank -p superbank-rpc -p superbank-solparq
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings

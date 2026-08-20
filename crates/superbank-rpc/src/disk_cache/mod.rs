@@ -29,6 +29,7 @@ use crate::clickhouse::{
     BlockMetadataRecord, StoredAccountsTransactionRecord, StoredBlockPayload, StoredBlockRecord,
     StoredTransactionRecord,
 };
+use crate::solana_sdk;
 
 pub(crate) mod codec;
 pub(crate) mod coverage;
@@ -387,10 +388,7 @@ impl DiskCache {
         let count = signatures.len();
         let results: Vec<Option<DiskSigStatus>> = self
             .run_read("get_sig_statuses", move |inner| {
-                Ok(signatures
-                    .iter()
-                    .map(|signature| inner.get_sig_status_sync(signature))
-                    .collect())
+                Ok(inner.get_sig_statuses_sync(&signatures))
             })
             .await
             .unwrap_or_else(|| vec![None; count]);
@@ -1108,6 +1106,7 @@ pub(crate) mod tests {
             rewards_post_balance: Vec::new(),
             rewards_type: Vec::new(),
             rewards_commission: Vec::new(),
+            rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
         }
     }
@@ -1123,6 +1122,10 @@ pub(crate) mod tests {
             block_time: Some(1_700_000_000 + slot as i64),
             is_vote: false,
             tx_version: None,
+            tx_config_priority_fee: None,
+            tx_config_compute_unit_limit: None,
+            tx_config_loaded_accounts_data_size_limit: None,
+            tx_config_heap_size: None,
             tx_signatures: vec![signature],
             tx_num_required_signatures: 1,
             tx_num_readonly_signed_accounts: 0,
@@ -1173,6 +1176,7 @@ pub(crate) mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: false,
