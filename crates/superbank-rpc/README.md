@@ -402,21 +402,21 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-query-cache-share-between-users` | `CLICKHOUSE_QUERY_CACHE_SHARE_BETWEEN_USERS` | `false` | Controls `query_cache_share_between_users` for historical read queries. |
 | `--clickhouse-query-condition-cache-enabled` | `CLICKHOUSE_QUERY_CONDITION_CACHE_ENABLED` | `false` | Enables `use_query_condition_cache=1` for selected historical address-filtered read queries. |
 | `--clickhouse-transport` | `CLICKHOUSE_TRANSPORT` | `http` | `tcp` or `http` (`tcp` requires `CLICKHOUSE_SCOPE=shard-direct`). |
-| `--clickhouse-scope` | `CLICKHOUSE_SCOPE` | `distributed` | `distributed` or `shard-direct`. |
-| `--clickhouse-tcp-access-check-timeout-ms` | `CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS` | `2000` | Startup TCP access-check timeout (ms). |
-| `--clickhouse-tcp-pool-min` | `CLICKHOUSE_TCP_POOL_MIN` | `10` | Minimum connections retained per shard in each ClickHouse native (TCP) connection pool. |
-| `--clickhouse-tcp-pool-max` | `CLICKHOUSE_TCP_POOL_MAX` | `20` | Maximum connections per shard in each ClickHouse native (TCP) connection pool. Total native connections per instance are bounded by this value times the number of shards, so size it against the ClickHouse connection budget. |
-| `--clickhouse-cluster` | `CLICKHOUSE_CLUSTER` | `{cluster}` | — |
-| `--clickhouse-topology-config` | `CLICKHOUSE_TOPOLOGY_CONFIG` | — | Optional authoritative YAML shard topology. When set, superbank-rpc skips `system.clusters` discovery, uses the YAML shard/IP/port mapping for shard-local connections, and routes `getTransactionsForAddress` to the address-owner shard. |
-| `--clickhouse-gsfa-local-table` | `CLICKHOUSE_GSFA_LOCAL_TABLE` | — | Local GSFA table used by shard-direct reads and owner-shard `getTransactionsForAddress` routing. |
+| `--clickhouse-scope` | `CLICKHOUSE_SCOPE` | `distributed` | `distributed` sends all queries through `CLICKHOUSE_URL`; `shard-direct` enables local-table routing. |
+| `--clickhouse-tcp-access-check-timeout-ms` | `CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS` | `2000` | Shard-direct only. Startup TCP access-check timeout (ms). |
+| `--clickhouse-tcp-pool-min` | `CLICKHOUSE_TCP_POOL_MIN` | `10` | Shard-direct only. Minimum connections retained per shard in each ClickHouse native (TCP) connection pool. |
+| `--clickhouse-tcp-pool-max` | `CLICKHOUSE_TCP_POOL_MAX` | `20` | Shard-direct only. Maximum connections per shard in each ClickHouse native (TCP) connection pool. Total native connections per instance are bounded by this value times the number of shards, so size it against the ClickHouse connection budget. |
+| `--clickhouse-cluster` | `CLICKHOUSE_CLUSTER` | `{cluster}` | Shard-direct only. Cluster used for topology discovery. |
+| `--clickhouse-topology-config` | `CLICKHOUSE_TOPOLOGY_CONFIG` | — | Shard-direct only. Optional authoritative YAML shard topology that replaces `system.clusters` discovery. |
+| `--clickhouse-gsfa-local-table` | `CLICKHOUSE_GSFA_LOCAL_TABLE` | — | Shard-direct only. Local GSFA table used by address queries. |
 | `--clickhouse-hot-address` | `CLICKHOUSE_GSFA_HOT_ADDRESSES` | empty | Repeatable; env accepts comma-separated values. |
 | `--clickhouse-gsfa-hot-table` | `CLICKHOUSE_GSFA_HOT_TABLE` | `default.gsfa_hot` | Distributed hot table used for active hot-address reads. |
-| `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-local backing table behind `CLICKHOUSE_GSFA_HOT_TABLE`. |
-| `--clickhouse-signatures-local-table` | `CLICKHOUSE_SIGNATURES_LOCAL_TABLE` | — | — |
-| `--clickhouse-token-owner-activity-local-table` | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE` | — | — |
-| `--clickhouse-transactions-local-table` | `CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE` | — | — |
-| `--clickhouse-blocks-metadata-local-table` | `CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE` | — | — |
-| `--clickhouse-shard-http-port` | `CLICKHOUSE_SHARD_HTTP_PORT` | — | — |
+| `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-direct only. Local hot table queried by hot-address fanout. |
+| `--clickhouse-signatures-local-table` | `CLICKHOUSE_SIGNATURES_LOCAL_TABLE` | — | Shard-direct only. |
+| `--clickhouse-token-owner-activity-local-table` | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE` | — | Shard-direct only. |
+| `--clickhouse-transactions-local-table` | `CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE` | — | Shard-direct only. |
+| `--clickhouse-blocks-metadata-local-table` | `CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE` | — | Shard-direct only. |
+| `--clickhouse-shard-http-port` | `CLICKHOUSE_SHARD_HTTP_PORT` | — | Shard-direct only. |
 
 Table selection (environment variables, read at startup):
 
@@ -431,20 +431,11 @@ Table selection (environment variables, read at startup):
 | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE` | `default.token_owner_activity` | — |
 
 Shard routing:
-When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and
-validates local table schemas. Local tables default to `{table}_local` when not provided
-explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`). When a
-topology is available in distributed scope, `getTransactionsForAddress` also uses the address
-hash to query the owner shard's local GSFA table; a failed owner-shard query is returned as an
-error instead of being retried against the distributed table.
-Set `CLICKHOUSE_TOPOLOGY_CONFIG` (or `--clickhouse-topology-config`) to make a YAML topology file
-authoritative for shard-local connection targets and skip `system.clusters` discovery at startup.
-When multiple YAML nodes are listed for the same shard, the first node listed for that shard is
-used as the shard-local TCP/HTTP connection target, and the remaining nodes are ignored.
-The YAML `ip-address` field is the authoritative connection address and does not need to match
-ClickHouse `host_address`. Shard-local TCP uses YAML `ip-address` and `tcp-port`; shard-local HTTP
-uses the same YAML `ip-address` plus `CLICKHOUSE_SHARD_HTTP_PORT` or the port from
-`CLICKHOUSE_URL`.
+When `CLICKHOUSE_SCOPE=distributed`, superbank-rpc sends every ClickHouse query through `CLICKHOUSE_URL`. It does not read `CLICKHOUSE_TOPOLOGY_CONFIG`, discover `system.clusters`, connect to shard endpoints, query local tables, or validate local schemas. Explicit shard-local settings are ignored with a startup warning.
+
+When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and validates local table schemas. Local tables default to `{table}_local` when not provided explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`).
+
+In shard-direct scope, set `CLICKHOUSE_TOPOLOGY_CONFIG` (or `--clickhouse-topology-config`) to make a YAML topology file authoritative for shard-local connection targets and skip `system.clusters` discovery at startup. When multiple YAML nodes are listed for the same shard, the first node listed for that shard is used as the shard-local TCP/HTTP connection target, and the remaining nodes are ignored. The YAML `ip-address` field is the authoritative connection address and does not need to match ClickHouse `host_address`. Shard-local TCP uses YAML `ip-address` and `tcp-port`; shard-local HTTP uses the same YAML `ip-address` plus `CLICKHOUSE_SHARD_HTTP_PORT` or the port from `CLICKHOUSE_URL`.
 YAML keys support both kebab-case and snake_case:
 
 ```yaml
@@ -522,18 +513,16 @@ routing by themselves.
 | --- | --- | --- | --- |
 | `--clickhouse-hot-address` | `CLICKHOUSE_GSFA_HOT_ADDRESSES` | empty | Repeatable; env accepts comma-separated values. |
 | `--clickhouse-gsfa-hot-table` | `CLICKHOUSE_GSFA_HOT_TABLE` | `default.gsfa_hot` | Distributed hot table used for active hot-address reads. |
-| `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-local backing table behind `CLICKHOUSE_GSFA_HOT_TABLE`. |
+| `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-direct local table queried by hot-address fanout. |
 
 Startup checks:
 - The hot distributed table must exist and contain rows for each configured address.
-- If a hot address has no rows (or the hot table is unavailable), that address falls back to
-  the standard GSFA table and a warning is logged.
+- If a hot address has no rows (or the hot table is unavailable), that address falls back to the standard GSFA table and a warning is logged.
+- Shard-direct scope also validates the local hot table schema and verifies that its bucket modulus matches the distributed hot table.
 
 Routing behavior:
-- Active hot addresses always query `CLICKHOUSE_GSFA_HOT_TABLE`, even when
-  `CLICKHOUSE_SCOPE=shard-direct` and `CLICKHOUSE_TRANSPORT=tcp`.
-- `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` remains the shard-local backing table for the distributed hot
-  table, but superbank-rpc no longer queries it directly.
+- In distributed scope, active hot addresses query `CLICKHOUSE_GSFA_HOT_TABLE` through `CLICKHOUSE_URL` and do not require shard topology.
+- In shard-direct scope, active hot addresses fan out across `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` using the configured or discovered topology.
 
 Hot table schema expectations:
 - Same columns as `default.gsfa_local` (`addr_bucket`, `address`, `signature`, `slot`,
