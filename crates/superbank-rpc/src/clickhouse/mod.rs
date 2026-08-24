@@ -16,6 +16,8 @@ mod transactions;
 mod types;
 mod util;
 
+#[cfg(feature = "disk-cache")]
+pub(crate) use client::ClickHouseTableNames;
 pub use client::{ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits};
 #[allow(unused_imports)]
 pub use types::TransactionsForAddressRecord;

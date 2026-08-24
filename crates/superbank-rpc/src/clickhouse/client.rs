@@ -420,6 +420,7 @@ pub struct ClickHouseClient {
     pub(crate) token_owner_activity_local_table: Option<String>,
     pub(crate) transactions_local_table: Option<String>,
     pub(crate) blocks_metadata_local_table: Option<String>,
+    pub(crate) blocks_metadata_supports_prewhere: bool,
     pub(crate) token_owner_activity_available: bool,
     pub(crate) bucket_moduli: BucketModuli,
     pub(crate) allow_query_settings: bool,
@@ -444,6 +445,34 @@ pub struct ClickHouseClient {
     pub(crate) startup_table_check: ClickHouseStartupTableCheck,
     #[cfg(test)]
     pub(crate) latest_finalized_slot_for_tests: Option<Option<u64>>,
+}
+
+/// Explicit table mapping for secondary ClickHouse clients such as the local
+/// forward cache. The primary client keeps its existing environment-derived
+/// mapping for backwards compatibility.
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug)]
+pub(crate) struct ClickHouseTableNames {
+    pub(crate) transactions: String,
+    pub(crate) blocks_metadata: String,
+    pub(crate) gsfa: String,
+    pub(crate) gsfa_hot: String,
+    pub(crate) signatures: String,
+    pub(crate) token_owner_activity: String,
+}
+
+#[cfg(feature = "disk-cache")]
+impl ClickHouseTableNames {
+    pub(crate) fn in_database(database: &str) -> Self {
+        Self {
+            transactions: format!("{database}.transactions"),
+            blocks_metadata: format!("{database}.blocks_metadata"),
+            gsfa: format!("{database}.gsfa"),
+            gsfa_hot: format!("{database}.gsfa_hot"),
+            signatures: format!("{database}.signatures"),
+            token_owner_activity: format!("{database}.token_owner_activity"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -720,6 +749,7 @@ impl ClickHouseClient {
             token_owner_activity_local_table,
             transactions_local_table,
             blocks_metadata_local_table,
+            blocks_metadata_supports_prewhere: true,
             token_owner_activity_available: true,
             bucket_moduli: BucketModuli::default(),
             allow_query_settings: !std::env::var("CLICKHOUSE_DISABLE_QUERY_SETTINGS")
@@ -748,6 +778,29 @@ impl ClickHouseClient {
 
     pub fn token_owner_activity_available(&self) -> bool {
         self.token_owner_activity_available
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn use_table_names(&mut self, names: ClickHouseTableNames) {
+        self.transaction_table = names.transactions;
+        self.blocks_metadata_table = names.blocks_metadata;
+        self.gsfa_table = names.gsfa;
+        self.gsfa_hot_table = names.gsfa_hot.clone();
+        self.gsfa_hot_local_table = names.gsfa_hot;
+        self.signature_statuses_table = names.signatures;
+        self.token_owner_activity_table = names.token_owner_activity;
+        self.signatures_local_table = None;
+        self.token_owner_activity_local_table = None;
+        self.transactions_local_table = None;
+        self.blocks_metadata_local_table = None;
+        self.shard_topology = None;
+        self.shard_routing = None;
+        self.gsfa_router = None;
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn set_blocks_metadata_supports_prewhere(&mut self, supported: bool) {
+        self.blocks_metadata_supports_prewhere = supported;
     }
 
     #[cfg(test)]

@@ -17,7 +17,7 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::client::ClickHouseClient;
 use super::constants::SLOT_SHARD_DIVISOR;
-#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+#[cfg(feature = "grpc-streaming")]
 use super::queries::build_transactions_by_slot_range_query;
 use super::queries::{
     BLOCK_ACCOUNTS_BASE_COLUMNS, BLOCK_FULL_BASE_COLUMNS, BLOCK_METADATA_BASE_COLUMNS,
@@ -30,7 +30,7 @@ use super::rows::{
     map_block_full_transaction_row, map_block_metadata_base_row, map_block_metadata_row,
     map_block_signature_row,
 };
-#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+#[cfg(feature = "grpc-streaming")]
 use super::rows::{TransactionRow, map_transaction_row};
 use super::types::{
     BlockMetadataRecord, InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings,
@@ -402,23 +402,51 @@ fn build_block_metadata_query(
     slot: u64,
     include_rewards: bool,
     settings_clause: &str,
+    supports_prewhere: bool,
 ) -> String {
     let mut columns = BLOCK_METADATA_BASE_COLUMNS.to_vec();
     if include_rewards {
         columns.extend_from_slice(BLOCK_METADATA_REWARD_COLUMNS);
     }
 
+    let filter_clause = if supports_prewhere {
+        "PREWHERE"
+    } else {
+        "WHERE"
+    };
     format!(
         "SELECT
                 {columns}
              FROM {blocks_metadata_table}
-             PREWHERE slot = {slot}
+             {filter_clause} slot = {slot}
              LIMIT 1
              {settings_clause}",
         columns = format_select_columns(&columns),
         blocks_metadata_table = table,
+        filter_clause = filter_clause,
         slot = slot,
         settings_clause = settings_clause
+    )
+}
+
+fn build_block_time_query(
+    table: &str,
+    slot: u64,
+    settings_clause: &str,
+    supports_prewhere: bool,
+) -> String {
+    let filter_clause = if supports_prewhere {
+        "PREWHERE"
+    } else {
+        "WHERE"
+    };
+    format!(
+        "SELECT
+                block_time
+             FROM {table}
+             {filter_clause} slot = {slot}
+             LIMIT 1
+             {settings_clause}"
     )
 }
 
@@ -624,7 +652,7 @@ async fn fetch_block_metadata_range(
     Ok((records, timings))
 }
 
-#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+#[cfg(feature = "grpc-streaming")]
 async fn fetch_transaction_range(
     client: &clickhouse::Client,
     query: &str,
@@ -1692,16 +1720,11 @@ impl ClickHouseClient {
                     "get_block_time_by_slot_local_http",
                     QueryFreshnessClass::Historical,
                 );
-                let query = format!(
-                    "SELECT
-                            block_time
-                         FROM {blocks_metadata_table}
-                         PREWHERE slot = {slot}
-                         LIMIT 1
-                         {settings_clause}",
-                    blocks_metadata_table = local_table,
-                    slot = slot,
-                    settings_clause = settings_clause
+                let query = build_block_time_query(
+                    local_table,
+                    slot,
+                    &settings_clause,
+                    self.blocks_metadata_supports_prewhere,
                 );
 
                 let start = Instant::now();
@@ -1732,16 +1755,11 @@ impl ClickHouseClient {
                             "get_block_time_by_slot_fallback_distributed",
                             QueryFreshnessClass::Historical,
                         );
-                        let query = format!(
-                            "SELECT
-                                    block_time
-                                 FROM {blocks_metadata_table}
-                                 PREWHERE slot = {slot}
-                                 LIMIT 1
-                                 {settings_clause}",
-                            blocks_metadata_table = self.blocks_metadata_table,
-                            slot = slot,
-                            settings_clause = settings_clause
+                        let query = build_block_time_query(
+                            &self.blocks_metadata_table,
+                            slot,
+                            &settings_clause,
+                            self.blocks_metadata_supports_prewhere,
                         );
                         let start = Instant::now();
                         let mut cursor = self
@@ -1769,16 +1787,11 @@ impl ClickHouseClient {
                     "get_block_time_by_slot_distributed",
                     QueryFreshnessClass::Historical,
                 );
-                let query = format!(
-                    "SELECT
-                            block_time
-                         FROM {blocks_metadata_table}
-                         PREWHERE slot = {slot}
-                         LIMIT 1
-                         {settings_clause}",
-                    blocks_metadata_table = self.blocks_metadata_table,
-                    slot = slot,
-                    settings_clause = settings_clause
+                let query = build_block_time_query(
+                    &self.blocks_metadata_table,
+                    slot,
+                    &settings_clause,
+                    self.blocks_metadata_supports_prewhere,
                 );
                 let start = Instant::now();
                 let mut cursor = self
@@ -1807,16 +1820,11 @@ impl ClickHouseClient {
                     "get_block_time_by_slot_distributed_retry",
                     QueryFreshnessClass::Historical,
                 );
-                let query = format!(
-                    "SELECT
-                        block_time
-                     FROM {blocks_metadata_table}
-                     PREWHERE slot = {slot}
-                     LIMIT 1
-                     {settings_clause}",
-                    blocks_metadata_table = self.blocks_metadata_table,
-                    slot = slot,
-                    settings_clause = settings_clause
+                let query = build_block_time_query(
+                    &self.blocks_metadata_table,
+                    slot,
+                    &settings_clause,
+                    self.blocks_metadata_supports_prewhere,
                 );
                 let start = Instant::now();
                 let mut cursor = self
@@ -1976,6 +1984,7 @@ impl ClickHouseClient {
                     slot,
                     include_rewards,
                     &settings_clause,
+                    self.blocks_metadata_supports_prewhere,
                 );
 
                 match fetch_block_metadata_projection(&shard.http_client, &query, include_rewards)
@@ -1998,6 +2007,7 @@ impl ClickHouseClient {
                             slot,
                             include_rewards,
                             &settings_clause,
+                            self.blocks_metadata_supports_prewhere,
                         );
                         let result =
                             fetch_block_metadata_projection(&self.client, &query, include_rewards)
@@ -2015,6 +2025,7 @@ impl ClickHouseClient {
                     slot,
                     include_rewards,
                     &settings_clause,
+                    self.blocks_metadata_supports_prewhere,
                 );
                 let result =
                     fetch_block_metadata_projection(&self.client, &query, include_rewards).await?;
@@ -2031,6 +2042,7 @@ impl ClickHouseClient {
                     slot,
                     include_rewards,
                     &settings_clause,
+                    self.blocks_metadata_supports_prewhere,
                 );
                 let (fallback_opt, fallback_timings) =
                     fetch_block_metadata_projection(&self.client, &query, include_rewards).await?;
@@ -2363,7 +2375,7 @@ impl ClickHouseClient {
     /// All transactions in `[start_slot, end_slot]`, ordered by
     /// `(slot, slot_idx)` ascending. See
     /// [`Self::get_block_metadata_by_slot_range`] for the routing rationale.
-    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+    #[cfg(feature = "grpc-streaming")]
     pub(crate) async fn get_block_full_transactions_by_slot_range(
         &self,
         start_slot: u64,
@@ -2450,12 +2462,12 @@ mod tests {
 
     use super::{
         BlockTransactionProjection, InflationRewardSelection, SLOT_SHARD_DIVISOR,
-        build_block_metadata_query, build_block_transactions_query, build_blockhash_valid_query,
-        build_inflation_boundary_query, build_inflation_partition_slots_query,
-        build_inflation_progress_query, build_inflation_rewards_query,
-        build_transaction_count_query, inflation_epoch_slot_bounds, inflation_reward_partition,
-        inflation_rewards_period_is_active, normalize_slots, plan_inflation_reward_partitions,
-        shard_indices_for_slot_range,
+        build_block_metadata_query, build_block_time_query, build_block_transactions_query,
+        build_blockhash_valid_query, build_inflation_boundary_query,
+        build_inflation_partition_slots_query, build_inflation_progress_query,
+        build_inflation_rewards_query, build_transaction_count_query, inflation_epoch_slot_bounds,
+        inflation_reward_partition, inflation_rewards_period_is_active, normalize_slots,
+        plan_inflation_reward_partitions, shard_indices_for_slot_range,
     };
     #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use super::{
@@ -2706,11 +2718,22 @@ mod tests {
 
     #[test]
     fn block_metadata_query_omits_reward_columns_when_not_requested() {
-        let query = build_block_metadata_query("default.blocks_metadata", 42, false, "");
+        let query = build_block_metadata_query("default.blocks_metadata", 42, false, "", true);
 
         assert!(query.contains("executed_transaction_count"));
         assert!(!query.contains("rewards_present"));
         assert!(!query.contains("rewards_pubkey"));
+    }
+
+    #[test]
+    fn memory_block_queries_use_where_instead_of_prewhere() {
+        let metadata = build_block_metadata_query("cache.blocks_metadata", 42, true, "", false);
+        let block_time = build_block_time_query("cache.blocks_metadata", 42, "", false);
+
+        assert!(metadata.contains("WHERE slot = 42"));
+        assert!(!metadata.contains("PREWHERE"));
+        assert!(block_time.contains("WHERE slot = 42"));
+        assert!(!block_time.contains("PREWHERE"));
     }
 
     #[test]

@@ -195,13 +195,15 @@ pub(crate) async fn handle_get_signature_statuses(
             (HashMap::new(), context_slot)
         }
     };
+    #[cfg(all(feature = "disk-cache", not(feature = "grpc-head-cache")))]
+    let head_statuses: HashMap<String, (u64, Option<Value>, String)> = HashMap::new();
 
     // Disk tier: finalized recent statuses for signatures the head cache does not hold.
     // This is part of the default status-cache lookup; searchTransactionHistory
     // only controls the ClickHouse fallback below.
     #[cfg(feature = "disk-cache")]
     let disk_statuses: HashMap<String, (u64, Option<Value>)> =
-        if let Some(disk) = state.disk_cache.as_ref() {
+        if let Some(disk) = state.disk_cache() {
             let pending: Vec<(String, Signature)> = unique_valid
                 .iter()
                 .filter(|sig_str| !head_statuses.contains_key(*sig_str))
@@ -642,7 +644,7 @@ pub(crate) async fn handle_get_signatures_for_address(
 
             #[cfg(feature = "disk-cache")]
             if pos.is_none()
-                && let Some(disk) = state.disk_cache.as_ref()
+                && let Some(disk) = state.disk_cache()
                 && let Ok(sig) = Signature::from_str(sig_str)
             {
                 route.disk_cache_read();
@@ -688,7 +690,7 @@ pub(crate) async fn handle_get_signatures_for_address(
 
                 #[cfg(feature = "disk-cache")]
                 if pos.is_none()
-                    && let Some(disk) = state.disk_cache.as_ref()
+                    && let Some(disk) = state.disk_cache()
                     && let Ok(sig) = Signature::from_str(sig_str)
                 {
                     route.disk_cache_read();
@@ -762,7 +764,7 @@ pub(crate) async fn handle_get_signatures_for_address(
         // coverage floor — and when it does, the ClickHouse bound is clamped
         // strictly below the floor so the tiers can never overlap.
         #[cfg(feature = "disk-cache")]
-        let disk_page = match state.disk_cache.as_ref() {
+        let disk_page = match state.disk_cache() {
             Some(disk) => {
                 route.disk_cache_read();
                 disk.signatures_for_address(
@@ -857,7 +859,7 @@ pub(crate) async fn handle_get_signatures_for_address(
         let disk_contributed = false;
 
         if !clickhouse_contributed {
-            if disk_contributed {
+            if skip_clickhouse || disk_contributed {
                 #[cfg(feature = "disk-cache")]
                 route.source_disk_cache();
             } else if !head_metas.is_empty() {
@@ -913,17 +915,29 @@ pub(crate) async fn handle_get_signatures_for_address(
     let mut precheck_timings = crate::clickhouse::QueryTimings::zero();
 
     if let Some(sig_str) = options.before.as_deref() {
-        route.source_clickhouse();
-        match state.clickhouse.get_signature_slot(sig_str).await {
-            Ok((pos_opt, timings)) => {
-                precheck_timings.add(timings);
-                before_boundary = pos_opt.map(SlotBoundary::Position);
-            }
-            Err(e) => {
-                metrics::backend_error("get_signature_slot");
-                error!("Failed to query ClickHouse for signature slot {sig_str}: {e}");
-                route.rpc_error();
-                return Ok(json_rpc_long_term_storage_unreachable_response(id));
+        #[cfg(feature = "disk-cache")]
+        if let Some(disk) = state.disk_cache()
+            && let Ok(signature) = Signature::from_str(sig_str)
+        {
+            route.disk_cache_read();
+            before_boundary = disk
+                .signature_position(signature)
+                .await
+                .map(SlotBoundary::Position);
+        }
+        if before_boundary.is_none() {
+            route.source_clickhouse();
+            match state.clickhouse.get_signature_slot(sig_str).await {
+                Ok((pos_opt, timings)) => {
+                    precheck_timings.add(timings);
+                    before_boundary = pos_opt.map(SlotBoundary::Position);
+                }
+                Err(e) => {
+                    metrics::backend_error("get_signature_slot");
+                    error!("Failed to query ClickHouse for signature slot {sig_str}: {e}");
+                    route.rpc_error();
+                    return Ok(json_rpc_long_term_storage_unreachable_response(id));
+                }
             }
         }
 
@@ -937,17 +951,29 @@ pub(crate) async fn handle_get_signatures_for_address(
         if options.before.as_deref() == Some(sig_str) {
             until_boundary = before_boundary;
         } else {
-            route.source_clickhouse();
-            match state.clickhouse.get_signature_slot(sig_str).await {
-                Ok((pos_opt, timings)) => {
-                    precheck_timings.add(timings);
-                    until_boundary = pos_opt.map(SlotBoundary::Position);
-                }
-                Err(e) => {
-                    metrics::backend_error("get_signature_slot");
-                    error!("Failed to query ClickHouse for signature slot {sig_str}: {e}");
-                    route.rpc_error();
-                    return Ok(json_rpc_long_term_storage_unreachable_response(id));
+            #[cfg(feature = "disk-cache")]
+            if let Some(disk) = state.disk_cache()
+                && let Ok(signature) = Signature::from_str(sig_str)
+            {
+                route.disk_cache_read();
+                until_boundary = disk
+                    .signature_position(signature)
+                    .await
+                    .map(SlotBoundary::Position);
+            }
+            if until_boundary.is_none() {
+                route.source_clickhouse();
+                match state.clickhouse.get_signature_slot(sig_str).await {
+                    Ok((pos_opt, timings)) => {
+                        precheck_timings.add(timings);
+                        until_boundary = pos_opt.map(SlotBoundary::Position);
+                    }
+                    Err(e) => {
+                        metrics::backend_error("get_signature_slot");
+                        error!("Failed to query ClickHouse for signature slot {sig_str}: {e}");
+                        route.rpc_error();
+                        return Ok(json_rpc_long_term_storage_unreachable_response(id));
+                    }
                 }
             }
 
@@ -958,38 +984,102 @@ pub(crate) async fn handle_get_signatures_for_address(
         }
     }
 
-    // Query ClickHouse for signatures
-    route.source_clickhouse();
-    match state
-        .clickhouse
-        .get_signatures_for_address_with_positions(address, limit, before_boundary, until_boundary)
+    #[cfg(feature = "disk-cache")]
+    let disk_page = if let Some(disk) = state.disk_cache() {
+        route.disk_cache_read();
+        disk.signatures_for_address(
+            Pubkey::from_str(address).expect("validated address"),
+            before_boundary,
+            until_boundary,
+            limit as usize,
+        )
         .await
-    {
-        Ok((signatures, timings)) => {
-            let mut timings = timings;
-            timings.add(precheck_timings);
-            let signature_infos: Vec<SignatureInfo> = signatures
-                .into_iter()
-                .map(|sig: SignatureRecord| SignatureInfo {
-                    signature: sig.signature,
-                    slot: sig.slot,
-                    err: sig.err,
-                    memo: sig.memo,
-                    block_time: sig.block_time,
-                    confirmation_status: Some("finalized".to_string()),
-                })
-                .collect();
+    } else {
+        None
+    };
+    #[cfg(feature = "disk-cache")]
+    let (skip_clickhouse, clickhouse_before, clickhouse_limit) = match disk_page.as_ref() {
+        Some(page) if !page.reached_floor => (true, before_boundary, 0),
+        Some(page) => (
+            false,
+            Some(clamp_before_to_floor(before_boundary, page.floor)),
+            limit - page.records.len() as u64,
+        ),
+        None => (false, before_boundary, limit),
+    };
+    #[cfg(not(feature = "disk-cache"))]
+    let (skip_clickhouse, clickhouse_before, clickhouse_limit) = (false, before_boundary, limit);
 
-            route.success();
-            let mut resp = json_rpc_success_response(id, signature_infos);
-            add_downstream_header(&mut resp, &timings);
-            Ok(resp)
+    let (mut signatures, mut timings) = if skip_clickhouse {
+        (Vec::new(), crate::clickhouse::QueryTimings::zero())
+    } else {
+        route.source_clickhouse();
+        match state
+            .clickhouse
+            .get_signatures_for_address_with_positions(
+                address,
+                clickhouse_limit,
+                clickhouse_before,
+                until_boundary,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                metrics::backend_error("get_signatures_for_address_with_positions");
+                error!("Failed to query ClickHouse: {}", e);
+                route.rpc_error();
+                return Ok(json_rpc_long_term_storage_unreachable_response(id));
+            }
         }
-        Err(e) => {
-            metrics::backend_error("get_signatures_for_address_with_positions");
-            error!("Failed to query ClickHouse: {}", e);
-            route.rpc_error();
-            Ok(json_rpc_long_term_storage_unreachable_response(id))
+    };
+    timings.add(precheck_timings);
+    #[cfg(feature = "disk-cache")]
+    let clickhouse_contributed = !signatures.is_empty();
+
+    #[cfg(feature = "disk-cache")]
+    let disk_contributed = if let Some(page) = disk_page {
+        let mut seen: HashSet<String> = signatures
+            .iter()
+            .map(|record| record.signature.clone())
+            .collect();
+        let mut contributed = false;
+        for record in page.records {
+            if seen.insert(record.signature.clone()) {
+                contributed = true;
+                signatures.push(record);
+            }
         }
+        contributed
+    } else {
+        false
+    };
+
+    signatures.sort_unstable_by(|a, b| {
+        b.slot
+            .cmp(&a.slot)
+            .then_with(|| b.slot_idx.cmp(&a.slot_idx))
+            .then_with(|| b.signature.cmp(&a.signature))
+    });
+    signatures.truncate(limit as usize);
+    let signature_infos: Vec<SignatureInfo> = signatures
+        .into_iter()
+        .map(|sig: SignatureRecord| SignatureInfo {
+            signature: sig.signature,
+            slot: sig.slot,
+            err: sig.err,
+            memo: sig.memo,
+            block_time: sig.block_time,
+            confirmation_status: Some("finalized".to_string()),
+        })
+        .collect();
+
+    #[cfg(feature = "disk-cache")]
+    if skip_clickhouse || (!clickhouse_contributed && disk_contributed) {
+        route.source_disk_cache();
     }
+    route.success();
+    let mut resp = json_rpc_success_response(id, signature_infos);
+    add_downstream_header(&mut resp, &timings);
+    Ok(resp)
 }

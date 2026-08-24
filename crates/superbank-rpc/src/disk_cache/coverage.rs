@@ -148,6 +148,7 @@ impl CoverageMap {
         holes
     }
 
+    #[cfg(test)]
     pub(crate) fn covered_slot_count(&self) -> u64 {
         self.ranges
             .iter()

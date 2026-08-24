@@ -5,6 +5,8 @@
 
 use axum::{
     Router,
+    extract::State,
+    http::StatusCode,
     routing::{get, post},
 };
 use hyper::Error as HyperError;
@@ -33,10 +35,7 @@ use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHea
 use crate::grpc::service::{self as superbank_grpc, SuperbankGrpcConfig};
 
 #[cfg(feature = "disk-cache")]
-use crate::disk_cache::{
-    DiskCache, DiskCacheConfig, filler, ingest::DiskIngestSink, ingest::RepairQueue,
-    writer::DiskWriterHandle,
-};
+use crate::disk_cache::{DiskCache, DiskCacheConfig, automatic_partition_slots, filler};
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::dragonsmouth::DragonsmouthHeadCacheConfig;
 #[cfg(feature = "grpc-head-cache")]
@@ -225,36 +224,17 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     #[cfg(feature = "pyroscope")]
     let pyroscope_agent = crate::profiling::start_pyroscope(&args);
 
-    #[cfg(feature = "disk-cache")]
-    if args.disk_cache_enabled {
-        let endpoint_usable = args
-            .dragonsmouth_endpoint
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|endpoint| !endpoint.is_empty());
-        if !args.head_cache_enabled || !endpoint_usable {
-            return Err(RpcError::Config(
-                "DISK_CACHE_ENABLED=true requires HEAD_CACHE_ENABLED=true and a usable \
-                 DRAGONSMOUTH_ENDPOINT (the DragonsMouth stream is the live ingestion source)"
-                    .to_string(),
-            ));
-        }
-        if args
-            .disk_cache_path
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            return Err(RpcError::Config(
-                "DISK_CACHE_ENABLED=true requires DISK_CACHE_PATH".to_string(),
-            ));
-        }
-    }
-
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     #[cfg(feature = "disk-cache")]
-    let mut disk_runtime: Option<DiskCacheRuntime> = None;
+    validate_disk_cache_args(&args)?;
+
+    #[cfg(feature = "disk-cache")]
+    let disk_runtime = if args.disk_cache_enabled {
+        Some(start_disk_cache(&args, &clickhouse, &shutdown_tx).await?)
+    } else {
+        None
+    };
 
     #[cfg(feature = "grpc-head-cache")]
     let (head_cache, head_cache_task): (Option<Arc<HeadCache>>, Option<JoinHandle<()>>) = if args
@@ -267,39 +247,16 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             .filter(|v| !v.is_empty())
         {
             let min_commitment = parse_commitment_level(&args.head_cache_min_commitment);
-            #[allow(unused_mut)]
-            let mut retain_slots = args.head_cache_retain_slots.max(1);
-            #[cfg(feature = "disk-cache")]
-            if args.disk_cache_enabled && retain_slots < DISK_CACHE_MIN_HEAD_RETAIN_SLOTS {
-                warn!(
-                    configured = retain_slots,
-                    clamped = DISK_CACHE_MIN_HEAD_RETAIN_SLOTS,
-                    "HEAD_CACHE_RETAIN_SLOTS is below the mainnet finalization lag; raising it \
-                     so finalized slots are still resident when the disk cache snapshots them"
-                );
-                retain_slots = DISK_CACHE_MIN_HEAD_RETAIN_SLOTS;
-            }
+            let retain_slots = args.head_cache_retain_slots.max(1);
             let max_per_address = args.max_signatures_limit as usize;
 
             let cache = Arc::new(HeadCache::new(retain_slots, max_per_address));
-
-            #[cfg(feature = "disk-cache")]
-            let disk_sink = if args.disk_cache_enabled {
-                let runtime = start_disk_cache(&args, &clickhouse, &cache, &shutdown_tx).await?;
-                let sink = runtime.sink.clone();
-                disk_runtime = Some(runtime);
-                Some(sink)
-            } else {
-                None
-            };
 
             let cfg = DragonsmouthHeadCacheConfig {
                 endpoint: endpoint.to_string(),
                 x_token: args.dragonsmouth_x_token.clone(),
                 max_decoding_bytes: args.grpc_max_decoding_bytes,
                 min_commitment,
-                #[cfg(feature = "disk-cache")]
-                disk_sink,
             };
 
             let task = tokio::spawn(dragonsmouth::run(cache.clone(), cfg));
@@ -360,7 +317,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 
     let app = Router::new()
         .route("/", post(handle_json_rpc_with_headers))
-        .route("/health", get(|| async { "OK" }))
+        .route("/health", get(health))
         .layer(rpc_layers)
         .with_state(state.clone());
 
@@ -450,18 +407,12 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     #[cfg(not(feature = "grpc-streaming"))]
     tokio::try_join!(rpc_server, metrics_server)?;
 
-    // The filler heard the shutdown broadcast; stop the writer thread last so
-    // every queued slot drains and the WAL is flushed. A timeout only costs a
-    // hole that the next start repairs from ClickHouse.
     #[cfg(feature = "disk-cache")]
     if let Some(runtime) = disk_runtime {
-        let writer = runtime.writer;
-        let shutdown = tokio::task::spawn_blocking(move || writer.shutdown());
-        if tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .is_err()
-        {
-            warn!("disk cache: writer shutdown timed out; holes will be repaired at next start");
+        match tokio::time::timeout(Duration::from_secs(10), runtime.supervisor_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!("disk cache: supervisor task failed: {err}"),
+            Err(_) => warn!("disk cache: supervisor shutdown timed out"),
         }
         metrics::disk_cache_set_active(false);
     }
@@ -470,92 +421,258 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 }
 
 #[cfg(feature = "disk-cache")]
-const DISK_CACHE_MIN_HEAD_RETAIN_SLOTS: u64 = 64;
-
-#[cfg(feature = "disk-cache")]
 struct DiskCacheRuntime {
-    cache: Arc<DiskCache>,
-    writer: DiskWriterHandle,
-    sink: Arc<DiskIngestSink>,
+    cache: Arc<tokio::sync::OnceCell<Arc<DiskCache>>>,
+    supervisor_task: JoinHandle<()>,
 }
 
-/// Open the disk cache and start its writer thread and backfill/repair filler.
-/// Corruption and schema mismatches are handled inside `DiskCache::open`
-/// (wipe-and-rebuild); any other open failure is an operator error that fails
-/// startup loudly.
+#[cfg(feature = "disk-cache")]
+fn validate_disk_cache_args(args: &RpcConfig) -> Result<(), RpcError> {
+    let removed = [
+        args.deprecated_disk_cache_path
+            .as_ref()
+            .map(|_| "DISK_CACHE_PATH"),
+        args.deprecated_disk_cache_block_cache_bytes
+            .map(|_| "DISK_CACHE_BLOCK_CACHE_BYTES"),
+        args.deprecated_disk_cache_write_queue_slots
+            .map(|_| "DISK_CACHE_WRITE_QUEUE_SLOTS"),
+        args.deprecated_disk_cache_read_concurrency
+            .map(|_| "DISK_CACHE_READ_CONCURRENCY"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !removed.is_empty() {
+        return Err(RpcError::Config(format!(
+            "removed RocksDB disk-cache settings are configured: {}; use the DISK_CACHE_CLICKHOUSE_* settings",
+            removed.join(", ")
+        )));
+    }
+    if !args.disk_cache_enabled {
+        return Ok(());
+    }
+    if args.disk_cache_retain_slots.is_none() {
+        return Err(RpcError::Config(
+            "DISK_CACHE_ENABLED=true requires DISK_CACHE_RETAIN_SLOTS".to_string(),
+        ));
+    }
+    let url = reqwest::Url::parse(args.disk_cache_clickhouse_url.trim())
+        .map_err(|err| RpcError::Config(format!("DISK_CACHE_CLICKHOUSE_URL is invalid: {err}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(RpcError::Config(
+            "DISK_CACHE_CLICKHOUSE_URL must use http or https".to_string(),
+        ));
+    }
+    let local = url.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if !local {
+        return Err(RpcError::Config(
+            "DISK_CACHE_CLICKHOUSE_URL must use localhost or a loopback IP address".to_string(),
+        ));
+    }
+    let database = args.disk_cache_clickhouse_database.trim();
+    let valid_database = database
+        .chars()
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && database
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+    if !valid_database {
+        return Err(RpcError::Config(
+            "DISK_CACHE_CLICKHOUSE_DATABASE must contain only ASCII letters, digits, and underscores and must not start with a digit"
+                .to_string(),
+        ));
+    }
+    if matches!(
+        database.to_ascii_lowercase().as_str(),
+        "default" | "system" | "information_schema"
+    ) {
+        return Err(RpcError::Config(
+            "DISK_CACHE_CLICKHOUSE_DATABASE must be a dedicated non-system database".to_string(),
+        ));
+    }
+
+    let memory_tables = args
+        .disk_cache_memory_tables
+        .iter()
+        .map(|table| table.trim())
+        .filter(|table| !table.is_empty())
+        .collect::<Vec<_>>();
+    if let Some(table) = memory_tables
+        .iter()
+        .find(|table| **table != "blocks_metadata")
+    {
+        return Err(RpcError::Config(format!(
+            "DISK_CACHE_MEMORY_TABLES does not support {table:?}; only blocks_metadata is safe in this release"
+        )));
+    }
+    if !memory_tables.is_empty()
+        && (args.disk_cache_memory_retain_slots.is_none()
+            || args.disk_cache_memory_max_bytes.is_none())
+    {
+        return Err(RpcError::Config(
+            "DISK_CACHE_MEMORY_TABLES requires both DISK_CACHE_MEMORY_RETAIN_SLOTS and DISK_CACHE_MEMORY_MAX_BYTES"
+                .to_string(),
+        ));
+    }
+    if let (Some(memory), Some(retain)) = (
+        args.disk_cache_memory_retain_slots,
+        args.disk_cache_retain_slots,
+    ) && memory > retain
+    {
+        return Err(RpcError::Config(
+            "DISK_CACHE_MEMORY_RETAIN_SLOTS cannot exceed DISK_CACHE_RETAIN_SLOTS".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "disk-cache")]
 async fn start_disk_cache(
     args: &RpcConfig,
     clickhouse: &ClickHouseClient,
-    head_cache: &Arc<HeadCache>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
 ) -> Result<DiskCacheRuntime, RpcError> {
-    let path = args
-        .disk_cache_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| {
-            RpcError::Config("DISK_CACHE_ENABLED=true requires DISK_CACHE_PATH".to_string())
-        })?;
-
+    let retain_slots = args.disk_cache_retain_slots.ok_or_else(|| {
+        RpcError::Config("DISK_CACHE_ENABLED=true requires DISK_CACHE_RETAIN_SLOTS".to_string())
+    })?;
+    let memory_blocks_metadata = args
+        .disk_cache_memory_tables
+        .iter()
+        .any(|table| table.trim() == "blocks_metadata");
     let disk_cfg = DiskCacheConfig {
-        path: path.into(),
-        retain_slots: args.disk_cache_retain_slots.max(1),
+        url: args.disk_cache_clickhouse_url.trim().to_string(),
+        database: args.disk_cache_clickhouse_database.trim().to_string(),
+        username: args.disk_cache_clickhouse_user.clone(),
+        password: args.disk_cache_clickhouse_password.clone(),
+        required: args.disk_cache_required,
+        retain_slots,
         max_bytes: args.disk_cache_max_bytes,
-        block_cache_bytes: args.disk_cache_block_cache_bytes,
-        read_concurrency: args.disk_cache_read_concurrency.max(1),
+        partition_slots: args
+            .disk_cache_partition_slots
+            .unwrap_or_else(|| automatic_partition_slots(retain_slots)),
+        query_timeout: Duration::from_millis(args.disk_cache_query_timeout_ms),
+        schema_check_interval: Duration::from_secs(args.disk_cache_schema_check_interval_secs),
+        memory_blocks_metadata,
+        memory_retain_slots: args.disk_cache_memory_retain_slots,
+        memory_max_bytes: args.disk_cache_memory_max_bytes,
     };
     info!(
-        path,
+        url = disk_cfg.url,
+        database = disk_cfg.database,
         retain_slots = disk_cfg.retain_slots,
+        partition_slots = disk_cfg.partition_slots,
         max_bytes = disk_cfg.max_bytes,
         backfill_enabled = args.disk_cache_backfill_enabled,
         "disk cache: starting"
     );
 
-    let cache = tokio::task::spawn_blocking(move || DiskCache::open(disk_cfg))
-        .await
-        .map_err(|err| RpcError::Config(format!("disk cache open task panicked: {err}")))?
-        .map_err(|err| RpcError::Config(format!("disk cache open failed: {err}")))?;
-    let cache = Arc::new(cache);
-
-    let repair = Arc::new(RepairQueue::new(100_000));
-    let writer = cache.spawn_writer(repair.clone(), args.disk_cache_write_queue_slots.max(1));
-
-    if args.disk_cache_backfill_enabled {
-        let filler_cfg = filler::FillerConfig {
-            retain_slots: args.disk_cache_retain_slots.max(1),
+    let filler_cfg = args
+        .disk_cache_backfill_enabled
+        .then(|| filler::FillerConfig {
+            retain_slots,
             slots_per_query: args.disk_cache_backfill_slots_per_query,
+            max_concurrency: usize::try_from(args.disk_cache_backfill_concurrency)
+                .expect("disk-cache backfill concurrency is bounded to 64"),
             max_slots_per_sec: args.disk_cache_backfill_max_slots_per_sec,
             query_timeout: Duration::from_millis(args.disk_cache_backfill_query_timeout_ms),
             repair_interval: Duration::from_millis(args.disk_cache_repair_interval_ms),
             repair_min_lag_slots: args.disk_cache_repair_min_lag_slots,
             ..Default::default()
-        };
-        tokio::spawn(filler::run(
-            cache.clone(),
-            clickhouse.clone(),
-            writer.bulk.clone(),
-            repair.clone(),
-            Some(head_cache.clone()),
-            filler_cfg,
-            shutdown_tx.subscribe(),
-        ));
-    }
+        });
 
-    let sink = Arc::new(DiskIngestSink::new(
+    let initial = match DiskCache::open(disk_cfg.clone(), clickhouse).await {
+        Ok(cache) => Some(Arc::new(cache)),
+        Err(err) if args.disk_cache_required => {
+            return Err(RpcError::Config(format!("disk cache open failed: {err}")));
+        }
+        Err(err) => {
+            warn!(
+                "disk cache: startup failed; source ClickHouse fallback remains active and initialization will retry: {err}"
+            );
+            None
+        }
+    };
+    let cache = Arc::new(tokio::sync::OnceCell::new());
+    if let Some(initial) = initial.as_ref() {
+        cache
+            .set(initial.clone())
+            .map_err(|_| RpcError::Config("disk cache initialization raced".to_string()))?;
+    }
+    let supervisor_task = tokio::spawn(run_disk_cache_supervisor(
         cache.clone(),
-        writer.sender.clone(),
-        repair,
+        initial,
+        disk_cfg,
+        clickhouse.clone(),
+        filler_cfg,
+        shutdown_tx.subscribe(),
     ));
-    metrics::disk_cache_set_active(true);
 
     Ok(DiskCacheRuntime {
         cache,
-        writer,
-        sink,
+        supervisor_task,
     })
+}
+
+#[cfg(feature = "disk-cache")]
+async fn run_disk_cache_supervisor(
+    published: Arc<tokio::sync::OnceCell<Arc<DiskCache>>>,
+    mut cache: Option<Arc<DiskCache>>,
+    disk_cfg: DiskCacheConfig,
+    source: ClickHouseClient,
+    filler_cfg: Option<filler::FillerConfig>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let mut retry_delay = Duration::from_secs(1);
+    while cache.is_none() {
+        tokio::select! {
+            _ = shutdown.recv() => return,
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        match DiskCache::open(disk_cfg.clone(), &source).await {
+            Ok(opened) => {
+                let opened = Arc::new(opened);
+                if published.set(opened.clone()).is_err() {
+                    warn!(
+                        "disk cache: a second initialization completed; keeping the published cache"
+                    );
+                    return;
+                }
+                cache = Some(opened);
+            }
+            Err(err) => {
+                warn!("disk cache: initialization retry failed: {err}");
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+
+    let cache = cache.expect("cache initialized");
+    if let Some(filler_cfg) = filler_cfg {
+        filler::run(cache, source, filler_cfg, shutdown).await;
+    } else {
+        let _ = shutdown.recv().await;
+        cache.set_ready(false);
+    }
+}
+
+async fn health(State(state): State<Arc<AppState>>) -> StatusCode {
+    #[cfg(not(feature = "disk-cache"))]
+    let _ = state;
+    #[cfg(feature = "disk-cache")]
+    if let Some(cache) = state.disk_cache()
+        && cache.required()
+        && !cache.healthy().await
+    {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    StatusCode::OK
 }
 
 async fn shutdown_signal() {
@@ -601,6 +718,8 @@ fn parse_commitment_level(value: &str) -> CommitmentLevel {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "disk-cache")]
+    use super::validate_disk_cache_args;
     use super::{build_routing_policy, build_shard_routing_config};
     use crate::clickhouse::{RoutingScope, RoutingTransport};
     use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
@@ -726,5 +845,74 @@ mod tests {
             "20000",
         ]);
         assert_eq!(cfg.clickhouse_tcp_access_check_timeout_ms, 20_000);
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn disk_cache_requires_a_retention_window() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.disk_cache_enabled = true;
+        let err = validate_disk_cache_args(&cfg).expect_err("missing retention must fail");
+        assert!(err.to_string().contains("DISK_CACHE_RETAIN_SLOTS"));
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn disk_cache_requires_loopback_and_a_dedicated_database() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.disk_cache_enabled = true;
+        cfg.disk_cache_retain_slots = Some(1000);
+        cfg.disk_cache_clickhouse_url = "http://clickhouse.example:8123".to_string();
+        assert!(
+            validate_disk_cache_args(&cfg)
+                .expect_err("remote endpoint must fail")
+                .to_string()
+                .contains("loopback")
+        );
+
+        cfg.disk_cache_clickhouse_url = "http://[::1]:8123".to_string();
+        cfg.disk_cache_clickhouse_database = "default".to_string();
+        assert!(
+            validate_disk_cache_args(&cfg)
+                .expect_err("default database must fail")
+                .to_string()
+                .contains("dedicated")
+        );
+
+        cfg.disk_cache_clickhouse_database = "recent_cache".to_string();
+        validate_disk_cache_args(&cfg).expect("loopback cache config");
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn disk_cache_rejects_unsafe_memory_and_removed_rocksdb_settings() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.disk_cache_enabled = true;
+        cfg.disk_cache_retain_slots = Some(1000);
+        cfg.disk_cache_memory_tables = vec!["transactions".to_string()];
+        assert!(
+            validate_disk_cache_args(&cfg)
+                .expect_err("unsafe Memory table must fail")
+                .to_string()
+                .contains("only blocks_metadata")
+        );
+
+        cfg.disk_cache_memory_tables.clear();
+        cfg.deprecated_disk_cache_path = Some("/tmp/old-cache".to_string());
+        assert!(
+            validate_disk_cache_args(&cfg)
+                .expect_err("removed setting must fail")
+                .to_string()
+                .contains("DISK_CACHE_PATH")
+        );
     }
 }

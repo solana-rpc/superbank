@@ -235,7 +235,7 @@ async fn get_block_slots_response_for_range(
     // covered head (the latter matters when disk writes lag the chain tip).
     #[cfg(feature = "disk-cache")]
     let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) =
-        if let Some(disk) = state.disk_cache.as_ref() {
+        if let Some(disk) = state.disk_cache() {
             route.disk_cache_read();
             match disk.tip_span() {
                 Some((floor, head)) if end_slot >= floor && start_slot <= head => {
@@ -305,16 +305,16 @@ async fn get_block_slots_response_for_range(
     let head_contributed = !head_slots.is_empty();
 
     if let Some(err) = clickhouse_error {
-        if !head_contributed && !disk_contributed {
+        if disk_contributed || !head_contributed {
             error!(
-                "Failed to query ClickHouse for block slots {}..={}: {}",
+                "Failed to query ClickHouse for the uncovered part of block range {}..={}: {}",
                 start_slot, end_slot, err
             );
             return Ok(json_rpc_internal_error_response(id));
         }
 
         warn!(
-            "Serving cache-only slots for range {}..={} after ClickHouse error: {}",
+            "Serving head-cache-only slots for range {}..={} after ClickHouse error: {}",
             start_slot, end_slot, err
         );
     }
@@ -1488,7 +1488,7 @@ pub(crate) async fn handle_get_block(
     // above). A Skipped marker is proof the slot has no block on the finalized
     // chain, so the miss is answered without ClickHouse.
     #[cfg(feature = "disk-cache")]
-    if let Some(disk) = state.disk_cache.as_ref() {
+    if let Some(disk) = state.disk_cache() {
         route.disk_cache_read();
         match disk.get_block(slot, fetch_plan.transaction_details).await {
             crate::disk_cache::DiskBlockResult::Found(payload) => {
@@ -1711,7 +1711,7 @@ pub(crate) async fn handle_get_block_time(
     // Disk tier: a covered slot answers conclusively (including a stored NULL
     // block time); a Skipped marker proves the slot has no block.
     #[cfg(feature = "disk-cache")]
-    if let Some(disk) = state.disk_cache.as_ref() {
+    if let Some(disk) = state.disk_cache() {
         route.disk_cache_read();
         match disk.block_time_for_slot(slot).await {
             crate::disk_cache::DiskBlockTime::Found(block_time) => {

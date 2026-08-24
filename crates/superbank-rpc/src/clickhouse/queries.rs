@@ -9,7 +9,7 @@ use ch_cityhash102::cityhash64;
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
-#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+#[cfg(feature = "grpc-streaming")]
 use super::constants::SLOT_SHARD_DIVISOR;
 use super::types::{
     NumericFilter, PaginationToken, ResolvedSignatureFilter, SignatureFilter, SignatureSlot,
@@ -691,6 +691,11 @@ pub(crate) fn build_transactions_for_address_query(
             &mut with_parts,
             &mut conditions,
         )?;
+    } else if let Some(signature_filter) = query.resolved_signature_filter.as_ref() {
+        // The local finalized cache resolves signature-shaped bounds before it
+        // enters the cache tier. Apply those positions directly instead of
+        // issuing nested signature lookups which could escape cache coverage.
+        apply_hot_resolved_signature_filter(signature_filter, &mut conditions);
     }
 
     if let Some(pagination) = &query.pagination {
@@ -908,10 +913,10 @@ pub(crate) fn build_transactions_by_slot_signatures_query(
     )
 }
 
-/// Range scan for disk-cache backfill: every transaction in
+/// Range scan for gRPC streaming: every transaction in
 /// `[start_slot, end_slot]` in `(slot, slot_idx)` order. `LIMIT 1 BY signature`
 /// mirrors the per-slot block query's ReplacingMergeTree dedup.
-#[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+#[cfg(feature = "grpc-streaming")]
 pub(crate) fn build_transactions_by_slot_range_query(
     transaction_table: &str,
     start_slot: u64,
@@ -946,13 +951,13 @@ pub(crate) fn build_transactions_by_slot_range_query(
 mod tests {
     use ch_cityhash102::cityhash64;
 
-    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+    #[cfg(feature = "grpc-streaming")]
     use super::build_transactions_by_slot_range_query;
     use super::{
         TransactionsForAddressTables, build_hot_position_pagination_clauses,
         build_transactions_for_address_hot_query, build_transactions_for_address_query,
     };
-    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+    #[cfg(feature = "grpc-streaming")]
     use crate::clickhouse::constants::SLOT_SHARD_DIVISOR;
     use crate::clickhouse::types::{
         NumericFilter, ResolvedSignatureFilter, SignatureFilter, SignatureSlot, SlotBoundary,
@@ -1014,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
+    #[cfg(feature = "grpc-streaming")]
     fn transactions_by_slot_range_query_includes_bucket_predicate_for_shard_pruning() {
         let query = build_transactions_by_slot_range_query(
             "default.transactions",
@@ -1110,6 +1115,46 @@ mod tests {
         assert!(!sql.contains("LIMIT BY"));
         assert!(sql.contains("ORDER BY slot DESC, slot_idx DESC, signature DESC LIMIT 64"));
         assert!(!sql.contains("FROM ( SELECT signature"));
+    }
+
+    #[test]
+    fn transactions_for_address_query_applies_pre_resolved_signature_bounds() {
+        let query = TransactionsForAddressQuery {
+            address: bs58::encode([9_u8; 32]).into_string(),
+            limit: 64,
+            sort_order: SortOrder::Desc,
+            pagination: None,
+            resolved_pagination: None,
+            slot_filter: None,
+            block_time_filter: None,
+            signature_filter: None,
+            resolved_signature_filter: Some(ResolvedSignatureFilter {
+                gte: Some(SignatureSlot {
+                    slot: 436_663_495,
+                    slot_idx: 1_387,
+                }),
+                ..ResolvedSignatureFilter::default()
+            }),
+            status: TransactionStatusFilter::Any,
+            token_accounts: TokenAccountsFilter::None,
+        };
+        let tables = TransactionsForAddressTables {
+            gsfa_table: "cache.gsfa",
+            gsfa_bucket_modulus: 32,
+            token_owner_table: "cache.token_owner_activity",
+            token_owner_bucket_modulus: 32,
+            signatures_table: "cache.signatures",
+            signature_bucket_modulus: 32,
+        };
+
+        let sql = normalize_sql(
+            &build_transactions_for_address_query(&tables, &query, "").expect("query"),
+        );
+
+        assert!(
+            sql.contains("WHERE (slot > 436663495 OR (slot = 436663495 AND slot_idx >= 1387))")
+        );
+        assert!(!sql.contains("FROM cache.signatures"));
     }
 
     #[test]

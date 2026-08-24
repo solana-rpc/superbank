@@ -109,10 +109,7 @@ Apply `transactions.sql` before the materialized-view schemas (`gsfa*.sql`, `sig
 `token_owner_activity.sql`) because those views read from the transactions table. If you use
 `gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then apply `gsfa_hot.sql`.
 
-For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL first, deploy
-`superbank-rpc` next (disk-cache schema 3 intentionally rebuilds existing caches), and only then
-deploy ingestion with transaction version 1 enabled. Rolling back the RPC binary is safe only
-before v1 or `DeactivatedStake` rows have arrived.
+For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL first, deploy `superbank-rpc` next, and only then deploy ingestion with transaction version 1 enabled. Rolling back the RPC binary is safe only before v1 or `DeactivatedStake` rows have arrived. The optional ClickHouse forward cache detects source schema changes and rebuilds its owned local database automatically.
 
 ## Run
 
@@ -231,45 +228,36 @@ Configuration:
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
 The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (also AGPL-3.0).
 
-## Optional RocksDB disk cache (`disk-cache`)
+## Optional local ClickHouse forward cache (`disk-cache`)
 
-When compiled with `--features disk-cache` (which implies `grpc-head-cache`) and enabled at
-runtime, superbank-rpc keeps a RocksDB-backed cache of recent **finalized** slots on local disk
-and serves it *in place of* ClickHouse. The read tiering becomes:
+When compiled with `--features disk-cache` and enabled at runtime, superbank-rpc forwards recent **finalized** slots from the configured source ClickHouse cluster into a separate ClickHouse instance on localhost. The feature is independent from `grpc-head-cache`. The local instance is a near cache, not a second source of truth. The read tiering is:
 
 ```
-head cache (memory, unfinalized tip) -> disk cache (finalized, recent slots) -> ClickHouse (full history)
+head cache (optional, unfinalized tip) -> local ClickHouse cache (finalized, recent slots) -> source ClickHouse (full history)
 ```
 
-The cache is hydrated FROM ClickHouse ("backfill") on startup, kept current by copying slots out
-of the head cache as the DragonsMouth stream finalizes them, and self-repairs gaps from
-ClickHouse. It never writes to ClickHouse. Coverage is tracked per slot and claimed atomically
-with the data, so the cache never serves a slot it holds partially; any miss, hole, or decode
-failure silently degrades to a ClickHouse read.
+At startup, superbank-rpc inspects the source tables through `system.tables` and `system.columns`. It copies columns, types, defaults, codecs, indexes, primary keys, sorting keys, and materialized-view queries into a cache-specific schema. Local MergeTree tables use slot-range partitions so retention can drop complete old partitions. The forwarder streams the source `transactions` and `blocks_metadata` tables in ClickHouse Native format over HTTP. Local materialized views build `signatures`, `gsfa`, optional `gsfa_hot`, and optional `token_owner_activity` from each transaction insert.
 
-Served from disk when covered: `getBlock` (all `transactionDetails` levels), `getBlocks`,
-`getBlocksWithLimit`, `getBlockTime`, `getTransaction`, `getSignatureStatuses`,
-`getSignaturesForAddress`, and `getTransactionsForAddress` (including `tokenAccounts` filters via
-an on-disk port of the `gsfa` and `token_owner_activity` materialized views). Address queries are
-answered from the contiguous covered span; ClickHouse is consulted only for the remainder strictly
-below the coverage floor.
+Coverage is published only after the base rows, dependent materialized views, and transaction-count validation complete. A hole, partial slot, local query error, or unavailable cache falls through to the source cluster. Address queries use only the contiguous covered tip span and ask the source cluster for any older remainder. The source credentials remain in superbank-rpc; the local ClickHouse instance does not connect to the source cluster.
 
-> [!WARNING]
-> **Sizing:** at mainnet volume the default 10-epoch window (4,320,000 slots) needs on the order
-> of **15–20 TB** of NVMe even with compression (~1.5–2 TB per epoch across the record and index
-> column families). Set `DISK_CACHE_MAX_BYTES` to bound disk usage — the retention window shrinks
-> to fit, with the tighter of the slot window and the byte budget winning.
+The source ClickHouse user needs read access to the copied tables and their `system.tables` and `system.columns` metadata. The local ClickHouse user needs permission to create and drop the dedicated database, create and alter its tables, and read and insert its data.
 
-Requires `HEAD_CACHE_ENABLED=true` with a usable `DRAGONSMOUTH_ENDPOINT` (the stream is the live
-ingestion source). `HEAD_CACHE_RETAIN_SLOTS` is clamped to at least `64` when the disk cache is
-enabled: the default `32` roughly equals the mainnet finalization lag, so finalized slots would
-already be evicted from the head cache when the disk snapshot hook fires; `150` is a comfortable
-setting (~1.5–3 GB of head-cache memory at mainnet rates).
+The cache serves `getBlock` (all `transactionDetails` levels), `getBlocks`, `getBlocksWithLimit`, `getBlockTime`, `getTransaction`, `getSignatureStatuses`, `getSignaturesForAddress`, and `getTransactionsForAddress` when the required rows are covered. `DISK_CACHE_RETAIN_SLOTS` is required. The forwarder fills backward to the configured retention floor when the cache starts partially filled or the retention window increases. `DISK_CACHE_MAX_BYTES` can impose a tighter MergeTree budget. The forwarder drops complete old slot partitions rather than deleting individual rows.
+
+The configured cache database is exclusively owned by this feature. A nonempty database without the Superbank ownership marker is rejected and never modified. A source schema fingerprint change rebuilds only a correctly marked cache database. Treat the instance and database as semi-ephemeral.
+
+By default, local initialization failures do not block RPC startup. Reads continue against the source cluster while a background supervisor retries local initialization. `DISK_CACHE_REQUIRED=true` makes initialization a startup requirement and makes `/health` return HTTP 503 when the local cache is not ready or cannot answer a health query.
+
+Query-facing tables use `ReplacingMergeTree` by default. `blocks_metadata` can opt into the ClickHouse `Memory` engine with `DISK_CACHE_MEMORY_TABLES=blocks_metadata`. This mode requires explicit row and byte caps. Memory-engine coverage is reset after a local ClickHouse restart because those rows are not durable. No other query-facing table is accepted in the Memory allowlist in this release.
 
 Run example:
 
 ```bash
-RPC_HOST=0.0.0.0 RPC_PORT=8899 CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default HEAD_CACHE_ENABLED=true HEAD_CACHE_RETAIN_SLOTS=150 DRAGONSMOUTH_ENDPOINT=https://YOUR_DRAGONSMOUTH_ENDPOINT DISK_CACHE_ENABLED=true DISK_CACHE_PATH=/var/lib/superbank/disk-cache DISK_CACHE_MAX_BYTES=2199023255552 cargo run -p superbank-rpc --features disk-cache --
+RPC_HOST=0.0.0.0 RPC_PORT=8899 \
+CLICKHOUSE_URL=http://source-clickhouse:8123 CLICKHOUSE_DATABASE=default \
+DISK_CACHE_ENABLED=true DISK_CACHE_RETAIN_SLOTS=432000 \
+DISK_CACHE_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+cargo run -p superbank-rpc --features disk-cache --
 ```
 
 Configuration:
@@ -277,22 +265,32 @@ Configuration:
 | Option | Environment | Default | Notes |
 | --- | --- | --- | --- |
 | `--disk-cache-enabled` | `DISK_CACHE_ENABLED` | `false` | Enables the feature at runtime. |
-| `--disk-cache-path` | `DISK_CACHE_PATH` | — | RocksDB directory; required when enabled. |
-| `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | `4320000` | Finalized slots to retain (~10 epochs). |
-| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Disk byte budget; `0` = unlimited. Tighter of window/budget wins. |
-| `--disk-cache-block-cache-bytes` | `DISK_CACHE_BLOCK_CACHE_BYTES` | `4294967296` | RocksDB block cache shared across column families. |
-| `--disk-cache-write-queue-slots` | `DISK_CACHE_WRITE_QUEUE_SLOTS` | `64` | Live write queue depth; overflow defers slots to repair. |
-| `--disk-cache-read-concurrency` | `DISK_CACHE_READ_CONCURRENCY` | `64` | Max concurrent blocking disk reads. |
-| `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | ClickHouse->disk backfill/repair task. |
-| `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots per ClickHouse range query. |
-| `--disk-cache-backfill-max-slots-per-sec` | `DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC` | `50` | Backfill rate limit (the default fills 10 epochs in ~24h). |
+| `--disk-cache-clickhouse-url` | `DISK_CACHE_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | Local ClickHouse HTTP endpoint. The host must be localhost or a loopback IP. |
+| `--disk-cache-clickhouse-database` | `DISK_CACHE_CLICKHOUSE_DATABASE` | `superbank_disk_cache` | Dedicated database owned by the cache. |
+| `--disk-cache-clickhouse-user` | `DISK_CACHE_CLICKHOUSE_USER` | `default` | Local ClickHouse user. |
+| `--disk-cache-clickhouse-password` | `DISK_CACHE_CLICKHOUSE_PASSWORD` | empty | Local ClickHouse password. |
+| `--disk-cache-required` | `DISK_CACHE_REQUIRED` | `false` | Fail startup and strict health when the local cache is unavailable. |
+| `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | — | Finalized slots to retain. Required when enabled. |
+| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | MergeTree byte budget; `0` means unlimited. The tighter slot or byte bound wins. |
+| `--disk-cache-partition-slots` | `DISK_CACHE_PARTITION_SLOTS` | automatic | Width of local slot partitions. The automatic value targets at most 128 active partitions. |
+| `--disk-cache-query-timeout-ms` | `DISK_CACHE_QUERY_TIMEOUT_MS` | `2000` | Timeout for one local cache read. |
+| `--disk-cache-schema-check-interval-secs` | `DISK_CACHE_SCHEMA_CHECK_INTERVAL_SECS` | `300` | Source schema fingerprint check interval. |
+| `--disk-cache-memory-tables` | `DISK_CACHE_MEMORY_TABLES` | empty | Comma-separated Memory-engine allowlist. Only `blocks_metadata` is accepted. |
+| `--disk-cache-memory-retain-slots` | `DISK_CACHE_MEMORY_RETAIN_SLOTS` | — | Required row cap when `blocks_metadata` uses Memory; must not exceed the main retention window. |
+| `--disk-cache-memory-max-bytes` | `DISK_CACHE_MEMORY_MAX_BYTES` | — | Required byte cap when `blocks_metadata` uses Memory. |
+| `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | Enables the unified source-to-local forward and repair task. |
+| `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots per ClickHouse range query. Larger ranges reduce fixed query overhead but need a longer timeout. |
+| `--disk-cache-backfill-concurrency` | `DISK_CACHE_BACKFILL_CONCURRENCY` | `4` | Independent validated ranges forwarded concurrently. Accepted range: 1–64. |
+| `--disk-cache-backfill-max-slots-per-sec` | `DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC` | `50` | Source forwarding rate limit. |
 | `--disk-cache-backfill-query-timeout-ms` | `DISK_CACHE_BACKFILL_QUERY_TIMEOUT_MS` | `30000` | Range scans need more than the interactive query timeout. |
-| `--disk-cache-repair-interval-ms` | `DISK_CACHE_REPAIR_INTERVAL_MS` | `5000` | Idle wait between repair/backfill planning rounds. |
-| `--disk-cache-repair-min-lag-slots` | `DISK_CACHE_REPAIR_MIN_LAG_SLOTS` | `75` | Never backfill slots ClickHouse ingest may not have landed. |
+| `--disk-cache-repair-interval-ms` | `DISK_CACHE_REPAIR_INTERVAL_MS` | `5000` | Idle wait between forward/repair planning rounds. |
+| `--disk-cache-repair-min-lag-slots` | `DISK_CACHE_REPAIR_MIN_LAG_SLOTS` | `75` | Do not claim source slots that ingestion may not have landed. |
 
-Observability: `superbank_disk_cache_*` metrics cover coverage span, hit/miss per operation,
-write/backfill/repair/eviction activity, and the route metrics gain a `disk_cache_read` label.
-The `X-Superbank-Sources` response header reports `disk-cache` combinations.
+The forwarder admits all concurrent ranges through one slots-per-second token bucket. Each range streams and validates independently. Coverage is published only for a range that completes both base-table writes and transaction-count validation. For a fast initial fill on capable source and local ClickHouse instances, increase concurrency and the rate limit first, then increase slots per query if fixed query overhead dominates. Watch `superbank_disk_cache_backfill_inflight_ranges`, write latency, fill errors, and source-cluster load while tuning.
+
+The removed RocksDB settings `DISK_CACHE_PATH`, `DISK_CACHE_BLOCK_CACHE_BYTES`, `DISK_CACHE_WRITE_QUEUE_SLOTS`, and `DISK_CACHE_READ_CONCURRENCY` produce a configuration error instead of being ignored.
+
+Observability: `superbank_disk_cache_*` metrics cover readiness, local ClickHouse bytes, coverage span, read outcomes, forwarding, errors, rebuilds, and partition eviction. Route metrics retain the `disk_cache_read` label. The `X-Superbank-Sources` response header reports `disk-cache` combinations.
 
 Parity validation against a reference target (e.g. the same build with the disk cache disabled):
 
@@ -315,8 +313,7 @@ The performance scenario pre-probes the target and only keeps workload items who
 `X-Superbank-Sources` header reports a disk-cache hit, then reports per-method latency deltas and
 speedup ratios versus the reference.
 
-License note: the `disk-cache` feature implies `grpc-head-cache` and therefore also pulls in
-`yellowstone-block-machine` (AGPL-3.0).
+The `disk-cache` feature does not pull in or require `grpc-head-cache`.
 
 ## Optional Pyroscope profiling (`pyroscope`)
 
@@ -552,7 +549,7 @@ Route normalization metric:
   - `scope`: `distributed|shard_direct` (active ClickHouse routing scope policy).
   - `source`: `clickhouse|head_cache|disk_cache|none` (primary source used for the returned response).
   - `head_cache_read`: `true|false` (whether handler read from head cache on that request).
-  - `disk_cache_read`: `true|false` (whether handler read from the RocksDB disk cache on that request).
+  - `disk_cache_read`: `true|false` (whether the handler read from the local ClickHouse disk cache on that request).
   - `outcome`: `success|not_found|invalid_params|rpc_error|backend_error|timeout`.
   - `x_endpoint`: omitted when capture is disabled; otherwise `missing|<value>` (`<value>` is the raw `X-Endpoint` header value).
   - `x_rpc_node`: omitted when capture is disabled; otherwise `missing|<value>`.

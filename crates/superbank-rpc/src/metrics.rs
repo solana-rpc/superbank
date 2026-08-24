@@ -577,11 +577,11 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_write_errors_total: Counter,
     #[cfg(feature = "disk-cache")]
-    disk_cache_dropped_to_repair_total: Family<DiskCacheReasonLabels, Counter>,
-    #[cfg(feature = "disk-cache")]
     disk_cache_evicted_slots_total: Family<DiskCacheReasonLabels, Counter>,
     #[cfg(feature = "disk-cache")]
     disk_cache_backfill_slots_remaining: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_backfill_inflight_ranges: Gauge,
     #[cfg(feature = "disk-cache")]
     disk_cache_fill_errors_total: Counter,
     #[cfg(feature = "disk-cache")]
@@ -678,11 +678,11 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         let disk_cache_write_errors_total = Counter::default();
         #[cfg(feature = "disk-cache")]
-        let disk_cache_dropped_to_repair_total = Family::default();
-        #[cfg(feature = "disk-cache")]
         let disk_cache_evicted_slots_total = Family::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_backfill_slots_remaining = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_backfill_inflight_ranges = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_fill_errors_total = Counter::default();
         #[cfg(feature = "disk-cache")]
@@ -920,7 +920,7 @@ impl Metrics {
             );
             registry.register(
                 "disk_cache_size_bytes",
-                "Live SST bytes across all disk-cache column families",
+                "Active local ClickHouse part bytes owned by the disk cache",
                 disk_cache_size_bytes.clone(),
             );
             registry.register(
@@ -940,13 +940,8 @@ impl Metrics {
             );
             registry.register(
                 "disk_cache_write_errors",
-                "RocksDB write failures",
+                "Local ClickHouse forward or insert failures",
                 disk_cache_write_errors_total.clone(),
-            );
-            registry.register(
-                "disk_cache_dropped_to_repair",
-                "Live slots deferred to the repair queue by reason",
-                disk_cache_dropped_to_repair_total.clone(),
             );
             registry.register(
                 "disk_cache_evicted_slots",
@@ -957,6 +952,11 @@ impl Metrics {
                 "disk_cache_backfill_slots_remaining",
                 "Holes remaining inside the retention window",
                 disk_cache_backfill_slots_remaining.clone(),
+            );
+            registry.register(
+                "disk_cache_backfill_inflight_ranges",
+                "Source-to-local slot ranges currently being forwarded",
+                disk_cache_backfill_inflight_ranges.clone(),
             );
             registry.register(
                 "disk_cache_fill_errors",
@@ -1058,11 +1058,11 @@ impl Metrics {
             #[cfg(feature = "disk-cache")]
             disk_cache_write_errors_total,
             #[cfg(feature = "disk-cache")]
-            disk_cache_dropped_to_repair_total,
-            #[cfg(feature = "disk-cache")]
             disk_cache_evicted_slots_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_backfill_slots_remaining,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_backfill_inflight_ranges,
             #[cfg(feature = "disk-cache")]
             disk_cache_fill_errors_total,
             #[cfg(feature = "disk-cache")]
@@ -1662,7 +1662,7 @@ pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {
     }
 }
 
-#[cfg(feature = "grpc-head-cache")]
+#[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
 fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -1857,18 +1857,6 @@ pub(crate) fn disk_cache_write_error() {
 }
 
 #[cfg(feature = "disk-cache")]
-pub(crate) fn disk_cache_dropped_to_repair(reason: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_dropped_to_repair_total
-            .get_or_create(&DiskCacheReasonLabels {
-                reason: reason.to_string(),
-            })
-            .inc();
-    }
-}
-
-#[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_evicted(reason: &'static str, slots: u64) {
     if let Some(metrics) = metrics() {
         metrics
@@ -1886,6 +1874,15 @@ pub(crate) fn disk_cache_backfill_remaining(slots: u64) {
         metrics
             .disk_cache_backfill_slots_remaining
             .set(clamp_i64(slots));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_backfill_inflight(ranges: usize) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_backfill_inflight_ranges
+            .set(i64::try_from(ranges).unwrap_or(i64::MAX));
     }
 }
 
