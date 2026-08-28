@@ -377,7 +377,7 @@ impl ClickHouseClient {
         .into();
 
         let mut join_set = JoinSet::new();
-        for shard in topology.shards.iter().cloned() {
+        for shard in topology.active_shards() {
             let local_table = local_table.clone();
             let address_literal = address_literal.clone();
             let with_clause = with_clause.clone();
@@ -472,6 +472,9 @@ impl ClickHouseClient {
                     timings.merge_parallel(shard_timings);
                 }
                 Ok(Err((host, port, err))) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_endpoint(&host, port);
+                    }
                     let context =
                         format!("Shard-local GSFA hot TCP query failed on {host}:{port}: {err}");
                     tracing::warn!("{context}");
@@ -509,7 +512,7 @@ impl ClickHouseClient {
         let query_timeout = self.query_timeout;
 
         let mut join_set = JoinSet::new();
-        for shard in topology.shards.iter().cloned() {
+        for shard in topology.active_shards() {
             let local_table = local_table.clone();
             let address_literal = address_literal.clone();
             let with_clause = with_clause.clone();
@@ -584,6 +587,9 @@ impl ClickHouseClient {
                     timings.merge_parallel(shard_timings);
                 }
                 Ok(Err((host, port, err))) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_endpoint(&host, port);
+                    }
                     return Err(ProcessingError::database_msg(format!(
                         "Shard-local GSFA hot HTTP query failed on {host}:{port}: {err}"
                     )));
@@ -878,7 +884,7 @@ impl ClickHouseClient {
 }
 
 impl GsfaShardRouter {
-    pub(crate) fn shard_for_pubkey(&self, pubkey: &Pubkey) -> &ShardTarget {
+    pub(crate) fn shard_for_pubkey(&self, pubkey: &Pubkey) -> ShardTarget {
         let hash = cityhash64(pubkey.as_ref());
         self.topology.shard_for_hash(hash)
     }

@@ -344,6 +344,15 @@ pub struct RpcConfig {
     )]
     pub(crate) clickhouse_tcp_access_check_timeout_ms: u64,
 
+    /// Interval between background health checks for unavailable shard replicas (milliseconds).
+    #[arg(
+        long,
+        env = "CLICKHOUSE_REPLICA_HEALTH_CHECK_INTERVAL_MS",
+        default_value_t = 10_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) clickhouse_replica_health_check_interval_ms: u64,
+
     /// ClickHouse cluster name used to discover shard topology (supports macros like {cluster}).
     #[arg(long, env = "CLICKHOUSE_CLUSTER", default_value = "{cluster}")]
     pub(crate) clickhouse_cluster: String,

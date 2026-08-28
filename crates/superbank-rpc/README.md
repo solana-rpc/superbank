@@ -401,6 +401,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-transport` | `CLICKHOUSE_TRANSPORT` | `http` | `tcp` or `http` (`tcp` requires `CLICKHOUSE_SCOPE=shard-direct`). |
 | `--clickhouse-scope` | `CLICKHOUSE_SCOPE` | `distributed` | `distributed` or `shard-direct`. |
 | `--clickhouse-tcp-access-check-timeout-ms` | `CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS` | `2000` | Startup TCP access-check timeout (ms). |
+| `--clickhouse-replica-health-check-interval-ms` | `CLICKHOUSE_REPLICA_HEALTH_CHECK_INTERVAL_MS` | `10000` | Background health-check interval for shard-direct replicas. Unavailable replicas are restored to the failover pool after recovery. |
 | `--clickhouse-tcp-pool-min` | `CLICKHOUSE_TCP_POOL_MIN` | `10` | Minimum connections retained per shard in each ClickHouse native (TCP) connection pool. |
 | `--clickhouse-tcp-pool-max` | `CLICKHOUSE_TCP_POOL_MAX` | `20` | Maximum connections per shard in each ClickHouse native (TCP) connection pool. Total native connections per instance are bounded by this value times the number of shards, so size it against the ClickHouse connection budget. |
 | `--clickhouse-cluster` | `CLICKHOUSE_CLUSTER` | `{cluster}` | — |
@@ -428,16 +429,19 @@ Table selection (environment variables, read at startup):
 | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE` | `default.token_owner_activity` | — |
 
 Shard routing:
+With `CLICKHOUSE_SCOPE=distributed`, all methods query Distributed tables and replica selection is
+delegated to ClickHouse. Hot addresses use `CLICKHOUSE_GSFA_HOT_TABLE` without discovering or
+connecting to shard-local replicas; shard topology and local-table settings are ignored.
 When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and
 validates local table schemas. Local tables default to `{table}_local` when not provided
 explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`). When a
-topology is available in distributed scope, `getTransactionsForAddress` also uses the address
-hash to query the owner shard's local GSFA table; a failed owner-shard query is returned as an
-error instead of being retried against the distributed table.
+shard has multiple replicas, startup selects the first reachable replica, warns about unavailable
+replicas, and fails only if no replica is reachable for a shard. Background health checks move
+traffic away from failed replicas and restore recovered replicas to the failover pool.
 Set `CLICKHOUSE_TOPOLOGY_CONFIG` (or `--clickhouse-topology-config`) to make a YAML topology file
 authoritative for shard-local connection targets and skip `system.clusters` discovery at startup.
-When multiple YAML nodes are listed for the same shard, the first node listed for that shard is
-used as the shard-local TCP/HTTP connection target, and the remaining nodes are ignored.
+When multiple YAML nodes are listed for the same shard, file order defines failover priority and
+all replicas must use the same shard weight. The first reachable node is selected at startup.
 The YAML `ip-address` field is the authoritative connection address and does not need to match
 ClickHouse `host_address`. Shard-local TCP uses YAML `ip-address` and `tcp-port`; shard-local HTTP
 uses the same YAML `ip-address` plus `CLICKHOUSE_SHARD_HTTP_PORT` or the port from

@@ -22,9 +22,7 @@ use crate::clickhouse::{
     ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, QueryCacheConfig,
     RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig,
 };
-use crate::config::{
-    ClickHouseScope, ClickHouseTransport, RpcConfig, has_usable_gsfa_hot_addresses,
-};
+use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::metrics;
 use crate::metrics::metrics_handler;
@@ -46,6 +44,20 @@ use solana_commitment_config::CommitmentLevel;
 pub type RpcResult<T> = Result<T, RpcError>;
 
 fn build_shard_routing_config(args: &RpcConfig) -> Option<ShardRoutingConfig> {
+    // Distributed mode must remain a pure Distributed-table client.  In particular, hot-address
+    // configuration changes the distributed table selected by address queries; it must not make
+    // startup depend on system.clusters or shard-local connectivity.
+    if args.clickhouse_scope != ClickHouseScope::ShardDirect {
+        if args
+            .clickhouse_topology_config
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+        {
+            warn!("CLICKHOUSE_TOPOLOGY_CONFIG is ignored because CLICKHOUSE_SCOPE=distributed");
+        }
+        return None;
+    }
+
     let topology_config_path = args
         .clickhouse_topology_config
         .as_deref()
@@ -53,10 +65,7 @@ fn build_shard_routing_config(args: &RpcConfig) -> Option<ShardRoutingConfig> {
         .filter(|path| !path.is_empty())
         .map(str::to_string);
 
-    if args.clickhouse_scope == ClickHouseScope::ShardDirect
-        || has_usable_gsfa_hot_addresses(&args.clickhouse_hot_addresses)
-        || topology_config_path.is_some()
-    {
+    if args.clickhouse_scope == ClickHouseScope::ShardDirect {
         Some(ShardRoutingConfig {
             cluster: args.clickhouse_cluster.clone(),
             topology_config_path,
@@ -177,6 +186,9 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         .with_query_timeout(Duration::from_millis(args.clickhouse_query_timeout_ms))
         .with_tcp_access_check_timeout(Duration::from_millis(
             args.clickhouse_tcp_access_check_timeout_ms,
+        ))
+        .with_replica_health_check_interval(Duration::from_millis(
+            args.clickhouse_replica_health_check_interval_ms,
         ))
         .with_query_cache_config(
             QueryCacheConfig::new(
@@ -749,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_routing_enabled_for_hot_routing_in_distributed_scope() {
+    fn shard_routing_disabled_for_hot_routing_in_distributed_scope() {
         use clap::Parser;
 
         let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
@@ -758,12 +770,11 @@ mod tests {
         cfg.clickhouse_hot_addresses =
             vec!["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()];
 
-        let routing = build_shard_routing_config(&cfg).expect("routing config");
-        assert_eq!(routing.cluster, "{cluster}");
+        assert!(build_shard_routing_config(&cfg).is_none());
     }
 
     #[test]
-    fn shard_routing_enabled_for_topology_config_in_distributed_scope() {
+    fn shard_routing_disabled_for_topology_config_in_distributed_scope() {
         use clap::Parser;
 
         let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
@@ -771,11 +782,7 @@ mod tests {
         cfg.clickhouse_scope = ClickHouseScope::Distributed;
         cfg.clickhouse_topology_config = Some(" /etc/superbank/topology.yaml ".to_string());
 
-        let routing = build_shard_routing_config(&cfg).expect("routing config");
-        assert_eq!(
-            routing.topology_config_path.as_deref(),
-            Some("/etc/superbank/topology.yaml")
-        );
+        assert!(build_shard_routing_config(&cfg).is_none());
     }
 
     #[test]
@@ -845,6 +852,21 @@ mod tests {
             "20000",
         ]);
         assert_eq!(cfg.clickhouse_tcp_access_check_timeout_ms, 20_000);
+    }
+
+    #[test]
+    fn replica_health_check_interval_parses_and_defaults() {
+        use clap::Parser;
+
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.clickhouse_replica_health_check_interval_ms, 10_000);
+
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-replica-health-check-interval-ms",
+            "30000",
+        ]);
+        assert_eq!(cfg.clickhouse_replica_health_check_interval_ms, 30_000);
     }
 
     #[cfg(feature = "disk-cache")]

@@ -559,6 +559,9 @@ impl ClickHouseClient {
                 match fetch_single_transaction_row(&shard.http_client, &query).await {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
+                        if transient_shard_local_error_reason(&err).is_some() {
+                            topology.failover_from(&shard);
+                        }
                         tracing::warn!(
                             "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
                             shard.host,
@@ -655,6 +658,9 @@ impl ClickHouseClient {
                 match fetch_single_transaction_row(&shard.http_client, &query).await {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
+                        if transient_shard_local_error_reason(&err).is_some() {
+                            topology.failover_from(&shard);
+                        }
                         tracing::warn!(
                             "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
                             shard.host,
@@ -823,7 +829,7 @@ impl ClickHouseClient {
         .into();
         let mut join_set = JoinSet::new();
 
-        for shard in topology.shards.iter().cloned() {
+        for shard in topology.active_shards() {
             let local_table = local_table.clone();
             let fanout_sem = fanout_sem.clone();
             let settings_clause = settings_clause.clone();
@@ -914,6 +920,9 @@ impl ClickHouseClient {
                     timings.merge_parallel(shard_timings);
                 }
                 Ok(Err((host, port, err))) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_endpoint(&host, port);
+                    }
                     let context = format!(
                         "Shard-local getTransactionsForAddress hot TCP query failed on {host}:{port}: {err}"
                     );
@@ -1047,7 +1056,7 @@ impl ClickHouseClient {
         let query_timeout = self.query_timeout;
         let mut join_set = JoinSet::new();
 
-        for shard in topology.shards.iter().cloned() {
+        for shard in topology.active_shards() {
             let local_table = local_table.clone();
             let settings_clause = settings_clause.clone();
             let fanout_sem = fanout_sem.clone();
@@ -1117,6 +1126,9 @@ impl ClickHouseClient {
                     timings.merge_parallel(shard_timings);
                 }
                 Ok(Err((host, port, err))) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_endpoint(&host, port);
+                    }
                     return Err(ProcessingError::database_msg(format!(
                         "Shard-local getTransactionsForAddress hot HTTP query failed on {host}:{port}: {err}"
                     )));
@@ -1154,7 +1166,7 @@ impl ClickHouseClient {
             )
             .into();
 
-        let mut per_shard: Vec<Vec<(u64, String)>> = vec![Vec::new(); topology.shards.len()];
+        let mut per_shard: Vec<Vec<(u64, String)>> = vec![Vec::new(); topology.shard_count()];
         for (slot, literal) in pairs {
             let shard_idx = topology.shard_index_for_hash(slot / SLOT_SHARD_DIVISOR);
             per_shard[shard_idx].push((*slot, literal.clone()));
@@ -1165,7 +1177,9 @@ impl ClickHouseClient {
             if shard_pairs.is_empty() {
                 continue;
             }
-            let shard = topology.shards[idx].clone();
+            let shard = topology
+                .shard_at(idx)
+                .expect("validated topology contains every routed shard");
             let local_table = local_table.clone();
             let version_filter = version_filter.clone();
             let fanout_sem = fanout_sem.clone();
@@ -1235,6 +1249,9 @@ impl ClickHouseClient {
                     timings.merge_parallel(shard_timings);
                 }
                 Ok(Err((host, port, err))) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_endpoint(&host, port);
+                    }
                     tracing::warn!(
                         "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
                         host,

@@ -413,6 +413,7 @@ impl ClickHouseClient {
             Ok(result) => result,
             Err(err) => {
                 if let Some(reason) = transient_shard_local_error_reason(&err) {
+                    topology.failover_from(&shard);
                     crate::metrics::clickhouse_transport_fallback(
                         "get_signature_slot_local",
                         "tcp",
@@ -553,7 +554,7 @@ impl ClickHouseClient {
         }
 
         let signature_bucket_modulus = self.signatures_bucket_modulus();
-        let mut per_shard: Vec<Vec<BucketedSignature>> = vec![Vec::new(); topology.shards.len()];
+        let mut per_shard: Vec<Vec<BucketedSignature>> = vec![Vec::new(); topology.shard_count()];
         for sig in signatures {
             let signature_bytes = bs58::decode(sig)
                 .into_vec()
@@ -603,7 +604,9 @@ impl ClickHouseClient {
             if bucketed.is_empty() {
                 continue;
             }
-            let shard = topology.shards[idx].clone();
+            let shard = topology
+                .shard_at(idx)
+                .expect("validated topology contains every routed shard");
             let local_table = local_table.clone();
             let fanout_sem = fanout_sem.clone();
             let settings_clause = settings_clause.clone();
@@ -752,7 +755,7 @@ impl ClickHouseClient {
         }
 
         let signature_bucket_modulus = self.signatures_bucket_modulus();
-        let mut per_shard: Vec<Vec<BucketedSignature>> = vec![Vec::new(); topology.shards.len()];
+        let mut per_shard: Vec<Vec<BucketedSignature>> = vec![Vec::new(); topology.shard_count()];
         for sig in signatures {
             let signature_bytes = bs58::decode(sig)
                 .into_vec()
@@ -791,7 +794,9 @@ impl ClickHouseClient {
             if bucketed.is_empty() {
                 continue;
             }
-            let shard = topology.shards[idx].clone();
+            let shard = topology
+                .shard_at(idx)
+                .expect("validated topology contains every routed shard");
             let local_table = local_table.clone();
             let fanout_sem = fanout_sem.clone();
             let settings_clause = settings_clause.clone();
@@ -888,6 +893,9 @@ impl ClickHouseClient {
                     timings.merge_parallel(shard_timings);
                 }
                 Ok(Err((host, port, err))) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_endpoint(&host, port);
+                    }
                     crate::metrics::clickhouse_transport_fallback(
                         "get_signature_statuses_local_http",
                         "http",

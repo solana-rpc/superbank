@@ -142,6 +142,7 @@ Routing and shard options:
 - `CLICKHOUSE_TRANSPORT=http|tcp` (default: `http`)
 - `CLICKHOUSE_SCOPE=distributed|shard-direct` (default: `distributed`)
 - `CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS` (default: `2000`)
+- `CLICKHOUSE_REPLICA_HEALTH_CHECK_INTERVAL_MS` (default: `10000`; shard-direct replica recovery checks)
 - `CLICKHOUSE_CLUSTER` (default: `{cluster}`)
 - `CLICKHOUSE_TOPOLOGY_CONFIG` (optional authoritative shard topology YAML; see
   `../crates/superbank-rpc/README.md`)

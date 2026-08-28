@@ -2320,7 +2320,7 @@ impl ClickHouseClient {
                 let mut timings = QueryTimings::zero();
                 let mut local_failed = false;
                 for range in ranges {
-                    let Some(shard) = topology.shards.get(range.shard_index) else {
+                    let Some(shard) = topology.shard_at(range.shard_index) else {
                         local_failed = true;
                         continue;
                     };
@@ -2402,7 +2402,7 @@ impl ClickHouseClient {
                     let mut timings = QueryTimings::zero();
                     let mut local_failed = false;
                     for range in ranges {
-                        let Some(shard) = topology.shards.get(range.shard_index) else {
+                        let Some(shard) = topology.shard_at(range.shard_index) else {
                             local_failed = true;
                             continue;
                         };
