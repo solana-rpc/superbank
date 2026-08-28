@@ -145,6 +145,12 @@ fn encode_request_header_labels(
     encode_optional_label(encoder, "x_account_id", x_account_id)
 }
 
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BlockIndexLookupLabels {
+    operation: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MethodLabels {
     method: String,
@@ -588,6 +594,18 @@ pub struct Metrics {
     disk_cache_poisoned_slots_total: Counter,
     #[cfg(feature = "disk-cache")]
     disk_cache_wipes_total: Counter,
+    #[cfg(feature = "disk-cache")]
+    block_index_active: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_floor_slot: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_head_slot: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_allocated_bytes: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_errors_total: Family<OperationLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    block_index_lookup_seconds: Family<BlockIndexLookupLabels, Histogram>,
 }
 
 impl Metrics {
@@ -689,6 +707,19 @@ impl Metrics {
         let disk_cache_poisoned_slots_total = Counter::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_wipes_total = Counter::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_active = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_floor_slot = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_head_slot = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_allocated_bytes = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_errors_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_lookup_seconds =
+            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
 
         let mut registry = Registry::with_prefix("superbank");
 
@@ -864,6 +895,40 @@ impl Metrics {
                 "head_cache_slot_entries",
                 "Current number of slot entries tracked by the gRPC head cache",
                 head_cache_slot_entries.clone(),
+            );
+        }
+
+        #[cfg(feature = "disk-cache")]
+        {
+            registry.register(
+                "block_index_active",
+                "Whether the full-history in-process block index worker is active",
+                block_index_active.clone(),
+            );
+            registry.register(
+                "block_index_floor_slot",
+                "Oldest slot hydrated into the full-history block index",
+                block_index_floor_slot.clone(),
+            );
+            registry.register(
+                "block_index_head_slot",
+                "Newest slot hydrated into the full-history block index",
+                block_index_head_slot.clone(),
+            );
+            registry.register(
+                "block_index_allocated_bytes",
+                "Bytes allocated by full-history block-index segments",
+                block_index_allocated_bytes.clone(),
+            );
+            registry.register(
+                "block_index_errors",
+                "Full-history block-index errors by operation",
+                block_index_errors_total.clone(),
+            );
+            registry.register(
+                "block_index_lookup_seconds",
+                "In-process full-history block-index lookup latency",
+                block_index_lookup_seconds.clone(),
             );
         }
 
@@ -1069,6 +1134,18 @@ impl Metrics {
             disk_cache_poisoned_slots_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_wipes_total,
+            #[cfg(feature = "disk-cache")]
+            block_index_active,
+            #[cfg(feature = "disk-cache")]
+            block_index_floor_slot,
+            #[cfg(feature = "disk-cache")]
+            block_index_head_slot,
+            #[cfg(feature = "disk-cache")]
+            block_index_allocated_bytes,
+            #[cfg(feature = "disk-cache")]
+            block_index_errors_total,
+            #[cfg(feature = "disk-cache")]
+            block_index_lookup_seconds,
         })
     }
 
@@ -1904,6 +1981,50 @@ pub(crate) fn disk_cache_poisoned_slot() {
 pub(crate) fn disk_cache_wipe() {
     if let Some(metrics) = metrics() {
         metrics.disk_cache_wipes_total.inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_enabled(active: bool) {
+    if let Some(metrics) = metrics() {
+        metrics.block_index_active.set(i64::from(active));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_state(floor: u64, head: u64, bytes: u64) {
+    if let Some(metrics) = metrics() {
+        metrics.block_index_floor_slot.set(clamp_i64(floor));
+        metrics.block_index_head_slot.set(clamp_i64(head));
+        metrics.block_index_allocated_bytes.set(clamp_i64(bytes));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_error(operation: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .block_index_errors_total
+            .get_or_create(&OperationLabels {
+                operation: operation.to_string(),
+                x_endpoint: None,
+                x_rpc_node: None,
+                x_subscription_id: None,
+                x_account_id: None,
+            })
+            .inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_lookup(operation: &'static str, elapsed_seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .block_index_lookup_seconds
+            .get_or_create(&BlockIndexLookupLabels {
+                operation: operation.to_string(),
+            })
+            .observe(elapsed_seconds);
     }
 }
 

@@ -522,6 +522,23 @@ pub struct RpcConfig {
     pub(crate) disk_cache_memory_max_bytes: Option<u64>,
 
     #[cfg(feature = "disk-cache")]
+    /// Enable the durable full-history block-time index and in-process read cache.
+    #[arg(long, env = "DISK_CACHE_BLOCK_INDEX_ENABLED", default_value_t = false)]
+    pub(crate) disk_cache_block_index_enabled: bool,
+
+    #[cfg(feature = "disk-cache")]
+    #[arg(long, env = "DISK_CACHE_BLOCK_INDEX_SLOTS_PER_QUERY", default_value_t = 250_000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) disk_cache_block_index_slots_per_query: u64,
+
+    #[cfg(feature = "disk-cache")]
+    #[arg(long, env = "DISK_CACHE_BLOCK_INDEX_MAX_SLOTS_PER_SEC", default_value_t = 25_000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) disk_cache_block_index_max_slots_per_sec: u64,
+
+    #[cfg(feature = "disk-cache")]
+    #[arg(long, env = "DISK_CACHE_BLOCK_INDEX_QUERY_TIMEOUT_MS", default_value_t = 300_000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) disk_cache_block_index_query_timeout_ms: u64,
+
+    #[cfg(feature = "disk-cache")]
     /// Enable the source-to-local ClickHouse forward/repair task (disable for debugging only).
     #[arg(long, env = "DISK_CACHE_BACKFILL_ENABLED", default_value_t = true)]
     pub(crate) disk_cache_backfill_enabled: bool,
@@ -1005,6 +1022,10 @@ mod disk_cache_config_tests {
         assert!(cfg.disk_cache_memory_tables.is_empty());
         assert_eq!(cfg.disk_cache_memory_retain_slots, None);
         assert_eq!(cfg.disk_cache_memory_max_bytes, None);
+        assert!(!cfg.disk_cache_block_index_enabled);
+        assert_eq!(cfg.disk_cache_block_index_slots_per_query, 250_000);
+        assert_eq!(cfg.disk_cache_block_index_max_slots_per_sec, 25_000);
+        assert_eq!(cfg.disk_cache_block_index_query_timeout_ms, 300_000);
         assert!(cfg.disk_cache_backfill_enabled);
         assert_eq!(cfg.disk_cache_backfill_slots_per_query, 8);
         assert_eq!(cfg.disk_cache_backfill_concurrency, 4);
@@ -1029,6 +1050,13 @@ mod disk_cache_config_tests {
             "10000",
             "--disk-cache-max-bytes",
             "2199023255552",
+            "--disk-cache-block-index-enabled",
+            "--disk-cache-block-index-slots-per-query",
+            "100000",
+            "--disk-cache-block-index-max-slots-per-sec",
+            "10000",
+            "--disk-cache-block-index-query-timeout-ms",
+            "120000",
             "--disk-cache-backfill-max-slots-per-sec",
             "200",
             "--disk-cache-backfill-concurrency",
@@ -1041,6 +1069,10 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_retain_slots, Some(432_000));
         assert_eq!(cfg.disk_cache_partition_slots, Some(10_000));
         assert_eq!(cfg.disk_cache_max_bytes, 2_199_023_255_552);
+        assert!(cfg.disk_cache_block_index_enabled);
+        assert_eq!(cfg.disk_cache_block_index_slots_per_query, 100_000);
+        assert_eq!(cfg.disk_cache_block_index_max_slots_per_sec, 10_000);
+        assert_eq!(cfg.disk_cache_block_index_query_timeout_ms, 120_000);
         assert_eq!(cfg.disk_cache_backfill_max_slots_per_sec, 200);
         assert_eq!(cfg.disk_cache_backfill_concurrency, 12);
     }
@@ -1071,6 +1103,22 @@ mod disk_cache_config_tests {
             RpcConfig::try_parse_from(
                 ["superbank-rpc", "--disk-cache-backfill-concurrency", "65",]
             )
+            .is_err()
+        );
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--disk-cache-block-index-slots-per-query",
+                "0",
+            ])
+            .is_err()
+        );
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--disk-cache-block-index-max-slots-per-sec",
+                "0",
+            ])
             .is_err()
         );
     }

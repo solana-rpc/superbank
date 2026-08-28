@@ -230,6 +230,27 @@ async fn get_block_slots_response_for_range(
     #[cfg(not(feature = "grpc-head-cache"))]
     let _ = commitment;
 
+    // Full-history memory tier. It is hydrated asynchronously and only claims
+    // ranges whose durable local rows have been loaded completely.
+    #[cfg(feature = "disk-cache")]
+    let (index_slots, index_span): (Vec<u64>, Option<(u64, u64)>) = state
+        .disk_cache()
+        .and_then(|disk| disk.block_index())
+        .and_then(|index| {
+            let (floor, head) = index.tip_span()?;
+            if end_slot < floor || start_slot > head {
+                return None;
+            }
+            let start = start_slot.max(floor);
+            let end = end_slot.min(head);
+            index
+                .slots_in_range(start, end)
+                .map(|slots| (slots, Some((floor, head))))
+        })
+        .unwrap_or_default();
+    #[cfg(not(feature = "disk-cache"))]
+    let (index_slots, index_span): (Vec<u64>, Option<(u64, u64)>) = (Vec::new(), None);
+
     // Disk tier: the contiguous covered span answers its part of the range, so
     // ClickHouse is only consulted below the coverage floor and above the
     // covered head (the latter matters when disk writes lag the chain tip).
@@ -255,9 +276,25 @@ async fn get_block_slots_response_for_range(
     #[cfg(not(feature = "disk-cache"))]
     let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) = (Vec::new(), None);
 
-    let disk_contributed = disk_span.is_some();
+    let (cached_slots, cached_span) = match (index_span, disk_span) {
+        (Some(index), Some(disk))
+            if index.0 <= disk.1.saturating_add(1) && disk.0 <= index.1.saturating_add(1) =>
+        {
+            (
+                merge_sorted_block_slots(index_slots, disk_slots),
+                Some((index.0.min(disk.0), index.1.max(disk.1))),
+            )
+        }
+        (Some(index), Some(disk)) if index.1 >= disk.1 => (index_slots, Some(index)),
+        (Some(_), Some(disk)) => (disk_slots, Some(disk)),
+        (Some(index), None) => (index_slots, Some(index)),
+        (None, Some(disk)) => (disk_slots, Some(disk)),
+        (None, None) => (Vec::new(), None),
+    };
+
+    let disk_contributed = cached_span.is_some();
     let mut clickhouse_ranges: Vec<(u64, u64)> = Vec::new();
-    match disk_span {
+    match cached_span {
         Some((floor, head)) => {
             if start_slot < floor {
                 clickhouse_ranges.push((start_slot, end_slot.min(floor.saturating_sub(1))));
@@ -332,7 +369,7 @@ async fn get_block_slots_response_for_range(
     }
 
     let slots = merge_sorted_block_slots(
-        merge_sorted_block_slots(clickhouse_slots, disk_slots),
+        merge_sorted_block_slots(clickhouse_slots, cached_slots),
         head_slots,
     );
     metrics::blocks_slots_returned(route.method(), slots.len());
@@ -1705,6 +1742,32 @@ pub(crate) async fn handle_get_block_time(
             route.source_head_cache();
             route.success();
             return Ok(json_rpc_success_response(id, json!(block_time)));
+        }
+    }
+
+    #[cfg(feature = "disk-cache")]
+    if let Some(index) = state.disk_cache().and_then(|disk| disk.block_index()) {
+        route.disk_cache_read();
+        match index.block_time(slot) {
+            crate::disk_cache::BlockTimeLookup::Found(block_time) => {
+                route.source_disk_cache();
+                route.success();
+                return Ok(match block_time {
+                    Some(value) => json_rpc_success_response(id, json!(value)),
+                    None => json_rpc_null_response(id),
+                });
+            }
+            crate::disk_cache::BlockTimeLookup::Skipped => {
+                route.source_disk_cache();
+                route.not_found();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32009,
+                    format!("Slot {slot} was skipped, or missing in long-term storage"),
+                    None,
+                ));
+            }
+            crate::disk_cache::BlockTimeLookup::NotCovered => {}
         }
     }
 

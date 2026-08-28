@@ -28,11 +28,13 @@ use crate::clickhouse::{
 use crate::config::ClickHouseStartupTableCheck;
 use crate::solana_sdk;
 
+pub(crate) mod block_index;
 pub(crate) mod coverage;
 pub(crate) mod filler;
 pub(crate) mod index;
 pub(crate) mod schema;
 
+pub(crate) use block_index::{BlockIndexConfig, BlockTimeLookup};
 use coverage::CoverageMap;
 pub(crate) use index::DiskSigStatus;
 use schema::{CacheSchemaConfig, CacheTableKind, SourceSchemaSnapshot};
@@ -70,6 +72,7 @@ pub(crate) struct DiskCacheConfig {
     pub(crate) memory_blocks_metadata: bool,
     pub(crate) memory_retain_slots: Option<u64>,
     pub(crate) memory_max_bytes: Option<u64>,
+    pub(crate) block_index: Option<BlockIndexConfig>,
 }
 
 impl DiskCacheConfig {
@@ -174,6 +177,7 @@ pub(crate) struct DiskCacheInner {
     pub(crate) http: reqwest::Client,
     pub(crate) schema: RwLock<Arc<SourceSchemaSnapshot>>,
     coverage: RwLock<CoverageMap>,
+    block_index: Option<Arc<block_index::BlockIndex>>,
     min_retained: AtomicU64,
     ready: AtomicBool,
 }
@@ -242,6 +246,12 @@ impl DiskCache {
             .create_tables()
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+        let block_index = match cfg.block_index.clone() {
+            Some(config) => Some(Arc::new(
+                block_index::BlockIndex::open(config, &admin).await?,
+            )),
+            None => None,
+        };
 
         let inner = Arc::new(DiskCacheInner {
             cfg,
@@ -251,6 +261,7 @@ impl DiskCache {
             http: reqwest::Client::new(),
             schema: RwLock::new(Arc::new(snapshot)),
             coverage: RwLock::new(CoverageMap::new()),
+            block_index,
             min_retained: AtomicU64::new(0),
             ready: AtomicBool::new(false),
         });
@@ -332,6 +343,10 @@ impl DiskCache {
             .read()
             .expect("coverage lock")
             .holes_in(start, end)
+    }
+
+    pub(crate) fn block_index(&self) -> Option<&Arc<block_index::BlockIndex>> {
+        self.inner.block_index.as_ref()
     }
 
     pub(crate) fn source_schema(&self) -> Arc<SourceSchemaSnapshot> {

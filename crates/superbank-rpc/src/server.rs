@@ -33,7 +33,9 @@ use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHea
 use crate::grpc::service::{self as superbank_grpc, SuperbankGrpcConfig};
 
 #[cfg(feature = "disk-cache")]
-use crate::disk_cache::{DiskCache, DiskCacheConfig, automatic_partition_slots, filler};
+use crate::disk_cache::{
+    BlockIndexConfig, DiskCache, DiskCacheConfig, automatic_partition_slots, filler,
+};
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::dragonsmouth::DragonsmouthHeadCacheConfig;
 #[cfg(feature = "grpc-head-cache")]
@@ -533,6 +535,12 @@ fn validate_disk_cache_args(args: &RpcConfig) -> Result<(), RpcError> {
                 .to_string(),
         ));
     }
+    if args.disk_cache_block_index_enabled && !memory_tables.is_empty() {
+        return Err(RpcError::Config(
+            "DISK_CACHE_BLOCK_INDEX_ENABLED cannot be combined with DISK_CACHE_MEMORY_TABLES"
+                .to_string(),
+        ));
+    }
     if let (Some(memory), Some(retain)) = (
         args.disk_cache_memory_retain_slots,
         args.disk_cache_retain_slots,
@@ -574,6 +582,14 @@ async fn start_disk_cache(
         memory_blocks_metadata,
         memory_retain_slots: args.disk_cache_memory_retain_slots,
         memory_max_bytes: args.disk_cache_memory_max_bytes,
+        block_index: args
+            .disk_cache_block_index_enabled
+            .then(|| BlockIndexConfig {
+                database: format!("{}_block_index", args.disk_cache_clickhouse_database.trim()),
+                slots_per_query: args.disk_cache_block_index_slots_per_query,
+                max_slots_per_sec: args.disk_cache_block_index_max_slots_per_sec,
+                query_timeout: Duration::from_millis(args.disk_cache_block_index_query_timeout_ms),
+            }),
     };
     info!(
         url = disk_cfg.url,
@@ -666,11 +682,17 @@ async fn run_disk_cache_supervisor(
     }
 
     let cache = cache.expect("cache initialized");
+    let block_index_task = cache
+        .block_index()
+        .map(|index| tokio::spawn(index.clone().run(source.clone(), shutdown.resubscribe())));
     if let Some(filler_cfg) = filler_cfg {
         filler::run(cache, source, filler_cfg, shutdown).await;
     } else {
         let _ = shutdown.recv().await;
         cache.set_ready(false);
+    }
+    if let Some(task) = block_index_task {
+        let _ = task.await;
     }
 }
 

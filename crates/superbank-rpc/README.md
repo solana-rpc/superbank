@@ -232,6 +232,8 @@ The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (als
 
 When compiled with `--features disk-cache` and enabled at runtime, superbank-rpc forwards recent **finalized** slots from the configured source ClickHouse cluster into a separate ClickHouse instance on localhost. The feature is independent from `grpc-head-cache`. The local instance is a near cache, not a second source of truth. The read tiering is:
 
+`DISK_CACHE_BLOCK_INDEX_ENABLED=true` adds a full-history cache for `getBlockTime`, `getBlocks`, and `getBlocksWithLimit`. A narrow `(slot, block_time)` copy is persisted in the separately owned local database `<cache_database>_block_index`, while one-million-slot segments are hydrated into RPC process memory. Startup remains asynchronous: uncovered ranges continue through the recent cache and source fallbacks. The historical worker reads finalized source metadata only, fills newest ranges first, and then proceeds toward slot zero. This feature cannot be combined with the ClickHouse Memory-engine mode.
+
 ```
 head cache (optional, unfinalized tip) -> local ClickHouse cache (finalized, recent slots) -> source ClickHouse (full history)
 ```
@@ -278,6 +280,10 @@ Configuration:
 | `--disk-cache-memory-tables` | `DISK_CACHE_MEMORY_TABLES` | empty | Comma-separated Memory-engine allowlist. Only `blocks_metadata` is accepted. |
 | `--disk-cache-memory-retain-slots` | `DISK_CACHE_MEMORY_RETAIN_SLOTS` | — | Required row cap when `blocks_metadata` uses Memory; must not exceed the main retention window. |
 | `--disk-cache-memory-max-bytes` | `DISK_CACHE_MEMORY_MAX_BYTES` | — | Required byte cap when `blocks_metadata` uses Memory. |
+| `--disk-cache-block-index-enabled` | `DISK_CACHE_BLOCK_INDEX_ENABLED` | `false` | Enables the durable full-history in-process index for block slots and times. |
+| `--disk-cache-block-index-slots-per-query` | `DISK_CACHE_BLOCK_INDEX_SLOTS_PER_QUERY` | `250000` | Slots copied per historical metadata query. |
+| `--disk-cache-block-index-max-slots-per-sec` | `DISK_CACHE_BLOCK_INDEX_MAX_SLOTS_PER_SEC` | `25000` | Read-only source scan rate limit for the historical index. |
+| `--disk-cache-block-index-query-timeout-ms` | `DISK_CACHE_BLOCK_INDEX_QUERY_TIMEOUT_MS` | `300000` | Timeout for one historical metadata range query. |
 | `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | Enables the unified source-to-local forward and repair task. |
 | `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots per ClickHouse range query. Larger ranges reduce fixed query overhead but need a longer timeout. |
 | `--disk-cache-backfill-concurrency` | `DISK_CACHE_BACKFILL_CONCURRENCY` | `4` | Independent validated ranges forwarded concurrently. Accepted range: 1–64. |
@@ -290,7 +296,7 @@ The forwarder admits all concurrent ranges through one slots-per-second token bu
 
 The removed RocksDB settings `DISK_CACHE_PATH`, `DISK_CACHE_BLOCK_CACHE_BYTES`, `DISK_CACHE_WRITE_QUEUE_SLOTS`, and `DISK_CACHE_READ_CONCURRENCY` produce a configuration error instead of being ignored.
 
-Observability: `superbank_disk_cache_*` metrics cover readiness, local ClickHouse bytes, coverage span, read outcomes, forwarding, errors, rebuilds, and partition eviction. Route metrics retain the `disk_cache_read` label. The `X-Superbank-Sources` response header reports `disk-cache` combinations.
+Observability: `superbank_disk_cache_*` metrics cover readiness, local ClickHouse bytes, coverage span, read outcomes, forwarding, errors, rebuilds, and partition eviction. `superbank_block_index_*` metrics report the full-history worker, hydrated floor/head, allocated memory, and errors. Route metrics retain the `disk_cache_read` label. The `X-Superbank-Sources` response header reports `disk-cache` combinations.
 
 Parity validation against a reference target (e.g. the same build with the disk cache disabled):
 
