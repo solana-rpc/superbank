@@ -647,6 +647,14 @@ impl ClickHouseClient {
         let client =
             build_clickhouse_http_client(url, database, username, password, http_connect_timeout);
 
+        // Distributed scope is coordinator-only. Ignore any injected shard routing so all
+        // startup checks, cleanup queries, and reads stay on the configured HTTP endpoint.
+        let shard_routing = if routing_policy.scope == RoutingScope::ShardDirect {
+            shard_routing
+        } else {
+            None
+        };
+
         let transaction_table = std::env::var("CLICKHOUSE_TRANSACTION_TABLE")
             .or_else(|_| std::env::var("CLICKHOUSE_SIGNATURE_TABLE"))
             .unwrap_or_else(|_| "default.transactions".to_string());
@@ -659,27 +667,37 @@ impl ClickHouseClient {
         let token_owner_activity_table = std::env::var("CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE")
             .unwrap_or_else(|_| "default.token_owner_activity".to_string());
 
-        let signatures_local_table = shard_routing
-            .as_ref()
-            .and_then(|config| config.signatures_local_table.clone())
-            .or_else(|| derive_local_table_name(&signature_statuses_table, None));
-        let token_owner_activity_local_table = shard_routing
-            .as_ref()
-            .and_then(|config| config.token_owner_activity_local_table.clone())
-            .or_else(|| derive_local_table_name(&token_owner_activity_table, None));
-        let transactions_local_table = shard_routing
-            .as_ref()
-            .and_then(|config| config.transactions_local_table.clone())
-            .or_else(|| derive_local_table_name(&transaction_table, None));
-        let blocks_metadata_local_table = shard_routing
-            .as_ref()
-            .and_then(|config| config.blocks_metadata_local_table.clone())
-            .or_else(|| derive_local_table_name(&blocks_metadata_table, None));
+        let signatures_local_table = shard_routing.as_ref().and_then(|config| {
+            config
+                .signatures_local_table
+                .clone()
+                .or_else(|| derive_local_table_name(&signature_statuses_table, None))
+        });
+        let token_owner_activity_local_table = shard_routing.as_ref().and_then(|config| {
+            config
+                .token_owner_activity_local_table
+                .clone()
+                .or_else(|| derive_local_table_name(&token_owner_activity_table, None))
+        });
+        let transactions_local_table = shard_routing.as_ref().and_then(|config| {
+            config
+                .transactions_local_table
+                .clone()
+                .or_else(|| derive_local_table_name(&transaction_table, None))
+        });
+        let blocks_metadata_local_table = shard_routing.as_ref().and_then(|config| {
+            config
+                .blocks_metadata_local_table
+                .clone()
+                .or_else(|| derive_local_table_name(&blocks_metadata_table, None))
+        });
 
-        let gsfa_local_table = shard_routing
-            .as_ref()
-            .and_then(|config| config.gsfa_local_table.clone())
-            .or_else(|| derive_local_table_name(&gsfa_table, None));
+        let gsfa_local_table = shard_routing.as_ref().and_then(|config| {
+            config
+                .gsfa_local_table
+                .clone()
+                .or_else(|| derive_local_table_name(&gsfa_table, None))
+        });
 
         let shard_routing = shard_routing.map(|mut config| {
             if config.gsfa_local_table.is_none() {
@@ -1139,7 +1157,9 @@ impl ClickHouseClient {
             None
         };
 
-        if let Some(topology) = &self.shard_topology {
+        if self.scope_shard_direct()
+            && let Some(topology) = &self.shard_topology
+        {
             if let Some(router) = &self.gsfa_router {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
@@ -1157,9 +1177,7 @@ impl ClickHouseClient {
                 )?;
             }
 
-            if self.scope_shard_direct()
-                && let Some(local_table) = &self.signatures_local_table
-            {
+            if let Some(local_table) = &self.signatures_local_table {
                 let local_modulus = detect_bucket_modulus_on_shards(
                     topology,
                     local_table,
@@ -1196,7 +1214,9 @@ impl ClickHouseClient {
             }
         }
 
-        if let (Some(topology), Some(distributed_modulus)) = (&self.shard_topology, hot_modulus) {
+        if self.scope_shard_direct()
+            && let (Some(topology), Some(distributed_modulus)) = (&self.shard_topology, hot_modulus)
+        {
             let local_modulus = detect_bucket_modulus_on_shards(
                 topology,
                 &self.gsfa_hot_local_table,
@@ -1545,7 +1565,9 @@ impl ClickHouseClient {
 
         let hot_routing_configured = self.gsfa_hot_routing_configured();
 
-        if let Some(config) = self.shard_routing.clone() {
+        if self.scope_shard_direct()
+            && let Some(config) = self.shard_routing.clone()
+        {
             match self.build_shard_topology(&config).await {
                 Ok(topology) => {
                     if self.transport_tcp() {
@@ -1580,8 +1602,7 @@ impl ClickHouseClient {
                         tracing::warn!("GSFA shard routing disabled; local table not configured");
                     }
 
-                    if self.scope_shard_direct()
-                        && let Some(local_table) = config.signatures_local_table.clone()
+                    if let Some(local_table) = config.signatures_local_table.clone()
                         && let Err(e) = validate_table_schema_on_shards(
                             topology.as_ref(),
                             &local_table,
@@ -1630,15 +1651,10 @@ impl ClickHouseClient {
                     }
                 }
                 Err(e) => {
-                    if self.scope_shard_direct()
-                        || hot_routing_configured
-                        || config.topology_config_path.is_some()
-                    {
-                        return Err(ProcessingError::database_msg(format!(
-                            "ClickHouse shard routing is required but topology initialization failed: {}",
-                            e
-                        )));
-                    }
+                    return Err(ProcessingError::database_msg(format!(
+                        "ClickHouse shard routing is required but topology initialization failed: {}",
+                        e
+                    )));
                 }
             }
         }
@@ -1646,10 +1662,15 @@ impl ClickHouseClient {
         self.discover_bucket_moduli().await?;
         self.initialize_gsfa_hot_addresses().await;
 
-        if !self.gsfa_hot_pubkeys.is_empty() {
+        if !self.gsfa_hot_pubkeys.is_empty() && self.scope_shard_direct() {
             tracing::info!(
                 "GSFA hot addresses use shard-local fanout over '{}' while '{}' remains the distributed hot table",
                 self.gsfa_hot_local_table,
+                self.gsfa_hot_table,
+            );
+        } else if !self.gsfa_hot_pubkeys.is_empty() {
+            tracing::info!(
+                "GSFA hot addresses use distributed table '{}' through the configured ClickHouse endpoint",
                 self.gsfa_hot_table,
             );
         }
@@ -2113,6 +2134,100 @@ mod tests {
                 "default.gsfa_hot_local".to_string(),
             ),
         )
+    }
+
+    #[test]
+    fn distributed_scope_discards_injected_shard_routing() {
+        let client = ClickHouseClient::new(
+            "http://localhost:8123",
+            "default",
+            "default",
+            "",
+            ClickHouseClientOptions::new(
+                RoutingPolicy {
+                    transport: RoutingTransport::Http,
+                    scope: RoutingScope::Distributed,
+                },
+                Some(ShardRoutingConfig {
+                    cluster: "production".to_string(),
+                    topology_config_path: Some("/unreachable/topology.yaml".to_string()),
+                    shard_http_port: Some(8124),
+                    gsfa_local_table: Some("default.gsfa_local".to_string()),
+                    signatures_local_table: Some("default.signatures_local".to_string()),
+                    token_owner_activity_local_table: Some(
+                        "default.token_owner_activity_local".to_string(),
+                    ),
+                    transactions_local_table: Some("default.transactions_local".to_string()),
+                    blocks_metadata_local_table: Some("default.blocks_metadata_local".to_string()),
+                }),
+                Vec::new(),
+                "default.gsfa_hot".to_string(),
+                "default.gsfa_hot_local".to_string(),
+            ),
+        );
+
+        let mut cleanup = client.http_query_cleanup("test", "query-id".to_string());
+        assert!(cleanup.cluster.is_none());
+        cleanup.disarm();
+
+        assert!(client.shard_routing.is_none());
+        assert!(client.shard_topology.is_none());
+        assert!(client.gsfa_router.is_none());
+        assert!(client.signatures_local_table.is_none());
+        assert!(client.token_owner_activity_local_table.is_none());
+        assert!(client.transactions_local_table.is_none());
+        assert!(client.blocks_metadata_local_table.is_none());
+    }
+
+    #[test]
+    fn shard_direct_scope_keeps_injected_shard_routing() {
+        let client = ClickHouseClient::new(
+            "http://localhost:8123",
+            "default",
+            "default",
+            "",
+            ClickHouseClientOptions::new(
+                RoutingPolicy {
+                    transport: RoutingTransport::Http,
+                    scope: RoutingScope::ShardDirect,
+                },
+                Some(ShardRoutingConfig {
+                    cluster: "production".to_string(),
+                    topology_config_path: None,
+                    shard_http_port: None,
+                    gsfa_local_table: None,
+                    signatures_local_table: None,
+                    token_owner_activity_local_table: None,
+                    transactions_local_table: None,
+                    blocks_metadata_local_table: None,
+                }),
+                Vec::new(),
+                "default.gsfa_hot".to_string(),
+                "default.gsfa_hot_local".to_string(),
+            ),
+        );
+
+        let mut cleanup = client.http_query_cleanup("test", "query-id".to_string());
+        assert_eq!(cleanup.cluster.as_deref(), Some("production"));
+        cleanup.disarm();
+
+        assert!(client.shard_routing.is_some());
+        assert_eq!(
+            client.signatures_local_table.as_deref(),
+            Some("default.signatures_local")
+        );
+        assert_eq!(
+            client.token_owner_activity_local_table.as_deref(),
+            Some("default.token_owner_activity_local")
+        );
+        assert_eq!(
+            client.transactions_local_table.as_deref(),
+            Some("default.transactions_local")
+        );
+        assert_eq!(
+            client.blocks_metadata_local_table.as_deref(),
+            Some("default.blocks_metadata_local")
+        );
     }
 
     fn test_client_with_query_cache() -> ClickHouseClient {
