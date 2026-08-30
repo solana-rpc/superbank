@@ -121,6 +121,7 @@ pub(crate) struct BlockMetadataBaseRow {
     pub(crate) rewards_num_partitions: Option<u64>,
 }
 
+#[cfg(feature = "disk-cache")]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, clickhouse::Row)]
 pub(crate) struct BlockTimeRangeRow {
     pub(crate) slot: u64,

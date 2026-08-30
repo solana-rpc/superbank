@@ -1821,7 +1821,6 @@ pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {
     }
 }
 
-#[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
 fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }

@@ -8,7 +8,9 @@ use crate::solana_sdk::pubkey::Pubkey;
 use axum::{body::Bytes, http::StatusCode, response::Response};
 use serde_json::{Value, json};
 use solana_clock::{DEFAULT_SLOTS_PER_EPOCH, MAX_PROCESSING_AGE};
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
+#[cfg(feature = "grpc-head-cache")]
+use solana_commitment_config::CommitmentLevel;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;

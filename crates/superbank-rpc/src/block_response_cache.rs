@@ -109,7 +109,7 @@ impl BlockResponseCache {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "grpc-head-cache"))]
     pub(crate) async fn run_pending_tasks(&self) {
         if let Some(cache) = self.inner.as_ref() {
             cache.run_pending_tasks().await;
