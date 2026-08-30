@@ -121,6 +121,12 @@ pub(crate) struct BlockMetadataBaseRow {
     pub(crate) rewards_num_partitions: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, clickhouse::Row)]
+pub(crate) struct BlockTimeRangeRow {
+    pub(crate) slot: u64,
+    pub(crate) block_time: Option<i64>,
+}
+
 #[derive(Deserialize, clickhouse::Row)]
 pub(crate) struct BlockSignatureRow {
     pub(crate) signature: Array<u8, 64>,

@@ -11,7 +11,7 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::clickhouse::{BlockMetadataRecord, ClickHouseClient};
+use crate::clickhouse::{BlockTimeRangeRow, ClickHouseClient};
 
 use super::DiskCacheError;
 use super::coverage::CoverageMap;
@@ -39,7 +39,7 @@ pub(crate) enum BlockTimeLookup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
-struct BlockTimeRow {
+struct PersistedBlockTimeRow {
     slot: u64,
     block_time: Option<i64>,
     version: u64,
@@ -56,12 +56,6 @@ struct CoverageRow {
 struct HydrateCoverageRow {
     range_start: u64,
     range_end: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Row)]
-struct HydrateRow {
-    slot: u64,
-    block_time: Option<i64>,
 }
 
 struct SegmentData {
@@ -245,7 +239,7 @@ impl BlockIndex {
             .clone()
     }
 
-    fn publish_memory(&self, start: u64, end: u64, rows: &[BlockMetadataRecord]) {
+    fn publish_memory(&self, start: u64, end: u64, rows: &[BlockTimeRangeRow]) {
         if end < start {
             return;
         }
@@ -309,14 +303,10 @@ impl BlockIndex {
                      FROM {database}.{DATA_TABLE} WHERE slot BETWEEN {} AND {} GROUP BY slot ORDER BY slot",
                     range.range_start, range.range_end
                 ))
-                .fetch_all::<HydrateRow>()
+                .fetch_all::<BlockTimeRangeRow>()
                 .await
                 .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
-            let metadata = rows
-                .into_iter()
-                .map(|row| minimal_metadata(row.slot, row.block_time))
-                .collect::<Vec<_>>();
-            self.publish_memory(range.range_start, range.range_end, &metadata);
+            self.publish_memory(range.range_start, range.range_end, &rows);
         }
         Ok(())
     }
@@ -325,18 +315,18 @@ impl BlockIndex {
         &self,
         start: u64,
         end: u64,
-        rows: &[BlockMetadataRecord],
+        rows: &[BlockTimeRangeRow],
     ) -> Result<(), DiskCacheError> {
         let version = now_version();
         let mut insert = self
             .local
             .client
-            .insert::<BlockTimeRow>(DATA_TABLE)
+            .insert::<PersistedBlockTimeRow>(DATA_TABLE)
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         for row in rows {
             insert
-                .write(&BlockTimeRow {
+                .write(&PersistedBlockTimeRow {
                     slot: row.slot,
                     block_time: row.block_time,
                     version,
@@ -420,7 +410,7 @@ impl BlockIndex {
             };
             let started = Instant::now();
             match source
-                .get_block_metadata_by_slot_range(start, end, self.cfg.query_timeout)
+                .get_block_times_by_slot_range(start, end, self.cfg.query_timeout)
                 .await
             {
                 Ok((rows, _)) => {
@@ -444,27 +434,6 @@ impl BlockIndex {
             }
         }
         crate::metrics::block_index_enabled(false);
-    }
-}
-
-fn minimal_metadata(slot: u64, block_time: Option<i64>) -> BlockMetadataRecord {
-    BlockMetadataRecord {
-        slot,
-        parent_slot: 0,
-        blockhash: [0; 32],
-        parent_blockhash: [0; 32],
-        block_time,
-        block_height: None,
-        executed_transaction_count: 0,
-        entry_count: 0,
-        rewards_present: false,
-        rewards_pubkey: Vec::new(),
-        rewards_lamports: Vec::new(),
-        rewards_post_balance: Vec::new(),
-        rewards_type: Vec::new(),
-        rewards_commission: Vec::new(),
-        rewards_commission_bps: Vec::new(),
-        rewards_num_partitions: None,
     }
 }
 
@@ -502,6 +471,34 @@ async fn wait_or_shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clickhouse::{
+        ClickHouseClientOptions, RoutingPolicy, RoutingScope, RoutingTransport,
+    };
+
+    fn test_index() -> BlockIndex {
+        let options = ClickHouseClientOptions::new(
+            RoutingPolicy {
+                transport: RoutingTransport::Http,
+                scope: RoutingScope::Distributed,
+            },
+            None,
+            Vec::new(),
+            "default.gsfa_hot".to_string(),
+            "default.gsfa_hot_local".to_string(),
+        );
+        let local = ClickHouseClient::new("http://127.0.0.1:1", "test", "", "", options);
+        BlockIndex {
+            cfg: BlockIndexConfig {
+                database: "test_block_index".to_string(),
+                slots_per_query: 50_000,
+                max_slots_per_sec: 25_000,
+                query_timeout: Duration::from_secs(300),
+            },
+            local,
+            segments: RwLock::new(HashMap::new()),
+            coverage: RwLock::new(CoverageMap::new()),
+        }
+    }
 
     #[test]
     fn sentinels_do_not_overlap_valid_block_times() {
@@ -519,11 +516,30 @@ mod tests {
     }
 
     #[test]
-    fn hydration_metadata_preserves_nullable_time() {
-        assert_eq!(
-            minimal_metadata(42, Some(1_700_000_000)).block_time,
-            Some(1_700_000_000)
+    fn narrow_rows_preserve_times_produced_slots_and_skips() {
+        let index = test_index();
+        index.publish_memory(
+            42,
+            44,
+            &[
+                BlockTimeRangeRow {
+                    slot: 42,
+                    block_time: Some(1_700_000_000),
+                },
+                BlockTimeRangeRow {
+                    slot: 44,
+                    block_time: None,
+                },
+            ],
         );
-        assert_eq!(minimal_metadata(43, None).block_time, None);
+
+        assert_eq!(
+            index.block_time(42),
+            BlockTimeLookup::Found(Some(1_700_000_000))
+        );
+        assert_eq!(index.block_time(43), BlockTimeLookup::Skipped);
+        assert_eq!(index.block_time(44), BlockTimeLookup::Found(None));
+        assert_eq!(index.block_time(45), BlockTimeLookup::NotCovered);
+        assert_eq!(index.slots_in_range(42, 44), Some(vec![42, 44]));
     }
 }
