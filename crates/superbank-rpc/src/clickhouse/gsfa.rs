@@ -146,11 +146,13 @@ impl ClickHouseClient {
     }
 
     pub(crate) fn should_use_gsfa_hot_fanout(&self, pubkey: &Pubkey) -> bool {
-        self.is_gsfa_hot_address(pubkey) && self.shard_topology.is_some()
+        self.scope_shard_direct()
+            && self.is_gsfa_hot_address(pubkey)
+            && self.shard_topology.is_some()
     }
 
     pub(crate) fn should_use_gsfa_shard_routing(&self, pubkey: &Pubkey) -> bool {
-        !self.is_gsfa_hot_address(pubkey)
+        self.scope_shard_direct() && !self.is_gsfa_hot_address(pubkey)
     }
 
     pub(crate) fn gsfa_table_for_address<'a>(&'a self, pubkey: &Pubkey) -> &'a str {
@@ -1048,14 +1050,15 @@ impl GsfaShardRouter {
 mod tests {
     use super::*;
     use crate::clickhouse::{
-        ClickHouseClientOptions, RoutingPolicy, RoutingScope, RoutingTransport, SignatureSlot,
+        ClickHouseClientOptions, QueryCacheConfig, RoutingPolicy, RoutingScope, RoutingTransport,
+        SignatureSlot,
     };
 
     fn normalize_sql(sql: &str) -> String {
         sql.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    fn test_client() -> ClickHouseClient {
+    fn test_client_with_scope(scope: RoutingScope) -> ClickHouseClient {
         ClickHouseClient::new(
             "http://localhost:8123",
             "default",
@@ -1064,7 +1067,7 @@ mod tests {
             ClickHouseClientOptions::new(
                 RoutingPolicy {
                     transport: RoutingTransport::Http,
-                    scope: RoutingScope::ShardDirect,
+                    scope,
                 },
                 None,
                 Vec::new(),
@@ -1072,6 +1075,23 @@ mod tests {
                 "default.gsfa_hot_local".to_string(),
             ),
         )
+    }
+
+    fn test_client() -> ClickHouseClient {
+        test_client_with_scope(RoutingScope::ShardDirect)
+    }
+
+    fn empty_test_topology() -> Arc<ShardTopology> {
+        Arc::new(ShardTopology {
+            total_weight: 1,
+            replicas: Vec::new(),
+            active_replicas: Vec::new(),
+            replica_health: Vec::new(),
+            weights: vec![1],
+            allow_query_settings: true,
+            query_cache: QueryCacheConfig::default(),
+            query_timeout: Duration::from_secs(8),
+        })
     }
 
     #[test]
@@ -1259,6 +1279,36 @@ mod tests {
         );
         assert!(!client.should_use_gsfa_hot_fanout(&hot_pubkey));
         assert!(!client.should_use_gsfa_shard_routing(&hot_pubkey));
+    }
+
+    #[test]
+    fn distributed_scope_never_uses_gsfa_shard_routing_with_topology() {
+        let mut client = test_client_with_scope(RoutingScope::Distributed);
+        let hot_pubkey = Pubkey::new_from_array([7; 32]);
+        let cold_pubkey = Pubkey::new_from_array([9; 32]);
+        client.gsfa_hot_pubkeys.insert(hot_pubkey);
+        client.shard_topology = Some(empty_test_topology());
+
+        assert_eq!(
+            client.gsfa_table_for_address(&hot_pubkey),
+            "default.gsfa_hot"
+        );
+        assert!(!client.should_use_gsfa_hot_fanout(&hot_pubkey));
+        assert!(!client.should_use_gsfa_shard_routing(&hot_pubkey));
+        assert!(!client.should_use_gsfa_shard_routing(&cold_pubkey));
+    }
+
+    #[test]
+    fn shard_direct_scope_uses_gsfa_shard_routing_with_topology() {
+        let mut client = test_client();
+        let hot_pubkey = Pubkey::new_from_array([7; 32]);
+        let cold_pubkey = Pubkey::new_from_array([9; 32]);
+        client.gsfa_hot_pubkeys.insert(hot_pubkey);
+        client.shard_topology = Some(empty_test_topology());
+
+        assert!(client.should_use_gsfa_hot_fanout(&hot_pubkey));
+        assert!(!client.should_use_gsfa_shard_routing(&hot_pubkey));
+        assert!(client.should_use_gsfa_shard_routing(&cold_pubkey));
     }
 
     #[test]

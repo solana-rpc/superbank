@@ -21,6 +21,7 @@ fn default_bigtable_decode_concurrency() -> usize {
 }
 
 pub(crate) const DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+pub(crate) const FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FromSlotSpec {
@@ -173,11 +174,11 @@ struct CliArgs {
     #[arg(long, env = "FUMAROLE_DATA_PLANE_TCP_CONNECTIONS", default_value_t = 4)]
     fumarole_data_plane_tcp_connections: u8,
 
-    /// Concurrent Fumarole shard downloads per TCP connection
+    /// Deprecated: accepted for compatibility; Fumarole always uses 1
     #[arg(
         long,
         env = "FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP",
-        default_value_t = 2
+        default_value_t = FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP
     )]
     fumarole_concurrent_download_limit_per_tcp: usize,
 
@@ -1826,6 +1827,17 @@ fumarole-no-commit: true
     }
 
     #[test]
+    fn fumarole_concurrent_download_limit_defaults_to_client_fixed_value() {
+        let matches = CliArgs::command().get_matches_from(["superbank", "--source", "fumarole"]);
+        let cli = CliArgs::from_arg_matches(&matches).expect("parse cli args");
+
+        assert_eq!(
+            cli.fumarole_concurrent_download_limit_per_tcp,
+            FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP
+        );
+    }
+
+    #[test]
     fn cli_accepts_zero_fumarole_memory_soft_limit() {
         let matches = CliArgs::command().get_matches_from([
             "superbank",
@@ -2082,7 +2094,7 @@ rpc-from-slot: 456
             fumarole_consumer_group: Some("superbank-mainnet".to_string()),
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
-            fumarole_concurrent_download_limit_per_tcp: 2,
+            fumarole_concurrent_download_limit_per_tcp: FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP,
             fumarole_data_channel_capacity: 4096,
             fumarole_memory_soft_limit_bytes: DEFAULT_FUMAROLE_MEMORY_SOFT_LIMIT_BYTES,
             fumarole_commit_interval_secs: 10,
