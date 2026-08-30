@@ -20,10 +20,10 @@ use solana_transaction_status::TransactionDetails;
 use tracing::{info, warn};
 
 use crate::clickhouse::{
-    ClickHouseClient, ClickHouseClientOptions, ClickHouseTableNames, PaginationToken,
-    QueryCacheConfig, RoutingPolicy, RoutingScope, RoutingTransport, SignatureRecord, SlotBoundary,
-    SortOrder, StoredBlockPayload, StoredBlockRecord, StoredTransactionRecord, TokenAccountsFilter,
-    TransactionsForAddressQuery,
+    BlockMetadataRecord, ClickHouseClient, ClickHouseClientOptions, ClickHouseTableNames,
+    PaginationToken, QueryCacheConfig, RoutingPolicy, RoutingScope, RoutingTransport,
+    SignatureRecord, SlotBoundary, SortOrder, StoredBlockPayload, StoredBlockRecord,
+    StoredTransactionRecord, TokenAccountsFilter, TransactionsForAddressQuery,
 };
 use crate::config::ClickHouseStartupTableCheck;
 use crate::solana_sdk;
@@ -468,34 +468,31 @@ impl DiskCache {
         &self,
         slot: u64,
         transaction_details: TransactionDetails,
+        show_rewards: bool,
     ) -> DiskBlockResult {
-        let tx_count = match self.slot_status(slot).await {
-            SlotStatus::Covered { tx_count } => tx_count,
-            SlotStatus::Skipped => return DiskBlockResult::Skipped,
-            SlotStatus::NotCovered => return DiskBlockResult::NotCovered,
-        };
-        let metadata = match self
-            .inner
-            .local
-            .get_block_metadata_by_slot(slot, true)
-            .await
-        {
-            Ok((Some(metadata), _)) => metadata,
-            Ok((None, _)) => {
-                self.poison_slot(slot).await;
-                return DiskBlockResult::NotCovered;
-            }
-            Err(err) => {
-                warn!(slot, "disk cache: block metadata read failed: {err}");
-                return DiskBlockResult::NotCovered;
-            }
-        };
-
+        if !self.ready() || !self.covers_slot(slot) {
+            return DiskBlockResult::NotCovered;
+        }
         let payload = match transaction_details {
-            TransactionDetails::None => StoredBlockPayload::Metadata(metadata),
+            TransactionDetails::None => {
+                let metadata = match self.read_block_metadata(slot, show_rewards).await {
+                    Ok(metadata) => metadata,
+                    Err(result) => return result,
+                };
+                StoredBlockPayload::Metadata(metadata)
+            }
             TransactionDetails::Signatures => {
-                let signatures = match self.inner.local.get_block_signatures_by_slot(slot).await {
-                    Ok((records, _)) if records.len() == tx_count as usize => records,
+                let (metadata, signatures) = tokio::join!(
+                    self.read_block_metadata(slot, show_rewards),
+                    self.inner.local.get_block_signatures_by_slot(slot),
+                );
+                let metadata = match metadata {
+                    Ok(metadata) => metadata,
+                    Err(result) => return result,
+                };
+                let tx_count = metadata.executed_transaction_count;
+                let signatures = match signatures {
+                    Ok((records, _)) if records.len() as u64 == tx_count => records,
                     Ok((records, _)) => {
                         warn!(
                             slot,
@@ -517,8 +514,17 @@ impl DiskCache {
                 }
             }
             TransactionDetails::Accounts => {
-                let transactions = match self.inner.local.get_block_accounts_by_slot(slot).await {
-                    Ok((records, _)) if records.len() == tx_count as usize => records,
+                let (metadata, transactions) = tokio::join!(
+                    self.read_block_metadata(slot, show_rewards),
+                    self.inner.local.get_block_accounts_by_slot(slot),
+                );
+                let metadata = match metadata {
+                    Ok(metadata) => metadata,
+                    Err(result) => return result,
+                };
+                let tx_count = metadata.executed_transaction_count;
+                let transactions = match transactions {
+                    Ok((records, _)) if records.len() as u64 == tx_count => records,
                     Ok((records, _)) => {
                         warn!(
                             slot,
@@ -540,13 +546,17 @@ impl DiskCache {
                 }
             }
             TransactionDetails::Full => {
-                let transactions = match self
-                    .inner
-                    .local
-                    .get_block_full_transactions_by_slot(slot)
-                    .await
-                {
-                    Ok((records, _)) if records.len() == tx_count as usize => records,
+                let (metadata, transactions) = tokio::join!(
+                    self.read_block_metadata(slot, show_rewards),
+                    self.inner.local.get_block_full_transactions_by_slot(slot),
+                );
+                let metadata = match metadata {
+                    Ok(metadata) => metadata,
+                    Err(result) => return result,
+                };
+                let tx_count = metadata.executed_transaction_count;
+                let transactions = match transactions {
+                    Ok((records, _)) if records.len() as u64 == tx_count => records,
                     Ok((records, _)) => {
                         warn!(
                             slot,
@@ -570,6 +580,33 @@ impl DiskCache {
         };
         crate::metrics::disk_cache_read("get_block", "hit");
         DiskBlockResult::Found(Box::new(payload))
+    }
+
+    async fn read_block_metadata(
+        &self,
+        slot: u64,
+        show_rewards: bool,
+    ) -> Result<BlockMetadataRecord, DiskBlockResult> {
+        match self
+            .inner
+            .local
+            .get_block_metadata_by_slot(slot, show_rewards)
+            .await
+        {
+            Ok((Some(metadata), _)) => Ok(metadata),
+            Ok((None, _)) => match self.slot_status(slot).await {
+                SlotStatus::Skipped => Err(DiskBlockResult::Skipped),
+                SlotStatus::Covered { .. } => {
+                    self.poison_slot(slot).await;
+                    Err(DiskBlockResult::NotCovered)
+                }
+                SlotStatus::NotCovered => Err(DiskBlockResult::NotCovered),
+            },
+            Err(err) => {
+                warn!(slot, "disk cache: block metadata read failed: {err}");
+                Err(DiskBlockResult::NotCovered)
+            }
+        }
     }
 
     pub(crate) async fn block_time_for_slot(&self, slot: u64) -> DiskBlockTime {

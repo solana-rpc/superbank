@@ -42,6 +42,7 @@ const ROUTE_SCOPE_DISTRIBUTED: &str = "distributed";
 const ROUTE_SCOPE_SHARD_DIRECT: &str = "shard_direct";
 pub(crate) const ROUTE_SOURCE_NONE: &str = "none";
 pub(crate) const ROUTE_SOURCE_CLICKHOUSE: &str = "clickhouse";
+pub(crate) const ROUTE_SOURCE_RESPONSE_CACHE: &str = "response_cache";
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) const ROUTE_SOURCE_HEAD_CACHE: &str = "head_cache";
 #[cfg(feature = "disk-cache")]
@@ -64,6 +65,7 @@ const SOURCE_TOUCHED_CLICKHOUSE_BIT: u8 = 0b0000_0001;
 const SOURCE_TOUCHED_HEAD_CACHE_BIT: u8 = 0b0000_0010;
 #[cfg(feature = "disk-cache")]
 const SOURCE_TOUCHED_DISK_CACHE_BIT: u8 = 0b0000_0100;
+const SOURCE_TOUCHED_RESPONSE_CACHE_BIT: u8 = 0b0000_1000;
 
 #[derive(Debug, Default)]
 struct ResponseHeaderMetricsContext {
@@ -87,6 +89,11 @@ impl ResponseHeaderMetricsContext {
     fn mark_clickhouse_source_touched(&self) {
         self.source_touched_bits
             .fetch_or(SOURCE_TOUCHED_CLICKHOUSE_BIT, Ordering::Relaxed);
+    }
+
+    fn mark_response_cache_source_touched(&self) {
+        self.source_touched_bits
+            .fetch_or(SOURCE_TOUCHED_RESPONSE_CACHE_BIT, Ordering::Relaxed);
     }
 
     #[cfg(feature = "grpc-head-cache")]
@@ -188,6 +195,12 @@ fn mark_disk_cache_source_touched() {
     }
 }
 
+fn mark_response_cache_source_touched() {
+    if let Some(context) = current_response_header_metrics_context() {
+        context.mark_response_cache_source_touched();
+    }
+}
+
 fn observe_clickhouse_timings(timings: &QueryTimings) {
     if let Some(context) = current_response_header_metrics_context() {
         let has_clickhouse_signal = timings.elapsed_ms > 0
@@ -211,7 +224,8 @@ fn sources_touched_header_value(source_touched_bits: u8) -> &'static str {
     let disk_cache = (source_touched_bits & SOURCE_TOUCHED_DISK_CACHE_BIT) != 0;
     #[cfg(not(feature = "disk-cache"))]
     let disk_cache = false;
-    match (head_cache, disk_cache, clickhouse) {
+    let response_cache = (source_touched_bits & SOURCE_TOUCHED_RESPONSE_CACHE_BIT) != 0;
+    let base = match (head_cache, disk_cache, clickhouse) {
         (false, false, false) => "none",
         (true, false, false) => "head-cache",
         (false, false, true) => "clickhouse",
@@ -221,6 +235,18 @@ fn sources_touched_header_value(source_touched_bits: u8) -> &'static str {
         (false, true, true) => "disk-cache,clickhouse",
         (true, true, false) => "head-cache,disk-cache",
         (true, true, true) => "all",
+    };
+    match (response_cache, base) {
+        (false, value) => value,
+        (true, "none") => "response-cache",
+        (true, "head-cache") => "response-cache,head-cache",
+        (true, "clickhouse") => "response-cache,clickhouse",
+        (true, "both") => "response-cache,head-cache,clickhouse",
+        (true, "disk-cache") => "response-cache,disk-cache",
+        (true, "disk-cache,clickhouse") => "response-cache,disk-cache,clickhouse",
+        (true, "head-cache,disk-cache") => "response-cache,head-cache,disk-cache",
+        (true, "all") => "response-cache,head-cache,disk-cache,clickhouse",
+        (true, _) => unreachable!(),
     }
 }
 
@@ -350,6 +376,15 @@ impl RouteMetric {
     pub(crate) fn source_clickhouse(&mut self) {
         mark_clickhouse_source_touched();
         self.source = ROUTE_SOURCE_CLICKHOUSE;
+    }
+
+    pub(crate) fn source_response_cache(&mut self) {
+        mark_response_cache_source_touched();
+        self.source = ROUTE_SOURCE_RESPONSE_CACHE;
+    }
+
+    pub(crate) fn response_cache_read(&mut self) {
+        mark_response_cache_source_touched();
     }
 
     #[cfg(feature = "grpc-head-cache")]

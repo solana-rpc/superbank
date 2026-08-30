@@ -66,6 +66,14 @@ pub struct RpcConfig {
     #[arg(long, env = "RPC_CONCURRENCY_LIMIT", default_value_t = 512)]
     pub(crate) rpc_concurrency_limit: usize,
 
+    /// Maximum serialized getBlock result bytes retained in memory; zero disables the cache.
+    #[arg(long, env = "GET_BLOCK_RESPONSE_CACHE_MAX_BYTES", default_value_t = 0)]
+    pub(crate) get_block_response_cache_max_bytes: u64,
+
+    /// Compress JSON-RPC responses when the client advertises gzip support.
+    #[arg(long, env = "RPC_RESPONSE_GZIP_ENABLED", default_value_t = false)]
+    pub(crate) rpc_response_gzip_enabled: bool,
+
     /// Maximum number of JSON-RPC calls accepted in a single batch request.
     #[arg(long, env = "RPC_MAX_BATCH_SIZE", default_value_t = 64)]
     pub(crate) rpc_max_batch_size: usize,
@@ -818,6 +826,8 @@ mod config_tests {
         assert!(!cfg.clickhouse_query_cache_share_between_users);
         assert!(!cfg.clickhouse_query_condition_cache_enabled);
         assert!(!cfg.emit_http_errors);
+        assert_eq!(cfg.get_block_response_cache_max_bytes, 0);
+        assert!(!cfg.rpc_response_gzip_enabled);
         assert!(!cfg.metrics_capture_x_endpoint());
         assert!(!cfg.metrics_capture_x_rpc_node());
         assert!(!cfg.metrics_capture_x_subscription_id());
@@ -902,6 +912,19 @@ mod config_tests {
         let cfg = RpcConfig::parse_from(["superbank-rpc"]);
 
         assert!(cfg.emit_http_errors);
+    }
+
+    #[test]
+    fn get_block_response_performance_flags_parse() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-block-response-cache-max-bytes",
+            "1073741824",
+            "--rpc-response-gzip-enabled",
+        ]);
+
+        assert_eq!(cfg.get_block_response_cache_max_bytes, 1_073_741_824);
+        assert!(cfg.rpc_response_gzip_enabled);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use solana_commitment_config::CommitmentLevel;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
+use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::ClickHouseClient;
 use crate::metrics;
 use crate::processing::ProcessingError;
@@ -42,6 +43,7 @@ pub(crate) struct AppState {
     pub(crate) emit_http_errors: bool,
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
+    pub(crate) block_response_cache: BlockResponseCache,
     #[cfg(feature = "grpc-head-cache")]
     pub(crate) head_cache: Option<Arc<HeadCache>>,
     /// Finalized recent-slot cache in local ClickHouse; consulted between the

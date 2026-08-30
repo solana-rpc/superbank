@@ -513,6 +513,11 @@ pub struct Metrics {
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
+    get_block_response_cache_access: Family<OperationOutcomeLabels, Counter>,
+    get_block_response_cache_entries: Gauge,
+    get_block_response_cache_weighted_bytes: Gauge,
+    get_block_response_cache_max_bytes: Gauge,
+    get_block_phase_seconds: Family<OperationLabels, Histogram>,
 
     backend_errors: Family<OperationLabels, Counter>,
     inflation_reward_rejections: Family<BatchRejectLabels, Counter>,
@@ -625,6 +630,12 @@ impl Metrics {
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let rpc_blocks_slots_returned =
             Family::new_with_constructor(block_slot_count_histogram as fn() -> Histogram);
+        let get_block_response_cache_access = Family::default();
+        let get_block_response_cache_entries = Gauge::default();
+        let get_block_response_cache_weighted_bytes = Gauge::default();
+        let get_block_response_cache_max_bytes = Gauge::default();
+        let get_block_phase_seconds =
+            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
 
         let backend_errors = Family::default();
         let inflation_reward_rejections = Family::default();
@@ -772,6 +783,31 @@ impl Metrics {
             "rpc_blocks_slots_returned",
             "Distribution of slot counts returned by getBlocks/getBlocksWithLimit",
             rpc_blocks_slots_returned.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_access",
+            "getBlock serialized-response cache access outcomes",
+            get_block_response_cache_access.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_entries",
+            "Approximate number of serialized getBlock responses cached",
+            get_block_response_cache_entries.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_weighted_bytes",
+            "Approximate serialized getBlock result bytes cached",
+            get_block_response_cache_weighted_bytes.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_max_bytes",
+            "Configured serialized getBlock response cache byte budget",
+            get_block_response_cache_max_bytes.clone(),
+        );
+        registry.register(
+            "get_block_phase_seconds",
+            "getBlock phase latency in seconds",
+            get_block_phase_seconds.clone(),
         );
         registry.register(
             "rpc_backend_errors",
@@ -1059,6 +1095,11 @@ impl Metrics {
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
             rpc_blocks_slots_returned,
+            get_block_response_cache_access,
+            get_block_response_cache_entries,
+            get_block_response_cache_weighted_bytes,
+            get_block_response_cache_max_bytes,
+            get_block_phase_seconds,
             backend_errors,
             inflation_reward_rejections,
             inflation_reward_lookups,
@@ -1363,6 +1404,29 @@ impl Metrics {
         self.rpc_blocks_slots_returned
             .get_or_create(&labels)
             .observe(slots as f64);
+    }
+
+    pub fn get_block_response_cache_access(&self, outcome: &'static str) {
+        let labels = Self::current_operation_outcome_labels("get_block", outcome);
+        self.get_block_response_cache_access
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    pub fn get_block_response_cache_state(&self, entries: u64, bytes: u64, max_bytes: u64) {
+        self.get_block_response_cache_entries
+            .set(clamp_i64(entries));
+        self.get_block_response_cache_weighted_bytes
+            .set(clamp_i64(bytes));
+        self.get_block_response_cache_max_bytes
+            .set(clamp_i64(max_bytes));
+    }
+
+    pub fn get_block_phase(&self, phase: &str, elapsed_seconds: f64) {
+        let labels = Self::current_operation_labels(phase);
+        self.get_block_phase_seconds
+            .get_or_create(&labels)
+            .observe(elapsed_seconds);
     }
 
     pub fn backend_error(&self, operation: &str) {
@@ -1729,6 +1793,24 @@ pub(crate) fn response_overhead(method: &str, elapsed_ms: u64) {
 pub(crate) fn blocks_slots_returned(method: &str, slots: usize) {
     if let Some(metrics) = metrics() {
         metrics.blocks_slots_returned(method, slots);
+    }
+}
+
+pub(crate) fn get_block_response_cache_access(outcome: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics.get_block_response_cache_access(outcome);
+    }
+}
+
+pub(crate) fn get_block_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
+    if let Some(metrics) = metrics() {
+        metrics.get_block_response_cache_state(entries, bytes, max_bytes);
+    }
+}
+
+pub(crate) fn get_block_phase(phase: &str, elapsed_seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics.get_block_phase(phase, elapsed_seconds);
     }
 }
 

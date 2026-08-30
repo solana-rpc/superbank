@@ -60,7 +60,8 @@ solana-transaction-status = { version = "4.2.0", features = ["agave-unstable-api
 thiserror = "2.0.11"
 tokio = { version = "1.46.1", features = ["full"] }
 tower = { version = "0.5", features = ["limit", "util"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"] }
+moka = { version = "0.12", features = ["future"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-log = "0.2.0"

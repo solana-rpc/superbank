@@ -30,6 +30,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::StoredAccountsTransactionRecord;
 use crate::clickhouse::{
     BlockMetadataRecord, ClickHouseClient, ClickHouseClientOptions, RoutingPolicy, RoutingScope,
@@ -166,6 +167,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        block_response_cache: BlockResponseCache::new(0),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
         #[cfg(feature = "disk-cache")]
@@ -247,6 +249,7 @@ fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
         emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        block_response_cache: BlockResponseCache::new(0),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
         #[cfg(feature = "disk-cache")]
@@ -304,6 +307,7 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        block_response_cache: BlockResponseCache::new(0),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
         #[cfg(feature = "disk-cache")]
@@ -353,6 +357,7 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        block_response_cache: BlockResponseCache::new(0),
         head_cache: Some(head_cache),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
@@ -404,6 +409,7 @@ fn test_state_with_head_cache_and_clickhouse_url(
         emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        block_response_cache: BlockResponseCache::new(0),
         head_cache: Some(head_cache),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
@@ -462,6 +468,7 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         emit_http_errors: false,
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        block_response_cache: BlockResponseCache::new(0),
         head_cache: Some(head_cache),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
@@ -1722,6 +1729,89 @@ async fn get_block_uses_complete_head_cache_before_clickhouse() {
         .expect("signatures array");
     assert_eq!(signatures, &vec![json!(signature.to_string())]);
     assert!(parsed.error.is_none());
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_block_reuses_finalized_serialized_response_with_new_id() {
+    let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+    let slot = 199u64;
+    let mut block = base_block_record(slot);
+    block.metadata.executed_transaction_count = 0;
+    block.metadata.entry_count = 0;
+    cache.note_block_metadata(block.metadata);
+    cache.note_slot_commitment(slot, CommitmentLevel::Finalized);
+
+    let mut state = test_state_with_head_cache_and_clickhouse_url(cache, "http://127.0.0.1:1");
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .block_response_cache = BlockResponseCache::new(1024 * 1024);
+    let params = vec![
+        json!(slot),
+        json!({
+            "transactionDetails": "none",
+            "rewards": false,
+            "commitment": "finalized"
+        }),
+    ];
+
+    let first = handle_get_block(state.clone(), json!("first"), Some(params.clone()))
+        .await
+        .expect("first response");
+    let first = parse_json_rpc_response(first).await;
+    assert_eq!(first.id, json!("first"));
+    assert!(first.error.is_none());
+
+    let second_request = json!({
+        "jsonrpc": "2.0",
+        "id": "second",
+        "method": "getBlock",
+        "params": params
+    });
+    let second_response = handle_json_rpc_value(state.clone(), &second_request).await;
+    assert_eq!(
+        second_response.headers()["X-Superbank-Sources"],
+        "response-cache"
+    );
+    let second = parse_json_rpc_response(second_response).await;
+    assert_eq!(second.id, json!("second"));
+    assert_eq!(second.result, first.result);
+    assert!(second.error.is_none());
+    state.block_response_cache.run_pending_tasks().await;
+    assert_eq!(state.block_response_cache.entry_count(), 1);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_block_does_not_cache_confirmed_only_head_response() {
+    let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+    let slot = 200u64;
+    let mut block = base_block_record(slot);
+    block.metadata.executed_transaction_count = 0;
+    cache.note_block_metadata(block.metadata);
+    cache.note_slot_commitment(slot, CommitmentLevel::Confirmed);
+
+    let mut state = test_state_with_head_cache_and_clickhouse_url(cache, "http://127.0.0.1:1");
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .block_response_cache = BlockResponseCache::new(1024 * 1024);
+    let response = handle_get_block(
+        state.clone(),
+        json!(1),
+        Some(vec![
+            json!(slot),
+            json!({
+                "transactionDetails": "none",
+                "commitment": "confirmed"
+            }),
+        ]),
+    )
+    .await
+    .expect("response");
+    assert!(parse_json_rpc_response(response).await.error.is_none());
+
+    state.block_response_cache.run_pending_tasks().await;
+    assert_eq!(state.block_response_cache.entry_count(), 0);
 }
 
 #[cfg(feature = "grpc-head-cache")]

@@ -10,5 +10,6 @@ pub(crate) use responses::{
     json_rpc_error_response, json_rpc_filter_transaction_not_found_response,
     json_rpc_internal_error_response, json_rpc_long_term_storage_unreachable_response,
     json_rpc_node_unhealthy_response, json_rpc_null_response, json_rpc_success_response,
+    json_rpc_success_response_from_result_bytes,
 };
 pub(crate) use types::{JsonRpcInboundRequest, JsonRpcRequest};

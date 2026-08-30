@@ -5,8 +5,11 @@
 
 use axum::{
     Json,
+    body::{Body, Bytes},
+    http::{Response as HttpResponse, header},
     response::{IntoResponse, Response},
 };
+use futures_util::stream;
 use jsonrpc_core::Error as SolanaJsonRpcError;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -29,6 +32,27 @@ where
         error: None,
     })
     .into_response()
+}
+
+pub(crate) fn json_rpc_success_response_from_result_bytes(id: Value, result: Bytes) -> Response {
+    let id = serde_json::to_vec(&id).expect("serde_json::Value must serialize");
+    let mut prefix = Vec::with_capacity(32 + id.len());
+    prefix.extend_from_slice(br#"{"jsonrpc":"2.0","id":"#);
+    prefix.extend_from_slice(&id);
+    prefix.extend_from_slice(b",\"result\":");
+
+    let suffix = Bytes::from_static(b"}");
+    let content_length = prefix.len() + result.len() + suffix.len();
+    let chunks = [
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(prefix)),
+        Ok(result),
+        Ok(suffix),
+    ];
+    HttpResponse::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, content_length)
+        .body(Body::from_stream(stream::iter(chunks)))
+        .expect("static JSON-RPC response headers must be valid")
 }
 
 pub(crate) fn json_rpc_null_response(id: Value) -> Response {

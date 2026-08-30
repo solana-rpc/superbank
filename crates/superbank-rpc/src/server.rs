@@ -16,8 +16,13 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
+use tower_http::{
+    CompressionLevel,
+    compression::{CompressionLayer, predicate::SizeAbove},
+};
 use tracing::{info, warn};
 
+use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::{
     ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, QueryCacheConfig,
     RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig,
@@ -44,6 +49,13 @@ use crate::head_cache::{HeadCache, dragonsmouth};
 use solana_commitment_config::CommitmentLevel;
 
 pub type RpcResult<T> = Result<T, RpcError>;
+
+fn rpc_response_compression_layer() -> CompressionLayer<SizeAbove> {
+    CompressionLayer::new()
+        .gzip(true)
+        .quality(CompressionLevel::Fastest)
+        .compress_when(SizeAbove::new(4 * 1024))
+}
 
 fn build_shard_routing_config(args: &RpcConfig) -> Option<ShardRoutingConfig> {
     // Distributed mode must remain a pure Distributed-table client.  In particular, hot-address
@@ -313,6 +325,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         hydration_sem: Arc::new(tokio::sync::Semaphore::new(
             args.hydration_cpu_concurrency.max(1),
         )),
+        block_response_cache: BlockResponseCache::new(args.get_block_response_cache_max_bytes),
         #[cfg(feature = "grpc-head-cache")]
         head_cache,
         #[cfg(feature = "disk-cache")]
@@ -334,6 +347,11 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         .route("/health", get(health))
         .layer(rpc_layers)
         .with_state(state.clone());
+    let app = if args.rpc_response_gzip_enabled {
+        app.layer(rpc_response_compression_layer())
+    } else {
+        app
+    };
 
     // Metrics server on a dedicated listener
     let metrics_app = Router::new().route("/metrics", get(metrics_handler));
@@ -754,9 +772,40 @@ fn parse_commitment_level(value: &str) -> CommitmentLevel {
 mod tests {
     #[cfg(feature = "disk-cache")]
     use super::validate_disk_cache_args;
-    use super::{build_routing_policy, build_shard_routing_config};
+    use super::{build_routing_policy, build_shard_routing_config, rpc_response_compression_layer};
     use crate::clickhouse::{RoutingScope, RoutingTransport};
     use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, Response, header},
+    };
+    use std::convert::Infallible;
+    use tower::{ServiceBuilder, ServiceExt, service_fn};
+
+    #[tokio::test]
+    async fn response_compression_negotiates_gzip_for_large_json() {
+        let service = ServiceBuilder::new()
+            .layer(rpc_response_compression_layer())
+            .service(service_fn(|_request| async {
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(vec![b'x'; 16 * 1024]))
+                        .expect("response"),
+                )
+            }));
+        let request = Request::builder()
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = service.oneshot(request).await.expect("compressed response");
+        assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+        let body = to_bytes(Body::new(response.into_body()), usize::MAX)
+            .await
+            .expect("compressed body");
+        assert!(body.len() < 16 * 1024);
+    }
 
     #[test]
     fn shard_routing_enabled_for_shard_direct_scope() {

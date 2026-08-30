@@ -246,6 +246,8 @@ The source ClickHouse user needs read access to the copied tables and their `sys
 
 The cache serves `getBlock` (all `transactionDetails` levels), `getBlocks`, `getBlocksWithLimit`, `getBlockTime`, `getTransaction`, `getSignatureStatuses`, `getSignaturesForAddress`, and `getTransactionsForAddress` when the required rows are covered. `DISK_CACHE_RETAIN_SLOTS` is required. The forwarder fills backward to the configured retention floor when the cache starts partially filled or the retention window increases. `DISK_CACHE_MAX_BYTES` can impose a tighter MergeTree budget. The forwarder drops complete old slot partitions rather than deleting individual rows.
 
+`GET_BLOCK_RESPONSE_CACHE_MAX_BYTES` adds a separate lazy in-process cache of serialized finalized `getBlock` results. Its key includes every response-shaping option, but not the JSON-RPC request ID. Concurrent requests for the same result share hydration and serialization work. Use `RPC_RESPONSE_GZIP_ENABLED=true` to negotiate gzip for large responses. Clients that can consume binary transaction encoding can request `base64` to reduce full-block encoding cost.
+
 The configured cache database is exclusively owned by this feature. A nonempty database without the Superbank ownership marker is rejected and never modified. A source schema fingerprint change rebuilds only a correctly marked cache database. Treat the instance and database as semi-ephemeral.
 
 By default, local initialization failures do not block RPC startup. Reads continue against the source cluster while a background supervisor retries local initialization. `DISK_CACHE_REQUIRED=true` makes initialization a startup requirement and makes `/health` return HTTP 503 when the local cache is not ready or cannot answer a health query.
@@ -368,6 +370,8 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--rpc-max-body-bytes` | `RPC_MAX_BODY_BYTES` | `1048576` | Maximum accepted JSON-RPC request body size (bytes). |
 | `--rpc-request-timeout-ms` | `RPC_REQUEST_TIMEOUT_MS` | `10000` | End-to-end timeout for a request envelope (single or batch). |
 | `--rpc-concurrency-limit` | `RPC_CONCURRENCY_LIMIT` | `512` | Maximum number of in-flight HTTP JSON-RPC envelopes. |
+| `--get-block-response-cache-max-bytes` | `GET_BLOCK_RESPONSE_CACHE_MAX_BYTES` | `0` | Serialized finalized `getBlock` result byte budget. `0` disables the in-process cache. Actual RSS also includes cache metadata and in-flight values. |
+| `--rpc-response-gzip-enabled` | `RPC_RESPONSE_GZIP_ENABLED` | `false` | Compress JSON-RPC responses of at least 4 KiB when the client advertises gzip support. |
 | `--rpc-max-batch-size` | `RPC_MAX_BATCH_SIZE` | `64` | Maximum number of JSON-RPC calls in a single batch envelope. |
 | `--rpc-batch-concurrency-limit` | `RPC_BATCH_CONCURRENCY_LIMIT` | `8` | Max concurrent item execution within one batch envelope. |
 | `--get-inflation-reward-max-addresses` | `GET_INFLATION_REWARD_MAX_ADDRESSES` | `100` | Maximum addresses accepted by one `getInflationReward` call. `0` disables this admission check; values above 100 are rejected at startup. |
@@ -557,7 +561,7 @@ Route normalization metric:
   - `method`: supported JSON-RPC method name.
   - `transport`: `tcp|http` (active ClickHouse routing transport policy).
   - `scope`: `distributed|shard_direct` (active ClickHouse routing scope policy).
-  - `source`: `clickhouse|head_cache|disk_cache|none` (primary source used for the returned response).
+  - `source`: `clickhouse|head_cache|disk_cache|response_cache|none` (primary source used for the returned response).
   - `head_cache_read`: `true|false` (whether handler read from head cache on that request).
   - `disk_cache_read`: `true|false` (whether the handler read from the local ClickHouse disk cache on that request).
   - `outcome`: `success|not_found|invalid_params|rpc_error|backend_error|timeout`.
@@ -571,6 +575,12 @@ Request-scoped metric families:
 - `rpc_requests`, `rpc_response_time_seconds`, `rpc_inflight_requests`, `rpc_timeouts`, `rpc_response_overhead_seconds`, `rpc_blocks_slots_returned`, `rpc_batch_requests`, `rpc_batch_items`, `rpc_batch_size`, `rpc_batch_rejected_total`, `rpc_backend_errors`, `rpc_clickhouse_duration_seconds`, `rpc_clickhouse_received_bytes`, `rpc_clickhouse_decoded_bytes`, `rpc_clickhouse_timeouts`, `rpc_clickhouse_query_cache_total`, `rpc_clickhouse_query_cache_settings_total` can include `x_endpoint`, `x_rpc_node`, `x_subscription_id`, and `x_account_id` when each capture option is enabled.
 - For those labels, values are `missing|<raw-value>` for enabled capture; disabled capture omits the label.
 
+`getBlock` response-cache metrics:
+
+- `superbank_get_block_response_cache_access_total{operation,outcome}` with `hit`, `miss`, `insert`, and `coalesced` outcomes.
+- `superbank_get_block_response_cache_entries`, `superbank_get_block_response_cache_weighted_bytes`, and `superbank_get_block_response_cache_max_bytes`.
+- `superbank_get_block_phase_seconds{operation}` for hydration and serialization work.
+
 Superbank gRPC streaming metrics, emitted only with `--features grpc-streaming`:
 
 - `superbank_grpc_stream_requests_total{method}`
@@ -580,10 +590,7 @@ Superbank gRPC streaming metrics, emitted only with `--features grpc-streaming`:
 
 Response metric headers:
 
-- `X-Superbank-Sources`: downstream sources consulted while serving the JSON-RPC response. Values
-  are `none`, `clickhouse`, `head-cache`, `both` (legacy head-cache + ClickHouse), `disk-cache`,
-  `disk-cache,clickhouse`, `head-cache,disk-cache`, or `all`. For batch responses, this is the
-  aggregate source footprint across batch items.
+- `X-Superbank-Sources`: downstream sources consulted while serving the JSON-RPC response. Values combine `response-cache`, `head-cache`, `disk-cache`, and `clickhouse` in that order. `both` remains the legacy value for head-cache plus ClickHouse, and `all` remains the value for head-cache, disk-cache, and ClickHouse without the response cache. For batch responses, this is the aggregate source footprint across batch items.
 - `X-Superbank-Metrics`: aggregate ClickHouse timing/volume counters for the response envelope. Format:
   - `rows_read=<u64>|unknown;rows_returned=<u64>;data_read_bytes=<u64>`
   - For batch responses, counters are aggregated across batch items.

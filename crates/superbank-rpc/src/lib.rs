@@ -35,6 +35,7 @@ mod solana_sdk {
     }
 }
 
+mod block_response_cache;
 mod clickhouse;
 mod metrics;
 mod processing;
