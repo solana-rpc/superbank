@@ -29,8 +29,8 @@ async fn main() {
     let args = match cli::resolve_args() {
         Ok(args) => args,
         Err(err) => {
-            eprintln!("superbank-verify: {err:#}");
-            std::process::exit(report::EXIT_OPERATIONAL_ERROR);
+            err.emit();
+            std::process::exit(err.exit_code());
         }
     };
     metrics::force_init(args.mode.as_str(), args.metrics_cluster_label.as_deref());

@@ -102,9 +102,24 @@ block is reported as unverifiable, not silently ignored).
 ### Resume
 
 `--checkpoint-file` saves progress after every window (atomic rename);
-`--resume` continues an interrupted run as long as the job parameters (range,
-mode, tables, era schedule) are identical. The findings report is appended on
-resume, truncated otherwise.
+`--resume` continues an interrupted run as long as the job parameters (range
+start, mode, tables, era schedule, genesis pin, and anchors) are identical.
+For `--full`, the upper bound is a live tip: resume accepts a later tip and
+continues from the saved cursor. It rejects a regressed tip or a changed range
+start. Checkpoints retain already checked anchors and the genesis-pin check, so
+pins behind the cursor stay part of the resumed result. The findings report is
+appended on resume, truncated otherwise.
+
+### Resource bounds
+
+The defaults are `--window-slots 64 --fetch-ahead 1`. The verifier accepts at
+most 128 slots per window, two queued fetch-ahead windows, and 512 in-flight
+window slots using `window-slots * (fetch-ahead + 2)`: one active verification
+window, up to `fetch-ahead` queued windows, and one fetch blocked on channel
+capacity. This is a bound on complete ClickHouse result sets retained by the
+pipeline, not an assertion that every slot has a fixed byte size. The entries
+and transaction rows can vary with ledger density; operators needing a larger
+budget need an explicit resource-policy change rather than an unbounded flag.
 
 ### Metrics
 

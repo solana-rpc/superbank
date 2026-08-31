@@ -24,9 +24,13 @@ expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 # anchor:
 #   - "290000000:<base58-blockhash-from-a-trusted-rpc>"
 
-# Throughput.
-window-slots: 256
-fetch-ahead: 3
+# Throughput and memory bounds. The verifier keeps at most
+# window-slots * (fetch-ahead + 2) complete result sets in flight: the active
+# window, queued prefetches, and one fetch blocked on channel capacity.
+# Limits: window-slots <= 128, fetch-ahead <= 2, product <= 512. These bound
+# result-set count, not the variable byte size of dense ledger rows.
+window-slots: 64
+fetch-ahead: 1
 verify-threads: 0 # 0 = all available cores
 
 # Resumability & reporting.

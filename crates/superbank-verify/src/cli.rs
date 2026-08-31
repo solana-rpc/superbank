@@ -7,9 +7,11 @@
 //! file > defaults, following the same three-layer merge as the ingestor's
 //! `cli.rs`.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use clap::error::ErrorKind;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,15 @@ use crate::verify::VerifyMode;
 use crate::verify::poh::Hash32;
 
 pub(crate) const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+/// The verifier intentionally bounds slots, not bytes: ClickHouse rows can
+/// vary with transaction and entry density. These limits cap the number of
+/// complete result sets retained by the fetch pipeline.
+const DEFAULT_WINDOW_SLOTS: u64 = 64;
+const DEFAULT_FETCH_AHEAD: usize = 1;
+const MAX_WINDOW_SLOTS: u64 = 128;
+const MAX_FETCH_AHEAD: usize = 2;
+const MAX_IN_FLIGHT_WINDOW_SLOTS: u64 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -114,12 +125,20 @@ struct CliArgs {
     #[arg(long, env = "SUPERBANK_VERIFY_HASHES_PER_TICK_SCHEDULE")]
     hashes_per_tick_schedule: Option<String>,
 
-    /// Slots fetched and verified per window
-    #[arg(long, env = "SUPERBANK_VERIFY_WINDOW_SLOTS", default_value_t = 256)]
+    /// Slots fetched and verified per window (maximum 128)
+    #[arg(
+        long,
+        env = "SUPERBANK_VERIFY_WINDOW_SLOTS",
+        default_value_t = DEFAULT_WINDOW_SLOTS
+    )]
     window_slots: u64,
 
-    /// Windows prefetched ahead of verification
-    #[arg(long, env = "SUPERBANK_VERIFY_FETCH_AHEAD", default_value_t = 3)]
+    /// Complete windows queued ahead of verification (maximum 2)
+    #[arg(
+        long,
+        env = "SUPERBANK_VERIFY_FETCH_AHEAD",
+        default_value_t = DEFAULT_FETCH_AHEAD
+    )]
     fetch_ahead: usize,
 
     /// Worker threads for hash recomputation (0 = all available cores)
@@ -352,10 +371,44 @@ pub(crate) struct Args {
     pub(crate) export_fixture: Option<(u64, PathBuf)>,
 }
 
-pub(crate) fn resolve_args() -> Result<Args> {
-    let matches = CliArgs::command().get_matches();
-    let cli = CliArgs::from_arg_matches(&matches).context("parse CLI arguments")?;
-    resolve_from(&matches, cli)
+pub(crate) enum ResolveError {
+    Usage(clap::Error),
+    Operational(anyhow::Error),
+}
+
+impl ResolveError {
+    pub(crate) fn exit_code(&self) -> i32 {
+        match self {
+            Self::Usage(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+            {
+                0
+            }
+            Self::Usage(_) | Self::Operational(_) => crate::report::EXIT_OPERATIONAL_ERROR,
+        }
+    }
+
+    pub(crate) fn emit(&self) {
+        match self {
+            Self::Usage(error) => {
+                let _ = error.print();
+            }
+            Self::Operational(error) => eprintln!("superbank-verify: {error:#}"),
+        }
+    }
+}
+
+pub(crate) fn resolve_args() -> std::result::Result<Args, ResolveError> {
+    let matches = CliArgs::command()
+        .try_get_matches()
+        .map_err(ResolveError::Usage)?;
+    let cli = CliArgs::from_arg_matches(&matches)
+        .context("parse CLI arguments")
+        .map_err(ResolveError::Operational)?;
+    resolve_from(&matches, cli).map_err(ResolveError::Operational)
 }
 
 fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
@@ -575,8 +628,34 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.fetch_ahead == 0 {
         bail!("--fetch-ahead must be at least 1");
     }
+    if args.window_slots > MAX_WINDOW_SLOTS {
+        bail!("--window-slots must be at most {MAX_WINDOW_SLOTS} to bound fetched result sets");
+    }
+    if args.fetch_ahead > MAX_FETCH_AHEAD {
+        bail!("--fetch-ahead must be at most {MAX_FETCH_AHEAD} to bound fetched result sets");
+    }
+    let in_flight_windows = u64::try_from(args.fetch_ahead)
+        .ok()
+        .and_then(|ahead| ahead.checked_add(2))
+        .ok_or_else(|| anyhow!("--fetch-ahead is too large"))?;
+    let in_flight_slots = args
+        .window_slots
+        .checked_mul(in_flight_windows)
+        .ok_or_else(|| anyhow!("window resource bound overflow"))?;
+    if in_flight_slots > MAX_IN_FLIGHT_WINDOW_SLOTS {
+        bail!(
+            "--window-slots × (--fetch-ahead + 2) must be at most \
+             {MAX_IN_FLIGHT_WINDOW_SLOTS} (got {in_flight_slots})"
+        );
+    }
     if args.ticks_per_slot == 0 {
         bail!("--ticks-per-slot must be at least 1");
+    }
+    let mut anchor_slots = BTreeSet::new();
+    for (slot, _) in &args.anchors {
+        if !anchor_slots.insert(*slot) {
+            bail!("--anchor slot {slot} was supplied more than once");
+        }
     }
     Ok(())
 }
@@ -715,6 +794,43 @@ mod tests {
                 "/tmp/cp.json"
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn resource_limits_bound_window_and_fetch_ahead_configuration() {
+        let defaults = resolve(&["superbank-verify", "--full"]).unwrap();
+        assert_eq!(defaults.window_slots, DEFAULT_WINDOW_SLOTS);
+        assert_eq!(defaults.fetch_ahead, DEFAULT_FETCH_AHEAD);
+
+        assert!(resolve(&["superbank-verify", "--full", "--window-slots", "129"]).is_err());
+        assert!(resolve(&["superbank-verify", "--full", "--fetch-ahead", "3"]).is_err());
+        assert!(
+            resolve(&[
+                "superbank-verify",
+                "--full",
+                "--window-slots",
+                "128",
+                "--fetch-ahead",
+                "2",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn duplicate_anchor_slots_are_rejected() {
+        let anchor = format!("5:{MAINNET_GENESIS_HASH}");
+        assert!(
+            resolve(&[
+                "superbank-verify",
+                "--full",
+                "--anchor",
+                &anchor,
+                "--anchor",
+                &anchor,
+            ])
+            .is_err()
         );
     }
 

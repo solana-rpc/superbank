@@ -241,10 +241,14 @@ pub(crate) fn observe_fetch_duration(table: &str, elapsed_seconds: f64) {
 
 pub(crate) async fn health_handler(stale_secs: u64) -> impl IntoResponse {
     let last_window = metrics().last_window_completed_timestamp_seconds.get();
-    let stale = stale_secs > 0
-        && last_window > 0
-        && current_timestamp_seconds().saturating_sub(last_window) > stale_secs as i64;
-    if stale {
+    health_status(stale_secs, last_window, current_timestamp_seconds())
+}
+
+fn health_status(stale_secs: u64, last_window: i64, now: i64) -> StatusCode {
+    if stale_secs == 0 {
+        return StatusCode::OK;
+    }
+    if last_window <= 0 || now.saturating_sub(last_window) > stale_secs as i64 {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -278,4 +282,27 @@ fn current_timestamp_seconds() -> i64 {
 
 fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_is_unavailable_before_the_first_completed_window() {
+        assert_eq!(
+            health_status(300, 0, 1_000),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(health_status(0, 0, 1_000), StatusCode::OK);
+    }
+
+    #[test]
+    fn health_tracks_the_completion_staleness_threshold() {
+        assert_eq!(health_status(300, 700, 1_000), StatusCode::OK);
+        assert_eq!(
+            health_status(300, 699, 1_000),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }

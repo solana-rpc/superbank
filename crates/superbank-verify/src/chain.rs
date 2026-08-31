@@ -8,7 +8,7 @@
 //! slot between consecutive present blocks as skipped (claimed by the chain
 //! via `parent_slot`) or missing (absent from our data with no skip claim).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::report::{Finding, FindingCode};
 use crate::verify::poh::Hash32;
@@ -31,21 +31,41 @@ pub(crate) struct ChainWalk {
     floor: u64,
     expected_genesis_hash: Option<Hash32>,
     anchors: HashMap<u64, Hash32>,
-    checked_anchors: std::collections::HashSet<u64>,
+    checked_anchors: BTreeSet<u64>,
+    genesis_checked: bool,
 }
 
 impl ChainWalk {
+    #[cfg(test)]
     pub(crate) fn new(
         floor: u64,
         expected_genesis_hash: Option<Hash32>,
         anchors: HashMap<u64, Hash32>,
+    ) -> Self {
+        Self::from_checkpoint(
+            floor,
+            expected_genesis_hash,
+            anchors,
+            BTreeSet::new(),
+            false,
+        )
+    }
+
+    /// Restore externally pinned checks completed before a resume cursor.
+    pub(crate) fn from_checkpoint(
+        floor: u64,
+        expected_genesis_hash: Option<Hash32>,
+        anchors: HashMap<u64, Hash32>,
+        checked_anchors: BTreeSet<u64>,
+        genesis_checked: bool,
     ) -> Self {
         Self {
             prev: None,
             floor,
             expected_genesis_hash,
             anchors,
-            checked_anchors: std::collections::HashSet::new(),
+            checked_anchors,
+            genesis_checked,
         }
     }
 
@@ -65,6 +85,14 @@ impl ChainWalk {
             .collect();
         unchecked.sort_unstable_by_key(|(slot, _)| *slot);
         unchecked
+    }
+
+    pub(crate) fn checked_anchors(&self) -> BTreeSet<u64> {
+        self.checked_anchors.clone()
+    }
+
+    pub(crate) fn genesis_checked(&self) -> bool {
+        self.genesis_checked
     }
 
     /// Seed the carry with the parent block of the first in-range block
@@ -89,17 +117,18 @@ impl ChainWalk {
                     .with_expected_actual("0", block.parent_slot.to_string()),
                 );
             }
-            if let Some(genesis) = self.expected_genesis_hash
-                && block.parent_blockhash != genesis
-            {
-                result.findings.push(
-                    Finding::new(
-                        0,
-                        FindingCode::GenesisHashMismatch,
-                        "slot 0 parent_blockhash does not match the expected genesis hash",
-                    )
-                    .with_expected_actual(b58(&genesis), b58(&block.parent_blockhash)),
-                );
+            if let Some(genesis) = self.expected_genesis_hash {
+                self.genesis_checked = true;
+                if block.parent_blockhash != genesis {
+                    result.findings.push(
+                        Finding::new(
+                            0,
+                            FindingCode::GenesisHashMismatch,
+                            "slot 0 parent_blockhash does not match the expected genesis hash",
+                        )
+                        .with_expected_actual(b58(&genesis), b58(&block.parent_blockhash)),
+                    );
+                }
             }
         } else if block.parent_slot >= block.slot {
             // A block claiming itself or a future slot as parent is
@@ -451,6 +480,22 @@ mod tests {
                 .iter()
                 .any(|finding| finding.code == FindingCode::AnchorMismatch)
         );
+    }
+
+    #[test]
+    fn resume_restores_checked_anchor_and_genesis_pin_state() {
+        let mut anchors = HashMap::new();
+        anchors.insert(0, [2; 32]);
+        anchors.insert(10, [3; 32]);
+        let mut walk =
+            ChainWalk::from_checkpoint(11, Some([7; 32]), anchors, BTreeSet::from([0, 10]), true);
+        walk.seed(10, [3; 32]);
+        let result = walk.observe_block(&block(11, 10, 4, 3));
+
+        assert!(result.findings.is_empty());
+        assert!(walk.unchecked_anchors().is_empty());
+        assert_eq!(walk.checked_anchors(), BTreeSet::from([0, 10]));
+        assert!(walk.genesis_checked());
     }
 
     #[test]

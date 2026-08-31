@@ -69,17 +69,23 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
         transactions_table: args.transactions_table.clone(),
         ticks_per_slot: args.ticks_per_slot,
         hashes_per_tick_schedule: args.hashes_per_tick_schedule.to_spec(),
+        expected_genesis_hash: args.expected_genesis_hash,
+        anchors: canonical_anchors(&args.anchors),
     };
 
     let mut counters = RunCounters::default();
     let mut cursor = range_start;
     let mut resumed = false;
+    let mut checked_anchors = Default::default();
+    let mut genesis_checked = false;
     if args.resume
         && let Some(path) = args.checkpoint_file.as_deref()
-        && let Some(saved) = checkpoint::load_for_resume(path, &descriptor)?
+        && let Some(saved) = checkpoint::load_for_resume(path, &descriptor, args.full)?
     {
         cursor = saved.next_start;
         counters = saved.counters;
+        checked_anchors = saved.checked_anchors;
+        genesis_checked = saved.genesis_checked;
         resumed = true;
         info!(
             next_start = cursor,
@@ -130,7 +136,13 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
     });
 
     let anchors: HashMap<u64, [u8; 32]> = args.anchors.iter().copied().collect();
-    let mut walk = ChainWalk::new(cursor, args.expected_genesis_hash, anchors);
+    let mut walk = ChainWalk::from_checkpoint(
+        cursor,
+        args.expected_genesis_hash,
+        anchors,
+        checked_anchors,
+        genesis_checked,
+    );
     let mut report = ReportWriter::new(args.report_file.as_deref(), resumed)?;
     let mut progress = ProgressTracker::new(cursor, range_end, args.progress_every_slots);
     let mut aborted = false;
@@ -143,38 +155,14 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
             walk.seed(seed.slot, seed.blockhash);
         }
 
-        let empty_tx: BTreeMap<u32, Vec<[u8; 64]>> = BTreeMap::new();
-        let ticks_per_slot = args.ticks_per_slot;
-        let schedule = &args.hashes_per_tick_schedule;
-        let outcomes: Vec<VerifyOutcome> = tokio::task::block_in_place(|| {
-            pool.install(|| {
-                window
-                    .blocks
-                    .par_iter()
-                    .map(|block| {
-                        let entries = window.entries.get(&block.slot);
-                        match entries.filter(|entries| !entries.is_empty()) {
-                            Some(entries) => verify_block(
-                                mode,
-                                block,
-                                entries,
-                                window.tx_signatures.get(&block.slot).unwrap_or(&empty_tx),
-                                ticks_per_slot,
-                                Some(schedule.value_at(block.slot)),
-                            ),
-                            None => VerifyOutcome {
-                                findings: vec![Finding::new(
-                                    block.slot,
-                                    FindingCode::MissingEntries,
-                                    "block has no entries rows; PoH unverifiable \
-                                     (range ingested without entry data?)",
-                                )],
-                                ..VerifyOutcome::default()
-                            },
-                        }
-                    })
-                    .collect()
-            })
+        let outcomes = tokio::task::block_in_place(|| {
+            verify_window(
+                &window,
+                &pool,
+                mode,
+                args.ticks_per_slot,
+                &args.hashes_per_tick_schedule,
+            )
         });
 
         let mut duplicates_by_slot: BTreeMap<u64, Vec<Finding>> = BTreeMap::new();
@@ -247,12 +235,7 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
                 .unwrap_or(cursor);
             checkpoint::save(
                 path,
-                &Checkpoint {
-                    descriptor: descriptor.clone(),
-                    next_start: accounted_through,
-                    counters: counters.clone(),
-                    updated_unix: checkpoint::now_unix(),
-                },
+                &checkpoint_state(&descriptor, accounted_through, &counters, &walk),
             )?;
         }
         progress.observe(window.end, &counters);
@@ -297,12 +280,7 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
         if let Some(path) = args.checkpoint_file.as_deref() {
             checkpoint::save(
                 path,
-                &Checkpoint {
-                    descriptor: descriptor.clone(),
-                    next_start: range_end + 1,
-                    counters: counters.clone(),
-                    updated_unix: checkpoint::now_unix(),
-                },
+                &checkpoint_state(&descriptor, range_end + 1, &counters, &walk),
             )?;
         }
     }
@@ -318,16 +296,20 @@ async fn fetch_window(
     fetch_transactions: bool,
     need_parent_seed: bool,
 ) -> Result<WindowData> {
-    let blocks = db.fetch_blocks(start, end).await?;
-    let entries = db.fetch_entries(start, end).await?;
-    let tx_signatures = if fetch_transactions {
-        db.fetch_tx_signatures(start, end).await?
-    } else {
-        TxSignaturesBySlot::new()
+    let include_transactions = fetch_transactions;
+    let fetch_transactions = async {
+        if include_transactions {
+            db.fetch_tx_signatures(start, end).await
+        } else {
+            Ok(TxSignaturesBySlot::new())
+        }
     };
-    let duplicate_findings = db
-        .fetch_duplicate_conflicts(start, end, fetch_transactions)
-        .await?;
+    let (blocks, entries, tx_signatures, duplicate_findings) = tokio::try_join!(
+        db.fetch_blocks(start, end),
+        db.fetch_entries(start, end),
+        fetch_transactions,
+        db.fetch_duplicate_conflicts(start, end, include_transactions),
+    )?;
 
     let parent_seed = match blocks.first() {
         Some(block) if need_parent_seed && block.slot != 0 && block.parent_slot < start => {
@@ -344,6 +326,66 @@ async fn fetch_window(
         duplicate_findings,
         parent_seed,
     })
+}
+
+fn canonical_anchors(anchors: &[(u64, [u8; 32])]) -> Vec<(u64, [u8; 32])> {
+    let mut anchors = anchors.to_vec();
+    anchors.sort_unstable();
+    anchors
+}
+
+fn verify_window(
+    window: &WindowData,
+    pool: &rayon::ThreadPool,
+    mode: VerifyMode,
+    ticks_per_slot: u64,
+    schedule: &crate::eras::HashesPerTickSchedule,
+) -> Vec<VerifyOutcome> {
+    let empty_tx: BTreeMap<u32, Vec<[u8; 64]>> = BTreeMap::new();
+    pool.install(|| {
+        window
+            .blocks
+            .par_iter()
+            .map(|block| {
+                let entries = window.entries.get(&block.slot);
+                match entries.filter(|entries| !entries.is_empty()) {
+                    Some(entries) => verify_block(
+                        mode,
+                        block,
+                        entries,
+                        window.tx_signatures.get(&block.slot).unwrap_or(&empty_tx),
+                        ticks_per_slot,
+                        Some(schedule.value_at(block.slot)),
+                    ),
+                    None => VerifyOutcome {
+                        findings: vec![Finding::new(
+                            block.slot,
+                            FindingCode::MissingEntries,
+                            "block has no entries rows; PoH unverifiable \
+                             (range ingested without entry data?)",
+                        )],
+                        ..VerifyOutcome::default()
+                    },
+                }
+            })
+            .collect()
+    })
+}
+
+fn checkpoint_state(
+    descriptor: &JobDescriptor,
+    next_start: u64,
+    counters: &RunCounters,
+    walk: &ChainWalk,
+) -> Checkpoint {
+    Checkpoint {
+        descriptor: descriptor.clone(),
+        next_start,
+        counters: counters.clone(),
+        checked_anchors: walk.checked_anchors(),
+        genesis_checked: walk.genesis_checked(),
+        updated_unix: checkpoint::now_unix(),
+    }
 }
 
 async fn resolve_range(args: &Args, db: &ChDb, epochs: &EpochSlots) -> Result<(u64, u64)> {
@@ -456,5 +498,96 @@ impl ProgressTracker {
             slots_unverifiable = counters.slots_unverifiable,
             "verification progress"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verify::test_support::build_block;
+
+    #[test]
+    fn full_window_execution_preserves_clean_poh_and_chain_results() {
+        let (block, entries, signatures) = build_block(
+            9,
+            8,
+            [1; 32],
+            &[(25, 0), (10, 2), (15, 0), (25, 0), (5, 1), (20, 0)],
+        );
+        let blockhash = block.blockhash;
+        let mut entries_by_slot = BTreeMap::new();
+        entries_by_slot.insert(block.slot, entries);
+        let mut signatures_by_slot = TxSignaturesBySlot::new();
+        signatures_by_slot.insert(block.slot, signatures);
+        let window = WindowData {
+            end: block.slot,
+            blocks: vec![block],
+            entries: entries_by_slot,
+            tx_signatures: signatures_by_slot,
+            duplicate_findings: Vec::new(),
+            parent_seed: None,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        let outcomes = verify_window(
+            &window,
+            &pool,
+            VerifyMode::Full,
+            4,
+            &crate::eras::HashesPerTickSchedule::parse("0:25").unwrap(),
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].findings.is_empty(),
+            "{:?}",
+            outcomes[0].findings
+        );
+        assert_eq!(outcomes[0].entries_verified, 6);
+
+        let mut walk = ChainWalk::new(9, None, HashMap::new());
+        walk.seed(8, [1; 32]);
+        let chain = walk.observe_block(&window.blocks[0]);
+        assert!(chain.findings.is_empty());
+        assert_eq!(slot_status(&outcomes[0].findings), SlotStatus::Ok);
+        assert_eq!(walk.last_present(), Some(9));
+        assert_eq!(blockhash, window.blocks[0].blockhash);
+    }
+
+    #[test]
+    fn missing_entries_are_classified_unverifiable_by_window_execution() {
+        let window = WindowData {
+            end: 10,
+            blocks: vec![BlockInfo {
+                slot: 10,
+                parent_slot: 9,
+                blockhash: [2; 32],
+                parent_blockhash: [1; 32],
+                executed_transaction_count: 0,
+                entry_count: 1,
+            }],
+            entries: BTreeMap::new(),
+            tx_signatures: TxSignaturesBySlot::new(),
+            duplicate_findings: Vec::new(),
+            parent_seed: None,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        let outcomes = verify_window(
+            &window,
+            &pool,
+            VerifyMode::Structural,
+            64,
+            &crate::eras::HashesPerTickSchedule::mainnet(),
+        );
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(slot_status(&outcomes[0].findings), SlotStatus::Unverifiable);
+        assert_eq!(outcomes[0].findings[0].code, FindingCode::MissingEntries);
     }
 }
