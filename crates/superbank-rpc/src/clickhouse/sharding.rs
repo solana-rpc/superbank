@@ -3,11 +3,12 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clickhouse::Client as HttpClient;
@@ -158,7 +159,11 @@ pub(crate) struct ShardTarget {
 #[derive(Clone)]
 pub(crate) struct ShardTopology {
     pub(crate) total_weight: u64,
-    pub(crate) shards: Vec<ShardTarget>,
+    /// All configured replicas grouped by logical shard. Replica order is the failover priority.
+    pub(crate) replicas: Vec<Vec<ShardTarget>>,
+    /// Current replica index for each logical shard. Background health checks may update these.
+    pub(crate) active_replicas: Vec<Arc<AtomicUsize>>,
+    pub(crate) replica_health: Vec<Vec<Arc<AtomicBool>>>,
     pub(crate) weights: Vec<u64>,
     pub(crate) allow_query_settings: bool,
     pub(crate) query_cache: QueryCacheConfig,
@@ -224,8 +229,57 @@ impl ShardTopology {
         select_weighted_index(&self.weights, self.total_weight, hash)
     }
 
-    pub(crate) fn shard_for_hash(&self, hash: u64) -> &ShardTarget {
-        &self.shards[self.shard_index_for_hash(hash)]
+    pub(crate) fn shard_count(&self) -> usize {
+        self.replicas.len()
+    }
+
+    pub(crate) fn shard_at(&self, shard_index: usize) -> Option<ShardTarget> {
+        let replicas = self.replicas.get(shard_index)?;
+        let active = self
+            .active_replicas
+            .get(shard_index)?
+            .load(Ordering::Acquire);
+        replicas.get(active).or_else(|| replicas.first()).cloned()
+    }
+
+    pub(crate) fn active_shards(&self) -> Vec<ShardTarget> {
+        (0..self.shard_count())
+            .filter_map(|idx| self.shard_at(idx))
+            .collect()
+    }
+
+    pub(crate) fn shard_for_hash(&self, hash: u64) -> ShardTarget {
+        self.shard_at(self.shard_index_for_hash(hash))
+            .expect("validated topology has at least one replica per shard")
+    }
+
+    /// Marks a failed active replica unhealthy and atomically advances the logical shard to the
+    /// first other replica currently known to be healthy. The returned target is used by the next
+    /// query; callers may also retry it immediately when their remaining deadline permits.
+    pub(crate) fn failover_from(&self, failed: &ShardTarget) -> Option<ShardTarget> {
+        self.failover_endpoint(&failed.host, failed.tcp_port)
+    }
+
+    pub(crate) fn failover_endpoint(&self, host: &str, port: u16) -> Option<ShardTarget> {
+        let (shard_index, replica_index) =
+            self.replicas
+                .iter()
+                .enumerate()
+                .find_map(|(shard_index, replicas)| {
+                    replicas
+                        .iter()
+                        .position(|replica| replica.host == host && replica.tcp_port == port)
+                        .map(|replica_index| (shard_index, replica_index))
+                })?;
+        self.replica_health[shard_index][replica_index].store(false, Ordering::Release);
+
+        let next = self.replica_health[shard_index]
+            .iter()
+            .enumerate()
+            .find(|(index, health)| *index != replica_index && health.load(Ordering::Acquire))
+            .map(|(index, _)| index)?;
+        self.active_replicas[shard_index].store(next, Ordering::Release);
+        self.replicas[shard_index].get(next).cloned()
     }
 }
 
@@ -291,18 +345,6 @@ fn validate_clickhouse_topology_config(config: &ClickHouseTopologyConfig) -> Pro
     Ok(())
 }
 
-pub(crate) fn selected_configured_shard_nodes(
-    config: &ClickHouseTopologyConfig,
-) -> Vec<ClickHouseTopologyNode> {
-    let mut by_shard = BTreeMap::new();
-    for node in &config.nodes {
-        by_shard
-            .entry(node.shard_id)
-            .or_insert_with(|| node.clone());
-    }
-    by_shard.into_values().collect()
-}
-
 pub(crate) fn derive_local_table_name(
     distributed: &str,
     override_table: Option<String>,
@@ -342,16 +384,6 @@ pub(crate) fn resolve_host(row: &ClusterRow) -> Option<String> {
     } else {
         None
     }
-}
-
-pub(crate) fn pick_replica(replicas: &[ClusterRow]) -> Option<&ClusterRow> {
-    if replicas.is_empty() {
-        return None;
-    }
-    replicas
-        .iter()
-        .find(|row| row.is_local != 0)
-        .or_else(|| replicas.iter().min_by_key(|row| row.replica_num))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -599,7 +631,7 @@ pub(crate) async fn validate_table_schema_on_shards(
     required_columns: &[&str],
     timeout: Duration,
 ) -> ProcessingResult<()> {
-    for shard in &topology.shards {
+    for shard in topology.active_shards() {
         validate_table_schema(
             shard.tcp_pool.as_ref(),
             table,
@@ -621,7 +653,7 @@ pub(crate) async fn detect_bucket_modulus_on_shards(
     timeout: Duration,
 ) -> ProcessingResult<u64> {
     let mut discovered = None;
-    for shard in &topology.shards {
+    for shard in topology.active_shards() {
         let modulus = match tokio::time::timeout(timeout, async {
             let rows = describe_table_schema(
                 shard.tcp_pool.as_ref(),
@@ -686,7 +718,7 @@ mod tests {
     use super::{
         BucketColumn, ClusterRow, DescribeTableRow, QueryCacheConfig, QueryFreshnessClass,
         ShardTopology, bucket_modulus_from_describe_rows, parse_clickhouse_topology_config,
-        resolve_host, select_weighted_index, selected_configured_shard_nodes,
+        resolve_host, select_weighted_index,
     };
 
     fn topology_yaml() -> &'static str {
@@ -909,39 +941,6 @@ nodes:
     }
 
     #[test]
-    fn configured_shard_selection_uses_first_yaml_node_per_shard() {
-        let config = parse_clickhouse_topology_config(
-            "\
-nodes:
-  - shard-id: 2
-    hostname: ch-bhs2-a
-    ip-address: 10.43.86.6
-    tcp-port: 9000
-    shard-weight: 2
-  - shard-id: 1
-    hostname: ch-bhs1
-    ip-address: 10.43.86.5
-    tcp-port: 9000
-    shard-weight: 1
-  - shard-id: 2
-    hostname: ch-bhs2-b
-    ip-address: 10.43.86.7
-    tcp-port: 9000
-    shard-weight: 2
-",
-        )
-        .expect("topology config parses");
-
-        let selected = selected_configured_shard_nodes(&config);
-
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].shard_id, 1);
-        assert_eq!(selected[0].hostname, "ch-bhs1");
-        assert_eq!(selected[1].shard_id, 2);
-        assert_eq!(selected[1].hostname, "ch-bhs2-a");
-    }
-
-    #[test]
     fn bucket_modulus_parses_current_expression_shape() {
         let rows = vec![DescribeTableRow {
             name: "addr_bucket".to_string(),
@@ -1007,7 +1006,9 @@ nodes:
     fn shard_topology_get_transaction_settings_clause_uses_overrides_only_for_that_path() {
         let topology = ShardTopology {
             total_weight: 1,
-            shards: Vec::new(),
+            replicas: Vec::new(),
+            active_replicas: Vec::new(),
+            replica_health: Vec::new(),
             weights: vec![1],
             allow_query_settings: true,
             query_cache: QueryCacheConfig::new(true, 10, false, false)

@@ -602,33 +602,30 @@ Configuration:
 
 ## Optional: disk cache (`disk-cache`)
 
-When compiled with `--features disk-cache` (which implies `grpc-head-cache`) and enabled at runtime, superbank-rpc keeps a RocksDB-backed cache of recent **finalized** slots on local disk. The read tiering becomes:
+When compiled with `--features disk-cache` and enabled at runtime, superbank-rpc forwards recent **finalized** slots from the source cluster to a separate ClickHouse instance on localhost. The feature is independent from `grpc-head-cache`. The read tiering is:
 
 ```
-head cache (memory, unfinalized tip) → disk cache (finalized, recent slots) → ClickHouse (full history)
+head cache (optional, unfinalized tip) → local ClickHouse cache (finalized, recent slots) → source ClickHouse (full history)
 ```
 
-The cache is hydrated from ClickHouse on startup, kept current as the Dragon's Mouth stream finalizes slots, and self-repairs gaps from ClickHouse. It never writes to ClickHouse. Any miss, hole, or decode failure silently falls back to a ClickHouse read.
+At startup, superbank-rpc inspects `system.tables` and `system.columns` on the source. It copies the required logical schema into an exclusively owned local database. The forwarder streams `transactions` and `blocks_metadata` in ClickHouse Native format. Local materialized views build the query indexes. Coverage becomes readable only after base rows, dependent views, and transaction counts validate. A miss, hole, local query error, or unavailable local instance falls through to the source cluster.
 
 Methods served from disk when covered: `getBlock`, `getBlocks`, `getBlocksWithLimit`, `getBlockTime`, `getTransaction`, `getSignatureStatuses`, `getSignaturesForAddress`, and `getTransactionsForAddress` (including `tokenAccounts` filters).
 
-> **Sizing:** at mainnet volume the default 10-epoch window (4,320,000 slots) needs on the order of **15–20 TB** of NVMe even with compression (~1.5–2 TB per epoch). Set `DISK_CACHE_MAX_BYTES` to bound disk usage — the retention window shrinks to fit.
+The source ClickHouse user needs read access to the copied tables and their metadata. The local ClickHouse user needs permission to create and drop the dedicated database, create and alter its tables, and read and insert its data. The local HTTP endpoint must use `localhost` or a loopback IP. It can use a different port when the source ClickHouse server is on the same host.
 
-Requires `HEAD_CACHE_ENABLED=true` with a `DRAGONSMOUTH_ENDPOINT`. Set `HEAD_CACHE_RETAIN_SLOTS` to at least `150` when the disk cache is enabled (the default `32` is too small — finalized slots are evicted before the disk snapshot hook fires).
+The local database is semi-ephemeral. Superbank marks databases that it owns and refuses to modify a nonempty unmarked database. A source schema change rebuilds only a marked cache database. `DISK_CACHE_RETAIN_SLOTS` is required. The forwarder fills backward to the configured retention floor when the cache starts partially filled or the retention window increases. `DISK_CACHE_MAX_BYTES` enforces the primary cache database's active-part budget after each fill by evicting complete old partitions; it can purge the newest partition and mark the cache unready when no retained partition fits. Retention drops complete old slot partitions.
 
 ```bash
-# Build with disk-cache (implies grpc-head-cache)
+# Build with the independent disk-cache feature
 cargo build --release -p superbank-rpc --features disk-cache
 
-# Run
+# Run with a source cluster and a separate local ClickHouse HTTP endpoint
 RPC_HOST=0.0.0.0 RPC_PORT=8899 \
-CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
-HEAD_CACHE_ENABLED=true HEAD_CACHE_RETAIN_SLOTS=150 \
-DRAGONSMOUTH_ENDPOINT=https://your-endpoint.rpcpool.com:443 \
-DRAGONSMOUTH_X_TOKEN=your-token \
-DISK_CACHE_ENABLED=true \
-DISK_CACHE_PATH=/var/lib/superbank/disk-cache \
-DISK_CACHE_MAX_BYTES=2199023255552 \
+CLICKHOUSE_URL=http://source-clickhouse:8123 CLICKHOUSE_DATABASE=default \
+DISK_CACHE_ENABLED=true DISK_CACHE_RETAIN_SLOTS=432000 \
+DISK_CACHE_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+DISK_CACHE_CLICKHOUSE_DATABASE=superbank_disk_cache \
 ./target/release/superbank-rpc
 ```
 
@@ -637,16 +634,25 @@ Key configuration options:
 | Option | Environment | Default | Notes |
 |---|---|---|---|
 | `--disk-cache-enabled` | `DISK_CACHE_ENABLED` | `false` | Enable at runtime |
-| `--disk-cache-path` | `DISK_CACHE_PATH` | — | RocksDB directory; required when enabled |
-| `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | `4320000` | Finalized slots to retain (~10 epochs) |
-| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Disk byte budget; `0` = unlimited |
-| `--disk-cache-block-cache-bytes` | `DISK_CACHE_BLOCK_CACHE_BYTES` | `4294967296` | RocksDB block cache (4 GB default) |
-| `--disk-cache-read-concurrency` | `DISK_CACHE_READ_CONCURRENCY` | `64` | Max concurrent blocking disk reads |
-| `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | ClickHouse→disk backfill on startup |
+| `--disk-cache-clickhouse-url` | `DISK_CACHE_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | Local ClickHouse HTTP endpoint; loopback only |
+| `--disk-cache-clickhouse-database` | `DISK_CACHE_CLICKHOUSE_DATABASE` | `superbank_disk_cache` | Dedicated database owned by the cache |
+| `--disk-cache-required` | `DISK_CACHE_REQUIRED` | `false` | Require local initialization at startup and local health for `/health` |
+| `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | — | Finalized slots to retain; required when enabled |
+| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Enforced active-part budget for the primary cache database; `0` means unlimited. A too-small budget can purge the newest partition and leave the cache unready. |
+| `--disk-cache-partition-slots` | `DISK_CACHE_PARTITION_SLOTS` | automatic | Width of local slot partitions |
+| `--disk-cache-memory-tables` | `DISK_CACHE_MEMORY_TABLES` | empty | Memory-engine allowlist; only `blocks_metadata` is accepted |
+| `--disk-cache-block-index-enabled` | `DISK_CACHE_BLOCK_INDEX_ENABLED` | `false` | Durable block-time history plus a bounded in-process read tier; requires `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES` |
+| `--disk-cache-block-index-max-memory-bytes` | `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES` | — | Required memory budget; must fit one 8,125,000-byte segment |
+| `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | Source-to-local forward and repair task |
+| `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots streamed and validated in one range |
+| `--disk-cache-backfill-concurrency` | `DISK_CACHE_BACKFILL_CONCURRENCY` | `4` | Concurrent independent ranges; accepted range is 1–64 |
+| `--disk-cache-backfill-max-slots-per-sec` | `DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC` | `50` | Global admission rate across all ranges |
 
-Observability: `superbank_disk_cache_*` metrics cover coverage span, hit/miss per operation, and write/backfill/repair/eviction activity. The `X-Superbank-Sources` response header reports `disk-cache` when a response was served from disk.
+If `DISK_CACHE_MEMORY_TABLES=blocks_metadata`, also set `DISK_CACHE_MEMORY_RETAIN_SLOTS` and `DISK_CACHE_MEMORY_MAX_BYTES`. Memory coverage resets after a local ClickHouse restart before the forwarder republishes it. The primary cache budget does not include the separately owned block-index database. See the [RPC server reference](../crates/superbank-rpc/README.md#optional-local-clickhouse-forward-cache-disk-cache) for every forwarding, timeout, retention, and Memory-engine option.
 
-Note: the `disk-cache` feature implies `grpc-head-cache` and therefore pulls in AGPL-licensed dependencies via the Yellowstone gRPC crate.
+By default, local initialization is fail-open. The RPC server starts against the source cluster and retries the local cache in the background. Set `DISK_CACHE_REQUIRED=true` to make initialization and health strict.
+
+Observability: `superbank_disk_cache_*` metrics cover readiness, local ClickHouse bytes, coverage, read outcomes, forwarding, errors, rebuilds, and partition eviction. The `X-Superbank-Sources` response header reports `disk-cache` when the local tier contributes.
 
 ---
 

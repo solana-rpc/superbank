@@ -193,6 +193,11 @@ function sourceContains(source, token) {
 }
 
 function isAcceptedDiskSource(source) {
+  // Repeated finalized getBlock requests can be served by the serialized
+  // response cache after the setup probe has proved the disk-cache route.
+  if (sourceContains(source, 'response-cache')) {
+    return !sourceContains(source, 'clickhouse');
+  }
   if (!sourceContains(source, 'disk-cache')) {
     return false;
   }
@@ -605,7 +610,7 @@ function addSignatureTasks(tasks, seen, signatures) {
     addTask(tasks, seen, {
       label: 'get_signature_statuses',
       method: 'getSignatureStatuses',
-      params: [batch],
+      params: [batch, { searchTransactionHistory: true }],
     });
   }
 }

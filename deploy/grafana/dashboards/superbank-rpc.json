@@ -3811,7 +3811,7 @@
               "transformations": []
             }
           },
-          "description": "Requires the disk-cache build feature. One means the RocksDB cache is open and serving.",
+          "description": "Requires the disk-cache build feature. One means the local ClickHouse cache is ready and serving.",
           "id": 30,
           "links": [],
           "title": "Disk cache active",
@@ -3897,7 +3897,7 @@
               "transformations": []
             }
           },
-          "description": "Live SST bytes across all disk-cache column families.",
+          "description": "Active local ClickHouse part bytes owned by the disk cache.",
           "id": 31,
           "links": [],
           "title": "Disk cache size",
@@ -4631,30 +4631,6 @@
                     },
                     "refId": "D"
                   }
-                },
-                {
-                  "kind": "PanelQuery",
-                  "spec": {
-                    "hidden": false,
-                    "query": {
-                      "kind": "DataQuery",
-                      "group": "prometheus",
-                      "version": "v0",
-                      "datasource": {
-                        "name": "$datasource"
-                      },
-                      "spec": {
-                        "editorMode": "code",
-                        "exemplar": false,
-                        "expr": "sum(rate(superbank_disk_cache_dropped_to_repair_total{job=~\"$job\", instance=~\"$instance\"}[$__rate_interval]))",
-                        "instant": false,
-                        "interval": "",
-                        "legendFormat": "deferred to repair",
-                        "range": true
-                      }
-                    },
-                    "refId": "E"
-                  }
                 }
               ],
               "queryOptions": {
@@ -4663,10 +4639,10 @@
               "transformations": []
             }
           },
-          "description": "Write/fill failures, poisoned slots, wipes, and writes deferred to repair.",
+          "description": "Local ClickHouse write/fill failures, poisoned slots, and schema rebuilds.",
           "id": 36,
           "links": [],
-          "title": "Repair and error activity",
+          "title": "Forward-cache error activity",
           "vizConfig": {
             "kind": "VizConfig",
             "group": "timeseries",

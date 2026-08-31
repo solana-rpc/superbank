@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::solana_sdk::pubkey::Pubkey;
@@ -13,6 +14,7 @@ use clickhouse_rs::{
     Block as TcpBlock,
     types::{Complex as TcpComplex, Query as TcpQuery},
 };
+use futures_util::future::join_all;
 use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use reqwest::Url;
@@ -33,7 +35,7 @@ use super::sharding::{
     ShardRoutingConfig, ShardTarget, ShardTopology, TcpPoolSizing,
     bucket_modulus_from_describe_rows, build_tcp_pool, derive_local_table_name,
     detect_bucket_modulus_on_shards, escape_clickhouse_string, load_clickhouse_topology_config,
-    pick_replica, resolve_host, selected_configured_shard_nodes, validate_table_schema_on_shards,
+    resolve_host, validate_table_schema_on_shards,
 };
 use super::types::QueryTimings;
 use super::util::{
@@ -420,6 +422,7 @@ pub struct ClickHouseClient {
     pub(crate) token_owner_activity_local_table: Option<String>,
     pub(crate) transactions_local_table: Option<String>,
     pub(crate) blocks_metadata_local_table: Option<String>,
+    pub(crate) blocks_metadata_supports_prewhere: bool,
     pub(crate) token_owner_activity_available: bool,
     pub(crate) bucket_moduli: BucketModuli,
     pub(crate) allow_query_settings: bool,
@@ -432,6 +435,7 @@ pub struct ClickHouseClient {
     pub(crate) query_timeout: Duration,
     pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
     pub(crate) tcp_access_check_timeout: Duration,
+    pub(crate) replica_health_check_interval: Duration,
     pub(crate) http_connect_timeout: Duration,
     pub(crate) fanout_sem: Arc<Semaphore>,
     // Bounds concurrent direct (scalar/lookup) ClickHouse HTTP queries server-wide so HTTP
@@ -446,6 +450,34 @@ pub struct ClickHouseClient {
     pub(crate) latest_finalized_slot_for_tests: Option<Option<u64>>,
 }
 
+/// Explicit table mapping for secondary ClickHouse clients such as the local
+/// forward cache. The primary client keeps its existing environment-derived
+/// mapping for backwards compatibility.
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug)]
+pub(crate) struct ClickHouseTableNames {
+    pub(crate) transactions: String,
+    pub(crate) blocks_metadata: String,
+    pub(crate) gsfa: String,
+    pub(crate) gsfa_hot: String,
+    pub(crate) signatures: String,
+    pub(crate) token_owner_activity: String,
+}
+
+#[cfg(feature = "disk-cache")]
+impl ClickHouseTableNames {
+    pub(crate) fn in_database(database: &str) -> Self {
+        Self {
+            transactions: format!("{database}.transactions"),
+            blocks_metadata: format!("{database}.blocks_metadata"),
+            gsfa: format!("{database}.gsfa"),
+            gsfa_hot: format!("{database}.gsfa_hot"),
+            signatures: format!("{database}.signatures"),
+            token_owner_activity: format!("{database}.token_owner_activity"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ClickHouseClientOptions {
     pub routing_policy: RoutingPolicy,
@@ -455,6 +487,7 @@ pub struct ClickHouseClientOptions {
     pub gsfa_hot_local_table: String,
     pub query_timeout: Duration,
     pub tcp_access_check_timeout: Duration,
+    pub replica_health_check_interval: Duration,
     pub query_cache: QueryCacheConfig,
     pub fanout_concurrency: usize,
     pub http_concurrency: usize,
@@ -554,6 +587,7 @@ impl ClickHouseClientOptions {
             gsfa_hot_local_table,
             query_timeout: Duration::from_millis(8_000),
             tcp_access_check_timeout: Duration::from_secs(2),
+            replica_health_check_interval: Duration::from_secs(10),
             query_cache: QueryCacheConfig::default(),
             fanout_concurrency: 8,
             http_concurrency: 512,
@@ -573,6 +607,11 @@ impl ClickHouseClientOptions {
 
     pub fn with_tcp_access_check_timeout(mut self, timeout: Duration) -> Self {
         self.tcp_access_check_timeout = timeout;
+        self
+    }
+
+    pub fn with_replica_health_check_interval(mut self, interval: Duration) -> Self {
+        self.replica_health_check_interval = interval;
         self
     }
 
@@ -634,6 +673,7 @@ impl ClickHouseClient {
             gsfa_hot_local_table,
             query_timeout,
             tcp_access_check_timeout,
+            replica_health_check_interval,
             query_cache,
             fanout_concurrency,
             http_concurrency,
@@ -738,6 +778,7 @@ impl ClickHouseClient {
             token_owner_activity_local_table,
             transactions_local_table,
             blocks_metadata_local_table,
+            blocks_metadata_supports_prewhere: true,
             token_owner_activity_available: true,
             bucket_moduli: BucketModuli::default(),
             allow_query_settings: !std::env::var("CLICKHOUSE_DISABLE_QUERY_SETTINGS")
@@ -752,6 +793,7 @@ impl ClickHouseClient {
             query_timeout,
             inflation_reward_limits,
             tcp_access_check_timeout,
+            replica_health_check_interval,
             http_connect_timeout,
             fanout_sem: Arc::new(Semaphore::new(fanout_concurrency.max(1))),
             http_query_sem: Arc::new(Semaphore::new(http_concurrency.max(1))),
@@ -766,6 +808,29 @@ impl ClickHouseClient {
 
     pub fn token_owner_activity_available(&self) -> bool {
         self.token_owner_activity_available
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn use_table_names(&mut self, names: ClickHouseTableNames) {
+        self.transaction_table = names.transactions;
+        self.blocks_metadata_table = names.blocks_metadata;
+        self.gsfa_table = names.gsfa;
+        self.gsfa_hot_table = names.gsfa_hot.clone();
+        self.gsfa_hot_local_table = names.gsfa_hot;
+        self.signature_statuses_table = names.signatures;
+        self.token_owner_activity_table = names.token_owner_activity;
+        self.signatures_local_table = None;
+        self.token_owner_activity_local_table = None;
+        self.transactions_local_table = None;
+        self.blocks_metadata_local_table = None;
+        self.shard_topology = None;
+        self.shard_routing = None;
+        self.gsfa_router = None;
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn set_blocks_metadata_supports_prewhere(&mut self, supported: bool) {
+        self.blocks_metadata_supports_prewhere = supported;
     }
 
     #[cfg(test)]
@@ -1570,9 +1635,7 @@ impl ClickHouseClient {
         {
             match self.build_shard_topology(&config).await {
                 Ok(topology) => {
-                    if self.transport_tcp() {
-                        self.check_tcp_access(&topology).await?;
-                    }
+                    self.initialize_replica_health(&topology).await?;
 
                     let topology = Arc::new(topology);
                     self.shard_topology = Some(topology.clone());
@@ -1675,6 +1738,10 @@ impl ClickHouseClient {
             );
         }
 
+        if let Some(topology) = self.shard_topology.clone() {
+            self.spawn_replica_health_monitor(topology);
+        }
+
         Ok(())
     }
 
@@ -1686,6 +1753,45 @@ impl ClickHouseClient {
             &self.password,
             self.http_connect_timeout,
         )
+    }
+
+    fn build_shard_target(
+        &self,
+        base_url: &Url,
+        http_port: u16,
+        shard_num: u32,
+        host: String,
+        tcp_port: u16,
+        context: &str,
+    ) -> ProcessingResult<ShardTarget> {
+        let tcp_pool = Arc::new(build_tcp_pool(
+            &self.database,
+            &self.username,
+            &self.password,
+            &host,
+            tcp_port,
+            self.shard_tcp_query_timeout(),
+            TcpPoolSizing {
+                min: self.tcp_pool_min,
+                max: self.tcp_pool_max,
+            },
+        )?);
+
+        let mut shard_url = base_url.clone();
+        shard_url.set_host(Some(&host)).map_err(|_| {
+            ProcessingError::database_msg(format!("Invalid shard host '{host}' for {context}"))
+        })?;
+        shard_url.set_port(Some(http_port)).map_err(|_| {
+            ProcessingError::database_msg(format!("Invalid HTTP port '{http_port}' for {context}"))
+        })?;
+
+        Ok(ShardTarget {
+            shard_num,
+            tcp_pool,
+            http_client: self.build_http_client(shard_url.as_str()),
+            host,
+            tcp_port,
+        })
     }
 
     async fn build_shard_topology(
@@ -1711,7 +1817,13 @@ impl ClickHouseClient {
             );
 
             let topology_config = load_clickhouse_topology_config(path).await?;
-            let selected_nodes = selected_configured_shard_nodes(&topology_config);
+            let mut nodes_by_shard = BTreeMap::new();
+            for node in topology_config.nodes.iter().cloned() {
+                nodes_by_shard
+                    .entry(node.shard_id)
+                    .or_insert_with(Vec::new)
+                    .push(node);
+            }
             let configured_lines = topology_config
                 .nodes
                 .iter()
@@ -1730,67 +1842,49 @@ impl ClickHouseClient {
             tracing::debug!(
                 cluster = %config.cluster,
                 topology_config = %path,
-                shard_count = selected_nodes.len(),
+                shard_count = nodes_by_shard.len(),
                 node_count = topology_config.nodes.len(),
                 topology = %configured_lines.join(" | "),
                 "ClickHouse shard routing topology config loaded"
             );
 
-            let mut shards = Vec::with_capacity(selected_nodes.len());
-            let mut weights = Vec::with_capacity(selected_nodes.len());
+            let mut replica_groups = Vec::with_capacity(nodes_by_shard.len());
+            let mut weights = Vec::with_capacity(nodes_by_shard.len());
             let mut total_weight = 0_u64;
 
-            for node in selected_nodes {
-                if node.shard_weight == 0 {
+            for (shard_num, nodes) in nodes_by_shard {
+                let shard_weight = nodes[0].shard_weight;
+                if shard_weight == 0 {
                     return Err(ProcessingError::database_msg(format!(
-                        "Shard {} has zero weight in ClickHouse topology config '{}'",
-                        node.shard_id, path
+                        "Shard {shard_num} has zero weight in ClickHouse topology config '{path}'"
+                    )));
+                }
+                if nodes.iter().any(|node| node.shard_weight != shard_weight) {
+                    return Err(ProcessingError::database_msg(format!(
+                        "Shard {shard_num} has inconsistent replica weights in ClickHouse topology config '{path}'"
                     )));
                 }
 
-                let host = node.ip_address.to_string();
-                let tcp_pool = Arc::new(build_tcp_pool(
-                    &self.database,
-                    &self.username,
-                    &self.password,
-                    &host,
-                    node.tcp_port,
-                    self.shard_tcp_query_timeout(),
-                    TcpPoolSizing {
-                        min: self.tcp_pool_min,
-                        max: self.tcp_pool_max,
-                    },
-                )?);
-
-                let mut shard_url = base_url.clone();
-                shard_url.set_host(Some(&host)).map_err(|_| {
-                    ProcessingError::database_msg(format!(
-                        "Invalid shard ip-address '{host}' in ClickHouse topology config '{path}'"
-                    ))
-                })?;
-                shard_url.set_port(Some(http_port)).map_err(|_| {
-                    ProcessingError::database_msg(format!(
-                        "Invalid HTTP port '{http_port}' for '{}'",
-                        config.cluster
-                    ))
-                })?;
-
-                let http_client = self.build_http_client(shard_url.as_str());
+                let mut replicas = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    replicas.push(self.build_shard_target(
+                        &base_url,
+                        http_port,
+                        shard_num,
+                        node.ip_address.to_string(),
+                        node.tcp_port,
+                        &format!("ClickHouse topology config '{path}'"),
+                    )?);
+                }
 
                 total_weight = total_weight
-                    .checked_add(u64::from(node.shard_weight))
+                    .checked_add(u64::from(shard_weight))
                     .ok_or_else(|| {
                         ProcessingError::database_msg("Total shard weight overflowed u64")
                     })?;
 
-                shards.push(ShardTarget {
-                    shard_num: node.shard_id,
-                    tcp_pool,
-                    http_client,
-                    host,
-                    tcp_port: node.tcp_port,
-                });
-                weights.push(u64::from(node.shard_weight));
+                replica_groups.push(replicas);
+                weights.push(u64::from(shard_weight));
             }
 
             if total_weight == 0 {
@@ -1799,7 +1893,20 @@ impl ClickHouseClient {
 
             return Ok(ShardTopology {
                 total_weight,
-                shards,
+                replica_health: replica_groups
+                    .iter()
+                    .map(|replicas| {
+                        replicas
+                            .iter()
+                            .map(|_| Arc::new(AtomicBool::new(false)))
+                            .collect()
+                    })
+                    .collect(),
+                replicas: replica_groups,
+                active_replicas: weights
+                    .iter()
+                    .map(|_| Arc::new(AtomicUsize::new(0)))
+                    .collect(),
                 weights,
                 allow_query_settings: self.allow_query_settings,
                 query_cache: self.query_cache.clone(),
@@ -1870,75 +1977,55 @@ impl ClickHouseClient {
             "ClickHouse shard routing cluster config discovered"
         );
 
-        let mut shards = Vec::with_capacity(by_shard.len());
+        let mut replica_groups = Vec::with_capacity(by_shard.len());
         let mut weights = Vec::with_capacity(by_shard.len());
         let mut total_weight = 0_u64;
 
-        for (shard_num, replicas) in by_shard {
-            let chosen = pick_replica(&replicas).ok_or_else(|| {
-                ProcessingError::database_msg(format!(
-                    "No replicas available for shard {shard_num} in '{}'",
-                    config.cluster
-                ))
-            })?;
-
-            if chosen.shard_weight == 0 {
+        for (shard_num, mut replicas) in by_shard {
+            replicas.sort_by_key(|replica| (replica.is_local == 0, replica.replica_num));
+            let shard_weight = replicas[0].shard_weight;
+            if shard_weight == 0 {
                 return Err(ProcessingError::database_msg(format!(
                     "Shard {shard_num} has zero weight in '{}'",
                     config.cluster
                 )));
             }
-
-            let host = resolve_host(chosen).ok_or_else(|| {
-                ProcessingError::database_msg(format!(
-                    "Shard {shard_num} has empty host_name/host_address in '{}'",
+            if replicas
+                .iter()
+                .any(|replica| replica.shard_weight != shard_weight)
+            {
+                return Err(ProcessingError::database_msg(format!(
+                    "Shard {shard_num} has inconsistent replica weights in '{}'",
                     config.cluster
-                ))
-            })?;
+                )));
+            }
 
-            let tcp_pool = Arc::new(build_tcp_pool(
-                &self.database,
-                &self.username,
-                &self.password,
-                &host,
-                chosen.port,
-                self.shard_tcp_query_timeout(),
-                TcpPoolSizing {
-                    min: self.tcp_pool_min,
-                    max: self.tcp_pool_max,
-                },
-            )?);
-
-            let mut shard_url = base_url.clone();
-            shard_url.set_host(Some(&host)).map_err(|_| {
-                ProcessingError::database_msg(format!(
-                    "Invalid shard host '{host}' for '{}'",
-                    config.cluster
-                ))
-            })?;
-            shard_url.set_port(Some(http_port)).map_err(|_| {
-                ProcessingError::database_msg(format!(
-                    "Invalid HTTP port '{http_port}' for '{}'",
-                    config.cluster
-                ))
-            })?;
-
-            let http_client = self.build_http_client(shard_url.as_str());
+            let mut targets = Vec::with_capacity(replicas.len());
+            for replica in replicas {
+                let host = resolve_host(&replica).ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "Shard {shard_num} has empty host_name/host_address in '{}'",
+                        config.cluster
+                    ))
+                })?;
+                targets.push(self.build_shard_target(
+                    &base_url,
+                    http_port,
+                    shard_num,
+                    host,
+                    replica.port,
+                    &format!("ClickHouse cluster '{}'", config.cluster),
+                )?);
+            }
 
             total_weight = total_weight
-                .checked_add(u64::from(chosen.shard_weight))
+                .checked_add(u64::from(shard_weight))
                 .ok_or_else(|| {
                     ProcessingError::database_msg("Total shard weight overflowed u64")
                 })?;
 
-            shards.push(ShardTarget {
-                shard_num,
-                tcp_pool,
-                http_client,
-                host,
-                tcp_port: chosen.port,
-            });
-            weights.push(u64::from(chosen.shard_weight));
+            replica_groups.push(targets);
+            weights.push(u64::from(shard_weight));
         }
 
         if total_weight == 0 {
@@ -1947,7 +2034,20 @@ impl ClickHouseClient {
 
         Ok(ShardTopology {
             total_weight,
-            shards,
+            replica_health: replica_groups
+                .iter()
+                .map(|replicas| {
+                    replicas
+                        .iter()
+                        .map(|_| Arc::new(AtomicBool::new(false)))
+                        .collect()
+                })
+                .collect(),
+            replicas: replica_groups,
+            active_replicas: weights
+                .iter()
+                .map(|_| Arc::new(AtomicUsize::new(0)))
+                .collect(),
             weights,
             allow_query_settings: self.allow_query_settings,
             query_cache: self.query_cache.clone(),
@@ -1955,55 +2055,157 @@ impl ClickHouseClient {
         })
     }
 
-    async fn check_tcp_access(&self, topology: &ShardTopology) -> ProcessingResult<()> {
-        let tcp_connect_timeout = self.tcp_access_check_timeout;
-        let mut failures = Vec::new();
+    async fn probe_replica(&self, replica: &ShardTarget) -> Result<(), String> {
+        probe_replica(
+            replica,
+            self.routing_policy.transport,
+            self.tcp_access_check_timeout,
+        )
+        .await
+    }
 
-        for shard in &topology.shards {
-            let mut client = match tokio::time::timeout(
-                tcp_connect_timeout,
-                shard.tcp_pool.get_handle(),
-            )
-            .await
-            {
-                Ok(Ok(handle)) => handle,
-                Ok(Err(e)) => {
-                    failures.push((shard.host.clone(), shard.tcp_port, e.to_string()));
-                    continue;
-                }
-                Err(_) => {
-                    failures.push((shard.host.clone(), shard.tcp_port, "timeout".to_string()));
-                    continue;
-                }
-            };
+    fn spawn_replica_health_monitor(&self, topology: Arc<ShardTopology>) {
+        let interval = self.replica_health_check_interval;
+        let timeout = self.tcp_access_check_timeout;
+        let transport = self.routing_policy.transport;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                for (shard_index, replicas) in topology.replicas.iter().enumerate() {
+                    for (replica_index, replica) in replicas.iter().enumerate() {
+                        let healthy = probe_replica(replica, transport, timeout).await.is_ok();
+                        let was_healthy = topology.replica_health[shard_index][replica_index]
+                            .swap(healthy, Ordering::AcqRel);
+                        if healthy != was_healthy {
+                            if healthy {
+                                tracing::info!(
+                                    shard = replica.shard_num,
+                                    host = %replica.host,
+                                    port = replica.tcp_port,
+                                    "ClickHouse replica recovered"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    shard = replica.shard_num,
+                                    host = %replica.host,
+                                    port = replica.tcp_port,
+                                    "ClickHouse replica became unavailable"
+                                );
+                            }
+                        }
+                    }
 
-            match tokio::time::timeout(tcp_connect_timeout, client.query("SELECT 1").fetch_all())
-                .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => failures.push((shard.host.clone(), shard.tcp_port, e.to_string())),
-                Err(_) => {
-                    failures.push((shard.host.clone(), shard.tcp_port, "timeout".to_string()))
+                    let active = topology.active_replicas[shard_index].load(Ordering::Acquire);
+                    let active_healthy = topology.replica_health[shard_index]
+                        .get(active)
+                        .is_some_and(|health| health.load(Ordering::Acquire));
+                    if !active_healthy
+                        && let Some(failed) = replicas.get(active)
+                        && let Some(selected) = topology.failover_from(failed)
+                    {
+                        tracing::warn!(
+                            shard = selected.shard_num,
+                            selected_host = %selected.host,
+                            selected_port = selected.tcp_port,
+                            "ClickHouse shard failed over to another replica"
+                        );
+                    }
                 }
             }
-        }
+        });
+    }
 
-        if failures.is_empty() {
-            return Ok(());
-        }
+    async fn initialize_replica_health(&self, topology: &ShardTopology) -> ProcessingResult<()> {
+        for (shard_index, replicas) in topology.replicas.iter().enumerate() {
+            let mut selected = None;
+            let mut failures = Vec::new();
+            let probe_results =
+                join_all(replicas.iter().map(|replica| self.probe_replica(replica))).await;
+            for (replica_index, (replica, result)) in replicas.iter().zip(probe_results).enumerate()
+            {
+                match result {
+                    Ok(()) if selected.is_none() => {
+                        topology.replica_health[shard_index][replica_index]
+                            .store(true, Ordering::Release);
+                        selected = Some(replica_index);
+                    }
+                    Ok(()) => {
+                        topology.replica_health[shard_index][replica_index]
+                            .store(true, Ordering::Release);
+                    }
+                    Err(err) => {
+                        topology.replica_health[shard_index][replica_index]
+                            .store(false, Ordering::Release);
+                        tracing::warn!(
+                            shard = replica.shard_num,
+                            host = %replica.host,
+                            port = replica.tcp_port,
+                            error = %err,
+                            "ClickHouse replica unavailable during startup"
+                        );
+                        failures.push(format!("{}:{} ({err})", replica.host, replica.tcp_port));
+                    }
+                }
+            }
 
-        let sample = failures
-            .iter()
-            .take(3)
-            .map(|(host, port, err)| format!("{host}:{port} ({err})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(ProcessingError::database_msg(format!(
-            "ClickHouse TCP access check failed for {} of {} shards: {}",
-            failures.len(),
-            topology.shards.len(),
-            sample
-        )))
+            let Some(selected) = selected else {
+                let shard_num = replicas
+                    .first()
+                    .map(|replica| replica.shard_num)
+                    .unwrap_or(0);
+                return Err(ProcessingError::database_msg(format!(
+                    "No reachable ClickHouse replica for shard {shard_num}: {}",
+                    failures.join(", ")
+                )));
+            };
+            topology.active_replicas[shard_index].store(selected, Ordering::Release);
+            if !failures.is_empty() {
+                let selected_replica = &replicas[selected];
+                tracing::warn!(
+                    shard = selected_replica.shard_num,
+                    selected_host = %selected_replica.host,
+                    selected_port = selected_replica.tcp_port,
+                    unavailable_replicas = failures.len(),
+                    "ClickHouse shard started in degraded replica state"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn probe_replica(
+    replica: &ShardTarget,
+    transport: RoutingTransport,
+    timeout: Duration,
+) -> Result<(), String> {
+    match transport {
+        RoutingTransport::Tcp => probe_replica_tcp(replica, timeout).await,
+        RoutingTransport::Http => probe_replica_http(replica, timeout).await,
+    }
+}
+
+async fn probe_replica_tcp(replica: &ShardTarget, timeout: Duration) -> Result<(), String> {
+    let mut client = match tokio::time::timeout(timeout, replica.tcp_pool.get_handle()).await {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(err)) => return Err(err.to_string()),
+        Err(_) => return Err("timeout acquiring TCP handle".to_string()),
+    };
+
+    match tokio::time::timeout(timeout, client.query("SELECT 1").fetch_all()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("timeout executing SELECT 1".to_string()),
+    }
+}
+
+async fn probe_replica_http(replica: &ShardTarget, timeout: Duration) -> Result<(), String> {
+    match tokio::time::timeout(timeout, replica.http_client.query("SELECT 1").execute()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("timeout executing HTTP SELECT 1".to_string()),
     }
 }
 
@@ -2080,7 +2282,8 @@ mod tests {
 
     use super::{
         ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, kill_query_sql,
-        shard_tcp_query_timeout_for, split_table_reference, validate_gsfa_shard_layout_query,
+        probe_replica, shard_tcp_query_timeout_for, split_table_reference,
+        validate_gsfa_shard_layout_query,
     };
     use crate::clickhouse::{
         QueryCacheConfig, QueryFreshnessClass, RoutingPolicy, RoutingScope, RoutingTransport,
@@ -2443,6 +2646,11 @@ nodes:
     ip-address: 10.43.128.230
     tcp-port: 9000
     shard-weight: 1
+  - shard-id: 1
+    hostname: ch-rbx1-replica
+    ip-address: 10.43.128.232
+    tcp-port: 9000
+    shard-weight: 1
   - shard-id: 2
     hostname: ch-rbx2
     ip-address: 10.43.128.231
@@ -2482,15 +2690,30 @@ nodes:
             .await
             .expect("YAML topology should load without querying system.clusters");
 
-        assert_eq!(topology.shards.len(), 2);
+        assert_eq!(topology.shard_count(), 2);
+        assert_eq!(topology.replicas[0].len(), 2);
         assert_eq!(topology.total_weight, 2);
         assert_eq!(topology.weights, vec![1, 1]);
-        assert_eq!(topology.shards[0].shard_num, 1);
-        assert_eq!(topology.shards[0].host, "10.43.128.230");
-        assert_eq!(topology.shards[0].tcp_port, 9000);
-        assert_eq!(topology.shards[1].shard_num, 2);
-        assert_eq!(topology.shards[1].host, "10.43.128.231");
-        assert_eq!(topology.shards[1].tcp_port, 9000);
+        let shard_1 = topology.shard_at(0).expect("shard 1");
+        assert_eq!(shard_1.shard_num, 1);
+        assert_eq!(shard_1.host, "10.43.128.230");
+        assert_eq!(shard_1.tcp_port, 9000);
+        let shard_2 = topology.shard_at(1).expect("shard 2");
+        assert_eq!(shard_2.shard_num, 2);
+        assert_eq!(shard_2.host, "10.43.128.231");
+        assert_eq!(shard_2.tcp_port, 9000);
+
+        topology.replica_health[0][0].store(true, Ordering::Release);
+        topology.replica_health[0][1].store(true, Ordering::Release);
+        let failed = topology.shard_at(0).expect("active shard 1 replica");
+        let replacement = topology
+            .failover_from(&failed)
+            .expect("healthy alternate replica");
+        assert_eq!(replacement.host, "10.43.128.232");
+        assert_eq!(
+            topology.shard_at(0).expect("failed-over shard").host,
+            replacement.host
+        );
     }
 
     #[test]
@@ -2515,6 +2738,73 @@ nodes:
             shard_tcp_query_timeout_for(std::time::Duration::from_millis(1)),
             std::time::Duration::from_millis(1)
         );
+    }
+
+    #[tokio::test]
+    async fn http_replica_probe_does_not_require_native_clickhouse() {
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP test listener");
+        let http_port = http_listener
+            .local_addr()
+            .expect("HTTP test listener address")
+            .port();
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unavailable TCP port");
+        let unavailable_tcp_port = tcp_listener
+            .local_addr()
+            .expect("unavailable TCP address")
+            .port();
+        drop(tcp_listener);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::OK });
+        let server = tokio::spawn(async move {
+            axum::serve(http_listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve HTTP probe")
+        });
+
+        let client = ClickHouseClient::new(
+            "http://127.0.0.1:8123",
+            "default",
+            "default",
+            "",
+            ClickHouseClientOptions::new(
+                RoutingPolicy {
+                    transport: RoutingTransport::Http,
+                    scope: RoutingScope::ShardDirect,
+                },
+                None,
+                Vec::new(),
+                "default.gsfa_hot".to_string(),
+                "default.gsfa_hot_local".to_string(),
+            ),
+        );
+        let base_url = reqwest::Url::parse("http://127.0.0.1:8123").expect("base URL");
+        let target = client
+            .build_shard_target(
+                &base_url,
+                http_port,
+                1,
+                "127.0.0.1".to_string(),
+                unavailable_tcp_port,
+                "HTTP-only test",
+            )
+            .expect("HTTP shard target");
+
+        assert!(
+            probe_replica(&target, RoutingTransport::Http, Duration::from_secs(1),)
+                .await
+                .is_ok()
+        );
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("HTTP probe server task");
     }
 
     #[test]

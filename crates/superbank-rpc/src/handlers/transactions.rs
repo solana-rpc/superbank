@@ -44,7 +44,7 @@ use crate::util::add_downstream_header;
 
 #[cfg(feature = "grpc-head-cache")]
 use crate::clickhouse::SlotBoundary;
-#[cfg(feature = "grpc-head-cache")]
+#[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
 use std::collections::HashSet;
 
 const GET_TRANSACTION_ALLOWED_FIELDS: [&str; 4] = [
@@ -149,7 +149,7 @@ async fn resolve_signature_slot_for_bounds(
     }
 
     #[cfg(feature = "disk-cache")]
-    if let Some(disk) = state.disk_cache.as_ref()
+    if let Some(disk) = state.disk_cache()
         && let Ok(parsed) = Signature::from_str(signature)
         && let Some(position) = disk.signature_position(parsed).await
     {
@@ -386,7 +386,7 @@ pub(crate) async fn handle_get_transaction(
     // EXCEPT when the request pinned a slot that the disk fully covers: then the
     // transaction conclusively does not exist there.
     #[cfg(feature = "disk-cache")]
-    if let Some(disk) = state.disk_cache.as_ref() {
+    if let Some(disk) = state.disk_cache() {
         route.disk_cache_read();
         if let Some(record) = disk.get_tx(signature).await {
             if requested_slot.is_some_and(|slot| record.slot != slot) {
@@ -757,7 +757,7 @@ pub(crate) async fn handle_get_transactions_for_address(
 
     #[cfg(feature = "disk-cache")]
     let pagination = {
-        if let Some(disk) = state.disk_cache.as_ref() {
+        if let Some(disk) = state.disk_cache() {
             match pagination {
                 Some(PaginationToken::Signature(sig_str)) => {
                     route.disk_cache_read();
@@ -1255,7 +1255,7 @@ pub(crate) async fn handle_get_transactions_for_address(
     // whole eligible range lies inside the contiguous covered span.
     #[cfg(feature = "disk-cache")]
     let disk_page = 'disk: {
-        let Some(disk) = state.disk_cache.as_ref() else {
+        let Some(disk) = state.disk_cache() else {
             break 'disk None;
         };
 
@@ -1335,12 +1335,26 @@ pub(crate) async fn handle_get_transactions_for_address(
 
     #[cfg(feature = "disk-cache")]
     let (skip_clickhouse, clickhouse_query) = match disk_page.as_ref() {
-        Some(page) if !page.reached_floor => (true, None),
+        Some(page)
+            if (query.sort_order == SortOrder::Desc && !page.reached_floor)
+                || (query.sort_order == SortOrder::Asc && !page.reached_tip) =>
+        {
+            (true, None)
+        }
         Some(page) => {
-            // ClickHouse owes only the remainder strictly below the floor.
             let mut remainder = query.clone();
             let slot_filter = remainder.slot_filter.get_or_insert_with(Default::default);
-            slot_filter.lt = Some(slot_filter.lt.map_or(page.floor, |lt| lt.min(page.floor)));
+            match query.sort_order {
+                SortOrder::Desc => {
+                    // ClickHouse owes only the remainder strictly below the floor.
+                    slot_filter.lt =
+                        Some(slot_filter.lt.map_or(page.floor, |lt| lt.min(page.floor)));
+                }
+                SortOrder::Asc => {
+                    // ClickHouse owes only the remainder strictly above the cache tip.
+                    slot_filter.gt = Some(slot_filter.gt.map_or(page.tip, |gt| gt.max(page.tip)));
+                }
+            }
             remainder.limit = limit - page.records.len() as u64;
             (false, Some(remainder))
         }
@@ -1368,7 +1382,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         }
     };
     timings.add(prequery_timings);
-    #[cfg(feature = "grpc-head-cache")]
+    #[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
     let clickhouse_records_count = signature_records.len();
 
     let merged_records = signature_records
@@ -1385,7 +1399,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         })
         .collect::<Vec<_>>();
 
-    #[cfg(feature = "grpc-head-cache")]
+    #[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
     let mut merged_records = merged_records;
     #[cfg(feature = "grpc-head-cache")]
     let mut merged_has_head = false;
@@ -1564,7 +1578,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         };
 
         #[cfg(feature = "grpc-head-cache")]
-        if clickhouse_records_count == 0 && merged_has_disk {
+        if skip_clickhouse || (clickhouse_records_count == 0 && merged_has_disk) {
             #[cfg(feature = "disk-cache")]
             route.source_disk_cache();
         } else if clickhouse_records_count == 0 && merged_has_head {
@@ -1572,7 +1586,13 @@ pub(crate) async fn handle_get_transactions_for_address(
         } else {
             route.source_clickhouse();
         }
-        #[cfg(not(feature = "grpc-head-cache"))]
+        #[cfg(all(not(feature = "grpc-head-cache"), feature = "disk-cache"))]
+        if skip_clickhouse || (clickhouse_records_count == 0 && merged_has_disk) {
+            route.source_disk_cache();
+        } else {
+            route.source_clickhouse();
+        }
+        #[cfg(all(not(feature = "grpc-head-cache"), not(feature = "disk-cache")))]
         route.source_clickhouse();
         route.success();
         let mut resp = json_rpc_success_response(id, result);
@@ -1617,10 +1637,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         if disk_records.is_empty() {
             HashMap::new()
         } else {
-            let disk = state
-                .disk_cache
-                .as_ref()
-                .expect("disk records imply disk cache");
+            let disk = state.disk_cache().expect("disk records imply disk cache");
             let positions: Vec<(u64, u32)> = disk_records
                 .iter()
                 .map(|(slot, idx, _)| (*slot, *idx))
@@ -1845,7 +1862,7 @@ pub(crate) async fn handle_get_transactions_for_address(
     };
 
     #[cfg(feature = "grpc-head-cache")]
-    if signature_pairs.is_empty() && merged_has_disk {
+    if skip_clickhouse || (signature_pairs.is_empty() && merged_has_disk) {
         #[cfg(feature = "disk-cache")]
         route.source_disk_cache();
     } else if signature_pairs.is_empty() && merged_has_head {
@@ -1853,7 +1870,13 @@ pub(crate) async fn handle_get_transactions_for_address(
     } else {
         route.source_clickhouse();
     }
-    #[cfg(not(feature = "grpc-head-cache"))]
+    #[cfg(all(not(feature = "grpc-head-cache"), feature = "disk-cache"))]
+    if skip_clickhouse || (signature_pairs.is_empty() && merged_has_disk) {
+        route.source_disk_cache();
+    } else {
+        route.source_clickhouse();
+    }
+    #[cfg(all(not(feature = "grpc-head-cache"), not(feature = "disk-cache")))]
     route.source_clickhouse();
     route.success();
     let mut combined_timings = timings;

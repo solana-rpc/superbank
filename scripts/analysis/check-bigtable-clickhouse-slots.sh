@@ -12,12 +12,12 @@ set -euo pipefail
 # - RPC_URL points to a Solana RPC node that can serve getBlocks for the requested epoch.
 # - For historical epochs, getBlocks is backed by Bigtable (so slots reflect Bigtable contents).
 # - ClickHouse tables follow ddl/cluster/blocks_metadata.sql (slot is UInt64, partitioned by intDiv(slot, 432000)).
-# - The Distributed table sharding key is stable or provided via CLICKHOUSE_SHARDING_KEY_EXPR.
+# - CLICKHOUSE_CLUSTER identifies the cluster that owns CLICKHOUSE_BLOCKS_LOCAL_TABLE.
 #
 # Failure modes to consider:
 # - RPC nodes may rate-limit or cap getBlocks responses; tune RPC_BLOCK_CHUNK_SLOTS and retries.
 # - Incorrect epoch -> slot mapping if RPC is unavailable; use RPC_URL to resolve epoch schedule.
-# - Shard routing failures; provide CLICKHOUSE_SHARDING_KEY_EXPR or CLICKHOUSE_CLUSTER explicitly.
+# - Missing or unavailable shards; the ClickHouse query fails instead of reporting a partial cluster as missing slots.
 
 die() {
   echo "error: $*" >&2
@@ -85,42 +85,6 @@ CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
 CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
 CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-default}
 CLICKHOUSE_CLUSTER=${CLICKHOUSE_CLUSTER:-default}
-CLICKHOUSE_SHARDING_TABLE=${CLICKHOUSE_SHARDING_TABLE:-blocks_metadata}
-CLICKHOUSE_SHARDING_KEY_EXPR=${CLICKHOUSE_SHARDING_KEY_EXPR:-}
-CLICKHOUSE_HOST_BASE=${CLICKHOUSE_HOST_BASE:-127.0.0}
-CLICKHOUSE_HOST_START=${CLICKHOUSE_HOST_START:-1}
-CLICKHOUSE_HOST_END=${CLICKHOUSE_HOST_END:-1}
-CLICKHOUSE_BLOCKS_LOCAL_TABLE=${CLICKHOUSE_BLOCKS_LOCAL_TABLE:-blocks_metadata_local}
-
-# Required settings
-RPC_URL=${RPC_URL:-}
-
-# Optional settings
-EPOCH_START=${EPOCH_START:-1}
-EPOCH_END=${EPOCH_END:-1}
-OUT_DIR=${OUT_DIR:-./missing-clickhouse-slots}
-
-RPC_TIMEOUT_SECS=${RPC_TIMEOUT_SECS:-30}
-RPC_RETRIES=${RPC_RETRIES:-3}
-RPC_BACKOFF_SECS=${RPC_BACKOFF_SECS:-0.5}
-RPC_BLOCK_CHUNK_SLOTS=${RPC_BLOCK_CHUNK_SLOTS:-2000}
-RPC_MIN_CHUNK_SLOTS=${RPC_MIN_CHUNK_SLOTS:-200}
-RPC_CHUNK_SLEEP_MS=${RPC_CHUNK_SLEEP_MS:-0}
-RPC_LOG_EVERY_CHUNKS=${RPC_LOG_EVERY_CHUNKS:-10}
-RPC_REQUEST_ID_START=${RPC_REQUEST_ID_START:-1}
-REFRESH_SLOTS=${REFRESH_SLOTS:-0}
-
-CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-localhost}
-CLICKHOUSE_PORT=${CLICKHOUSE_PORT:-9000}
-CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
-CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
-CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-default}
-CLICKHOUSE_CLUSTER=${CLICKHOUSE_CLUSTER:-default}
-CLICKHOUSE_SHARDING_TABLE=${CLICKHOUSE_SHARDING_TABLE:-blocks_metadata}
-CLICKHOUSE_SHARDING_KEY_EXPR=${CLICKHOUSE_SHARDING_KEY_EXPR:-}
-CLICKHOUSE_HOST_BASE=${CLICKHOUSE_HOST_BASE:-127.0.0}
-CLICKHOUSE_HOST_START=${CLICKHOUSE_HOST_START:-1}
-CLICKHOUSE_HOST_END=${CLICKHOUSE_HOST_END:-1}
 CLICKHOUSE_BLOCKS_LOCAL_TABLE=${CLICKHOUSE_BLOCKS_LOCAL_TABLE:-blocks_metadata_local}
 
 if [[ -z "$RPC_URL" ]]; then
@@ -147,13 +111,6 @@ if (( RPC_MIN_CHUNK_SLOTS > RPC_BLOCK_CHUNK_SLOTS )); then
   die "RPC_MIN_CHUNK_SLOTS must be <= RPC_BLOCK_CHUNK_SLOTS"
 fi
 
-require_int_in_range "CLICKHOUSE_HOST_START" "$CLICKHOUSE_HOST_START" 0 255
-require_int_in_range "CLICKHOUSE_HOST_END" "$CLICKHOUSE_HOST_END" 0 255
-if (( CLICKHOUSE_HOST_START > CLICKHOUSE_HOST_END )); then
-  die "CLICKHOUSE_HOST_START must be <= CLICKHOUSE_HOST_END"
-fi
-CLICKHOUSE_HOST_COUNT=$((CLICKHOUSE_HOST_END - CLICKHOUSE_HOST_START + 1))
-
 mkdir -p "$OUT_DIR"
 
 export RPC_URL RPC_TIMEOUT_SECS RPC_RETRIES RPC_BACKOFF_SECS RPC_REQUEST_ID_START RPC_BLOCK_CHUNK_SLOTS RPC_MIN_CHUNK_SLOTS RPC_CHUNK_SLEEP_MS RPC_LOG_EVERY_CHUNKS
@@ -168,86 +125,12 @@ clickhouse_query() {
   clickhouse client "${CH_ARGS[@]}" --query "$query"
 }
 
-declare -A CLUSTER_SHARD_HOSTS
-CLUSTER_SHARD_COUNT=0
-if cluster_rows="$(clickhouse_query "SELECT shard_num, if(host_address = '', host_name, host_address) AS host FROM system.clusters WHERE cluster='${CLICKHOUSE_CLUSTER}' AND replica_num=1 ORDER BY shard_num FORMAT TabSeparated")"; then
-  while IFS=$'\t' read -r shard_num host; do
-    if [[ -n "$shard_num" && -n "$host" ]]; then
-      CLUSTER_SHARD_HOSTS["$shard_num"]="$host"
-      CLUSTER_SHARD_COUNT=$((CLUSTER_SHARD_COUNT + 1))
-    fi
-  done <<<"$cluster_rows"
-else
-  warn "unable to query system.clusters for cluster '${CLICKHOUSE_CLUSTER}', falling back to host range rotation"
+cluster_row_count="$(clickhouse_query "SELECT count() FROM system.clusters WHERE cluster='${CLICKHOUSE_CLUSTER}' FORMAT TabSeparated")" \
+  || die "unable to query system.clusters for cluster '${CLICKHOUSE_CLUSTER}'"
+cluster_row_count="$(trim_whitespace "$cluster_row_count")"
+if [[ ! "$cluster_row_count" =~ ^[0-9]+$ ]] || (( cluster_row_count == 0 )); then
+  die "cluster '${CLICKHOUSE_CLUSTER}' was not found on ${CLICKHOUSE_HOST}"
 fi
-
-if [[ -z "$CLICKHOUSE_SHARDING_KEY_EXPR" ]]; then
-  if shard_expr="$(clickhouse_query "SELECT nullIf(replaceRegexpOne(engine_full, '^Distributed\\([^,]+,\\s*[^,]+,\\s*[^,]+,\\s*(.*)\\)$', '\\\\1'), engine_full) FROM system.tables WHERE database='${CLICKHOUSE_DATABASE}' AND name='${CLICKHOUSE_SHARDING_TABLE}' FORMAT TabSeparated")"; then
-    shard_expr="$(trim_whitespace "$shard_expr")"
-    if [[ "$shard_expr" != "\\N" && -n "$shard_expr" ]]; then
-      CLICKHOUSE_SHARDING_KEY_EXPR="$shard_expr"
-    fi
-  else
-    warn "unable to query sharding key for ${CLICKHOUSE_DATABASE}.${CLICKHOUSE_SHARDING_TABLE}, falling back to epoch-based routing"
-  fi
-fi
-
-if [[ -n "$CLICKHOUSE_SHARDING_KEY_EXPR" && "$CLICKHOUSE_SHARDING_KEY_EXPR" =~ rand[[:alnum:]_]*[[:space:]]*\( ]]; then
-  warn "sharding key is random (${CLICKHOUSE_SHARDING_KEY_EXPR}); falling back to epoch-based routing"
-  CLICKHOUSE_SHARDING_KEY_EXPR=""
-fi
-
-get_shard_for_slot() {
-  local slot="$1"
-  local shard_num=""
-  if [[ -n "$CLICKHOUSE_SHARDING_KEY_EXPR" ]]; then
-    if shard_num="$(clickhouse_query "WITH
-      toUInt64(${slot}) AS slot,
-      toUInt32(0) AS slot_idx,
-      ${CLICKHOUSE_SHARDING_KEY_EXPR} AS shard_key,
-      (SELECT sum(shard_weight) FROM system.clusters WHERE cluster='${CLICKHOUSE_CLUSTER}') AS total_weight,
-      shard_key % total_weight AS shard_rem
-    SELECT shard_num
-    FROM (
-      SELECT
-        shard_num,
-        sum(shard_weight) OVER (ORDER BY shard_num) AS cumulative_weight
-      FROM system.clusters
-      WHERE cluster='${CLICKHOUSE_CLUSTER}'
-    )
-    WHERE shard_rem < cumulative_weight
-    ORDER BY shard_num
-    LIMIT 1
-    FORMAT TabSeparated")"; then
-      shard_num="$(trim_whitespace "$shard_num")"
-      if [[ "$shard_num" =~ ^[0-9]+$ ]]; then
-        printf '%s' "$shard_num"
-        return 0
-      fi
-    fi
-  fi
-  return 1
-}
-
-fallback_host_for_epoch() {
-  local epoch="$1"
-  local epoch_num=$((10#$epoch))
-  if (( CLUSTER_SHARD_COUNT > 0 )); then
-    local shard_index=$((epoch_num % CLUSTER_SHARD_COUNT))
-    local shard_num=$((shard_index + 1))
-    local host="${CLUSTER_SHARD_HOSTS[$shard_num]}"
-    if [[ -n "$host" ]]; then
-      printf '%s' "$host"
-      return 0
-    fi
-  fi
-  if (( CLICKHOUSE_HOST_COUNT > 0 )); then
-    local host_octet=$((CLICKHOUSE_HOST_START + (epoch_num % CLICKHOUSE_HOST_COUNT)))
-    printf '%s' "${CLICKHOUSE_HOST_BASE}.${host_octet}"
-    return 0
-  fi
-  printf '%s' "$CLICKHOUSE_HOST"
-}
 
 blocks_table="$(resolve_table_name "$CLICKHOUSE_BLOCKS_LOCAL_TABLE")"
 
@@ -461,33 +344,18 @@ PY
     continue
   fi
 
-  shard_host=""
-  shard_num=""
-  if shard_num="$(get_shard_for_slot "$start_slot")"; then
-    shard_host="${CLUSTER_SHARD_HOSTS[$shard_num]}"
-  fi
-  if [[ -z "$shard_host" ]]; then
-    shard_host="$(fallback_host_for_epoch "$epoch")"
-  fi
-  if [[ -z "$shard_host" ]]; then
-    die "unable to resolve shard host for epoch ${epoch}"
-  fi
+  echo "  checking ClickHouse cluster ${CLICKHOUSE_CLUSTER} via ${CLICKHOUSE_HOST}"
 
-  echo "  checking ClickHouse on ${shard_host} (shard ${shard_num:-unknown})"
-
-  CH_HOST_ARGS=(--host "$shard_host" --port "$CLICKHOUSE_PORT" --user "$CLICKHOUSE_USER" --database "$CLICKHOUSE_DATABASE")
-  if [[ -n "$CLICKHOUSE_PASSWORD" ]]; then
-    CH_HOST_ARGS+=(--password "$CLICKHOUSE_PASSWORD")
-  fi
   ch_slots_file="$OUT_DIR/clickhouse-slots-epoch-${epoch}.txt"
-  clickhouse client "${CH_HOST_ARGS[@]}" --query "
+  clickhouse_query "
 WITH
   toUInt64(${start_slot}) AS start_slot,
   toUInt64(${end_slot}) AS end_slot
 SELECT slot
-FROM ${blocks_table}
+FROM cluster('${CLICKHOUSE_CLUSTER}', ${blocks_table})
 WHERE slot BETWEEN start_slot AND end_slot
 ORDER BY slot
+SETTINGS skip_unavailable_shards = 0
 FORMAT TSV
 " > "$ch_slots_file"
 

@@ -151,7 +151,7 @@ get_shard_for_epoch() {
       epoch_value * slots_per_epoch AS slot,
       toUInt32(0) AS slot_idx,
       ${CLICKHOUSE_SHARDING_KEY_EXPR} AS shard_key,
-      (SELECT sum(shard_weight) FROM system.clusters WHERE cluster='${CLICKHOUSE_CLUSTER}') AS total_weight,
+      (SELECT sum(shard_weight) FROM system.clusters WHERE cluster='${CLICKHOUSE_CLUSTER}' AND replica_num=1) AS total_weight,
       shard_key % total_weight AS shard_rem
     SELECT shard_num
     FROM (
@@ -159,7 +159,7 @@ get_shard_for_epoch() {
         shard_num,
         sum(shard_weight) OVER (ORDER BY shard_num) AS cumulative_weight
       FROM system.clusters
-      WHERE cluster='${CLICKHOUSE_CLUSTER}'
+      WHERE cluster='${CLICKHOUSE_CLUSTER}' AND replica_num=1
     )
     WHERE shard_rem < cumulative_weight
     ORDER BY shard_num

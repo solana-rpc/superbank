@@ -35,7 +35,7 @@ import http from 'k6/http';
 import { check, fail } from 'k6';
 import { config } from '../../lib/config.js';
 import { deepEqual } from '../../lib/compare.js';
-import { initAddressPool, getAddressPool } from '../../lib/addresses.js';
+import { initAddressPool } from '../../lib/addresses.js';
 
 const rpcUrl = config.rpcUrl;
 const referenceUrl = config.referenceRpcUrl;
@@ -44,6 +44,7 @@ const blockSamples = Number(__ENV.PARITY_BLOCK_SAMPLES || 12);
 const addressCount = Number(__ENV.PARITY_ADDRESSES || 5);
 const pageSize = Number(__ENV.PARITY_PAGE_SIZE || 100);
 const maxPages = Number(__ENV.PARITY_MAX_PAGES || 10);
+const addressPool = initAddressPool();
 
 export const options = {
   vus: 1,
@@ -72,6 +73,14 @@ function rpc(url, method, params) {
   }
 }
 
+function comparableResult(label, result) {
+  if (label !== 'getSignatureStatuses' || !result?.context) {
+    return result;
+  }
+  const { slot: _slot, ...context } = result.context;
+  return { ...result, context };
+}
+
 /**
  * Issue the same call against both targets and require identical outcomes:
  * equal results, or equal error codes.
@@ -87,7 +96,11 @@ function compareCall(label, method, params) {
       Boolean(target.error) === Boolean(reference.error) &&
       (!target.error || target.error.code === reference.error.code),
     [`${label}: result parity`]: () =>
-      Boolean(target.error) || deepEqual(target.result ?? null, reference.result ?? null),
+      Boolean(target.error) ||
+      deepEqual(
+        comparableResult(label, target.result ?? null),
+        comparableResult(label, reference.result ?? null),
+      ),
   });
   if (!ok) {
     console.error(
@@ -103,8 +116,6 @@ export function setup() {
   if (!referenceUrl) {
     fail('REFERENCE_RPC_URL is required for parity validation');
   }
-  initAddressPool();
-
   // Anchor on a finalized tip both targets have passed.
   const target = rpc(rpcUrl, 'getSlot', [{ commitment: 'finalized' }]);
   const reference = rpc(referenceUrl, 'getSlot', [{ commitment: 'finalized' }]);
@@ -112,7 +123,7 @@ export function setup() {
     fail('could not resolve finalized tips for both targets');
   }
   const tip = Math.min(target.result, reference.result) - 32;
-  return { tip, addresses: getAddressPool().slice(0, addressCount) };
+  return { tip, addresses: addressPool.slice(0, addressCount) };
 }
 
 export default function (data) {

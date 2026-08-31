@@ -5,10 +5,10 @@
 
 use crate::solana_sdk::hash::Hash;
 use crate::solana_sdk::pubkey::Pubkey;
-use axum::{http::StatusCode, response::Response};
+use axum::{body::Bytes, http::StatusCode, response::Response};
 use serde_json::{Value, json};
 use solana_clock::{DEFAULT_SLOTS_PER_EPOCH, MAX_PROCESSING_AGE};
-use solana_commitment_config::CommitmentConfig;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
@@ -19,8 +19,10 @@ use solana_transaction_status::{EncodeError, TransactionDetails, UiTransactionEn
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{error, warn};
 
+use crate::block_response_cache::BlockResponseCacheKey;
 use crate::clickhouse::{
     InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings, StoredBlockPayload,
     StoredBlockRecord,
@@ -38,7 +40,7 @@ use crate::hydration::{BlockHydrationError, hydrate_block_payload};
 use crate::metrics;
 use crate::rpc::{
     json_rpc_error_response, json_rpc_internal_error_response, json_rpc_node_unhealthy_response,
-    json_rpc_null_response, json_rpc_success_response,
+    json_rpc_null_response, json_rpc_success_response, json_rpc_success_response_from_result_bytes,
 };
 use crate::state::{AppState, LatestSlotSource};
 use crate::util::add_downstream_header;
@@ -70,11 +72,43 @@ impl GetBlockFetchPlan {
     }
 
     fn needs_blocking_hydration(self) -> bool {
-        matches!(
-            self.transaction_details,
-            TransactionDetails::Accounts | TransactionDetails::Full
-        )
+        !matches!(self.transaction_details, TransactionDetails::None)
     }
+
+    fn cache_key(self, slot: u64, commitment: CommitmentLevel) -> BlockResponseCacheKey {
+        let encoding = match self.encoding {
+            UiTransactionEncoding::Binary => 0,
+            UiTransactionEncoding::Base58 => 1,
+            UiTransactionEncoding::Base64 => 2,
+            UiTransactionEncoding::Json => 3,
+            UiTransactionEncoding::JsonParsed => 4,
+        };
+        let transaction_details = match self.transaction_details {
+            TransactionDetails::Full => 0,
+            TransactionDetails::Signatures => 1,
+            TransactionDetails::None => 2,
+            TransactionDetails::Accounts => 3,
+        };
+        BlockResponseCacheKey {
+            slot,
+            commitment,
+            encoding,
+            transaction_details,
+            show_rewards: self.show_rewards,
+            max_supported_transaction_version: self.max_supported_transaction_version,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BlockResultBuildError {
+    UnsupportedTransactionVersion(u8),
+    Failed(String),
+}
+
+struct BlockResponseOptions {
+    cache_key: Option<BlockResponseCacheKey>,
+    timings: Option<QueryTimings>,
 }
 
 fn block_payload_transaction_count(payload: &StoredBlockPayload) -> Option<usize> {
@@ -230,12 +264,33 @@ async fn get_block_slots_response_for_range(
     #[cfg(not(feature = "grpc-head-cache"))]
     let _ = commitment;
 
+    // Full-history memory tier. It is hydrated asynchronously and only claims
+    // ranges whose durable local rows have been loaded completely.
+    #[cfg(feature = "disk-cache")]
+    let (index_slots, index_span): (Vec<u64>, Option<(u64, u64)>) = state
+        .disk_cache()
+        .and_then(|disk| disk.block_index())
+        .and_then(|index| {
+            let (floor, head) = index.tip_span()?;
+            if end_slot < floor || start_slot > head {
+                return None;
+            }
+            let start = start_slot.max(floor);
+            let end = end_slot.min(head);
+            index
+                .slots_in_range(start, end)
+                .map(|slots| (slots, Some((floor, head))))
+        })
+        .unwrap_or_default();
+    #[cfg(not(feature = "disk-cache"))]
+    let (index_slots, index_span): (Vec<u64>, Option<(u64, u64)>) = (Vec::new(), None);
+
     // Disk tier: the contiguous covered span answers its part of the range, so
     // ClickHouse is only consulted below the coverage floor and above the
     // covered head (the latter matters when disk writes lag the chain tip).
     #[cfg(feature = "disk-cache")]
     let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) =
-        if let Some(disk) = state.disk_cache.as_ref() {
+        if let Some(disk) = state.disk_cache() {
             route.disk_cache_read();
             match disk.tip_span() {
                 Some((floor, head)) if end_slot >= floor && start_slot <= head => {
@@ -255,9 +310,25 @@ async fn get_block_slots_response_for_range(
     #[cfg(not(feature = "disk-cache"))]
     let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) = (Vec::new(), None);
 
-    let disk_contributed = disk_span.is_some();
+    let (cached_slots, cached_span) = match (index_span, disk_span) {
+        (Some(index), Some(disk))
+            if index.0 <= disk.1.saturating_add(1) && disk.0 <= index.1.saturating_add(1) =>
+        {
+            (
+                merge_sorted_block_slots(index_slots, disk_slots),
+                Some((index.0.min(disk.0), index.1.max(disk.1))),
+            )
+        }
+        (Some(index), Some(disk)) if index.1 >= disk.1 => (index_slots, Some(index)),
+        (Some(_), Some(disk)) => (disk_slots, Some(disk)),
+        (Some(index), None) => (index_slots, Some(index)),
+        (None, Some(disk)) => (disk_slots, Some(disk)),
+        (None, None) => (Vec::new(), None),
+    };
+
+    let disk_contributed = cached_span.is_some();
     let mut clickhouse_ranges: Vec<(u64, u64)> = Vec::new();
-    match disk_span {
+    match cached_span {
         Some((floor, head)) => {
             if start_slot < floor {
                 clickhouse_ranges.push((start_slot, end_slot.min(floor.saturating_sub(1))));
@@ -305,16 +376,16 @@ async fn get_block_slots_response_for_range(
     let head_contributed = !head_slots.is_empty();
 
     if let Some(err) = clickhouse_error {
-        if !head_contributed && !disk_contributed {
+        if disk_contributed || !head_contributed {
             error!(
-                "Failed to query ClickHouse for block slots {}..={}: {}",
+                "Failed to query ClickHouse for the uncovered part of block range {}..={}: {}",
                 start_slot, end_slot, err
             );
             return Ok(json_rpc_internal_error_response(id));
         }
 
         warn!(
-            "Serving cache-only slots for range {}..={} after ClickHouse error: {}",
+            "Serving head-cache-only slots for range {}..={} after ClickHouse error: {}",
             start_slot, end_slot, err
         );
     }
@@ -332,7 +403,7 @@ async fn get_block_slots_response_for_range(
     }
 
     let slots = merge_sorted_block_slots(
-        merge_sorted_block_slots(clickhouse_slots, disk_slots),
+        merge_sorted_block_slots(clickhouse_slots, cached_slots),
         head_slots,
     );
     metrics::blocks_slots_returned(route.method(), slots.len());
@@ -1272,8 +1343,9 @@ async fn respond_with_hydrated_block(
     slot: u64,
     payload: StoredBlockPayload,
     fetch_plan: GetBlockFetchPlan,
-    timings: Option<QueryTimings>,
+    options: BlockResponseOptions,
 ) -> Result<Response, StatusCode> {
+    let BlockResponseOptions { cache_key, timings } = options;
     if payload.metadata().slot != slot {
         warn!(
             requested = slot,
@@ -1299,70 +1371,95 @@ async fn respond_with_hydrated_block(
         }
     };
 
-    let hydrated = if fetch_plan.needs_blocking_hydration() {
-        let permit = match state.hydration_sem.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                error!(slot, "Hydration semaphore closed");
-                let mut resp = json_rpc_internal_error_response(id);
-                attach_timings(&mut resp);
-                return Ok(resp);
-            }
-        };
-        match tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            hydrate_block_payload(
+    let build_result = async move {
+        let started = Instant::now();
+        let encode = move || {
+            let encoded_block = hydrate_block_payload(
                 payload,
                 fetch_plan.encoding,
                 fetch_plan.transaction_details,
                 fetch_plan.show_rewards,
                 fetch_plan.max_supported_transaction_version,
             )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(join_err) => {
-                error!(
-                    "Failed to join hydration task for block {}: {}",
-                    slot, join_err
-                );
-                let mut resp = json_rpc_internal_error_response(id);
-                attach_timings(&mut resp);
-                return Ok(resp);
-            }
-        }
-    } else {
-        hydrate_block_payload(
-            payload,
-            fetch_plan.encoding,
-            fetch_plan.transaction_details,
-            fetch_plan.show_rewards,
-            fetch_plan.max_supported_transaction_version,
-        )
+            .map_err(|err| match err {
+                BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
+                    version,
+                )) => BlockResultBuildError::UnsupportedTransactionVersion(version),
+                other => BlockResultBuildError::Failed(other.to_string()),
+            })?;
+            serde_json::to_vec(&encoded_block)
+                .map(Bytes::from)
+                .map_err(|err| BlockResultBuildError::Failed(err.to_string()))
+        };
+
+        let result = if fetch_plan.needs_blocking_hydration() {
+            let permit = state
+                .hydration_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    BlockResultBuildError::Failed("hydration semaphore closed".to_string())
+                })?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                encode()
+            })
+            .await
+            .map_err(|err| BlockResultBuildError::Failed(err.to_string()))?
+        } else {
+            encode()
+        };
+        metrics::get_block_phase("hydrate_serialize", started.elapsed().as_secs_f64());
+        result
     };
 
-    match hydrated {
-        Ok(encoded_block) => {
+    let built = match cache_key {
+        Some(key) => state
+            .block_response_cache
+            .get_or_try_insert_with(key, build_result)
+            .await
+            .map(|(bytes, evaluated)| {
+                if !evaluated {
+                    route.source_response_cache();
+                }
+                bytes
+            }),
+        None => build_result.await.map_err(Arc::new),
+    };
+
+    match built {
+        Ok(result_bytes) => {
             route.success();
-            let mut resp = json_rpc_success_response(id, encoded_block);
+            let mut resp = json_rpc_success_response_from_result_bytes(id, result_bytes);
             attach_timings(&mut resp);
             Ok(resp)
         }
-        Err(BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(version))) => {
+        Err(err)
+            if matches!(
+                err.as_ref(),
+                BlockResultBuildError::UnsupportedTransactionVersion(_)
+            ) =>
+        {
+            let BlockResultBuildError::UnsupportedTransactionVersion(version) = err.as_ref() else {
+                unreachable!()
+            };
             route.rpc_error();
             let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
             let mut resp = json_rpc_error_response(
                 id,
                 code,
-                unsupported_transaction_version_message(version),
+                unsupported_transaction_version_message(*version),
                 None,
             );
             attach_timings(&mut resp);
             Ok(resp)
         }
-        Err(e) => {
-            error!("Failed to hydrate block {}: {}", slot, e);
+        Err(err) => {
+            let BlockResultBuildError::Failed(message) = err.as_ref() else {
+                unreachable!()
+            };
+            error!("Failed to build block {} response: {}", slot, message);
             let mut resp = json_rpc_internal_error_response(id);
             attach_timings(&mut resp);
             Ok(resp)
@@ -1443,6 +1540,22 @@ pub(crate) async fn handle_get_block(
         ));
     }
 
+    let response_cache_key = (commitment.commitment == CommitmentLevel::Finalized)
+        .then(|| fetch_plan.cache_key(slot, commitment.commitment));
+    if let Some(response_cache_key) = response_cache_key.as_ref()
+        && state.block_response_cache.enabled()
+    {
+        route.response_cache_read();
+        if let Some(result_bytes) = state.block_response_cache.get(response_cache_key).await {
+            route.source_response_cache();
+            route.success();
+            return Ok(json_rpc_success_response_from_result_bytes(
+                id,
+                result_bytes,
+            ));
+        }
+    }
+
     #[cfg(feature = "grpc-head-cache")]
     if let Some(cache) = state.head_cache.as_ref() {
         route.head_cache_read();
@@ -1477,7 +1590,10 @@ pub(crate) async fn handle_get_block(
                 slot,
                 payload,
                 fetch_plan,
-                None,
+                BlockResponseOptions {
+                    cache_key: response_cache_key.clone(),
+                    timings: None,
+                },
             )
             .await;
         }
@@ -1488,9 +1604,16 @@ pub(crate) async fn handle_get_block(
     // above). A Skipped marker is proof the slot has no block on the finalized
     // chain, so the miss is answered without ClickHouse.
     #[cfg(feature = "disk-cache")]
-    if let Some(disk) = state.disk_cache.as_ref() {
+    if let Some(disk) = state.disk_cache() {
         route.disk_cache_read();
-        match disk.get_block(slot, fetch_plan.transaction_details).await {
+        match disk
+            .get_block(
+                slot,
+                fetch_plan.transaction_details,
+                fetch_plan.show_rewards,
+            )
+            .await
+        {
             crate::disk_cache::DiskBlockResult::Found(payload) => {
                 route.source_disk_cache();
                 return respond_with_hydrated_block(
@@ -1500,7 +1623,10 @@ pub(crate) async fn handle_get_block(
                     slot,
                     *payload,
                     fetch_plan,
-                    None,
+                    BlockResponseOptions {
+                        cache_key: response_cache_key.clone(),
+                        timings: None,
+                    },
                 )
                 .await;
             }
@@ -1640,7 +1766,10 @@ pub(crate) async fn handle_get_block(
         slot,
         block_payload,
         fetch_plan,
-        Some(timings),
+        BlockResponseOptions {
+            cache_key: response_cache_key,
+            timings: Some(timings),
+        },
     )
     .await
 }
@@ -1708,10 +1837,36 @@ pub(crate) async fn handle_get_block_time(
         }
     }
 
+    #[cfg(feature = "disk-cache")]
+    if let Some(index) = state.disk_cache().and_then(|disk| disk.block_index()) {
+        route.disk_cache_read();
+        match index.block_time(slot) {
+            crate::disk_cache::BlockTimeLookup::Found(block_time) => {
+                route.source_disk_cache();
+                route.success();
+                return Ok(match block_time {
+                    Some(value) => json_rpc_success_response(id, json!(value)),
+                    None => json_rpc_null_response(id),
+                });
+            }
+            crate::disk_cache::BlockTimeLookup::Skipped => {
+                route.source_disk_cache();
+                route.not_found();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32009,
+                    format!("Slot {slot} was skipped, or missing in long-term storage"),
+                    None,
+                ));
+            }
+            crate::disk_cache::BlockTimeLookup::NotCovered => {}
+        }
+    }
+
     // Disk tier: a covered slot answers conclusively (including a stored NULL
     // block time); a Skipped marker proves the slot has no block.
     #[cfg(feature = "disk-cache")]
-    if let Some(disk) = state.disk_cache.as_ref() {
+    if let Some(disk) = state.disk_cache() {
         route.disk_cache_read();
         match disk.block_time_for_slot(slot).await {
             crate::disk_cache::DiskBlockTime::Found(block_time) => {

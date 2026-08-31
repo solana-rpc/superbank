@@ -12,6 +12,7 @@ use solana_epoch_schedule::EpochSchedule;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
+use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::ClickHouseClient;
 use crate::metrics;
 use crate::processing::ProcessingError;
@@ -45,14 +46,15 @@ pub(crate) struct AppState {
     pub(crate) emit_http_errors: bool,
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
+    pub(crate) block_response_cache: BlockResponseCache,
     pub(crate) epoch_schedule: EpochSchedule,
     #[cfg(feature = "grpc-head-cache")]
     pub(crate) head_cache: Option<Arc<HeadCache>>,
-    /// Finalized recent-slot cache on local disk; consulted between the head
-    /// cache and ClickHouse. Intentionally not part of latest-slot resolution:
+    /// Finalized recent-slot cache in local ClickHouse; consulted between the
+    /// head cache and source ClickHouse. It is not part of latest-slot resolution:
     /// its tip never leads the head cache, so it adds nothing there.
     #[cfg(feature = "disk-cache")]
-    pub(crate) disk_cache: Option<Arc<DiskCache>>,
+    pub(crate) disk_cache: Option<Arc<tokio::sync::OnceCell<Arc<DiskCache>>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +65,11 @@ pub(crate) enum LatestSlotSource {
 }
 
 impl AppState {
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn disk_cache(&self) -> Option<&Arc<DiskCache>> {
+        self.disk_cache.as_ref()?.get()
+    }
+
     pub(crate) async fn resolve_latest_slot_with_source(
         &self,
         operation: &'static str,

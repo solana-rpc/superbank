@@ -22,8 +22,6 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::clickhouse::BlockMetadataRecord;
-#[cfg(feature = "disk-cache")]
-use crate::disk_cache::ingest::DiskIngestSink;
 use crate::head_cache::HeadCache;
 use crate::metrics;
 
@@ -33,9 +31,6 @@ pub(crate) struct DragonsmouthHeadCacheConfig {
     pub(crate) x_token: Option<String>,
     pub(crate) max_decoding_bytes: usize,
     pub(crate) min_commitment: CommitmentLevel,
-    /// Receives finalized slots for the disk cache; never blocks the stream.
-    #[cfg(feature = "disk-cache")]
-    pub(crate) disk_sink: Option<Arc<DiskIngestSink>>,
 }
 
 const TRANSACTIONS_FILTER_NAME: &str = "_superbank_rpc";
@@ -64,7 +59,7 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
 
                 while let Some(result) = stream.next().await {
                     match result {
-                        Ok(output) => handle_output(&cache, output, &cfg),
+                        Ok(output) => handle_output(&cache, output),
                         Err(err) => {
                             warn!("head cache: block-machine error: {err:?}");
                             break;
@@ -188,8 +183,7 @@ async fn run_block_meta_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCache
     }
 }
 
-#[cfg_attr(not(feature = "disk-cache"), allow(unused_variables))]
-fn handle_output(cache: &HeadCache, output: BlockMachineOutput, cfg: &DragonsmouthHeadCacheConfig) {
+fn handle_output(cache: &HeadCache, output: BlockMachineOutput) {
     match output {
         BlockMachineOutput::FrozenBlock(block) => {
             let slot = block.slot;
@@ -227,12 +221,6 @@ fn handle_output(cache: &HeadCache, output: BlockMachineOutput, cfg: &Dragonsmou
         }
         BlockMachineOutput::SlotCommitmentUpdate(update) => {
             cache.note_slot_commitment(update.slot, update.commitment);
-            #[cfg(feature = "disk-cache")]
-            if update.commitment == CommitmentLevel::Finalized
-                && let Some(sink) = cfg.disk_sink.as_ref()
-            {
-                sink.on_slot_finalized(update.slot, cache);
-            }
         }
         BlockMachineOutput::ForkDetected(fork) => {
             warn!(slot = fork.slot, "head cache: fork detected; dropping slot");

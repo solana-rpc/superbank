@@ -145,6 +145,12 @@ fn encode_request_header_labels(
     encode_optional_label(encoder, "x_account_id", x_account_id)
 }
 
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BlockIndexLookupLabels {
+    operation: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct MethodLabels {
     method: String,
@@ -507,6 +513,11 @@ pub struct Metrics {
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
+    get_block_response_cache_access: Family<OperationOutcomeLabels, Counter>,
+    get_block_response_cache_entries: Gauge,
+    get_block_response_cache_weighted_bytes: Gauge,
+    get_block_response_cache_max_bytes: Gauge,
+    get_block_phase_seconds: Family<OperationLabels, Histogram>,
 
     backend_errors: Family<OperationLabels, Counter>,
     inflation_reward_rejections: Family<BatchRejectLabels, Counter>,
@@ -577,17 +588,29 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_write_errors_total: Counter,
     #[cfg(feature = "disk-cache")]
-    disk_cache_dropped_to_repair_total: Family<DiskCacheReasonLabels, Counter>,
-    #[cfg(feature = "disk-cache")]
     disk_cache_evicted_slots_total: Family<DiskCacheReasonLabels, Counter>,
     #[cfg(feature = "disk-cache")]
     disk_cache_backfill_slots_remaining: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_backfill_inflight_ranges: Gauge,
     #[cfg(feature = "disk-cache")]
     disk_cache_fill_errors_total: Counter,
     #[cfg(feature = "disk-cache")]
     disk_cache_poisoned_slots_total: Counter,
     #[cfg(feature = "disk-cache")]
     disk_cache_wipes_total: Counter,
+    #[cfg(feature = "disk-cache")]
+    block_index_active: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_floor_slot: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_head_slot: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_allocated_bytes: Gauge,
+    #[cfg(feature = "disk-cache")]
+    block_index_errors_total: Family<OperationLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    block_index_lookup_seconds: Family<BlockIndexLookupLabels, Histogram>,
 }
 
 impl Metrics {
@@ -607,6 +630,12 @@ impl Metrics {
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let rpc_blocks_slots_returned =
             Family::new_with_constructor(block_slot_count_histogram as fn() -> Histogram);
+        let get_block_response_cache_access = Family::default();
+        let get_block_response_cache_entries = Gauge::default();
+        let get_block_response_cache_weighted_bytes = Gauge::default();
+        let get_block_response_cache_max_bytes = Gauge::default();
+        let get_block_phase_seconds =
+            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
 
         let backend_errors = Family::default();
         let inflation_reward_rejections = Family::default();
@@ -678,17 +707,30 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         let disk_cache_write_errors_total = Counter::default();
         #[cfg(feature = "disk-cache")]
-        let disk_cache_dropped_to_repair_total = Family::default();
-        #[cfg(feature = "disk-cache")]
         let disk_cache_evicted_slots_total = Family::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_backfill_slots_remaining = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_backfill_inflight_ranges = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_fill_errors_total = Counter::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_poisoned_slots_total = Counter::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_wipes_total = Counter::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_active = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_floor_slot = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_head_slot = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_allocated_bytes = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_errors_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let block_index_lookup_seconds =
+            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
 
         let mut registry = Registry::with_prefix("superbank");
 
@@ -741,6 +783,31 @@ impl Metrics {
             "rpc_blocks_slots_returned",
             "Distribution of slot counts returned by getBlocks/getBlocksWithLimit",
             rpc_blocks_slots_returned.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_access",
+            "getBlock serialized-response cache access outcomes",
+            get_block_response_cache_access.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_entries",
+            "Approximate number of serialized getBlock responses cached",
+            get_block_response_cache_entries.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_weighted_bytes",
+            "Approximate serialized getBlock result bytes cached",
+            get_block_response_cache_weighted_bytes.clone(),
+        );
+        registry.register(
+            "get_block_response_cache_max_bytes",
+            "Configured serialized getBlock response cache byte budget",
+            get_block_response_cache_max_bytes.clone(),
+        );
+        registry.register(
+            "get_block_phase_seconds",
+            "getBlock phase latency in seconds",
+            get_block_phase_seconds.clone(),
         );
         registry.register(
             "rpc_backend_errors",
@@ -867,6 +934,40 @@ impl Metrics {
             );
         }
 
+        #[cfg(feature = "disk-cache")]
+        {
+            registry.register(
+                "block_index_active",
+                "Whether the full-history in-process block index worker is active",
+                block_index_active.clone(),
+            );
+            registry.register(
+                "block_index_floor_slot",
+                "Oldest slot hydrated into the full-history block index",
+                block_index_floor_slot.clone(),
+            );
+            registry.register(
+                "block_index_head_slot",
+                "Newest slot hydrated into the full-history block index",
+                block_index_head_slot.clone(),
+            );
+            registry.register(
+                "block_index_allocated_bytes",
+                "Bytes allocated by full-history block-index segments",
+                block_index_allocated_bytes.clone(),
+            );
+            registry.register(
+                "block_index_errors",
+                "Full-history block-index errors by operation",
+                block_index_errors_total.clone(),
+            );
+            registry.register(
+                "block_index_lookup_seconds",
+                "In-process full-history block-index lookup latency",
+                block_index_lookup_seconds.clone(),
+            );
+        }
+
         #[cfg(feature = "grpc-streaming")]
         {
             registry.register(
@@ -920,7 +1021,7 @@ impl Metrics {
             );
             registry.register(
                 "disk_cache_size_bytes",
-                "Live SST bytes across all disk-cache column families",
+                "Active local ClickHouse part bytes owned by the disk cache",
                 disk_cache_size_bytes.clone(),
             );
             registry.register(
@@ -940,13 +1041,8 @@ impl Metrics {
             );
             registry.register(
                 "disk_cache_write_errors",
-                "RocksDB write failures",
+                "Local ClickHouse forward or insert failures",
                 disk_cache_write_errors_total.clone(),
-            );
-            registry.register(
-                "disk_cache_dropped_to_repair",
-                "Live slots deferred to the repair queue by reason",
-                disk_cache_dropped_to_repair_total.clone(),
             );
             registry.register(
                 "disk_cache_evicted_slots",
@@ -957,6 +1053,11 @@ impl Metrics {
                 "disk_cache_backfill_slots_remaining",
                 "Holes remaining inside the retention window",
                 disk_cache_backfill_slots_remaining.clone(),
+            );
+            registry.register(
+                "disk_cache_backfill_inflight_ranges",
+                "Source-to-local slot ranges currently being forwarded",
+                disk_cache_backfill_inflight_ranges.clone(),
             );
             registry.register(
                 "disk_cache_fill_errors",
@@ -994,6 +1095,11 @@ impl Metrics {
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
             rpc_blocks_slots_returned,
+            get_block_response_cache_access,
+            get_block_response_cache_entries,
+            get_block_response_cache_weighted_bytes,
+            get_block_response_cache_max_bytes,
+            get_block_phase_seconds,
             backend_errors,
             inflation_reward_rejections,
             inflation_reward_lookups,
@@ -1058,17 +1164,29 @@ impl Metrics {
             #[cfg(feature = "disk-cache")]
             disk_cache_write_errors_total,
             #[cfg(feature = "disk-cache")]
-            disk_cache_dropped_to_repair_total,
-            #[cfg(feature = "disk-cache")]
             disk_cache_evicted_slots_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_backfill_slots_remaining,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_backfill_inflight_ranges,
             #[cfg(feature = "disk-cache")]
             disk_cache_fill_errors_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_poisoned_slots_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_wipes_total,
+            #[cfg(feature = "disk-cache")]
+            block_index_active,
+            #[cfg(feature = "disk-cache")]
+            block_index_floor_slot,
+            #[cfg(feature = "disk-cache")]
+            block_index_head_slot,
+            #[cfg(feature = "disk-cache")]
+            block_index_allocated_bytes,
+            #[cfg(feature = "disk-cache")]
+            block_index_errors_total,
+            #[cfg(feature = "disk-cache")]
+            block_index_lookup_seconds,
         })
     }
 
@@ -1286,6 +1404,29 @@ impl Metrics {
         self.rpc_blocks_slots_returned
             .get_or_create(&labels)
             .observe(slots as f64);
+    }
+
+    pub fn get_block_response_cache_access(&self, outcome: &'static str) {
+        let labels = Self::current_operation_outcome_labels("get_block", outcome);
+        self.get_block_response_cache_access
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    pub fn get_block_response_cache_state(&self, entries: u64, bytes: u64, max_bytes: u64) {
+        self.get_block_response_cache_entries
+            .set(clamp_i64(entries));
+        self.get_block_response_cache_weighted_bytes
+            .set(clamp_i64(bytes));
+        self.get_block_response_cache_max_bytes
+            .set(clamp_i64(max_bytes));
+    }
+
+    pub fn get_block_phase(&self, phase: &str, elapsed_seconds: f64) {
+        let labels = Self::current_operation_labels(phase);
+        self.get_block_phase_seconds
+            .get_or_create(&labels)
+            .observe(elapsed_seconds);
     }
 
     pub fn backend_error(&self, operation: &str) {
@@ -1655,6 +1796,24 @@ pub(crate) fn blocks_slots_returned(method: &str, slots: usize) {
     }
 }
 
+pub(crate) fn get_block_response_cache_access(outcome: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics.get_block_response_cache_access(outcome);
+    }
+}
+
+pub(crate) fn get_block_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
+    if let Some(metrics) = metrics() {
+        metrics.get_block_response_cache_state(entries, bytes, max_bytes);
+    }
+}
+
+pub(crate) fn get_block_phase(phase: &str, elapsed_seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics.get_block_phase(phase, elapsed_seconds);
+    }
+}
+
 pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {
     match metrics() {
         Some(metrics) => metrics.export(),
@@ -1662,7 +1821,6 @@ pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {
     }
 }
 
-#[cfg(feature = "grpc-head-cache")]
 fn clamp_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -1857,18 +2015,6 @@ pub(crate) fn disk_cache_write_error() {
 }
 
 #[cfg(feature = "disk-cache")]
-pub(crate) fn disk_cache_dropped_to_repair(reason: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_dropped_to_repair_total
-            .get_or_create(&DiskCacheReasonLabels {
-                reason: reason.to_string(),
-            })
-            .inc();
-    }
-}
-
-#[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_evicted(reason: &'static str, slots: u64) {
     if let Some(metrics) = metrics() {
         metrics
@@ -1890,6 +2036,15 @@ pub(crate) fn disk_cache_backfill_remaining(slots: u64) {
 }
 
 #[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_backfill_inflight(ranges: usize) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_backfill_inflight_ranges
+            .set(i64::try_from(ranges).unwrap_or(i64::MAX));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_fill_error() {
     if let Some(metrics) = metrics() {
         metrics.disk_cache_fill_errors_total.inc();
@@ -1907,6 +2062,50 @@ pub(crate) fn disk_cache_poisoned_slot() {
 pub(crate) fn disk_cache_wipe() {
     if let Some(metrics) = metrics() {
         metrics.disk_cache_wipes_total.inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_enabled(active: bool) {
+    if let Some(metrics) = metrics() {
+        metrics.block_index_active.set(i64::from(active));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_state(floor: u64, head: u64, bytes: u64) {
+    if let Some(metrics) = metrics() {
+        metrics.block_index_floor_slot.set(clamp_i64(floor));
+        metrics.block_index_head_slot.set(clamp_i64(head));
+        metrics.block_index_allocated_bytes.set(clamp_i64(bytes));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_error(operation: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .block_index_errors_total
+            .get_or_create(&OperationLabels {
+                operation: operation.to_string(),
+                x_endpoint: None,
+                x_rpc_node: None,
+                x_subscription_id: None,
+                x_account_id: None,
+            })
+            .inc();
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn block_index_lookup(operation: &'static str, elapsed_seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .block_index_lookup_seconds
+            .get_or_create(&BlockIndexLookupLabels {
+                operation: operation.to_string(),
+            })
+            .observe(elapsed_seconds);
     }
 }
 

@@ -54,7 +54,7 @@ flowchart LR
   subgraph Serve
     RPC[superbank-rpc]
     HC[gRPC head cache (optional)]
-    DC[RocksDB disk cache (optional)]
+    DC[local ClickHouse forward cache (optional)]
     SGRPC[Superbank gRPC streaming (optional)]
   end
 
@@ -84,8 +84,7 @@ flowchart LR
 
   DM -. optional .-> HC
   HC -. merges recent slots .-> RPC
-  CH -. optional backfill .-> DC
-  HC -. finalized slots .-> DC
+  CH -. schema and recent finalized rows .-> DC
   DC -. recent finalized reads .-> RPC
   CH --> SGRPC
 
@@ -107,12 +106,11 @@ License note: enabling `grpc-head-cache` pulls in an AGPL-3.0 dependency. See
 [`crates/superbank-rpc/README.md`](../crates/superbank-rpc/README.md) for details, including supported
 methods and configuration.
 
-## Optional Disk Cache
+## Optional Local ClickHouse Forward Cache
 
-With `--features disk-cache`, `superbank-rpc` can keep a RocksDB-backed cache of recent finalized
-slots. The disk cache is hydrated from ClickHouse and updated from finalized head-cache slots. It is
-a read-through acceleration tier for recent finalized JSON-RPC reads; it does not write back to
-ClickHouse.
+With `--features disk-cache`, `superbank-rpc` can forward recent finalized slots from the source ClickHouse cluster to a separate ClickHouse instance on localhost. This feature is independent from the optional gRPC head cache. The local instance is a bounded near cache and never becomes a source of truth.
+
+At startup, the RPC server inspects source metadata and creates an equivalent cache-specific schema. The forwarder streams bounded ranges concurrently in ClickHouse Native format through one global rate limiter. Each range lets local materialized views build the query indexes, validates transaction counts, and only then marks its slots covered. A failed range remains a hole without invalidating successful sibling ranges. Reads use a contiguous covered range and fall through to the source cluster for misses, holes, and older history. MergeTree tables use whole-slot-range partitions for retention. The `blocks_metadata` table can use a bounded `Memory` engine when explicitly configured.
 
 ## Optional Superbank gRPC Streaming
 

@@ -660,8 +660,9 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-block.js \
 
 ### Response Metrics
 
-Current Superbank versions emit `X-Superbank-Metrics`; older deployments may still emit
-`X-Downstream-Timings`. The k6 helpers accept both headers and record whichever metrics are present.
+Current Superbank versions emit `X-Superbank-Metrics` and no longer emit
+`X-Downstream-Timings`. Older deployments may still emit the legacy header, so the k6 helpers
+accept both headers and record whichever metrics are present.
 
 - `rpc_response_size` - Response body size in bytes (Trend)
 - `rpc_signatures_count` - Number of signatures returned per request (Trend)

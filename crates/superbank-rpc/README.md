@@ -112,7 +112,8 @@ Apply `transactions.sql` before the materialized-view schemas (`gsfa*.sql`, `sig
 For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL first, deploy
 `superbank-rpc` next (disk-cache schema 3 intentionally rebuilds existing caches), and only then
 deploy ingestion with transaction version 1 enabled. Rolling back the RPC binary is safe only
-before v1 or `DeactivatedStake` rows have arrived.
+before v1 or `DeactivatedStake` rows have arrived. The optional ClickHouse forward cache detects
+later source schema changes and rebuilds its owned local database automatically.
 ## Run
 
 ```bash
@@ -277,45 +278,40 @@ Configuration:
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
 The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (also AGPL-3.0).
 
-## Optional RocksDB disk cache (`disk-cache`)
+## Optional local ClickHouse forward cache (`disk-cache`)
 
-When compiled with `--features disk-cache` (which implies `grpc-head-cache`) and enabled at
-runtime, superbank-rpc keeps a RocksDB-backed cache of recent **finalized** slots on local disk
-and serves it *in place of* ClickHouse. The read tiering becomes:
+When compiled with `--features disk-cache` and enabled at runtime, superbank-rpc forwards recent **finalized** slots from the configured source ClickHouse cluster into a separate ClickHouse instance on localhost. The feature is independent from `grpc-head-cache`. The local instance is a near cache, not a second source of truth. The read tiering is:
+
+`DISK_CACHE_BLOCK_INDEX_ENABLED=true` adds a durable full-history `(slot, block_time)` store for `getBlockTime`, `getBlocks`, and `getBlocksWithLimit` in the separately owned local database `<cache_database>_block_index`. Its in-process read tier is deliberately bounded by the required `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES`: one-million-slot segments are retained only while they fit that budget, rounded down to whole segments. Startup remains asynchronous: ranges outside the hydrated window continue through the recent cache and source fallbacks. The historical worker reads finalized source metadata only, fills newest ranges first, and then proceeds toward slot zero. This feature cannot be combined with the ClickHouse Memory-engine mode.
 
 ```
-head cache (memory, unfinalized tip) -> disk cache (finalized, recent slots) -> ClickHouse (full history)
+head cache (optional, unfinalized tip) -> local ClickHouse cache (finalized, recent slots) -> source ClickHouse (full history)
 ```
 
-The cache is hydrated FROM ClickHouse ("backfill") on startup, kept current by copying slots out
-of the head cache as the DragonsMouth stream finalizes them, and self-repairs gaps from
-ClickHouse. It never writes to ClickHouse. Coverage is tracked per slot and claimed atomically
-with the data, so the cache never serves a slot it holds partially; any miss, hole, or decode
-failure silently degrades to a ClickHouse read.
+At startup, superbank-rpc inspects the source tables through `system.tables` and `system.columns`. It copies columns, types, defaults, codecs, indexes, primary keys, sorting keys, and materialized-view queries into a cache-specific schema. Local MergeTree tables use slot-range partitions so retention can drop complete old partitions. The forwarder streams the source `transactions` and `blocks_metadata` tables in ClickHouse Native format over HTTP. Local materialized views build `signatures`, `gsfa`, optional `gsfa_hot`, and optional `token_owner_activity` from each transaction insert.
 
-Served from disk when covered: `getBlock` (all `transactionDetails` levels), `getBlocks`,
-`getBlocksWithLimit`, `getBlockTime`, `getTransaction`, `getSignatureStatuses`,
-`getSignaturesForAddress`, and `getTransactionsForAddress` (including `tokenAccounts` filters via
-an on-disk port of the `gsfa` and `token_owner_activity` materialized views). Address queries are
-answered from the contiguous covered span; ClickHouse is consulted only for the remainder strictly
-below the coverage floor.
+Coverage is published only after the base rows, dependent materialized views, and transaction-count validation complete. A hole, partial slot, local query error, or unavailable cache falls through to the source cluster. Address queries use only the contiguous covered tip span and ask the source cluster for any older remainder. The source credentials remain in superbank-rpc; the local ClickHouse instance does not connect to the source cluster.
 
-> [!WARNING]
-> **Sizing:** at mainnet volume the default 10-epoch window (4,320,000 slots) needs on the order
-> of **15–20 TB** of NVMe even with compression (~1.5–2 TB per epoch across the record and index
-> column families). Set `DISK_CACHE_MAX_BYTES` to bound disk usage — the retention window shrinks
-> to fit, with the tighter of the slot window and the byte budget winning.
+The source ClickHouse user needs read access to the copied tables and their `system.tables` and `system.columns` metadata. The local ClickHouse user needs permission to create and drop the dedicated database, create and alter its tables, and read and insert its data.
 
-Requires `HEAD_CACHE_ENABLED=true` with a usable `DRAGONSMOUTH_ENDPOINT` (the stream is the live
-ingestion source). `HEAD_CACHE_RETAIN_SLOTS` is clamped to at least `64` when the disk cache is
-enabled: the default `32` roughly equals the mainnet finalization lag, so finalized slots would
-already be evicted from the head cache when the disk snapshot hook fires; `150` is a comfortable
-setting (~1.5–3 GB of head-cache memory at mainnet rates).
+The cache serves `getBlock` (all `transactionDetails` levels), `getBlocks`, `getBlocksWithLimit`, `getBlockTime`, `getTransaction`, `getSignatureStatuses`, `getSignaturesForAddress`, and `getTransactionsForAddress` when the required rows are covered. `DISK_CACHE_RETAIN_SLOTS` is required. The forwarder fills backward to the configured retention floor when the cache starts partially filled or the retention window increases. `DISK_CACHE_MAX_BYTES` is enforced after each successful fill against active MergeTree parts in the primary cache database: it evicts complete old partitions to a 90% low-water mark, and purges the newest partition too if that is necessary to get below the budget. If the database cannot get below the budget even after that purge, the cache marks itself unready and returns to source fallback. The limit does not cover the separately owned block-index database, ClickHouse server overhead, or transient in-flight writes.
+
+`GET_BLOCK_RESPONSE_CACHE_MAX_BYTES` adds a separate lazy in-process cache of serialized finalized `getBlock` results. Confirmed requests never read or populate it. Its key includes the commitment and every response-shaping option, but not the JSON-RPC request ID. Concurrent finalized requests for the same result share hydration and serialization work. Use `RPC_RESPONSE_GZIP_ENABLED=true` to negotiate gzip for large responses. Clients that can consume binary transaction encoding can request `base64` to reduce full-block encoding cost.
+
+The configured cache database is exclusively owned by this feature. A nonempty database without the Superbank ownership marker is rejected and never modified. A source schema fingerprint change rebuilds only a correctly marked cache database. Treat the instance and database as semi-ephemeral.
+
+By default, local initialization failures do not block RPC startup. Reads continue against the source cluster while a background supervisor retries local initialization. `DISK_CACHE_REQUIRED=true` makes initialization a startup requirement and makes `/health` return HTTP 503 when the local cache is not ready or cannot answer a health query.
+
+Query-facing tables use `ReplacingMergeTree` by default. `blocks_metadata` can opt into the ClickHouse `Memory` engine with `DISK_CACHE_MEMORY_TABLES=blocks_metadata`. This mode requires explicit row and byte caps. Memory-engine coverage is reset after a local ClickHouse restart because those rows are not durable. No other query-facing table is accepted in the Memory allowlist in this release.
 
 Run example:
 
 ```bash
-RPC_HOST=0.0.0.0 RPC_PORT=8899 CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default HEAD_CACHE_ENABLED=true HEAD_CACHE_RETAIN_SLOTS=150 DRAGONSMOUTH_ENDPOINT=https://YOUR_DRAGONSMOUTH_ENDPOINT DISK_CACHE_ENABLED=true DISK_CACHE_PATH=/var/lib/superbank/disk-cache DISK_CACHE_MAX_BYTES=2199023255552 cargo run -p superbank-rpc --features disk-cache --
+RPC_HOST=0.0.0.0 RPC_PORT=8899 \
+CLICKHOUSE_URL=http://source-clickhouse:8123 CLICKHOUSE_DATABASE=default \
+DISK_CACHE_ENABLED=true DISK_CACHE_RETAIN_SLOTS=432000 \
+DISK_CACHE_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+cargo run -p superbank-rpc --features disk-cache --
 ```
 
 Configuration:
@@ -323,22 +319,37 @@ Configuration:
 | Option | Environment | Default | Notes |
 | --- | --- | --- | --- |
 | `--disk-cache-enabled` | `DISK_CACHE_ENABLED` | `false` | Enables the feature at runtime. |
-| `--disk-cache-path` | `DISK_CACHE_PATH` | — | RocksDB directory; required when enabled. |
-| `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | `4320000` | Finalized slots to retain (~10 epochs). |
-| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Disk byte budget; `0` = unlimited. Tighter of window/budget wins. |
-| `--disk-cache-block-cache-bytes` | `DISK_CACHE_BLOCK_CACHE_BYTES` | `4294967296` | RocksDB block cache shared across column families. |
-| `--disk-cache-write-queue-slots` | `DISK_CACHE_WRITE_QUEUE_SLOTS` | `64` | Live write queue depth; overflow defers slots to repair. |
-| `--disk-cache-read-concurrency` | `DISK_CACHE_READ_CONCURRENCY` | `64` | Max concurrent blocking disk reads. |
-| `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | ClickHouse->disk backfill/repair task. |
-| `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots per ClickHouse range query. |
-| `--disk-cache-backfill-max-slots-per-sec` | `DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC` | `50` | Backfill rate limit (the default fills 10 epochs in ~24h). |
+| `--disk-cache-clickhouse-url` | `DISK_CACHE_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | Local ClickHouse HTTP endpoint. The host must be localhost or a loopback IP. |
+| `--disk-cache-clickhouse-database` | `DISK_CACHE_CLICKHOUSE_DATABASE` | `superbank_disk_cache` | Dedicated database owned by the cache. |
+| `--disk-cache-clickhouse-user` | `DISK_CACHE_CLICKHOUSE_USER` | `default` | Local ClickHouse user. |
+| `--disk-cache-clickhouse-password` | `DISK_CACHE_CLICKHOUSE_PASSWORD` | empty | Local ClickHouse password. |
+| `--disk-cache-required` | `DISK_CACHE_REQUIRED` | `false` | Fail startup and strict health when the local cache is unavailable. |
+| `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | — | Finalized slots to retain. Required when enabled. |
+| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Enforced active-part byte budget for the primary cache database; `0` means unlimited. May purge the newest partition and mark the cache unready when one partition cannot fit. |
+| `--disk-cache-partition-slots` | `DISK_CACHE_PARTITION_SLOTS` | automatic | Width of local slot partitions. The automatic value targets at most 128 active partitions. |
+| `--disk-cache-query-timeout-ms` | `DISK_CACHE_QUERY_TIMEOUT_MS` | `2000` | Timeout for one local cache read. |
+| `--disk-cache-schema-check-interval-secs` | `DISK_CACHE_SCHEMA_CHECK_INTERVAL_SECS` | `300` | Source schema fingerprint check interval. |
+| `--disk-cache-memory-tables` | `DISK_CACHE_MEMORY_TABLES` | empty | Comma-separated Memory-engine allowlist. Only `blocks_metadata` is accepted. |
+| `--disk-cache-memory-retain-slots` | `DISK_CACHE_MEMORY_RETAIN_SLOTS` | — | Required row cap when `blocks_metadata` uses Memory; must not exceed the main retention window. |
+| `--disk-cache-memory-max-bytes` | `DISK_CACHE_MEMORY_MAX_BYTES` | — | Required byte cap when `blocks_metadata` uses Memory. |
+| `--disk-cache-block-index-enabled` | `DISK_CACHE_BLOCK_INDEX_ENABLED` | `false` | Enables the durable full-history block-time store and bounded in-process index. Requires `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES`. |
+| `--disk-cache-block-index-max-memory-bytes` | `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES` | — | Required in-process block-index segment budget. Must fit at least one 8,125,000-byte segment; values are rounded down to whole segments. |
+| `--disk-cache-block-index-slots-per-query` | `DISK_CACHE_BLOCK_INDEX_SLOTS_PER_QUERY` | `250000` | Slots copied per historical metadata query. |
+| `--disk-cache-block-index-max-slots-per-sec` | `DISK_CACHE_BLOCK_INDEX_MAX_SLOTS_PER_SEC` | `25000` | Read-only source scan rate limit for the historical index. |
+| `--disk-cache-block-index-query-timeout-ms` | `DISK_CACHE_BLOCK_INDEX_QUERY_TIMEOUT_MS` | `300000` | Timeout for one historical metadata range query. |
+| `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | Enables the unified source-to-local forward and repair task. |
+| `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots per ClickHouse range query. Larger ranges reduce fixed query overhead but need a longer timeout. |
+| `--disk-cache-backfill-concurrency` | `DISK_CACHE_BACKFILL_CONCURRENCY` | `4` | Independent validated ranges forwarded concurrently. Accepted range: 1–64. |
+| `--disk-cache-backfill-max-slots-per-sec` | `DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC` | `50` | Source forwarding rate limit. |
 | `--disk-cache-backfill-query-timeout-ms` | `DISK_CACHE_BACKFILL_QUERY_TIMEOUT_MS` | `30000` | Range scans need more than the interactive query timeout. |
-| `--disk-cache-repair-interval-ms` | `DISK_CACHE_REPAIR_INTERVAL_MS` | `5000` | Idle wait between repair/backfill planning rounds. |
-| `--disk-cache-repair-min-lag-slots` | `DISK_CACHE_REPAIR_MIN_LAG_SLOTS` | `75` | Never backfill slots ClickHouse ingest may not have landed. |
+| `--disk-cache-repair-interval-ms` | `DISK_CACHE_REPAIR_INTERVAL_MS` | `5000` | Idle wait between forward/repair planning rounds. |
+| `--disk-cache-repair-min-lag-slots` | `DISK_CACHE_REPAIR_MIN_LAG_SLOTS` | `75` | Do not claim source slots that ingestion may not have landed. |
 
-Observability: `superbank_disk_cache_*` metrics cover coverage span, hit/miss per operation,
-write/backfill/repair/eviction activity, and the route metrics gain a `disk_cache_read` label.
-The `X-Superbank-Sources` response header reports `disk-cache` combinations.
+The forwarder admits all concurrent ranges through one slots-per-second token bucket. Each range streams and validates independently. Coverage is published only for a range that completes both base-table writes and transaction-count validation. For a fast initial fill on capable source and local ClickHouse instances, increase concurrency and the rate limit first, then increase slots per query if fixed query overhead dominates. Watch `superbank_disk_cache_backfill_inflight_ranges`, write latency, fill errors, and source-cluster load while tuning.
+
+The removed RocksDB settings `DISK_CACHE_PATH`, `DISK_CACHE_BLOCK_CACHE_BYTES`, `DISK_CACHE_WRITE_QUEUE_SLOTS`, and `DISK_CACHE_READ_CONCURRENCY` produce a configuration error instead of being ignored.
+
+Observability: `superbank_disk_cache_*` metrics cover readiness, local ClickHouse bytes, coverage span, read outcomes, forwarding, errors, rebuilds, and partition eviction. `superbank_block_index_*` metrics report the full-history worker, hydrated floor/head, allocated memory, and errors. Route metrics retain the `disk_cache_read` label. The `X-Superbank-Sources` response header reports `disk-cache` combinations.
 
 Parity validation against a reference target (e.g. the same build with the disk cache disabled):
 
@@ -361,8 +372,7 @@ The performance scenario pre-probes the target and only keeps workload items who
 `X-Superbank-Sources` header reports a disk-cache hit, then reports per-method latency deltas and
 speedup ratios versus the reference.
 
-License note: the `disk-cache` feature implies `grpc-head-cache` and therefore also pulls in
-`yellowstone-block-machine` (AGPL-3.0).
+The `disk-cache` feature does not pull in or require `grpc-head-cache`.
 
 ## Optional Pyroscope profiling (`pyroscope`)
 
@@ -411,6 +421,8 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--rpc-max-body-bytes` | `RPC_MAX_BODY_BYTES` | `1048576` | Maximum accepted JSON-RPC request body size (bytes). |
 | `--rpc-request-timeout-ms` | `RPC_REQUEST_TIMEOUT_MS` | `10000` | End-to-end timeout for a request envelope (single or batch). |
 | `--rpc-concurrency-limit` | `RPC_CONCURRENCY_LIMIT` | `512` | Maximum number of in-flight HTTP JSON-RPC envelopes. |
+| `--get-block-response-cache-max-bytes` | `GET_BLOCK_RESPONSE_CACHE_MAX_BYTES` | `0` | Serialized finalized `getBlock` result byte budget. `0` disables the in-process cache. Actual RSS also includes cache metadata and in-flight values. |
+| `--rpc-response-gzip-enabled` | `RPC_RESPONSE_GZIP_ENABLED` | `false` | Compress JSON-RPC responses of at least 4 KiB when the client advertises gzip support. |
 | `--rpc-max-batch-size` | `RPC_MAX_BATCH_SIZE` | `64` | Maximum number of JSON-RPC calls in a single batch envelope. |
 | `--rpc-batch-concurrency-limit` | `RPC_BATCH_CONCURRENCY_LIMIT` | `8` | Max concurrent item execution within one batch envelope. |
 | `--get-inflation-reward-max-addresses` | `GET_INFLATION_REWARD_MAX_ADDRESSES` | `100` | Maximum addresses accepted by one `getInflationReward` call. `0` disables this admission check; values above 100 are rejected at startup. |
@@ -451,11 +463,12 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-transport` | `CLICKHOUSE_TRANSPORT` | `http` | `tcp` or `http` (`tcp` requires `CLICKHOUSE_SCOPE=shard-direct`). |
 | `--clickhouse-scope` | `CLICKHOUSE_SCOPE` | `distributed` | `distributed` sends all queries through `CLICKHOUSE_URL`; `shard-direct` enables local-table routing. |
 | `--clickhouse-tcp-access-check-timeout-ms` | `CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS` | `2000` | Shard-direct only. Startup TCP access-check timeout (ms). |
+| `--clickhouse-replica-health-check-interval-ms` | `CLICKHOUSE_REPLICA_HEALTH_CHECK_INTERVAL_MS` | `10000` | Background health-check interval for shard-direct replicas. Unavailable replicas are restored to the failover pool after recovery. |
 | `--clickhouse-tcp-pool-min` | `CLICKHOUSE_TCP_POOL_MIN` | `10` | Shard-direct only. Minimum connections retained per shard in each ClickHouse native (TCP) connection pool. |
 | `--clickhouse-tcp-pool-max` | `CLICKHOUSE_TCP_POOL_MAX` | `20` | Shard-direct only. Maximum connections per shard in each ClickHouse native (TCP) connection pool. Total native connections per instance are bounded by this value times the number of shards, so size it against the ClickHouse connection budget. |
 | `--clickhouse-cluster` | `CLICKHOUSE_CLUSTER` | `{cluster}` | Shard-direct only. Cluster used for topology discovery. |
-| `--clickhouse-topology-config` | `CLICKHOUSE_TOPOLOGY_CONFIG` | — | Shard-direct only. Optional authoritative YAML shard topology that replaces `system.clusters` discovery. |
-| `--clickhouse-gsfa-local-table` | `CLICKHOUSE_GSFA_LOCAL_TABLE` | — | Shard-direct only. Local GSFA table used by address queries. |
+| `--clickhouse-topology-config` | `CLICKHOUSE_TOPOLOGY_CONFIG` | — | Shard-direct only. Optional authoritative YAML shard topology. When set, superbank-rpc skips `system.clusters` discovery, uses the YAML shard/IP/port mapping for shard-local connections, and routes `getTransactionsForAddress` to the address-owner shard. |
+| `--clickhouse-gsfa-local-table` | `CLICKHOUSE_GSFA_LOCAL_TABLE` | — | Shard-direct only. Local GSFA table used by shard-direct reads and owner-shard `getTransactionsForAddress` routing. |
 | `--clickhouse-hot-address` | `CLICKHOUSE_GSFA_HOT_ADDRESSES` | empty | Repeatable; env accepts comma-separated values. |
 | `--clickhouse-gsfa-hot-table` | `CLICKHOUSE_GSFA_HOT_TABLE` | `default.gsfa_hot` | Distributed hot table used for active hot-address reads. |
 | `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-direct only. Local hot table queried by hot-address fanout. |
@@ -480,9 +493,9 @@ Table selection (environment variables, read at startup):
 Shard routing:
 When `CLICKHOUSE_SCOPE=distributed`, superbank-rpc sends every ClickHouse query through `CLICKHOUSE_URL`. It does not read `CLICKHOUSE_TOPOLOGY_CONFIG`, discover `system.clusters`, connect to shard endpoints, query local tables, or validate local schemas. Explicit shard-local settings are ignored with a startup warning.
 
-When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and validates local table schemas. Local tables default to `{table}_local` when not provided explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`).
+When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and validates local table schemas. Local tables default to `{table}_local` when not provided explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`). When a shard has multiple replicas, startup selects the first reachable replica, warns about unavailable replicas, and fails only if no replica is reachable for a shard. Background health checks move traffic away from failed replicas and restore recovered replicas to the failover pool.
 
-In shard-direct scope, set `CLICKHOUSE_TOPOLOGY_CONFIG` (or `--clickhouse-topology-config`) to make a YAML topology file authoritative for shard-local connection targets and skip `system.clusters` discovery at startup. When multiple YAML nodes are listed for the same shard, the first node listed for that shard is used as the shard-local TCP/HTTP connection target, and the remaining nodes are ignored. The YAML `ip-address` field is the authoritative connection address and does not need to match ClickHouse `host_address`. Shard-local TCP uses YAML `ip-address` and `tcp-port`; shard-local HTTP uses the same YAML `ip-address` plus `CLICKHOUSE_SHARD_HTTP_PORT` or the port from `CLICKHOUSE_URL`.
+In shard-direct scope, set `CLICKHOUSE_TOPOLOGY_CONFIG` (or `--clickhouse-topology-config`) to make a YAML topology file authoritative for shard-local connection targets and skip `system.clusters` discovery at startup. When multiple YAML nodes are listed for the same shard, file order defines failover priority and all replicas must use the same shard weight. The first reachable node is selected at startup. The YAML `ip-address` field is the authoritative connection address and does not need to match ClickHouse `host_address`. Shard-local TCP uses YAML `ip-address` and `tcp-port`; shard-local HTTP uses the same YAML `ip-address` plus `CLICKHOUSE_SHARD_HTTP_PORT` or the port from `CLICKHOUSE_URL`.
 YAML keys support both kebab-case and snake_case:
 
 ```yaml
@@ -586,9 +599,9 @@ Route normalization metric:
   - `method`: supported JSON-RPC method name.
   - `transport`: `tcp|http` (active ClickHouse routing transport policy).
   - `scope`: `distributed|shard_direct` (active ClickHouse routing scope policy).
-  - `source`: `clickhouse|head_cache|disk_cache|none` (primary source used for the returned response).
+  - `source`: `clickhouse|head_cache|disk_cache|response_cache|none` (primary source used for the returned response).
   - `head_cache_read`: `true|false` (whether handler read from head cache on that request).
-  - `disk_cache_read`: `true|false` (whether handler read from the RocksDB disk cache on that request).
+  - `disk_cache_read`: `true|false` (whether the handler read from the local ClickHouse disk cache on that request).
   - `outcome`: `success|not_found|invalid_params|rpc_error|backend_error|timeout`.
   - `x_endpoint`: omitted when capture is disabled; otherwise `missing|<value>` (`<value>` is the raw `X-Endpoint` header value).
   - `x_rpc_node`: omitted when capture is disabled; otherwise `missing|<value>`.
@@ -600,6 +613,12 @@ Request-scoped metric families:
 - `rpc_requests`, `rpc_response_time_seconds`, `rpc_inflight_requests`, `rpc_timeouts`, `rpc_response_overhead_seconds`, `rpc_blocks_slots_returned`, `rpc_batch_requests`, `rpc_batch_items`, `rpc_batch_size`, `rpc_batch_rejected_total`, `rpc_backend_errors`, `rpc_clickhouse_duration_seconds`, `rpc_clickhouse_received_bytes`, `rpc_clickhouse_decoded_bytes`, `rpc_clickhouse_timeouts`, `rpc_clickhouse_query_cache_total`, `rpc_clickhouse_query_cache_settings_total` can include `x_endpoint`, `x_rpc_node`, `x_subscription_id`, and `x_account_id` when each capture option is enabled.
 - For those labels, values are `missing|<raw-value>` for enabled capture; disabled capture omits the label.
 
+`getBlock` response-cache metrics:
+
+- `superbank_get_block_response_cache_access_total{operation,outcome}` with `hit`, `miss`, `insert`, and `coalesced` outcomes.
+- `superbank_get_block_response_cache_entries`, `superbank_get_block_response_cache_weighted_bytes`, and `superbank_get_block_response_cache_max_bytes`.
+- `superbank_get_block_phase_seconds{operation}` for hydration and serialization work.
+
 Superbank gRPC streaming metrics, emitted only with `--features grpc-streaming`:
 
 - `superbank_grpc_stream_requests_total{method}`
@@ -609,10 +628,7 @@ Superbank gRPC streaming metrics, emitted only with `--features grpc-streaming`:
 
 Response metric headers:
 
-- `X-Superbank-Sources`: downstream sources consulted while serving the JSON-RPC response. Values
-  are `none`, `clickhouse`, `head-cache`, `both` (legacy head-cache + ClickHouse), `disk-cache`,
-  `disk-cache,clickhouse`, `head-cache,disk-cache`, or `all`. For batch responses, this is the
-  aggregate source footprint across batch items.
+- `X-Superbank-Sources`: downstream sources consulted while serving the JSON-RPC response. Values combine `response-cache`, `head-cache`, `disk-cache`, and `clickhouse` in that order. `both` remains the legacy value for head-cache plus ClickHouse, and `all` remains the value for head-cache, disk-cache, and ClickHouse without the response cache. For batch responses, this is the aggregate source footprint across batch items.
 - `X-Superbank-Metrics`: aggregate ClickHouse timing/volume counters for the response envelope. Format:
   - `rows_read=<u64>|unknown;rows_returned=<u64>;data_read_bytes=<u64>`
   - For batch responses, counters are aggregated across batch items.
