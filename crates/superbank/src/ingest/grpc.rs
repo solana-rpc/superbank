@@ -483,20 +483,24 @@ async fn resolve_initial_from_slot(
 ) -> Result<(Option<u64>, Option<FromSlotMode>)> {
     match args.dragonsmouth_from_slot {
         Some(FromSlotSpec::LatestDb) => {
-            let latest = fetch_latest_slot_from_blocks(clickhouse, &args.blocks_table)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "dragonsmouth-from-slot '*' requires at least one row in {}",
+            match fetch_latest_slot_from_blocks(clickhouse, &args.blocks_table).await? {
+                Some(latest) => {
+                    info!(
+                        slot = latest,
+                        table = %args.blocks_table,
+                        "resolved dragonsmouth-from-slot='*' to latest slot in blocks_metadata"
+                    );
+                    Ok((Some(latest), Some(FromSlotMode::LatestDb)))
+                }
+                None => {
+                    info!(
+                        table = %args.blocks_table,
+                        "dragonsmouth-from-slot='*' found no rows in {}; falling back to gRPC-reported available slot",
                         args.blocks_table
-                    )
-                })?;
-            info!(
-                slot = latest,
-                table = %args.blocks_table,
-                "resolved dragonsmouth-from-slot='*' to latest slot in blocks_metadata"
-            );
-            Ok((Some(latest), Some(FromSlotMode::LatestDb)))
+                    );
+                    Ok((None, Some(FromSlotMode::LatestDb)))
+                }
+            }
         }
         Some(FromSlotSpec::Slot(0)) => Ok((Some(0), Some(FromSlotMode::Zero))),
         Some(FromSlotSpec::Slot(slot)) => Ok((Some(slot), Some(FromSlotMode::Strict))),
