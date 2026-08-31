@@ -37,6 +37,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     fi \
     && cp target/release/superbank-rpc /app/superbank-rpc
 
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked -p superbank-verify \
+    && cp target/release/superbank-verify /app/superbank-verify
+
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
@@ -46,9 +51,10 @@ RUN apt-get update \
 
 COPY --from=builder /app/superbank /usr/local/bin/superbank
 COPY --from=builder /app/superbank-rpc /usr/local/bin/superbank-rpc
+COPY --from=builder /app/superbank-verify /usr/local/bin/superbank-verify
 
 USER superbank
 
-EXPOSE 8899 9900 9901
+EXPOSE 8899 9900 9901 9902
 
 ENTRYPOINT ["/usr/local/bin/superbank-rpc"]

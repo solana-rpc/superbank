@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`), and `crates/superbank-solparq/` (ClickHouse-to-Parquet archiver) which builds two binaries: `superbank-solparq` (archiver daemon) and `superbank-solparq-read` (Parquet archive reader; `src/bin/superbank-solparq-read.rs` over the `read` module).
+- Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`), `crates/superbank-solparq/` (ClickHouse-to-Parquet archiver; `superbank-solparq` and `superbank-solparq-read` binaries), and `crates/superbank-verify/` (Proof-of-History validator).
 - ClickHouse DDL: `ddl/`
 - Load tests: `tests/k6/`
 - Helper scripts: `scripts/`
@@ -13,7 +13,7 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
 
 ## Build, Test, and Development Commands
 - Build (release):
-  `cargo build --release -p superbank -p superbank-rpc -p superbank-solparq` (the `superbank-solparq` package builds both the `superbank-solparq` and `superbank-solparq-read` binaries)
+  `cargo build --release -p superbank -p superbank-rpc -p superbank-solparq -p superbank-verify` (`superbank-solparq` builds both the `superbank-solparq` and `superbank-solparq-read` binaries)
 - Run ingestor with local config:
   `cargo run -p superbank -- --config superbank.yaml`
 - Run RPC server (local ClickHouse):

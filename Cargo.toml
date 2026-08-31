@@ -21,11 +21,28 @@ authors = [
     "aspnxdd <43625217+aspnxdd@users.noreply.github.com>",
 ]
 
+# Versions and baseline features shared by workspace members.
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+clap = { version = "4.5.40", features = ["derive", "env"] }
+kubert-prometheus-process = "0.2.3"
+object_store = { version = "0.13", features = ["aws"] }
+prometheus-client = "0.23.1"
+prometheus-client-derive-encode = "0.4.2"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.46.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [workspace]
 members = [
     "crates/superbank",
     "crates/superbank-rpc",
     "crates/superbank-solparq",
+    "crates/superbank-verify",
 ]
 
 resolver = "2"
@@ -33,4 +50,5 @@ default-members = [
     "crates/superbank",
     "crates/superbank-rpc",
     "crates/superbank-solparq",
+    "crates/superbank-verify",
 ]

@@ -41,3 +41,7 @@ GSFA note:
 - In clustered deployments, `default.gsfa` uses `ENGINE = Distributed(..., 'gsfa_local',
   cityHash64(address))`, so derived rows are routed to the correct shard-local `gsfa_local`
   storage table.
+
+Optional analyst-friendly views over `default.transactions` live in `additional/` and are not
+applied by the base install (Compose, Tilt, k8s). See `additional/README.md` and
+`docs/analyst-views.md`.

@@ -30,10 +30,10 @@ grpc-streaming = [
 ]
 
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
-clap = { version = "4.5.40", features = ["derive", "env"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0"
+axum = { workspace = true, features = ["macros"] }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 serde_yaml = "0.9"
 jsonrpc-core = "18.0.0"
 bincode = "1.3.3"
@@ -41,6 +41,8 @@ wincode = "0.5.5"
 serde_bytes = "0.11"
 serde-big-array = "0.5"
 solana-commitment-config = "3.0.0"
+solana-epoch-schedule = "3.0.0"
+solana-genesis-config = { version = "3", features = ["serde"] }
 solana-rpc-client-api = "4.2.0"
 solana-rpc-client-types = "4.2.0"
 solana-account-decoder-client-types = "4.2.0"
@@ -58,19 +60,19 @@ solana-transaction-error = { version = "3.3.1", features = ["serde", "wincode"] 
 solana-transaction-context = "4.2.0"
 solana-transaction-status = { version = "4.2.0", features = ["agave-unstable-api"] }
 thiserror = "2.0.11"
-tokio = { version = "1.46.1", features = ["full"] }
+tokio.workspace = true
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"] }
 moka = { version = "0.12", features = ["future"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
 tracing-log = "0.2.0"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 once_cell = "1.20"
-prometheus-client = "0.23.1"
-prometheus-client-derive-encode = "0.4.2"
-kubert-prometheus-process = "0.2.3"
+prometheus-client.workspace = true
+prometheus-client-derive-encode.workspace = true
+kubert-prometheus-process.workspace = true
 clickhouse = { version = "0.15", features = ["inserter"] }
 clickhouse-rs = "1.1.0-alpha.1"
 reqwest = { version = "0.13", features = ["json", "stream"] }

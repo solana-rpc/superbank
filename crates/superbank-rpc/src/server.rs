@@ -10,6 +10,8 @@ use axum::{
     routing::{get, post},
 };
 use hyper::Error as HyperError;
+use solana_epoch_schedule::EpochSchedule;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -28,10 +30,12 @@ use crate::clickhouse::{
     RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig,
 };
 use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
+use crate::genesis;
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::metrics;
 use crate::metrics::metrics_handler;
 use crate::processing::ProcessingError;
+use crate::request_filter::RpcParameterFilterSet;
 use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHeaderCaptureConfig};
 
 #[cfg(feature = "grpc-streaming")]
@@ -166,8 +170,40 @@ pub enum RpcError {
     Config(String),
 }
 
+fn epoch_schedule_from_config(args: &RpcConfig) -> RpcResult<EpochSchedule> {
+    let Some(path) = args
+        .genesis_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        warn!(
+            "no --genesis-path set; using the production no-warmup epoch schedule; set --genesis-path for a cluster with warmup epochs"
+        );
+        return Ok(EpochSchedule::without_warmup());
+    };
+
+    let schedule = genesis::load_epoch_schedule(Path::new(path)).map_err(|err| {
+        RpcError::Config(format!(
+            "failed to load epoch schedule from genesis file '{path}': {err}"
+        ))
+    })?;
+    info!(
+        slots_per_epoch = schedule.slots_per_epoch,
+        warmup = schedule.warmup,
+        "loaded epoch schedule from genesis file"
+    );
+    Ok(schedule)
+}
+
 pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     info!("Starting Solana RPC server on {}:{}", args.host, args.port);
+    let rpc_parameter_filters =
+        RpcParameterFilterSet::load(args.config.as_deref()).map_err(RpcError::Config)?;
+    info!(
+        filters = rpc_parameter_filters.len(),
+        "RPC parameter filters loaded"
+    );
     info!(
         transport = ?args.clickhouse_transport,
         scope = ?args.clickhouse_scope,
@@ -217,6 +253,8 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
                 .to_string(),
         ));
     }
+
+    let epoch_schedule = epoch_schedule_from_config(&args)?;
 
     // Initialize ClickHouse client
     let routing_policy = build_routing_policy(&args)?;
@@ -346,6 +384,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 
     let state = Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters,
         max_signatures_limit: args.max_signatures_limit,
         rpc_max_batch_size: args.rpc_max_batch_size.max(1),
         rpc_batch_concurrency_limit: args.rpc_batch_concurrency_limit.max(1),
@@ -360,6 +399,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         latest_block_height_cache: LatestBlockHeightCache::new(Duration::from_millis(1000)),
         rpc_request_timeout: Duration::from_millis(args.rpc_request_timeout_ms),
         emit_http_errors: args.emit_http_errors,
+        epoch_schedule,
         metrics_header_capture: MetricsHeaderCaptureConfig {
             capture_x_endpoint: args.metrics_capture_x_endpoint(),
             capture_x_rpc_node: args.metrics_capture_x_rpc_node(),
@@ -817,8 +857,8 @@ mod tests {
     #[cfg(feature = "disk-cache")]
     use super::validate_disk_cache_args;
     use super::{
-        build_routing_policy, build_shard_routing_config, ignored_distributed_shard_settings,
-        rpc_response_compression_layer,
+        build_routing_policy, build_shard_routing_config, epoch_schedule_from_config,
+        ignored_distributed_shard_settings, rpc_response_compression_layer,
     };
     use crate::clickhouse::{RoutingScope, RoutingTransport};
     use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
@@ -826,6 +866,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, Response, header},
     };
+    use solana_epoch_schedule::EpochSchedule;
     use std::convert::Infallible;
     use tower::{ServiceBuilder, ServiceExt, service_fn};
 
@@ -852,6 +893,53 @@ mod tests {
             .await
             .expect("compressed body");
         assert!(body.len() < 16 * 1024);
+    }
+
+    #[test]
+    fn epoch_schedule_startup_uses_no_warmup_fallback_when_unset() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+
+        assert_eq!(
+            epoch_schedule_from_config(&cfg).expect("default epoch schedule"),
+            EpochSchedule::without_warmup()
+        );
+    }
+
+    #[test]
+    fn epoch_schedule_startup_loads_configured_genesis_file() {
+        use clap::Parser;
+        use std::io::Write;
+
+        use solana_genesis_config::GenesisConfig;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut genesis = GenesisConfig::new(&[], &[]);
+        genesis.epoch_schedule = EpochSchedule::custom(8_192, 8_192, true);
+        let encoded = bincode::serialize(&genesis).expect("serialize genesis");
+        let mut file = tempfile::NamedTempFile::new().expect("temporary genesis file");
+        file.write_all(&encoded).expect("write genesis");
+
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.genesis_path = Some(file.path().display().to_string());
+
+        assert_eq!(
+            epoch_schedule_from_config(&cfg).expect("configured epoch schedule"),
+            genesis.epoch_schedule
+        );
+    }
+
+    #[test]
+    fn epoch_schedule_startup_rejects_unreadable_configured_path() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.genesis_path = Some("/definitely-missing/superbank-genesis.bin".to_string());
+
+        assert!(epoch_schedule_from_config(&cfg).is_err());
     }
 
     #[test]

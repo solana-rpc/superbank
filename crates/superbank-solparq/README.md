@@ -134,14 +134,17 @@ cargo build -p superbank-solparq --bin superbank-solparq-read --release
 
 ## Release
 
-`superbank-solparq` ships through the same release workflow as the main Superbank
-binaries. Releases are triggered by annotated `vX.Y.Z` tags and use
-`.goreleaser.yaml`.
+`superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` ship
+through the same root release workflow as the main Superbank binaries. The
+root `Cargo.toml` is the version authority: every workspace member inherits
+`workspace.package.version`. Normal releases use annotated `vX.Y.Z` tags and
+`.goreleaser.yaml`; tags matching `v*-solparq.*` are intentionally excluded
+from that shared release workflow.
 
-Before tagging, update workspace member versions in `Cargo.toml` files,
-including `crates/superbank-solparq/Cargo.toml` (which builds both the
-`superbank-solparq` and `superbank-solparq-read` binaries), commit release
-changes, and push the branch:
+Before tagging, update `workspace.package.version` in the root `Cargo.toml`,
+commit the release changes, and push the branch. Do not add per-crate version
+fields: `crates/superbank-solparq/Cargo.toml` builds both Solparq binaries but
+inherits the workspace version.
 
 ```bash
 git add Cargo.toml crates/superbank-solparq/Cargo.toml .goreleaser.yaml .github/workflows/release.yml
@@ -171,6 +174,8 @@ superbank-solparq-v0.3.0-linux-amd64.tar.gz
 superbank-solparq-v0.3.0-linux-arm64.tar.gz
 superbank-solparq-read-v0.3.0-linux-amd64.tar.gz
 superbank-solparq-read-v0.3.0-linux-arm64.tar.gz
+superbank-verify-v0.3.0-linux-amd64.tar.gz
+superbank-verify-v0.3.0-linux-arm64.tar.gz
 SHA256SUMS.txt
 ```
 

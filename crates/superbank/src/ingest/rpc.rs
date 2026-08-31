@@ -537,6 +537,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
     flush_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut shutdown_requested = false;
+    let mut progress_open = true;
 
     loop {
         tokio::select! {
@@ -572,7 +573,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                     last_progress = None;
                 }
             }
-            progress = progress_rx.changed() => {
+            progress = progress_rx.changed(), if progress_open => {
                 if progress.is_ok() {
                     let new_cursor = *progress_rx.borrow();
                     let new_processed = new_cursor
@@ -589,6 +590,8 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                         ));
                         next_progress_slot = next_progress_slot.saturating_add(progress_every);
                     }
+                } else {
+                    progress_open = false;
                 }
             }
             result = result_rx.recv() => {
@@ -2488,6 +2491,62 @@ mod tests {
                 "run_rpc_inserter returned Ok despite a pending fatal worker error",
             );
         }
+    }
+
+    #[test]
+    fn inserter_parks_after_discovery_drops_progress_sender() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .expect("build paused runtime");
+
+            runtime.block_on(async move {
+                let args = sample_args();
+
+                let (result_tx, result_rx) = mpsc::channel::<RpcSlotResult>(1);
+                let (progress_tx, progress_rx) = watch::channel(0u64);
+                let (_shutdown_tx, shutdown_rx) = watch::channel(0u64);
+                let (_fatal_tx, fatal_rx) = mpsc::channel::<anyhow::Error>(1);
+
+                drop(progress_tx);
+
+                let inserter = tokio::spawn(async move {
+                    run_rpc_inserter(RpcInserterArgs {
+                        clickhouse: Arc::new(build_clickhouse_client(&args)),
+                        insert_tables: Arc::new(InsertTables::from_args(&args)),
+                        insert_concurrency: 2,
+                        args: &args,
+                        rpc_clients: Arc::new(Vec::new()),
+                        result_rx,
+                        progress_rx,
+                        shutdown_rx,
+                        fatal_rx,
+                        range: RpcRange { start: 0, end: 0 },
+                        start_time: std::time::Instant::now(),
+                    })
+                    .await
+                });
+
+                tokio::time::sleep(Duration::from_secs(30)).await;
+
+                drop(result_tx);
+                inserter
+                    .await
+                    .expect("inserter task panicked")
+                    .expect("inserter returned an error");
+            });
+
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "inserter kept polling the closed progress channel instead of parking",
+        );
     }
 
     #[test]

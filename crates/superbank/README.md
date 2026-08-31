@@ -380,7 +380,9 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `dragonsmouth-from-slot: 0` attempts slot 0; if unavailable, superbank parses the gRPC error to
   find the earliest available slot.
 - `dragonsmouth-from-slot: "*"` uses the highest slot in `blocks_metadata` before subscribing; if
-  rejected, superbank falls back to the gRPC-reported available slot.
+  rejected, superbank falls back to the gRPC-reported available slot. If `blocks_metadata` has no
+  rows yet (fresh deployment), superbank skips straight to that same gRPC-reported available slot
+  instead of erroring.
 - For seeded live-tail gRPC deployments, prefer `dragonsmouth-from-slot: "*"` so process restarts
   resume from the latest durable ClickHouse slot instead of replaying from the earliest available
   upstream slot.
