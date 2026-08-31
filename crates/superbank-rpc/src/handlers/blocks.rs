@@ -2074,6 +2074,17 @@ fn inflation_reward_address_limit_exceeded(
     max_addresses.is_some_and(|max_addresses| address_count > max_addresses)
 }
 
+fn inflation_reward_epoch(
+    requested_epoch: Option<u64>,
+    context_slot: Option<u64>,
+    schedule: &solana_epoch_schedule::EpochSchedule,
+) -> u64 {
+    requested_epoch.unwrap_or_else(|| {
+        let slot = context_slot.expect("context slot must be resolved when epoch is omitted");
+        schedule.get_epoch(slot).saturating_sub(1)
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InflationRewardAvailabilityRoute {
     NotFound,
@@ -2285,17 +2296,7 @@ pub(crate) async fn handle_get_inflation_reward(
         }
     }
 
-    let epoch = match config.epoch {
-        Some(epoch) => epoch,
-        None => {
-            let context_slot =
-                context_slot_opt.expect("context slot must be resolved when epoch is omitted");
-            state
-                .epoch_schedule
-                .get_epoch(context_slot)
-                .saturating_sub(1)
-        }
-    };
+    let epoch = inflation_reward_epoch(config.epoch, context_slot_opt, &state.epoch_schedule);
 
     let _inflation_reward_permit = if let Some(semaphore) = &state.get_inflation_reward_sem {
         match semaphore.clone().try_acquire_owned() {
@@ -2509,10 +2510,11 @@ mod tests {
     use super::{
         InflationRewardAvailabilityRoute, classify_get_block_miss,
         inflation_reward_address_limit_exceeded, inflation_reward_availability_error,
-        inflation_reward_result, merge_sorted_block_slots,
+        inflation_reward_epoch, inflation_reward_result, merge_sorted_block_slots,
     };
     use crate::clickhouse::InflationRewardLookupOutcome;
     use crate::clickhouse::InflationRewardRecord;
+    use solana_epoch_schedule::EpochSchedule;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
@@ -2544,6 +2546,21 @@ mod tests {
         assert!(!inflation_reward_address_limit_exceeded(None, usize::MAX));
         assert!(!inflation_reward_address_limit_exceeded(Some(100), 100));
         assert!(inflation_reward_address_limit_exceeded(Some(100), 101));
+    }
+
+    #[test]
+    fn inflation_reward_rpc_epoch_uses_warmup_schedule() {
+        let schedule = EpochSchedule::default();
+        let context_slot = schedule.get_first_slot_in_epoch(3);
+
+        assert_eq!(
+            inflation_reward_epoch(None, Some(context_slot), &schedule),
+            2
+        );
+        assert_eq!(
+            inflation_reward_epoch(Some(99), Some(context_slot), &schedule),
+            99
+        );
     }
 
     #[test]

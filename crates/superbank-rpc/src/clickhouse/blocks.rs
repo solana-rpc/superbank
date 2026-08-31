@@ -44,7 +44,7 @@ fn inflation_epoch_slot_bounds(epoch: u64, schedule: &EpochSchedule) -> Option<(
     let following_epoch = next_epoch.checked_add(1)?;
     let start_slot = schedule.get_first_slot_in_epoch(next_epoch);
     let end_slot_exclusive = schedule.get_first_slot_in_epoch(following_epoch);
-    Some((start_slot, end_slot_exclusive))
+    (start_slot < end_slot_exclusive).then_some((start_slot, end_slot_exclusive))
 }
 
 const MAX_INFLATION_REWARD_PARTITIONS: usize = 4_096;
@@ -2564,10 +2564,45 @@ mod tests {
 
     #[test]
     fn inflation_epoch_1018_payout_starts_at_foundation_error_slot() {
+        let schedule = EpochSchedule::without_warmup();
         assert_eq!(
-            inflation_epoch_slot_bounds(1_018),
+            inflation_epoch_slot_bounds(1_018, &schedule),
             Some((440_208_000, 440_640_000))
         );
+    }
+
+    #[test]
+    fn inflation_epoch_bounds_use_warmup_schedule_slots() {
+        let schedule = EpochSchedule::default();
+
+        assert_eq!(
+            inflation_epoch_slot_bounds(2, &schedule),
+            Some((
+                schedule.get_first_slot_in_epoch(3),
+                schedule.get_first_slot_in_epoch(4)
+            ))
+        );
+    }
+
+    #[test]
+    fn inflation_epoch_bounds_reject_epoch_overflow() {
+        assert_eq!(
+            inflation_epoch_slot_bounds(u64::MAX, &EpochSchedule::without_warmup()),
+            None
+        );
+    }
+
+    #[test]
+    fn inflation_epoch_bounds_reject_non_monotonic_schedule() {
+        let schedule = EpochSchedule {
+            slots_per_epoch: 0,
+            leader_schedule_slot_offset: 0,
+            warmup: false,
+            first_normal_epoch: 0,
+            first_normal_slot: 0,
+        };
+
+        assert_eq!(inflation_epoch_slot_bounds(2, &schedule), None);
     }
 
     #[test]
@@ -2823,23 +2858,5 @@ mod tests {
         assert!(!query.contains("\n                slot,"));
         assert!(!query.contains("\n                block_time,"));
         assert!(query.contains("meta_reward_pubkey"));
-    }
-
-    #[test]
-    fn inflation_bounds_mainnet_matches_default_math() {
-        let sched = EpochSchedule::without_warmup();
-        assert_eq!(
-            inflation_epoch_slot_bounds(2, &sched),
-            Some((3 * 432_000, 4 * 432_000))
-        );
-    }
-
-    #[test]
-    fn inflation_bounds_warmup_uses_real_schedule() {
-        let sched = EpochSchedule::default();
-        let (start, end) = inflation_epoch_slot_bounds(2, &sched).unwrap();
-        assert_eq!(start, sched.get_first_slot_in_epoch(3));
-        assert_eq!(end, sched.get_first_slot_in_epoch(4));
-        assert_ne!(start, 3 * 432_000);
     }
 }
