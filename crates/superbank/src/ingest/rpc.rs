@@ -113,6 +113,7 @@ type RewardsFields = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 type LoadedAddressFields = (Vec<Array<u8, 32>>, Vec<Array<u8, 32>>);
 type RpcInstructionFields = (Vec<u8>, Vec<Vec<u8>>, Vec<serde_bytes::ByteBuf>);
@@ -124,6 +125,7 @@ type RpcBlockRewardsFields = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 
 pub(crate) async fn run_rpc_ingest(args: &Args) -> Result<()> {
@@ -535,6 +537,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
     flush_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut shutdown_requested = false;
+    let mut progress_open = true;
 
     loop {
         tokio::select! {
@@ -570,7 +573,7 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                     last_progress = None;
                 }
             }
-            progress = progress_rx.changed() => {
+            progress = progress_rx.changed(), if progress_open => {
                 if progress.is_ok() {
                     let new_cursor = *progress_rx.borrow();
                     let new_processed = new_cursor
@@ -587,6 +590,8 @@ async fn run_rpc_inserter(args: RpcInserterArgs<'_>) -> Result<RpcInserterOutcom
                         ));
                         next_progress_slot = next_progress_slot.saturating_add(progress_every);
                     }
+                } else {
+                    progress_open = false;
                 }
             }
             result = result_rx.recv() => {
@@ -1007,6 +1012,7 @@ pub(crate) fn map_rpc_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
     ) = convert_rpc_block_rewards(block.rewards.as_ref())?;
 
     Ok(BlockMetadataRow {
@@ -1024,6 +1030,7 @@ pub(crate) fn map_rpc_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards_num_partitions: block.num_reward_partitions,
     })
 }
@@ -1096,6 +1103,21 @@ fn map_rpc_transaction(
     let tx_version = match decoded.message {
         VersionedMessage::Legacy(_) => None,
         VersionedMessage::V0(_) => Some(0),
+        VersionedMessage::V1(_) => Some(1),
+    };
+    let (
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
+    ) = match &decoded.message {
+        VersionedMessage::V1(message) => (
+            message.config.priority_fee,
+            message.config.compute_unit_limit,
+            message.config.loaded_accounts_data_size_limit,
+            message.config.heap_size,
+        ),
+        _ => (None, None, None, None),
     };
 
     let meta_fields = map_rpc_meta_fields(tx.meta.as_ref())?;
@@ -1108,6 +1130,10 @@ fn map_rpc_transaction(
         message_hash,
         is_vote,
         tx_version,
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
         tx_signatures,
         tx_num_required_signatures: header.num_required_signatures,
         tx_num_readonly_signed_accounts: header.num_readonly_signed_accounts,
@@ -1163,6 +1189,7 @@ fn map_rpc_transaction(
         meta_reward_post_balance: meta_fields.meta_reward_post_balance,
         meta_reward_type: meta_fields.meta_reward_type,
         meta_reward_commission: meta_fields.meta_reward_commission,
+        meta_reward_commission_bps: meta_fields.meta_reward_commission_bps,
         meta_loaded_addresses_writable: meta_fields.meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly: meta_fields.meta_loaded_addresses_readonly,
         meta_return_data_present: meta_fields.meta_return_data_present,
@@ -1189,6 +1216,7 @@ pub(crate) fn map_bigtable_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
     ) = convert_rpc_block_rewards(Some(&block.rewards))?;
 
     Ok(BlockMetadataRow {
@@ -1206,6 +1234,7 @@ pub(crate) fn map_bigtable_block_metadata(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards_num_partitions: block.num_partitions,
     })
 }
@@ -1320,6 +1349,20 @@ fn map_versioned_transaction_with_meta(
             Some(version)
         }
     };
+    let (
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
+    ) = match &tx.message {
+        VersionedMessage::V1(message) => (
+            message.config.priority_fee,
+            message.config.compute_unit_limit,
+            message.config.loaded_accounts_data_size_limit,
+            message.config.heap_size,
+        ),
+        _ => (None, None, None, None),
+    };
 
     let meta_fields = map_native_meta_fields(meta)?;
 
@@ -1331,6 +1374,10 @@ fn map_versioned_transaction_with_meta(
         message_hash,
         is_vote,
         tx_version,
+        tx_config_priority_fee,
+        tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size,
         tx_signatures,
         tx_num_required_signatures: header.num_required_signatures,
         tx_num_readonly_signed_accounts: header.num_readonly_signed_accounts,
@@ -1386,6 +1433,7 @@ fn map_versioned_transaction_with_meta(
         meta_reward_post_balance: meta_fields.meta_reward_post_balance,
         meta_reward_type: meta_fields.meta_reward_type,
         meta_reward_commission: meta_fields.meta_reward_commission,
+        meta_reward_commission_bps: meta_fields.meta_reward_commission_bps,
         meta_loaded_addresses_writable: meta_fields.meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly: meta_fields.meta_loaded_addresses_readonly,
         meta_return_data_present: meta_fields.meta_return_data_present,
@@ -1434,6 +1482,7 @@ struct RpcMetaFields {
     meta_reward_post_balance: Vec<u64>,
     meta_reward_type: Vec<Option<String>>,
     meta_reward_commission: Vec<Option<u8>>,
+    meta_reward_commission_bps: Vec<Option<u16>>,
     meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
     meta_return_data_present: u8,
@@ -1483,6 +1532,7 @@ impl RpcMetaFields {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: 0,
@@ -1548,6 +1598,7 @@ fn map_rpc_meta_fields(meta: Option<&UiTransactionStatusMeta>) -> Result<RpcMeta
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
     ) = convert_rpc_rewards(&meta.rewards)?;
 
     let (meta_loaded_addresses_writable, meta_loaded_addresses_readonly) =
@@ -1597,6 +1648,7 @@ fn map_rpc_meta_fields(meta: Option<&UiTransactionStatusMeta>) -> Result<RpcMeta
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
         meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly,
         meta_return_data_present,
@@ -1661,6 +1713,7 @@ fn map_native_meta_fields(meta: Option<&TransactionStatusMeta>) -> Result<RpcMet
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
     ) = convert_native_rewards(&meta.rewards)?;
 
     let (meta_loaded_addresses_writable, meta_loaded_addresses_readonly) =
@@ -1714,6 +1767,7 @@ fn map_native_meta_fields(meta: Option<&TransactionStatusMeta>) -> Result<RpcMet
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
         meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly,
         meta_return_data_present,
@@ -1873,6 +1927,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ));
     };
 
@@ -1881,6 +1936,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(reward.pubkey.clone());
@@ -1888,6 +1944,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
         post_balances.push(reward.post_balance);
         reward_types.push(reward.reward_type.map(|ty| ty.to_string()));
         commissions.push(reward.commission);
+        commission_bps.push(reward.commission_bps);
     }
 
     Ok((
@@ -1897,6 +1954,7 @@ fn convert_native_rewards(rewards: &Option<Vec<UiReward>>) -> Result<RewardsFiel
         post_balances,
         reward_types,
         commissions,
+        commission_bps,
     ))
 }
 
@@ -2099,6 +2157,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ));
     };
 
@@ -2107,6 +2166,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(reward.pubkey.clone());
@@ -2114,6 +2174,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
         post_balances.push(reward.post_balance);
         reward_types.push(reward.reward_type.map(|ty| ty.to_string()));
         commissions.push(reward.commission);
+        commission_bps.push(reward.commission_bps);
     }
 
     Ok((
@@ -2123,6 +2184,7 @@ fn convert_rpc_rewards(rewards: &OptionSerializer<Vec<UiReward>>) -> Result<Rewa
         post_balances,
         reward_types,
         commissions,
+        commission_bps,
     ))
 }
 
@@ -2177,6 +2239,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ));
     };
 
@@ -2185,6 +2248,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(decode_base58_32(&reward.pubkey).context("decode reward pubkey")?);
@@ -2192,6 +2256,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
         post_balances.push(reward.post_balance);
         reward_types.push(reward.reward_type.map(|ty| ty.to_string()));
         commissions.push(reward.commission);
+        commission_bps.push(reward.commission_bps);
     }
 
     Ok((
@@ -2201,6 +2266,7 @@ fn convert_rpc_block_rewards(rewards: Option<&Vec<UiReward>>) -> Result<RpcBlock
         post_balances,
         reward_types,
         commissions,
+        commission_bps,
     ))
 }
 
@@ -2253,7 +2319,10 @@ mod tests {
     use solana_address::Address;
     use solana_hash::Hash;
     use solana_message::{
-        MessageHeader, compiled_instruction::CompiledInstruction, legacy::Message,
+        MessageHeader,
+        compiled_instruction::CompiledInstruction,
+        legacy::Message,
+        v1::{Message as V1Message, TransactionConfig},
     };
     use solana_transaction_status_client_types::{EncodedTransaction, TransactionBinaryEncoding};
 
@@ -2278,6 +2347,27 @@ mod tests {
         VersionedTransaction {
             signatures: vec![Default::default()],
             message: VersionedMessage::Legacy(message),
+        }
+    }
+
+    fn build_test_v1_transaction(config: TransactionConfig) -> VersionedTransaction {
+        VersionedTransaction {
+            signatures: vec![Default::default()],
+            message: VersionedMessage::V1(V1Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                config,
+                lifetime_specifier: Hash::new_from_array([9; 32]),
+                account_keys: vec![Address::from([1; 32]), Address::from([2; 32])],
+                instructions: vec![CompiledInstruction {
+                    program_id_index: 1,
+                    accounts: vec![0],
+                    data: vec![1, 2, 3],
+                }],
+            }),
         }
     }
 
@@ -2404,6 +2494,62 @@ mod tests {
     }
 
     #[test]
+    fn inserter_parks_after_discovery_drops_progress_sender() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .expect("build paused runtime");
+
+            runtime.block_on(async move {
+                let args = sample_args();
+
+                let (result_tx, result_rx) = mpsc::channel::<RpcSlotResult>(1);
+                let (progress_tx, progress_rx) = watch::channel(0u64);
+                let (_shutdown_tx, shutdown_rx) = watch::channel(0u64);
+                let (_fatal_tx, fatal_rx) = mpsc::channel::<anyhow::Error>(1);
+
+                drop(progress_tx);
+
+                let inserter = tokio::spawn(async move {
+                    run_rpc_inserter(RpcInserterArgs {
+                        clickhouse: Arc::new(build_clickhouse_client(&args)),
+                        insert_tables: Arc::new(InsertTables::from_args(&args)),
+                        insert_concurrency: 2,
+                        args: &args,
+                        rpc_clients: Arc::new(Vec::new()),
+                        result_rx,
+                        progress_rx,
+                        shutdown_rx,
+                        fatal_rx,
+                        range: RpcRange { start: 0, end: 0 },
+                        start_time: std::time::Instant::now(),
+                    })
+                    .await
+                });
+
+                tokio::time::sleep(Duration::from_secs(30)).await;
+
+                drop(result_tx);
+                inserter
+                    .await
+                    .expect("inserter task panicked")
+                    .expect("inserter returned an error");
+            });
+
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "inserter kept polling the closed progress channel instead of parking",
+        );
+    }
+
+    #[test]
     fn uningested_slots_drops_present_and_preserves_order() {
         let present: HashSet<u64> = [101, 106].into_iter().collect();
         assert_eq!(
@@ -2444,6 +2590,75 @@ mod tests {
         assert_eq!(row.meta_rewards_present, 0);
         assert!(row.meta_compute_units_consumed.is_none());
         assert!(row.meta_cost_units.is_none());
+    }
+
+    #[test]
+    fn rpc_v1_round_trip_preserves_all_config_fields_and_hash() {
+        let tx = build_test_v1_transaction(TransactionConfig {
+            priority_fee: Some(42),
+            compute_unit_limit: Some(1_000_000),
+            loaded_accounts_data_size_limit: Some(65_536),
+            heap_size: Some(32_768),
+        });
+        let tx_bytes = wincode05::serialize(&tx).expect("serialize v1 transaction");
+        assert_eq!(
+            crate::message_wire::serialize_versioned_transaction(&tx)
+                .expect("serialize with Superbank schema"),
+            tx_bytes
+        );
+        let tx_with_meta = EncodedTransactionWithStatusMeta {
+            transaction: EncodedTransaction::Binary(
+                BASE64_STANDARD.encode(&tx_bytes),
+                TransactionBinaryEncoding::Base64,
+            ),
+            meta: None,
+            version: Some(TransactionVersion::Number(1)),
+        };
+
+        let row = map_rpc_transaction(42, Some(123), 0, &tx_with_meta).expect("map RPC v1");
+        assert_eq!(row.tx_version, Some(1));
+        assert_eq!(row.tx_recent_blockhash.0, [9; 32]);
+        assert_eq!(row.tx_config_priority_fee, Some(42));
+        assert_eq!(row.tx_config_compute_unit_limit, Some(1_000_000));
+        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, Some(65_536));
+        assert_eq!(row.tx_config_heap_size, Some(32_768));
+        assert_eq!(
+            row.message_hash.0,
+            *compute_message_hash_versioned(&tx.message)
+                .expect("message hash")
+                .as_ref()
+        );
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(match &tx_with_meta.transaction {
+                    EncodedTransaction::Binary(value, _) => value,
+                    _ => unreachable!(),
+                })
+                .expect("decode fixture"),
+            tx_bytes
+        );
+    }
+
+    #[test]
+    fn bigtable_v1_mapping_preserves_empty_config_and_enforces_max_version() {
+        let tx = build_test_v1_transaction(TransactionConfig::empty());
+        let row = map_versioned_transaction_with_meta(42, None, 0, &tx, None, 1)
+            .expect("map Bigtable v1");
+        assert_eq!(row.tx_version, Some(1));
+        assert_eq!(row.tx_recent_blockhash.0, [9; 32]);
+        assert_eq!(row.tx_config_priority_fee, None);
+        assert_eq!(row.tx_config_compute_unit_limit, None);
+        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, None);
+        assert_eq!(row.tx_config_heap_size, None);
+
+        let err = match map_versioned_transaction_with_meta(42, None, 0, &tx, None, 0) {
+            Ok(_) => panic!("v1 must be rejected at max version 0"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("unsupported transaction version 1")
+        );
     }
 
     #[tokio::test]

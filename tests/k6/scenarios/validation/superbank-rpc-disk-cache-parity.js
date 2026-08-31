@@ -169,6 +169,7 @@ export default function (data) {
   if (harvestedSignatures.length > 0) {
     compareCall('getSignatureStatuses', 'getSignatureStatuses', [
       harvestedSignatures.slice(0, 50),
+      { searchTransactionHistory: true },
     ]);
   }
 

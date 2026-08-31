@@ -28,7 +28,10 @@ pub use types::{
     TransferDirectionFilter, TransferPositionFilter, TransferRecord, TransfersByAddressQuery,
 };
 
-pub(crate) use types::{ResolvedSignatureFilter, SignatureSlot, SlotBoundary};
+pub(crate) use types::{
+    InflationRewardLookupOutcome, InflationRewardRecord, ResolvedSignatureFilter, SignatureSlot,
+    SlotBoundary,
+};
 
 pub(crate) use sharding::{RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig};
 pub(crate) use util::{QueryCacheConfig, QueryFreshnessClass};

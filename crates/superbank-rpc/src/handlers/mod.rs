@@ -1271,8 +1271,8 @@ mod tests {
     use super::{
         JSON_RPC_INTERNAL_ERROR_CODE, JSON_RPC_REQUEST_TIMEOUT_CODE,
         JSON_RPC_REQUEST_TIMEOUT_MESSAGE, is_http_503_eligible_json_rpc_error,
-        json_rpc_response_value_has_http_503_error, request_header_metric_labels,
-        response_to_json_value, validate_json_rpc_response_value,
+        json_rpc_response_value_has_http_503_error, promote_http_status_for_json_rpc_errors,
+        request_header_metric_labels, response_to_json_value, validate_json_rpc_response_value,
     };
     use axum::{
         Json,
@@ -1282,6 +1282,7 @@ mod tests {
     use serde_json::json;
     use solana_rpc_client_api::custom_error::{
         JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+        JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE,
         JSON_RPC_SERVER_ERROR_FILTER_TRANSACTION_NOT_FOUND,
         JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
         JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE,
@@ -1321,6 +1322,7 @@ mod tests {
             JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED,
             JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
             JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
+            JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE,
             JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
             JSON_RPC_SERVER_ERROR_FILTER_TRANSACTION_NOT_FOUND,
         ] {
@@ -1334,6 +1336,67 @@ mod tests {
             JSON_RPC_REQUEST_TIMEOUT_CODE,
             Some("Upstream returned -32000"),
         ));
+    }
+
+    #[tokio::test]
+    async fn block_not_available_keeps_foundation_http_200_error_contract() {
+        let response = crate::rpc::json_rpc_error_response(
+            json!(1),
+            JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32,
+            "Block not available for slot 440208000",
+            None,
+        );
+        let response = promote_http_status_for_json_rpc_errors(response, true).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_to_json_value(response)
+                .await
+                .expect("response must contain valid JSON-RPC"),
+            json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32004,
+                    "message": "Block not available for slot 440208000"
+                },
+                "id": 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn active_epoch_rewards_period_keeps_http_200_error_contract() {
+        let response = crate::rpc::json_rpc_error_response(
+            json!(1),
+            JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE as i32,
+            "Epoch rewards period still active at slot 440208021",
+            Some(json!({
+                "slot": 440_208_021,
+                "currentBlockHeight": 420_000_020,
+                "rewardsCompleteBlockHeight": 420_000_294,
+            })),
+        );
+        let response = promote_http_status_for_json_rpc_errors(response, true).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_to_json_value(response)
+                .await
+                .expect("response must contain valid JSON-RPC"),
+            json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32017,
+                    "message": "Epoch rewards period still active at slot 440208021",
+                    "data": {
+                        "slot": 440_208_021,
+                        "currentBlockHeight": 420_000_020,
+                        "rewardsCompleteBlockHeight": 420_000_294,
+                    }
+                },
+                "id": 1
+            })
+        );
     }
 
     #[test]

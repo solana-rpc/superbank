@@ -1074,6 +1074,249 @@ fn escape_sql_string(value: &str) -> String {
 }
 
 fn clickhouse_status_error(status: StatusCode, body: String, sql: &str) -> anyhow::Error {
-    let preview = if sql.len() > 500 { &sql[..500] } else { sql };
+    // Redact S3 credentials *before* truncating: the export SQL built by
+    // `build_s3_table_archive_sql` embeds the access key and secret as the second
+    // and third `s3(...)` arguments, and a failed export would otherwise leak both
+    // in plaintext through this error (and any log line carrying it).
+    let redacted = redact_s3_credentials(sql);
+    let preview = if redacted.len() > 500 {
+        // Slice on a char boundary — `redacted` may contain multi-byte UTF-8.
+        let mut end = 500;
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        &redacted[..end]
+    } else {
+        &redacted
+    };
     anyhow!("ClickHouse query failed with status {status}: {body}; query: {preview}")
+}
+
+/// Replace the credential arguments of every ClickHouse `s3(...)` / `s3Cluster(...)`
+/// table-function call in `sql` with `'[REDACTED]'`.
+///
+/// The archive export statement embeds the S3 access key and secret as the second
+/// and third string arguments of the `s3(...)` function (see
+/// [`build_s3_table_archive_sql`]); the URL (first arg) and format (fourth arg)
+/// are non-sensitive and left intact for debugging. Literals are parsed with the
+/// same `\'` / `\\` escaping that [`escape_sql_string`] emits, so an embedded
+/// quote in a credential cannot prematurely end the redacted span.
+fn redact_s3_credentials(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(call_len) = match_s3_call(bytes, i) {
+            out.push_str(&sql[i..i + call_len]);
+            i = redact_s3_arg_list(sql, bytes, i + call_len, &mut out);
+        } else {
+            // Copy verbatim up to the next byte that could begin an `s3(` call.
+            // `s`/`S` are single-byte ASCII, so this never splits a UTF-8 char.
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b's' && bytes[i] != b'S' {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+        }
+    }
+    out
+}
+
+/// If `bytes[i..]` begins an `s3(` or `s3Cluster(` call at a word boundary, return
+/// the length of the matched `<name>(` prefix; otherwise `None`. Matching is
+/// case-insensitive on the function name.
+fn match_s3_call(bytes: &[u8], i: usize) -> Option<usize> {
+    if i > 0 {
+        let prev = bytes[i - 1];
+        if prev == b'_' || prev.is_ascii_alphanumeric() {
+            return None;
+        }
+    }
+    for keyword in [b"s3cluster(".as_slice(), b"s3(".as_slice()] {
+        let end = i + keyword.len();
+        if end <= bytes.len() && bytes[i..end].eq_ignore_ascii_case(keyword) {
+            return Some(keyword.len());
+        }
+    }
+    None
+}
+
+/// Walk the argument list of an `s3(...)` call starting at `i` (just past the
+/// opening paren), appending each argument to `out` and replacing the second and
+/// third string literals (access key, secret key) with `'[REDACTED]'`. Returns the
+/// index just past the closing paren (or end of input if unterminated).
+fn redact_s3_arg_list(sql: &str, bytes: &[u8], mut i: usize, out: &mut String) -> usize {
+    let mut literal_index = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b')' => {
+                out.push(')');
+                return i + 1;
+            }
+            b'\'' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' if i + 1 < bytes.len() => i += 2,
+                        b'\'' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                if literal_index == 1 || literal_index == 2 {
+                    out.push_str("'[REDACTED]'");
+                } else {
+                    out.push_str(&sql[start..i]);
+                }
+                literal_index += 1;
+            }
+            _ => {
+                // Non-literal argument text (whitespace, commas). Copy up to the
+                // next quote or closing paren; neither is a UTF-8 continuation
+                // byte, so slicing stays on char boundaries.
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' && bytes[i] != b')' {
+                    i += 1;
+                }
+                out.push_str(&sql[start..i]);
+            }
+        }
+    }
+    i
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    fn entries_table() -> ArchiveDbTable {
+        DbTables {
+            transactions_table: "transactions".to_string(),
+            blocks_table: "blocks_metadata".to_string(),
+            entries_table: "entries".to_string(),
+            gsfa_table: "gsfa".to_string(),
+            gsfa_hot_table: "gsfa_hot".to_string(),
+            signatures_table: "signatures".to_string(),
+            token_owner_activity_table: "token_owner_activity".to_string(),
+        }
+        .archive_tables()
+        .into_iter()
+        .find(|table| table.kind.as_str() == "entries")
+        .expect("entries table")
+    }
+
+    #[test]
+    fn redacts_credentials_in_generated_archive_sql() {
+        let table = entries_table();
+        let sql = build_s3_table_archive_sql(S3ArchiveSql {
+            table: &table,
+            start_slot: 42,
+            end_slot: 84,
+            endpoint: "https://s3.us-west.example",
+            bucket: "bucket",
+            bucket_path: "prefix/hourly",
+            archive_name: "hourly_0_42-84",
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            settings: "max_threads=4",
+            dedup: true,
+        });
+
+        let redacted = redact_s3_credentials(&sql);
+
+        assert!(
+            !redacted.contains("AKIAIOSFODNN7EXAMPLE"),
+            "access key leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            "secret key leaked: {redacted}"
+        );
+        assert_eq!(redacted.matches("'[REDACTED]'").count(), 2);
+        // URL (first arg) and format (fourth arg) stay intact for debugging.
+        assert!(redacted.contains(
+            "'https://s3.us-west.example/bucket/prefix/hourly/hourly_0_42-84/entries.parquet'"
+        ));
+        assert!(redacted.contains("'Parquet'"));
+        assert!(redacted.contains("WHERE slot BETWEEN 42 AND 84"));
+    }
+
+    #[test]
+    fn status_error_preview_never_contains_credentials() {
+        let table = entries_table();
+        let sql = build_s3_table_archive_sql(S3ArchiveSql {
+            table: &table,
+            start_slot: 42,
+            end_slot: 84,
+            endpoint: "https://s3.us-west.example",
+            bucket: "bucket",
+            bucket_path: "prefix/hourly",
+            archive_name: "hourly_0_42-84",
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            settings: "",
+            dedup: false,
+        });
+
+        let err = clickhouse_status_error(StatusCode::BAD_REQUEST, "bad bucket".to_string(), &sql)
+            .to_string();
+
+        assert!(
+            !err.contains("AKIAIOSFODNN7EXAMPLE"),
+            "access key leaked: {err}"
+        );
+        assert!(
+            !err.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            "secret key leaked: {err}"
+        );
+        assert!(err.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redacts_single_line_restore_style_call() {
+        // Mirrors the restore statement form used by the ingestor.
+        let sql = "INSERT INTO db.transactions SELECT * FROM \
+             s3('https://s3.example/bucket/x.parquet', 'AKIA_KEY', 'SUPER_SECRET', 'Parquet') \
+             WHERE slot BETWEEN 1 AND 2";
+
+        let redacted = redact_s3_credentials(sql);
+
+        assert!(!redacted.contains("AKIA_KEY"));
+        assert!(!redacted.contains("SUPER_SECRET"));
+        assert_eq!(redacted.matches("'[REDACTED]'").count(), 2);
+        assert!(redacted.contains("'https://s3.example/bucket/x.parquet'"));
+        assert!(redacted.contains("'Parquet'"));
+    }
+
+    #[test]
+    fn redaction_respects_escaped_quotes_in_secret() {
+        // A secret containing an escaped quote must not let the closing quote of
+        // the redacted span land early and expose trailing credential bytes.
+        let sql = "s3('url', 'ke\\'y', 'sec\\'ret', 'Parquet')";
+
+        let redacted = redact_s3_credentials(sql);
+
+        assert!(!redacted.contains("ke\\'y"));
+        assert!(!redacted.contains("sec\\'ret"));
+        assert_eq!(redacted, "s3('url', '[REDACTED]', '[REDACTED]', 'Parquet')");
+    }
+
+    #[test]
+    fn leaves_non_s3_sql_untouched() {
+        let sql = "SELECT count() FROM transactions WHERE slot BETWEEN 1 AND 2";
+        assert_eq!(redact_s3_credentials(sql), sql);
+    }
+
+    #[test]
+    fn does_not_match_s3_inside_identifiers() {
+        // A column/table whose name merely contains `s3(`-like text must not be
+        // treated as an s3() call.
+        let sql = "SELECT hs3(col) FROM t";
+        assert_eq!(redact_s3_credentials(sql), sql);
+    }
 }

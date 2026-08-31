@@ -53,7 +53,7 @@ export const config = {
     transactionCommitment: __ENV.TX_COMMITMENT || null,
   maxSupportedTransactionVersion: (() => {
     const value = Number(__ENV.MAX_SUPPORTED_TX_VERSION);
-    return Number.isFinite(value) ? value : 0;
+    return Number.isFinite(value) ? value : 1;
   })(),
 
     // getBlock options

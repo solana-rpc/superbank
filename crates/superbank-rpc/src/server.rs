@@ -20,9 +20,7 @@ use crate::clickhouse::{
     ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, QueryCacheConfig,
     RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig,
 };
-use crate::config::{
-    ClickHouseScope, ClickHouseTransport, RpcConfig, has_usable_gsfa_hot_addresses,
-};
+use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::metrics;
 use crate::metrics::metrics_handler;
@@ -47,6 +45,10 @@ use solana_commitment_config::CommitmentLevel;
 pub type RpcResult<T> = Result<T, RpcError>;
 
 fn build_shard_routing_config(args: &RpcConfig) -> Option<ShardRoutingConfig> {
+    if args.clickhouse_scope != ClickHouseScope::ShardDirect {
+        return None;
+    }
+
     let topology_config_path = args
         .clickhouse_topology_config
         .as_deref()
@@ -54,26 +56,73 @@ fn build_shard_routing_config(args: &RpcConfig) -> Option<ShardRoutingConfig> {
         .filter(|path| !path.is_empty())
         .map(str::to_string);
 
-    if args.clickhouse_scope == ClickHouseScope::ShardDirect
-        || has_usable_gsfa_hot_addresses(&args.clickhouse_hot_addresses)
-        || topology_config_path.is_some()
-    {
-        Some(ShardRoutingConfig {
-            cluster: args.clickhouse_cluster.clone(),
-            topology_config_path,
-            shard_http_port: args.clickhouse_shard_http_port,
-            gsfa_local_table: args.clickhouse_gsfa_local_table.clone(),
-            signatures_local_table: args.clickhouse_signatures_local_table.clone(),
-            token_owner_activity_local_table: args
-                .clickhouse_token_owner_activity_local_table
-                .clone(),
-            transfers_local_table: args.clickhouse_transfers_local_table.clone(),
-            transactions_local_table: args.clickhouse_transactions_local_table.clone(),
-            blocks_metadata_local_table: args.clickhouse_blocks_metadata_local_table.clone(),
-        })
-    } else {
-        None
+    Some(ShardRoutingConfig {
+        cluster: args.clickhouse_cluster.clone(),
+        topology_config_path,
+        shard_http_port: args.clickhouse_shard_http_port,
+        gsfa_local_table: args.clickhouse_gsfa_local_table.clone(),
+        signatures_local_table: args.clickhouse_signatures_local_table.clone(),
+        token_owner_activity_local_table: args.clickhouse_token_owner_activity_local_table.clone(),
+        transfers_local_table: args.clickhouse_transfers_local_table.clone(),
+        transactions_local_table: args.clickhouse_transactions_local_table.clone(),
+        blocks_metadata_local_table: args.clickhouse_blocks_metadata_local_table.clone(),
+    })
+}
+
+fn has_nonempty_setting(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn ignored_distributed_shard_settings(args: &RpcConfig) -> Vec<&'static str> {
+    if args.clickhouse_scope != ClickHouseScope::Distributed {
+        return Vec::new();
     }
+
+    let mut ignored = Vec::new();
+    if args.clickhouse_cluster.trim() != "{cluster}" {
+        ignored.push("CLICKHOUSE_CLUSTER");
+    }
+    if has_nonempty_setting(args.clickhouse_topology_config.as_deref()) {
+        ignored.push("CLICKHOUSE_TOPOLOGY_CONFIG");
+    }
+    if has_nonempty_setting(args.clickhouse_gsfa_local_table.as_deref()) {
+        ignored.push("CLICKHOUSE_GSFA_LOCAL_TABLE");
+    }
+    if has_nonempty_setting(args.clickhouse_signatures_local_table.as_deref()) {
+        ignored.push("CLICKHOUSE_SIGNATURES_LOCAL_TABLE");
+    }
+    if has_nonempty_setting(args.clickhouse_token_owner_activity_local_table.as_deref()) {
+        ignored.push("CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE");
+    }
+    if has_nonempty_setting(args.clickhouse_transfers_local_table.as_deref()) {
+        ignored.push("CLICKHOUSE_TRANSFERS_LOCAL_TABLE");
+    }
+    if has_nonempty_setting(args.clickhouse_transactions_local_table.as_deref()) {
+        ignored.push("CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE");
+    }
+    if has_nonempty_setting(args.clickhouse_blocks_metadata_local_table.as_deref()) {
+        ignored.push("CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE");
+    }
+    if args.clickhouse_shard_http_port.is_some() {
+        ignored.push("CLICKHOUSE_SHARD_HTTP_PORT");
+    }
+    if args.clickhouse_gsfa_hot_local_table.trim() != "default.gsfa_hot_local" {
+        ignored.push("CLICKHOUSE_GSFA_HOT_LOCAL_TABLE");
+    }
+    if args.clickhouse_tcp_access_check_timeout_ms != 2_000 {
+        ignored.push("CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS");
+    }
+    if args.clickhouse_tcp_pool_min != 10 {
+        ignored.push("CLICKHOUSE_TCP_POOL_MIN");
+    }
+    if args.clickhouse_tcp_pool_max != 20 {
+        ignored.push("CLICKHOUSE_TCP_POOL_MAX");
+    }
+    if args.clickhouse_shard_fanout_concurrency != 8 {
+        ignored.push("CLICKHOUSE_SHARD_FANOUT_CONCURRENCY");
+    }
+
+    ignored
 }
 
 fn build_routing_policy(args: &RpcConfig) -> Result<RoutingPolicy, ProcessingError> {
@@ -161,8 +210,15 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     }
 
     // Initialize ClickHouse client
-    let shard_routing = build_shard_routing_config(&args);
     let routing_policy = build_routing_policy(&args)?;
+    let ignored_shard_settings = ignored_distributed_shard_settings(&args);
+    if !ignored_shard_settings.is_empty() {
+        warn!(
+            settings = %ignored_shard_settings.join(", "),
+            "Shard-local ClickHouse settings are ignored because CLICKHOUSE_SCOPE=distributed"
+        );
+    }
+    let shard_routing = build_shard_routing_config(&args);
 
     let mut clickhouse = ClickHouseClient::new(
         &args.clickhouse_url,
@@ -602,7 +658,9 @@ fn parse_commitment_level(value: &str) -> CommitmentLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_routing_policy, build_shard_routing_config};
+    use super::{
+        build_routing_policy, build_shard_routing_config, ignored_distributed_shard_settings,
+    };
     use crate::clickhouse::{RoutingScope, RoutingTransport};
     use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
 
@@ -631,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_routing_enabled_for_hot_routing_in_distributed_scope() {
+    fn shard_routing_disabled_for_hot_routing_in_distributed_scope() {
         use clap::Parser;
 
         let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
@@ -640,12 +698,11 @@ mod tests {
         cfg.clickhouse_hot_addresses =
             vec!["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()];
 
-        let routing = build_shard_routing_config(&cfg).expect("routing config");
-        assert_eq!(routing.cluster, "{cluster}");
+        assert!(build_shard_routing_config(&cfg).is_none());
     }
 
     #[test]
-    fn shard_routing_enabled_for_topology_config_in_distributed_scope() {
+    fn shard_routing_disabled_for_topology_config_in_distributed_scope() {
         use clap::Parser;
 
         let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
@@ -653,11 +710,92 @@ mod tests {
         cfg.clickhouse_scope = ClickHouseScope::Distributed;
         cfg.clickhouse_topology_config = Some(" /etc/superbank/topology.yaml ".to_string());
 
+        assert!(build_shard_routing_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn shard_routing_normalizes_topology_config_in_shard_direct_scope() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.clickhouse_scope = ClickHouseScope::ShardDirect;
+        cfg.clickhouse_topology_config = Some(" /etc/superbank/topology.yaml ".to_string());
+
         let routing = build_shard_routing_config(&cfg).expect("routing config");
         assert_eq!(
             routing.topology_config_path.as_deref(),
             Some("/etc/superbank/topology.yaml")
         );
+    }
+
+    #[test]
+    fn distributed_scope_reports_explicit_shard_settings_as_ignored() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.clickhouse_scope = ClickHouseScope::Distributed;
+        cfg.clickhouse_cluster = "production".to_string();
+        cfg.clickhouse_topology_config = Some("/etc/superbank/topology.yaml".to_string());
+        cfg.clickhouse_gsfa_local_table = Some("default.gsfa_local".to_string());
+        cfg.clickhouse_signatures_local_table = Some("default.signatures_local".to_string());
+        cfg.clickhouse_token_owner_activity_local_table =
+            Some("default.token_owner_activity_local".to_string());
+        cfg.clickhouse_transfers_local_table = Some("default.transfers_local".to_string());
+        cfg.clickhouse_transactions_local_table = Some("default.transactions_local".to_string());
+        cfg.clickhouse_blocks_metadata_local_table =
+            Some("default.blocks_metadata_local".to_string());
+        cfg.clickhouse_shard_http_port = Some(8124);
+        cfg.clickhouse_gsfa_hot_local_table = "default.custom_hot_local".to_string();
+        cfg.clickhouse_tcp_access_check_timeout_ms = 3_000;
+        cfg.clickhouse_tcp_pool_min = 11;
+        cfg.clickhouse_tcp_pool_max = 21;
+        cfg.clickhouse_shard_fanout_concurrency = 9;
+
+        assert_eq!(
+            ignored_distributed_shard_settings(&cfg),
+            vec![
+                "CLICKHOUSE_CLUSTER",
+                "CLICKHOUSE_TOPOLOGY_CONFIG",
+                "CLICKHOUSE_GSFA_LOCAL_TABLE",
+                "CLICKHOUSE_SIGNATURES_LOCAL_TABLE",
+                "CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE",
+                "CLICKHOUSE_TRANSFERS_LOCAL_TABLE",
+                "CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE",
+                "CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE",
+                "CLICKHOUSE_SHARD_HTTP_PORT",
+                "CLICKHOUSE_GSFA_HOT_LOCAL_TABLE",
+                "CLICKHOUSE_TCP_ACCESS_CHECK_TIMEOUT_MS",
+                "CLICKHOUSE_TCP_POOL_MIN",
+                "CLICKHOUSE_TCP_POOL_MAX",
+                "CLICKHOUSE_SHARD_FANOUT_CONCURRENCY",
+            ]
+        );
+    }
+
+    #[test]
+    fn distributed_scope_has_no_ignored_shard_settings_at_defaults() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.clickhouse_scope = ClickHouseScope::Distributed;
+
+        assert!(ignored_distributed_shard_settings(&cfg).is_empty());
+    }
+
+    #[test]
+    fn shard_direct_scope_does_not_report_shard_settings_as_ignored() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.clickhouse_scope = ClickHouseScope::ShardDirect;
+        cfg.clickhouse_topology_config = Some("/etc/superbank/topology.yaml".to_string());
+        cfg.clickhouse_gsfa_local_table = Some("default.gsfa_local".to_string());
+
+        assert!(ignored_distributed_shard_settings(&cfg).is_empty());
     }
 
     #[test]

@@ -3,8 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use solana_sdk::hash::Hash;
-use solana_sdk::pubkey::Pubkey;
+use crate::solana_sdk::hash::Hash;
+use crate::solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{
     BlockEncodingOptions, ConfirmedBlock, Reward, TransactionDetails, TransactionWithStatusMeta,
     UiConfirmedBlock, UiTransactionEncoding, VersionedTransactionWithStatusMeta,
@@ -241,6 +241,7 @@ fn build_block_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<Reward>, Bl
             || !metadata.rewards_post_balance.is_empty()
             || !metadata.rewards_type.is_empty()
             || !metadata.rewards_commission.is_empty()
+            || !metadata.rewards_commission_bps.is_empty()
         {
             return Err(BlockHydrationError::InvalidBlockMetadata(
                 "rewards fields populated without rewards_present".to_string(),
@@ -254,13 +255,16 @@ fn build_block_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<Reward>, Bl
         || metadata.rewards_post_balance.len() != len
         || metadata.rewards_type.len() != len
         || metadata.rewards_commission.len() != len
+        || (!metadata.rewards_commission_bps.is_empty()
+            && metadata.rewards_commission_bps.len() != len)
     {
         return Err(BlockHydrationError::InvalidBlockMetadata(format!(
-            "reward length mismatch (pubkey={len}, lamports={}, post_balance={}, reward_type={}, commission={})",
+            "reward length mismatch (pubkey={len}, lamports={}, post_balance={}, reward_type={}, commission={}, commission_bps={})",
             metadata.rewards_lamports.len(),
             metadata.rewards_post_balance.len(),
             metadata.rewards_type.len(),
-            metadata.rewards_commission.len()
+            metadata.rewards_commission.len(),
+            metadata.rewards_commission_bps.len()
         )));
     }
 
@@ -272,7 +276,7 @@ fn build_block_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<Reward>, Bl
             post_balance: metadata.rewards_post_balance[idx],
             reward_type: parse_reward_type(&metadata.rewards_type[idx])?,
             commission: metadata.rewards_commission[idx],
-            commission_bps: None,
+            commission_bps: metadata.rewards_commission_bps.get(idx).copied().flatten(),
         });
     }
 

@@ -7,6 +7,14 @@ Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
 default. The `solparq` source runs in reverse: it restores `superbank-solparq`
 Parquet archive bundles (local or S3) back into ClickHouse.
 
+The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer workspaces
+under `ingest/` remain on their upstream Agave 3 line and must not be used for post-v1 Old
+Faithful backfills until they are migrated and added to root CI.
+
+Agave 4.2 also adds the `DeactivatedStake` reward type and changes confidential-transfer parsed
+JSON from `source`/`destination` keys to `account`; consumers of parsed RPC responses should treat
+that JSON-key correction as a compatibility break.
+
 ## Prereqs
 
 - ClickHouse with the matching schema set under `ddl/`: use `ddl/local/transactions.sql` +
@@ -170,12 +178,16 @@ its validation step already computes the exact missing slots.
 The `solparq` source is the inverse of the `superbank-solparq` archiver: it reads
 archive bundles and loads every table in each bundle's `manifest.json` back into
 ClickHouse. Loading is ClickHouse-native and schema-symmetric with the export —
-no rows are decoded in-process:
+no rows are decoded in-process. Both paths match columns by **name** (not
+position), so a destination table whose column order has drifted from the
+archive still restores correctly instead of silently landing in the wrong
+columns:
 
-- **S3** — `INSERT INTO <table> SELECT * FROM s3(<url>, <key>, <secret>, 'Parquet')`,
-  so ClickHouse pulls each object directly.
+- **S3** — `INSERT INTO <table> (<cols>) SELECT <cols> FROM s3(<url>, <key>, <secret>, 'Parquet')`,
+  where `<cols>` is read from the archived file's own schema (`DESCRIBE`), so
+  ClickHouse pulls each object directly and maps columns by name.
 - **Local** — `INSERT INTO <table> FORMAT Parquet` with the bundle's parquet file
-  streamed as the request body.
+  streamed as the request body (name-matched by ClickHouse's Parquet reader).
 
 Each table is restored into the configured `CLICKHOUSE_DATABASE` under the bare
 table name recorded in the manifest, regardless of where the archive was
@@ -265,7 +277,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--fumarole-consumer-group` / `FUMAROLE_CONSUMER_GROUP` (required for fumarole source)
 - `--fumarole-create-consumer-group[=true|false]` / `FUMAROLE_CREATE_CONSUMER_GROUP` (default: false)
 - `--fumarole-data-plane-tcp-connections` / `FUMAROLE_DATA_PLANE_TCP_CONNECTIONS` (default: 4; maximum: 20)
-- `--fumarole-concurrent-download-limit-per-tcp` / `FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP` (default: 2)
+- `--fumarole-concurrent-download-limit-per-tcp` / `FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP` (deprecated compatibility option; default: 1; values other than 1 are ignored because the Fumarole client fixes this concurrency at 1)
 - `--fumarole-data-channel-capacity` / `FUMAROLE_DATA_CHANNEL_CAPACITY` (default: 4096; Fumarole client data channel capacity)
 - `--fumarole-memory-soft-limit-bytes` / `FUMAROLE_MEMORY_SOFT_LIMIT_BYTES` (default: 25769803776; Fumarole backpressure guard soft limit, set 0 to disable)
 - `--fumarole-commit-interval-secs` / `FUMAROLE_COMMIT_INTERVAL_SECS` (default: 10)
@@ -294,7 +306,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--rpc-timeout-secs` / `RPC_TIMEOUT_SECS` (default: 30)
 - `--rpc-retry-backoff-ms` / `RPC_RETRY_BACKOFF_MS` (default: 500)
 - `--rpc-max-inflight` / `RPC_MAX_INFLIGHT` (default: 64)
-- `--rpc-max-supported-tx-version` / `RPC_MAX_SUPPORTED_TX_VERSION` (default: 0)
+- `--rpc-max-supported-tx-version` / `RPC_MAX_SUPPORTED_TX_VERSION` (default: 1)
 - `--rpc-flush-every-slots` / `RPC_FLUSH_EVERY_SLOTS` (default: 500)
 - `--rpc-progress-every-slots` / `RPC_PROGRESS_EVERY_SLOTS` (default: 100)
 - `--rpc-discovery-chunk-slots` / `RPC_DISCOVERY_CHUNK_SLOTS` (default: 10000)

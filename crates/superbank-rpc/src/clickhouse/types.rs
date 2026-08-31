@@ -351,6 +351,7 @@ pub struct BlockMetadataRecord {
     pub rewards_post_balance: Vec<u64>,
     pub rewards_type: Vec<Option<String>>,
     pub rewards_commission: Vec<Option<u8>>,
+    pub rewards_commission_bps: Vec<Option<u16>>,
     pub rewards_num_partitions: Option<u64>,
 }
 
@@ -361,6 +362,20 @@ pub struct InflationRewardRecord {
     pub lamports: i64,
     pub post_balance: u64,
     pub commission: Option<u8>,
+    pub commission_bps: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub enum InflationRewardLookupOutcome {
+    Complete(Vec<InflationRewardRecord>),
+    BoundaryUnavailable {
+        slot: u64,
+    },
+    RewardsPeriodActive {
+        slot: u64,
+        current_block_height: u64,
+        rewards_complete_block_height: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +422,7 @@ pub struct StoredAccountsTransactionRecord {
     pub meta_reward_post_balance: Vec<u64>,
     pub meta_reward_type: Vec<Option<String>>,
     pub meta_reward_commission: Vec<Option<u8>>,
+    pub meta_reward_commission_bps: Vec<Option<u16>>,
     pub meta_loaded_addresses_writable: Vec<[u8; 32]>,
     pub meta_loaded_addresses_readonly: Vec<[u8; 32]>,
 }
@@ -450,6 +466,7 @@ impl From<StoredTransactionRecord> for StoredAccountsTransactionRecord {
             meta_reward_post_balance: record.meta_reward_post_balance,
             meta_reward_type: record.meta_reward_type,
             meta_reward_commission: record.meta_reward_commission,
+            meta_reward_commission_bps: record.meta_reward_commission_bps,
             meta_loaded_addresses_writable: record.meta_loaded_addresses_writable,
             meta_loaded_addresses_readonly: record.meta_loaded_addresses_readonly,
         }
@@ -509,6 +526,10 @@ pub struct StoredTransactionRecord {
     #[cfg_attr(not(feature = "grpc-streaming"), allow(dead_code))]
     pub is_vote: bool,
     pub tx_version: Option<u8>,
+    pub tx_config_priority_fee: Option<u64>,
+    pub tx_config_compute_unit_limit: Option<u32>,
+    pub tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    pub tx_config_heap_size: Option<u32>,
     #[cfg_attr(feature = "disk-cache", serde(with = "serde_sig_vec"))]
     pub tx_signatures: Vec<[u8; 64]>,
     pub tx_num_required_signatures: u8,
@@ -560,6 +581,7 @@ pub struct StoredTransactionRecord {
     pub meta_reward_post_balance: Vec<u64>,
     pub meta_reward_type: Vec<Option<String>>,
     pub meta_reward_commission: Vec<Option<u8>>,
+    pub meta_reward_commission_bps: Vec<Option<u16>>,
     pub meta_loaded_addresses_writable: Vec<[u8; 32]>,
     pub meta_loaded_addresses_readonly: Vec<[u8; 32]>,
     pub meta_return_data_present: bool,

@@ -21,7 +21,7 @@ use rocksdb::{
     Options, SliceTransform, compaction_filter::Decision,
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 pub(crate) const CF_META: &str = "meta";
 pub(crate) const CF_SLOT_COVERAGE: &str = "slot_coverage";
@@ -318,7 +318,11 @@ mod tests {
             slot_idx: 4,
             block_time: Some(1_700_000_000),
             is_vote: false,
-            tx_version: Some(0),
+            tx_version: Some(1),
+            tx_config_priority_fee: Some(42),
+            tx_config_compute_unit_limit: Some(1_000_000),
+            tx_config_loaded_accounts_data_size_limit: Some(65_536),
+            tx_config_heap_size: Some(32_768),
             tx_signatures: vec![[7u8; 64], [8u8; 64]],
             tx_num_required_signatures: 1,
             tx_num_readonly_signed_accounts: 0,
@@ -328,10 +332,10 @@ mod tests {
             tx_instructions_program_id_index: vec![1],
             tx_instructions_accounts: vec![vec![0, 1]],
             tx_instructions_data: vec![vec![9, 9, 9]],
-            tx_address_table_lookups_present: true,
-            tx_address_table_lookup_account_key: vec![[4u8; 32]],
-            tx_address_table_lookup_writable_indexes: vec![vec![0]],
-            tx_address_table_lookup_readonly_indexes: vec![vec![1]],
+            tx_address_table_lookups_present: false,
+            tx_address_table_lookup_account_key: Vec::new(),
+            tx_address_table_lookup_writable_indexes: Vec::new(),
+            tx_address_table_lookup_readonly_indexes: Vec::new(),
             meta_status_ok: false,
             meta_err: Some("{\"InstructionError\":[0,{\"Custom\":1}]}".to_string()),
             meta_fee: 5000,
@@ -369,6 +373,7 @@ mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: vec![[11u8; 32]],
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: true,
@@ -382,9 +387,17 @@ mod tests {
         let decoded: StoredTransactionRecord = bincode::deserialize(&tx_bytes).expect("round trip");
         assert_eq!(decoded.signature, record.signature);
         assert_eq!(decoded.tx_signatures, record.tx_signatures);
+        assert_eq!(decoded.tx_version, Some(1));
+        assert_eq!(decoded.tx_config_priority_fee, Some(42));
+        assert_eq!(decoded.tx_config_compute_unit_limit, Some(1_000_000));
+        assert_eq!(
+            decoded.tx_config_loaded_accounts_data_size_limit,
+            Some(65_536)
+        );
+        assert_eq!(decoded.tx_config_heap_size, Some(32_768));
         assert_eq!(
             fingerprint(&tx_bytes),
-            0x7448_21a9_4fd3_d7bb,
+            0x9873_da3b_0e9e_f6a1,
             "tx layout drift"
         );
 
@@ -403,12 +416,13 @@ mod tests {
             rewards_post_balance: vec![99],
             rewards_type: vec![Some("Fee".to_string())],
             rewards_commission: vec![Some(7)],
+            rewards_commission_bps: vec![Some(725)],
             rewards_num_partitions: Some(4),
         };
         let meta_bytes = bincode::serialize(&meta).expect("serialize meta");
         assert_eq!(
             fingerprint(&meta_bytes),
-            0x3200_ea90_2cf4_50dc,
+            0xf372_e612_a68f_ed8f,
             "block-meta layout drift"
         );
     }
