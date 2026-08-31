@@ -71,6 +71,7 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
         hashes_per_tick_schedule: args.hashes_per_tick_schedule.to_spec(),
         expected_genesis_hash: args.expected_genesis_hash,
         anchors: canonical_anchors(&args.anchors),
+        audit_duplicate_conflicts: args.audit_duplicate_conflicts,
     };
 
     let mut counters = RunCounters::default();
@@ -114,14 +115,22 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
     let fetch_db = db.clone();
     let window_slots = args.window_slots;
     let fetch_transactions = mode == VerifyMode::Full;
+    let audit_duplicate_conflicts = args.audit_duplicate_conflicts;
     let fetch_cursor = cursor;
     let fetcher = tokio::spawn(async move {
         let mut start = fetch_cursor;
         let mut need_parent_seed = true;
         while start <= range_end {
             let end = range_end.min(start.saturating_add(window_slots - 1));
-            let window =
-                fetch_window(&fetch_db, start, end, fetch_transactions, need_parent_seed).await;
+            let window = fetch_window(
+                &fetch_db,
+                start,
+                end,
+                fetch_transactions,
+                audit_duplicate_conflicts,
+                need_parent_seed,
+            )
+            .await;
             if let Ok(window) = &window
                 && !window.blocks.is_empty()
             {
@@ -294,6 +303,7 @@ async fn fetch_window(
     start: u64,
     end: u64,
     fetch_transactions: bool,
+    audit_duplicate_conflicts: bool,
     need_parent_seed: bool,
 ) -> Result<WindowData> {
     let include_transactions = fetch_transactions;
@@ -304,11 +314,19 @@ async fn fetch_window(
             Ok(TxSignaturesBySlot::new())
         }
     };
+    let fetch_duplicate_conflicts = async {
+        if audit_duplicate_conflicts {
+            db.fetch_duplicate_conflicts(start, end, include_transactions)
+                .await
+        } else {
+            Ok(Vec::new())
+        }
+    };
     let (blocks, entries, tx_signatures, duplicate_findings) = tokio::try_join!(
         db.fetch_blocks(start, end),
         db.fetch_entries(start, end),
         fetch_transactions,
-        db.fetch_duplicate_conflicts(start, end, include_transactions),
+        fetch_duplicate_conflicts,
     )?;
 
     let parent_seed = match blocks.first() {

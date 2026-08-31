@@ -37,6 +37,9 @@ pub(crate) struct JobDescriptor {
     /// Canonically sorted external pins, also part of the job identity.
     #[serde(default)]
     pub(crate) anchors: Vec<(u64, Hash32)>,
+    /// A forensic duplicate audit changes which findings are accumulated.
+    #[serde(default)]
+    pub(crate) audit_duplicate_conflicts: bool,
 }
 
 impl JobDescriptor {
@@ -137,6 +140,7 @@ mod tests {
             hashes_per_tick_schedule: "0:12500".to_string(),
             expected_genesis_hash: Some([7; 32]),
             anchors: vec![(7, [9; 32])],
+            audit_duplicate_conflicts: false,
         }
     }
 
@@ -185,6 +189,10 @@ mod tests {
 
         let mut other = descriptor();
         other.mode = "structural".to_string();
+        assert!(load_for_resume(&path, &other, false).is_err());
+
+        let mut other = descriptor();
+        other.audit_duplicate_conflicts = true;
         assert!(load_for_resume(&path, &other, false).is_err());
     }
 

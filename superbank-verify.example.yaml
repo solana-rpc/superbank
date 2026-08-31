@@ -11,6 +11,10 @@ full: true
 # structural = invariants only (fast); full = recompute every SHA-256 hash.
 mode: structural
 
+# Optional forensic integrity audit. Off by default because it adds raw-table
+# ClickHouse aggregation scans for every window (transactions in full mode).
+audit-duplicate-conflicts: false
+
 # Cluster shape (defaults are mainnet-beta).
 slots-per-epoch: 432000
 epoch-warmup: true

@@ -141,6 +141,19 @@ struct CliArgs {
     )]
     fetch_ahead: usize,
 
+    /// Forensic audit: scan raw ClickHouse rows for conflicting duplicates
+    /// (off by default; adds extra scans for every window)
+    #[arg(
+        long,
+        env = "SUPERBANK_VERIFY_AUDIT_DUPLICATE_CONFLICTS",
+        default_value_t = false,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+        action = clap::ArgAction::Set
+    )]
+    audit_duplicate_conflicts: bool,
+
     /// Worker threads for hash recomputation (0 = all available cores)
     #[arg(long, env = "SUPERBANK_VERIFY_VERIFY_THREADS", default_value_t = 0)]
     verify_threads: usize,
@@ -297,6 +310,11 @@ struct FileConfig {
     window_slots: Option<u64>,
     #[serde(rename = "fetch-ahead", alias = "fetch_ahead")]
     fetch_ahead: Option<usize>,
+    #[serde(
+        rename = "audit-duplicate-conflicts",
+        alias = "audit_duplicate_conflicts"
+    )]
+    audit_duplicate_conflicts: Option<bool>,
     #[serde(rename = "verify-threads", alias = "verify_threads")]
     verify_threads: Option<usize>,
     #[serde(rename = "checkpoint-file", alias = "checkpoint_file")]
@@ -349,6 +367,7 @@ pub(crate) struct Args {
     pub(crate) hashes_per_tick_schedule: HashesPerTickSchedule,
     pub(crate) window_slots: u64,
     pub(crate) fetch_ahead: usize,
+    pub(crate) audit_duplicate_conflicts: bool,
     pub(crate) verify_threads: usize,
     pub(crate) checkpoint_file: Option<PathBuf>,
     pub(crate) resume: bool,
@@ -505,6 +524,12 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
             config.window_slots,
         ),
         fetch_ahead: merge_value(matches, "fetch_ahead", cli.fetch_ahead, config.fetch_ahead),
+        audit_duplicate_conflicts: merge_value(
+            matches,
+            "audit_duplicate_conflicts",
+            cli.audit_duplicate_conflicts,
+            config.audit_duplicate_conflicts,
+        ),
         verify_threads: merge_value(
             matches,
             "verify_threads",
@@ -758,6 +783,7 @@ mod tests {
             HashesPerTickSchedule::mainnet()
         );
         assert_eq!(args.metrics_port, 9902);
+        assert!(!args.audit_duplicate_conflicts);
     }
 
     #[test]
@@ -815,6 +841,35 @@ mod tests {
                 "2",
             ])
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn duplicate_conflict_audit_is_opt_in_across_cli_and_yaml() {
+        assert!(
+            resolve(&["superbank-verify", "--full", "--audit-duplicate-conflicts",])
+                .unwrap()
+                .audit_duplicate_conflicts
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "full: true\naudit_duplicate_conflicts: true\n").unwrap();
+        let path = path.to_str().unwrap();
+        assert!(
+            resolve(&["superbank-verify", "--config", path])
+                .unwrap()
+                .audit_duplicate_conflicts
+        );
+        assert!(
+            !resolve(&[
+                "superbank-verify",
+                "--config",
+                path,
+                "--audit-duplicate-conflicts=false",
+            ])
+            .unwrap()
+            .audit_duplicate_conflicts
         );
     }
 
@@ -889,11 +944,12 @@ mod tests {
     #[test]
     fn file_config_parses_kebab_and_snake_case() {
         let config: FileConfig = serde_yaml::from_str(
-            "window-slots: 512\nticks_per_slot: 32\nmode: full\nanchor:\n  - \"5:abc\"\n",
+            "window-slots: 512\nticks_per_slot: 32\nmode: full\naudit-duplicate-conflicts: true\nanchor:\n  - \"5:abc\"\n",
         )
         .expect("parse config");
         assert_eq!(config.window_slots, Some(512));
         assert_eq!(config.ticks_per_slot, Some(32));
         assert_eq!(config.mode, Some(ModeArg::Full));
+        assert_eq!(config.audit_duplicate_conflicts, Some(true));
     }
 }

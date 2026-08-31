@@ -50,13 +50,23 @@ Range grammar (same as the ingestor's `--bigtable-range`): `a:b` = slots
   including ticks carried for skipped slots), the trailing-tick rule, a
   replica of Agave's `verify_tick_hash_count` (per-tick `num_hashes` windows
   against the era's `hashes_per_tick`), transaction-index tiling, the
-  last-entry-hash == blockhash equality, duplicate conflicts, and blockhash
-  chain linkage.
+  last-entry-hash == blockhash equality, and blockhash chain linkage.
 - **full**: everything above **plus** recomputing every SHA-256 hash of every
   entry, including the transaction-signature merkle mixin, and comparing
   against the recorded entry hashes and blockhash. Roughly 800k hashes per
   slot in the 12,500 hashes-per-tick era (~4M in the current 62,500 era);
   budget multiple days for a genesis-to-tip run on a large machine.
+
+### Optional duplicate-conflict audit
+
+`--audit-duplicate-conflicts` (or
+`SUPERBANK_VERIFY_AUDIT_DUPLICATE_CONFLICTS=true`, or YAML
+`audit-duplicate-conflicts: true`) scans the raw ClickHouse tables for logical
+duplicates with differing values and emits `duplicate_conflict` findings. It
+is off by default: the baseline verifier uses the deduplicated rows selected
+by `LIMIT 1 BY`. Enabling the audit adds aggregation scans of the blocks and
+entries tables for every window, plus transactions in full mode, so use it as
+a targeted forensic integrity audit rather than a normal PoH sweep.
 
 ### hashes_per_tick eras
 
@@ -147,9 +157,10 @@ golden vectors.
 
 ## Notes
 
-- ReplacingMergeTree duplicates are deduplicated with `LIMIT 1 BY`; rows whose
-  duplicates *differ* are reported as `duplicate_conflict` since no
-  deterministic winner exists.
+- ReplacingMergeTree duplicates are deduplicated with `LIMIT 1 BY`. Enable
+  `--audit-duplicate-conflicts` to report differing duplicates as
+  `duplicate_conflict`; otherwise the baseline verifier does not scan for
+  them.
 - Not yet handled: the Alpenglow migration (post-PoH tick rules on Agave
   master) — revisit the era schedule when it activates on a target cluster.
 - `getEpochSchedule` in superbank-rpc ignores mainnet's warmup epochs; this
