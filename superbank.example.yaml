@@ -30,7 +30,7 @@ grpc-slot-notifications: true
 # fumarole-create-consumer-group: false
 # fumarole-from-slot: 0
 # fumarole-data-plane-tcp-connections: 4
-# fumarole-concurrent-download-limit-per-tcp: 2
+# fumarole-concurrent-download-limit-per-tcp: 1 # deprecated compatibility option; values other than 1 are ignored
 # fumarole-data-channel-capacity: 4096
 # fumarole-memory-soft-limit-bytes: 25769803776 # 24 GiB; set 0 to disable
 # fumarole-commit-interval-secs: 10
@@ -44,7 +44,7 @@ grpc-slot-notifications: true
 # rpc-timeout-secs: 30
 # rpc-retry-backoff-ms: 500
 # rpc-max-inflight: 64
-# rpc-max-supported-tx-version: 0
+# rpc-max-supported-tx-version: 1
 # rpc-flush-every-slots: 500
 # rpc-progress-every-slots: 100
 # rpc-discovery-chunk-slots: 10000

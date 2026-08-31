@@ -134,14 +134,17 @@ cargo build -p superbank-solparq --bin superbank-solparq-read --release
 
 ## Release
 
-`superbank-solparq` ships through the same release workflow as the main Superbank
-binaries. Releases are triggered by annotated `vX.Y.Z` tags and use
-`.goreleaser.yaml`.
+`superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` ship
+through the same root release workflow as the main Superbank binaries. The
+root `Cargo.toml` is the version authority: every workspace member inherits
+`workspace.package.version`. Normal releases use annotated `vX.Y.Z` tags and
+`.goreleaser.yaml`; tags matching `v*-solparq.*` are intentionally excluded
+from that shared release workflow.
 
-Before tagging, update workspace member versions in `Cargo.toml` files,
-including `crates/superbank-solparq/Cargo.toml` (which builds both the
-`superbank-solparq` and `superbank-solparq-read` binaries), commit release
-changes, and push the branch:
+Before tagging, update `workspace.package.version` in the root `Cargo.toml`,
+commit the release changes, and push the branch. Do not add per-crate version
+fields: `crates/superbank-solparq/Cargo.toml` builds both Solparq binaries but
+inherits the workspace version.
 
 ```bash
 git add Cargo.toml crates/superbank-solparq/Cargo.toml .goreleaser.yaml .github/workflows/release.yml
@@ -171,6 +174,8 @@ superbank-solparq-v0.3.0-linux-amd64.tar.gz
 superbank-solparq-v0.3.0-linux-arm64.tar.gz
 superbank-solparq-read-v0.3.0-linux-amd64.tar.gz
 superbank-solparq-read-v0.3.0-linux-arm64.tar.gz
+superbank-verify-v0.3.0-linux-amd64.tar.gz
+superbank-verify-v0.3.0-linux-arm64.tar.gz
 SHA256SUMS.txt
 ```
 
@@ -607,8 +612,9 @@ boundaries. Notes:
 - Aligning skips any leading partial window: if the earliest slot is `10_500`, the
   first `custom:1000` archive is `11000-11999` and slots `10_500–10_999` are not
   archived by this kind — the same trade-off `epoch` already makes for a partial
-  leading epoch. Take care when `custom` is the only configured kind combined with
-  `--delete-archived-data-range`.
+  leading epoch. `--delete-archived-data-range` preserves this never-archived
+  leading window by flooring the delete at the lowest archived start slot; pass
+  `--delete-archived-data-from-slot-zero` if you want it purged too.
 - Enabling it on an existing unaligned custom history realigns forward from the
   next boundary after the last archive.
 
@@ -747,14 +753,28 @@ To delete the archived ClickHouse data range after a successful archive:
 When multiple archive types are configured, ClickHouse data deletion is gated by
 the completed archive high-watermark for every configured type. After any
 archive succeeds, `superbank-solparq` checks the latest completed archive for each type
-and deletes everything from the beginning of the table up to the highest slot
-that all configured types have already covered. Sweeping from slot `0` (rather
-than only the current archive's range) ensures no older slots are stranded when
-one archive type was lagging while an earlier range was written. For example, if
-`custom:500` and `hourly` are both configured, early `custom:500` archives will
-defer deletion until an `hourly` archive covers the same slots. Once the
-`hourly` archive exists, later `custom:500` completions can delete every slot up
-to their safe high-watermark without waiting for another hourly cycle.
+and deletes up to the highest slot that all configured types have already
+covered. For example, if `custom:500` and `hourly` are both configured, early
+`custom:500` archives will defer deletion until an `hourly` archive covers the
+same slots. Once the `hourly` archive exists, later `custom:500` completions can
+delete every slot up to their safe high-watermark without waiting for another
+hourly cycle.
+
+The delete range starts at the **lowest archived start slot** across the
+configured types, not at slot `0`. Aligned kinds do not archive from the earliest
+ingested slot: `epoch` (and `custom` with `--custom-aligned`) begins its first
+archive at an `align_up` boundary, so the window between the earliest ingested
+slot and that boundary is never captured by any archive. Flooring the delete
+start at the lowest archived start slot keeps that never-archived leading window
+in ClickHouse instead of dropping data that lives in no archive.
+
+To instead sweep from slot `0` — purging the leading, never-archived window too —
+add `--delete-archived-data-from-slot-zero` (server mode only, off by default):
+
+```bash
+--delete-archived-data-range \
+--delete-archived-data-from-slot-zero
+```
 
 That deletes matching slots from:
 
@@ -797,6 +817,8 @@ Common defaults:
 - `--custom-aligned` unset (off; only affects `custom` — see [Aligned custom archives](#aligned-custom-archives))
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset
+- `--delete-archived-data-range` unset (off)
+- `--delete-archived-data-from-slot-zero` unset (off; server mode only)
 - `--repair-mismatches` unset (off)
 - `--allow-rpc-validation-failure` unset (off)
 - `--backfill-gaps` unset (off)

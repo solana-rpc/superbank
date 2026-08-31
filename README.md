@@ -9,7 +9,7 @@
 
 Ingest Solana ledger data into ClickHouse and serve Solana-compatible JSON-RPC from that data.
 
-[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [superbank-solparq](crates/superbank-solparq/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md)
+[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [superbank-solparq](crates/superbank-solparq/README.md) · [PoH validator](crates/superbank-verify/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md)
 
 </div>
 
@@ -31,6 +31,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Archive Superbank ClickHouse table bundles to Parquet (`crates/superbank-solparq`)
 - Inspect and read superbank-solparq Parquet archives from local files or S3 (`superbank-solparq-read` binary in `crates/superbank-solparq`)
 - Restore superbank-solparq Parquet archives (local or S3) back into ClickHouse (`source: solparq`)
+- Validate Proof-of-History over the stored data (`crates/superbank-verify`)
 - Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
@@ -42,6 +43,7 @@ flowchart LR
   Ingest --> CH[ClickHouse]
   CH --> RPC[superbank-rpc]
   CH --> Archive[superbank-solparq Parquet archives]
+  CH --> Verify[superbank-verify]
 ```
 
 ## Table of contents
@@ -254,7 +256,8 @@ Build the production image from the repo root:
 docker build -t superbank:0.5.0 .
 ```
 
-The image contains both binaries. It runs `superbank-rpc` by default:
+The image contains all three binaries (`superbank`, `superbank-rpc`,
+`superbank-verify`). It runs `superbank-rpc` by default:
 
 ```bash
 docker run --rm -p 8899:8899 \
@@ -354,6 +357,7 @@ rows already present on the target by exact table key instead of failing the run
 - `crates/superbank` ingestor binary (Yellowstone Fumarole, Yellowstone gRPC, Solana JSON-RPC, or Solana Bigtable sources, plus the `solparq` source that restores Parquet archives back into ClickHouse)
 - `crates/superbank-rpc` Solana-compatible JSON-RPC server backed by ClickHouse
 - `crates/superbank-solparq` ClickHouse table archiver that writes Parquet bundles locally or to S3-compatible storage
+- `crates/superbank-verify` Proof-of-History validator for the stored data (genesis-to-tip or arbitrary slot/epoch ranges)
 - `ddl/` ClickHouse schemas (transactions, block metadata, optional PoH entries, GSFA/signatures, token owner activity)
 - `tests/k6/` load/validation tests for `superbank-rpc`
 - `scripts/` helper scripts (local runs, analysis, k6 orchestration)
@@ -363,7 +367,7 @@ rows already present on the target by exact table key instead of failing the run
 ## Development
 
 ```bash
-cargo build -p superbank -p superbank-rpc -p superbank-solparq
+cargo build -p superbank -p superbank-rpc -p superbank-solparq -p superbank-verify
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings

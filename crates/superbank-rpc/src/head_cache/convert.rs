@@ -10,6 +10,7 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::clickhouse::StoredTransactionRecord;
+use crate::solana_sdk;
 
 #[derive(Debug, Error)]
 pub(crate) enum ConvertError {
@@ -25,6 +26,8 @@ pub(crate) enum ConvertError {
     OutOfRange(&'static str),
     #[error("invalid base58 value for {what}")]
     InvalidBase58 { what: &'static str },
+    #[error("invalid message: {0}")]
+    InvalidMessage(&'static str),
 }
 
 pub(crate) fn bytes_to_array<const N: usize>(value: &[u8]) -> Result<[u8; N], ConvertError> {
@@ -90,6 +93,7 @@ type RewardsConversion = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 type ReturnDataConversion = (bool, Option<[u8; 32]>, Option<Vec<u8>>);
 
@@ -291,6 +295,7 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(reward.pubkey.clone());
@@ -298,9 +303,17 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
         post_balances.push(reward.post_balance);
         reward_types.push(reward_type_to_string(reward.reward_type));
         commissions.push(parse_commission(&reward.commission));
+        commission_bps.push(parse_commission_bps(&reward.commission_bps));
     }
 
-    (pubkeys, lamports, post_balances, reward_types, commissions)
+    (
+        pubkeys,
+        lamports,
+        post_balances,
+        reward_types,
+        commissions,
+        commission_bps,
+    )
 }
 
 fn reward_type_to_string(value: i32) -> Option<String> {
@@ -316,6 +329,13 @@ fn parse_commission(value: &str) -> Option<u8> {
         return None;
     }
     value.parse::<u8>().ok()
+}
+
+fn parse_commission_bps(value: &str) -> Option<u16> {
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<u16>().ok()
 }
 
 fn convert_pubkeys(keys: &[Vec<u8>], what: &'static str) -> Result<Vec<[u8; 32]>, ConvertError> {
@@ -375,6 +395,11 @@ pub(crate) fn stored_record_from_transaction_info(
         .header
         .as_ref()
         .ok_or(ConvertError::Missing("message.header"))?;
+    if message.config.is_some() && !message.address_table_lookups.is_empty() {
+        return Err(ConvertError::InvalidMessage(
+            "v1 transaction contains address table lookups",
+        ));
+    }
 
     let tx_signatures = convert_signatures(&transaction.signatures)?;
     let tx_account_keys = convert_account_keys(&message.account_keys)?;
@@ -441,6 +466,7 @@ pub(crate) fn stored_record_from_transaction_info(
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
     ) = convert_rewards(&meta.rewards);
 
     // gRPC does not distinguish between absent and empty rewards. Treat empty as present.
@@ -460,7 +486,26 @@ pub(crate) fn stored_record_from_transaction_info(
         slot_idx: tx_info.index.min(u64::from(u32::MAX)) as u32,
         block_time: None,
         is_vote: tx_info.is_vote,
-        tx_version: if message.versioned { Some(0) } else { None },
+        tx_version: if message.config.is_some() {
+            Some(1)
+        } else if message.versioned {
+            Some(0)
+        } else {
+            None
+        },
+        tx_config_priority_fee: message
+            .config
+            .as_ref()
+            .and_then(|config| config.priority_fee),
+        tx_config_compute_unit_limit: message
+            .config
+            .as_ref()
+            .and_then(|config| config.compute_unit_limit),
+        tx_config_loaded_accounts_data_size_limit: message
+            .config
+            .as_ref()
+            .and_then(|config| config.loaded_accounts_data_size_limit),
+        tx_config_heap_size: message.config.as_ref().and_then(|config| config.heap_size),
         tx_signatures,
         tx_num_required_signatures: header
             .num_required_signatures
@@ -520,6 +565,7 @@ pub(crate) fn stored_record_from_transaction_info(
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
         meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly,
         meta_return_data_present,
@@ -528,4 +574,72 @@ pub(crate) fn stored_record_from_transaction_info(
         meta_compute_units_consumed: meta.compute_units_consumed,
         meta_cost_units: meta.cost_units,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yellowstone_grpc_proto::prelude::{
+        Message, MessageHeader, Transaction, TransactionConfig, TransactionStatusMeta,
+    };
+
+    fn v1_update(
+        address_table_lookups: Vec<MessageAddressTableLookup>,
+    ) -> SubscribeUpdateTransactionInfo {
+        SubscribeUpdateTransactionInfo {
+            signature: vec![7; 64],
+            is_vote: false,
+            transaction: Some(Transaction {
+                signatures: vec![vec![7; 64]],
+                message: Some(Message {
+                    header: Some(MessageHeader {
+                        num_required_signatures: 1,
+                        num_readonly_signed_accounts: 0,
+                        num_readonly_unsigned_accounts: 0,
+                    }),
+                    account_keys: vec![vec![1; 32]],
+                    recent_blockhash: vec![9; 32],
+                    instructions: Vec::new(),
+                    versioned: false,
+                    address_table_lookups,
+                    config: Some(TransactionConfig {
+                        priority_fee: Some(42),
+                        compute_unit_limit: Some(1_000_000),
+                        loaded_accounts_data_size_limit: Some(65_536),
+                        heap_size: Some(32_768),
+                    }),
+                }),
+            }),
+            meta: Some(TransactionStatusMeta::default()),
+            index: 3,
+        }
+    }
+
+    #[test]
+    fn head_cache_conversion_preserves_v1_fields() {
+        let record =
+            stored_record_from_transaction_info(55, &v1_update(Vec::new())).expect("convert v1");
+        assert_eq!(record.tx_version, Some(1));
+        assert_eq!(record.tx_recent_blockhash, [9; 32]);
+        assert_eq!(record.tx_config_priority_fee, Some(42));
+        assert_eq!(record.tx_config_compute_unit_limit, Some(1_000_000));
+        assert_eq!(
+            record.tx_config_loaded_accounts_data_size_limit,
+            Some(65_536)
+        );
+        assert_eq!(record.tx_config_heap_size, Some(32_768));
+    }
+
+    #[test]
+    fn head_cache_conversion_rejects_v1_lookups() {
+        let update = v1_update(vec![MessageAddressTableLookup {
+            account_key: vec![2; 32],
+            writable_indexes: vec![0],
+            readonly_indexes: Vec::new(),
+        }]);
+        assert!(matches!(
+            stored_record_from_transaction_info(55, &update),
+            Err(ConvertError::InvalidMessage(_))
+        ));
+    }
 }

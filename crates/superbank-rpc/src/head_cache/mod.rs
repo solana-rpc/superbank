@@ -3,10 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use solana_commitment_config::CommitmentLevel;
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::TransactionDetails;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -894,7 +894,7 @@ fn commitment_to_str(c: CommitmentLevel) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::hash::Hash;
+    use crate::solana_sdk::hash::Hash;
 
     fn base_transaction(slot: u64, blockhash: [u8; 32]) -> StoredTransactionRecord {
         StoredTransactionRecord {
@@ -904,6 +904,10 @@ mod tests {
             block_time: None,
             is_vote: false,
             tx_version: None,
+            tx_config_priority_fee: None,
+            tx_config_compute_unit_limit: None,
+            tx_config_loaded_accounts_data_size_limit: None,
+            tx_config_heap_size: None,
             tx_signatures: vec![[0u8; 64]],
             tx_num_required_signatures: 1,
             tx_num_readonly_signed_accounts: 0,
@@ -954,6 +958,7 @@ mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: false,
@@ -980,6 +985,7 @@ mod tests {
             rewards_post_balance: Vec::new(),
             rewards_type: Vec::new(),
             rewards_commission: Vec::new(),
+            rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
         }
     }

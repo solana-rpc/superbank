@@ -933,7 +933,7 @@ fn clickhouse_cleanup_deletes_only_safe_prefix_when_other_kinds_lag() {
 }
 
 #[test]
-fn clickhouse_cleanup_removes_slots_before_current_archive_start() {
+fn clickhouse_cleanup_floors_delete_start_at_lowest_archived_start() {
     let config = Config::try_parse_from([
         "superbank-solparq",
         "--db-server",
@@ -949,9 +949,44 @@ fn clickhouse_cleanup_removes_slots_before_current_archive_start() {
     ])
     .expect("valid config");
 
-    // A continuation archive covering the second epoch (432000-863999). Older
-    // slots from the first epoch (0-431999) must still be swept even though this
-    // archive does not start at slot 0.
+    // A continuation archive covering the second epoch (432000-863999). The
+    // first epoch's aligned start means slots before 432000 (the earliest
+    // ingested slot up to the first `align_up` boundary) were never archived by
+    // any kind, so the delete must be floored at the archive start rather than
+    // reaching back to slot 0.
+    let delete_range = safe_delete_archived_data_range(
+        &config,
+        863_999,
+        &[(
+            ArchiveKind::Epoch,
+            Some("epoch_1_432000-863999".to_string()),
+        )],
+    )
+    .expect("safe delete check");
+
+    assert_eq!(delete_range, Some(SlotRange::new(432_000, 863_999)));
+}
+
+#[test]
+fn clickhouse_cleanup_sweeps_from_slot_zero_when_opted_in() {
+    let config = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "epoch",
+        "--server-mode",
+        "--delete-archived-data-range",
+        "--delete-archived-data-from-slot-zero",
+    ])
+    .expect("valid config");
+
+    // With `--delete-archived-data-from-slot-zero`, the delete reaches back to
+    // slot 0 even though the archive starts at an aligned boundary.
     let delete_range = safe_delete_archived_data_range(
         &config,
         863_999,
@@ -963,6 +998,29 @@ fn clickhouse_cleanup_removes_slots_before_current_archive_start() {
     .expect("safe delete check");
 
     assert_eq!(delete_range, Some(SlotRange::new(0, 863_999)));
+}
+
+#[test]
+fn delete_archived_data_from_slot_zero_requires_server_mode() {
+    let err = Config::try_parse_from([
+        "superbank-solparq",
+        "--db-server",
+        "127.0.0.1",
+        "--db-user",
+        "admin",
+        "--db-password",
+        "secret",
+        "--archive-range-type",
+        "epoch",
+        "--delete-archived-data-range",
+        "--delete-archived-data-from-slot-zero",
+    ])
+    .expect_err("--delete-archived-data-from-slot-zero requires --server-mode");
+
+    assert!(
+        err.to_string().contains("--server-mode"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

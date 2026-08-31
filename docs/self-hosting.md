@@ -677,6 +677,7 @@ Set `source: fumarole` in your YAML and configure `fumarole-consumer-group`. Aft
 ### Metrics
 
 Both binaries expose Prometheus metrics at `/metrics`:
+
 - Ingestor: `http://<host>:9901/metrics`
 - RPC server: `http://<host>:9900/metrics`
 
@@ -685,17 +686,33 @@ Both binaries expose Prometheus metrics at `/metrics`:
 | Metric | What it tells you |
 |---|---|
 | `superbank_rpc_requests_total{method,status}` | Request count per method — track error rate by filtering `status!="200"` |
-| `superbank_rpc_response_time_seconds{method}` | Full end-to-end latency histogram — use for p50/p95/p99 |
-| `superbank_rpc_clickhouse_duration_seconds{method}` | Time spent in ClickHouse per method — isolates DB vs. overhead |
+| `superbank_rpc_response_time_seconds_bucket{method,le}` | Full end-to-end latency histogram — use for p50/p95/p99 |
+| `superbank_rpc_clickhouse_duration_seconds_bucket{method,le}` | Time spent in ClickHouse per method — isolates DB vs. overhead |
 | `superbank_rpc_inflight_requests{method}` | Concurrent in-flight requests — spike indicates backpressure |
-| `superbank_rpc_route_total{method,outcome}` | Routing outcomes — watch for `outcome="backend_error"` or `outcome="timeout"` |
+| `superbank_rpc_route_total_total{method,outcome}` | Routing outcomes — watch for `outcome="backend_error"` or `outcome="timeout"` |
 | `superbank_head_cache_active` | `1` = head cache connected to Dragon's Mouth; `0` = disconnected |
 | `superbank_head_cache_latest_slot` | Most recent slot in cache — compare to chain tip to measure lag |
-| `superbank_process_uptime_seconds_total` | Process uptime |
+| `superbank_process_resident_memory_bytes` | Resident memory used by the RPC process |
+| `superbank_process_cpu_seconds_total` | CPU time consumed by the RPC process |
 
 **Key ingestor metrics (`:9901`):**
 
 The ingestor tracks insert throughput, batch sizes, and ClickHouse write latency. Watch for any sustained gap between the max ingested slot and the chain tip — this indicates the ingestor is falling behind.
+
+| Metric | What it tells you |
+|---|---|
+| `superbank_ingest_source_info{source}` | Static source identity for each ingestor target |
+| `superbank_ingest_last_processed_slot` | Highest source slot processed before durable insertion |
+| `superbank_ingest_last_inserted_slot` | Highest slot durably inserted into ClickHouse |
+| `superbank_ingest_slot_lag` | Processed-to-inserted slot gap |
+| `superbank_ingest_chain_tip_lag` | Network-tip-to-inserted gap; populated only by Fumarole and gRPC |
+| `superbank_ingest_inserted_slots_total_total` | Slots durably inserted into ClickHouse |
+| `superbank_ingest_inserted_transactions_total_total` | Transaction rows durably inserted into ClickHouse |
+| `superbank_ingest_clickhouse_flush_duration_seconds_bucket{table,le}` | ClickHouse flush latency histogram by table |
+| `superbank_ingest_clickhouse_flush_rows_total_total{table}` | Rows successfully flushed by table |
+| `superbank_ingest_clickhouse_flush_failures_total_total{table,stage}` | ClickHouse flush failures by table and stage |
+| `superbank_ingest_source_errors_total_total{stage,kind}` | Source-side errors by stage and kind |
+| `superbank_ingest_last_successful_flush_timestamp_seconds` | Unix timestamp of the latest successful ClickHouse flush |
 
 The ingestor exposes a liveness health check at `http://<host>:9901/health`. It returns `200 OK` while flushing normally, and `503 Service Unavailable` when no successful ClickHouse flush has occurred within `health-stale-secs` seconds (default: 120). Set `health-stale-secs: 0` in your config to disable the staleness check. Add `METRICS_CLUSTER_LABEL` to attach a static `cluster="..."` label to all ingestor metrics — useful for multi-cluster Prometheus setups.
 
@@ -707,21 +724,91 @@ When running the Fumarole source, the following additional gauges and counters a
 | `superbank_ingest_fumarole_buffered_bytes` | Estimated assembler bytes in memory |
 | `superbank_ingest_fumarole_pending_slots` | Slots waiting to flush |
 | `superbank_ingest_fumarole_rss_bytes` | Process RSS sampled by the memory guard |
-| `superbank_ingest_fumarole_pressure_flushes_total` | Backpressure-triggered flushes (rising counter indicates memory pressure) |
+| `superbank_ingest_fumarole_pressure_flushes_total_total` | Backpressure-triggered flushes (rising counter indicates memory pressure) |
 
 **Example Prometheus queries:**
 
 ```promql
 # p99 RPC latency per method
-histogram_quantile(0.99, rate(superbank_rpc_response_time_seconds_bucket[5m]))
+histogram_quantile(
+  0.99,
+  sum by (le, method) (rate(superbank_rpc_response_time_seconds_bucket[5m]))
+)
 
 # Error rate across all methods
 sum(rate(superbank_rpc_requests_total{status!="200"}[5m]))
   / sum(rate(superbank_rpc_requests_total[5m]))
 
 # ClickHouse query time p95
-histogram_quantile(0.95, rate(superbank_rpc_clickhouse_duration_seconds_bucket[5m]))
+histogram_quantile(
+  0.95,
+  sum by (le, method) (rate(superbank_rpc_clickhouse_duration_seconds_bucket[5m]))
+)
 ```
+
+### Grafana dashboards
+
+The repository includes two portable Grafana 13 dashboards. Both use Grafana's stable dashboard
+v2 resource format. Their core panels query metrics emitted by Superbank itself; the ingest
+dashboard also has an explicitly optional tab for ClickHouse server metrics.
+
+| Dashboard | Resource | Metrics endpoint | Variables |
+|---|---|---|---|
+| Superbank RPC | [`deploy/grafana/dashboards/superbank-rpc.json`](../deploy/grafana/dashboards/superbank-rpc.json) | RPC server, port `9900` | `datasource`, `job`, `instance`, `method` |
+| Superbank Ingest | [`deploy/grafana/dashboards/superbank-ingest.json`](../deploy/grafana/dashboards/superbank-ingest.json) | Ingestor, port `9901`; optional ClickHouse Prometheus scrape | `datasource`, `cluster`, `job`, `source`, `instance`, `table`, `clickhouse_dc`, `clickhouse_node` |
+
+To import either dashboard interactively, open **Dashboards → New → Import** in Grafana, upload
+the JSON resource, and select the Prometheus datasource containing the corresponding Superbank
+metrics. Repeat for the other resource if the datasource scrapes both ports. To populate the
+optional ClickHouse server tab, use a datasource that also contains the ClickHouse metric families
+listed below. Neither dashboard contains a hard-coded datasource UID or assumes
+Kubernetes-specific labels.
+
+The ingest dashboard's optional `cluster` control uses `METRICS_CLUSTER_LABEL` when present. Its
+default **All** value also matches ingestors without that label. The `source` control filters all
+common panels even when **All instances** is selected, and `table` filters the ClickHouse panels.
+Chain-tip lag is populated only by Fumarole and gRPC sources. Last-flush age remains empty until
+the first successful flush and is informational because `HEALTH_STALE_SECS` is configurable.
+
+The ingest dashboard's **ClickHouse Server (optional)** tab reuses the following Prometheus metric
+families when they are available:
+
+| Metric family | Dashboard use |
+|---|---|
+| `ClickHouseProfileEvents_InsertedRows` | Inserted rows per second by node |
+| `ClickHouseAsyncMetrics_TotalRowsOfMergeTreeTables` | Current row count and row change over the selected range |
+| `ClickHouseAsyncMetrics_MemoryResident` | Resident memory by node |
+| `ClickHouseAsyncMetrics_DiskAvailable_*` | Available space by disk and node |
+| `ClickHouseAsyncMetrics_MaxPartCountForPartition` | Merge-pressure trend by node |
+| `ClickHouseAsyncMetrics_TotalPartsOfMergeTreeTables` | Net MergeTree part change per minute |
+| `ClickHouseMetrics_DistributedFilesToInsert`, `ClickHouseMetrics_DistributedBytesToInsert` | Distributed send-queue backlog |
+| `ClickHouseErrorMetric_*` | Error increases by type and node |
+| `ClickHouseAsyncMetrics_NetworkReceiveBytes_*`, `ClickHouseAsyncMetrics_NetworkSendBytes_*` | Aggregate ingress and egress across reported interfaces |
+
+`clickhouse_dc` and `clickhouse_node` filter the optional panels using the exporter labels `dc` and
+`nodename`. Both default to `.*`; leaving them at **All** also permits unlabeled series. The tab
+does not require the ClickHouse Grafana datasource, issue SQL queries, or encode cluster names,
+hostnames, interface names, datasource UIDs, or links to private infrastructure.
+
+For file provisioning, mount the dashboard JSON into Grafana and configure a dashboard provider:
+
+```yaml
+apiVersion: 1
+
+providers:
+  - name: superbank
+    type: file
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards/superbank
+```
+
+The RPC dashboard's **Head Cache**, **Disk Cache**, and **gRPC Streaming** tabs use feature-gated
+metrics. Those tabs show no data unless `superbank-rpc` was built with the corresponding feature
+and the feature is enabled at runtime. The ingest dashboard's **Fumarole (optional)** tab remains
+visible but shows no data for other sources, and **ClickHouse Server (optional)** remains visible
+but shows no data without the metric families above. Generic host metrics and query-cache metrics
+from unrelated exporters remain outside the dashboards' scope.
 
 ---
 

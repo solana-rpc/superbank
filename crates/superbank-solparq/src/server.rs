@@ -446,6 +446,7 @@ async fn status(State(ops): State<OpsState>) -> Json<serde_json::Value> {
             "archives_to_keep": ops.config.archives_to_keep,
             "continue_from_last_archive": ops.config.continue_from_last_archive,
             "delete_archived_data_range": ops.config.delete_archived_data_range,
+            "delete_archived_data_from_slot_zero": ops.config.delete_archived_data_from_slot_zero,
             "force_archive": ops.config.force_archive,
             "archive_check_interval_secs": ops.config.archive_check_interval_secs
         }

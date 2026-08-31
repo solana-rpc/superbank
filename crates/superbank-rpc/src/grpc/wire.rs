@@ -6,8 +6,8 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
+use crate::solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 use prost::Message;
-use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 use solana_transaction_status::{Reward, RewardType, TransactionStatusMeta};
 use tonic::{Code, Status};
 
@@ -177,7 +177,7 @@ fn encode_transaction(
 }
 
 fn serialize_transaction(transaction: VersionedTransaction) -> Result<Vec<u8>, Status> {
-    bincode::serialize(&transaction).map_err(|err| {
+    wincode::serialize(&transaction).map_err(|err| {
         Status::new(
             Code::Internal,
             format!("failed to encode transaction: {err}"),
@@ -280,6 +280,8 @@ fn encode_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<u8>, Status> {
         || metadata.rewards_post_balance.len() != len
         || metadata.rewards_type.len() != len
         || metadata.rewards_commission.len() != len
+        || (!metadata.rewards_commission_bps.is_empty()
+            && metadata.rewards_commission_bps.len() != len)
     {
         return Err(Status::new(
             Code::Internal,
@@ -301,6 +303,13 @@ fn encode_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<u8>, Status> {
                     reward_type: reward_type as i32,
                     commission: metadata.rewards_commission[idx]
                         .map(|commission| commission.to_string())
+                        .unwrap_or_default(),
+                    commission_bps: metadata
+                        .rewards_commission_bps
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                        .map(|commission_bps| commission_bps.to_string())
                         .unwrap_or_default(),
                 }
             })
@@ -326,6 +335,10 @@ fn encode_reward(reward: &Reward) -> storage_proto::Reward {
             .commission
             .map(|commission| commission.to_string())
             .unwrap_or_default(),
+        commission_bps: reward
+            .commission_bps
+            .map(|commission_bps| commission_bps.to_string())
+            .unwrap_or_default(),
     }
 }
 
@@ -335,6 +348,7 @@ fn encode_reward_type(reward_type: RewardType) -> storage_proto::RewardType {
         RewardType::Rent => storage_proto::RewardType::Rent,
         RewardType::Staking => storage_proto::RewardType::Staking,
         RewardType::Voting => storage_proto::RewardType::Voting,
+        RewardType::DeactivatedStake => storage_proto::RewardType::DeactivatedStake,
     }
 }
 
@@ -344,6 +358,7 @@ fn reward_type_from_string(value: &str) -> storage_proto::RewardType {
         "Rent" | "rent" => storage_proto::RewardType::Rent,
         "Staking" | "staking" => storage_proto::RewardType::Staking,
         "Voting" | "voting" => storage_proto::RewardType::Voting,
+        "DeactivatedStake" | "deactivated-stake" => storage_proto::RewardType::DeactivatedStake,
         _ => storage_proto::RewardType::Unspecified,
     }
 }
@@ -418,6 +433,10 @@ mod tests {
             block_time: Some(3),
             is_vote: false,
             tx_version: None,
+            tx_config_priority_fee: None,
+            tx_config_compute_unit_limit: None,
+            tx_config_loaded_accounts_data_size_limit: None,
+            tx_config_heap_size: None,
             tx_signatures: vec![[9; 64]],
             tx_num_required_signatures: 1,
             tx_num_readonly_signed_accounts: 0,
@@ -468,6 +487,7 @@ mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: false,
@@ -509,5 +529,48 @@ mod tests {
             Some(&filter),
             &AccountFilters::empty()
         ));
+    }
+
+    #[test]
+    fn grpc_transaction_wire_round_trips_v1_config_and_signed_bytes() {
+        let mut record = record_with_accounts(vec![[1; 32], [2; 32]]);
+        record.tx_version = Some(1);
+        record.tx_num_readonly_unsigned_accounts = 1;
+        record.tx_config_priority_fee = Some(42);
+        record.tx_config_compute_unit_limit = Some(1_000_000);
+        record.tx_config_loaded_accounts_data_size_limit = Some(65_536);
+        record.tx_config_heap_size = Some(32_768);
+
+        let transaction = build_versioned_transaction(&record).expect("build v1 transaction");
+        let expected = wincode::serialize(&transaction).expect("serialize expected v1");
+        let encoded = serialize_transaction(transaction).expect("serialize gRPC transaction");
+        assert_eq!(encoded, expected);
+        let decoded: VersionedTransaction =
+            wincode::deserialize(&encoded).expect("decode gRPC transaction");
+        let solana_message::VersionedMessage::V1(message) = decoded.message else {
+            panic!("expected v1 message")
+        };
+        assert_eq!(message.lifetime_specifier.to_bytes(), [7; 32]);
+        assert_eq!(message.config.priority_fee, Some(42));
+        assert_eq!(message.config.compute_unit_limit, Some(1_000_000));
+        assert_eq!(message.config.loaded_accounts_data_size_limit, Some(65_536));
+        assert_eq!(message.config.heap_size, Some(32_768));
+    }
+
+    #[test]
+    fn grpc_reward_wire_accepts_both_deactivated_stake_spellings() {
+        assert_eq!(storage_proto::RewardType::DeactivatedStake as i32, 5);
+        assert_eq!(
+            reward_type_from_string("DeactivatedStake") as i32,
+            storage_proto::RewardType::DeactivatedStake as i32
+        );
+        assert_eq!(
+            reward_type_from_string("deactivated-stake") as i32,
+            storage_proto::RewardType::DeactivatedStake as i32
+        );
+        assert_eq!(
+            encode_reward_type(RewardType::DeactivatedStake) as i32,
+            storage_proto::RewardType::DeactivatedStake as i32
+        );
     }
 }

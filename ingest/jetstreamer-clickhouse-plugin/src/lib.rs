@@ -1039,6 +1039,7 @@ struct BlocksMetadataRow {
     rewards_post_balance: Vec<u64>,
     rewards_type: Vec<Option<String>>,
     rewards_commission: Vec<Option<u8>>,
+    rewards_commission_bps: Vec<Option<u16>>,
     rewards_num_partitions: Option<u64>,
 }
 
@@ -1061,6 +1062,7 @@ impl BlocksMetadataRow {
                 let mut rewards_post_balance = Vec::with_capacity(rewards.keyed_rewards.len());
                 let mut rewards_type = Vec::with_capacity(rewards.keyed_rewards.len());
                 let mut rewards_commission = Vec::with_capacity(rewards.keyed_rewards.len());
+                let mut rewards_commission_bps = Vec::with_capacity(rewards.keyed_rewards.len());
 
                 for (pubkey, reward) in rewards.keyed_rewards.iter() {
                     rewards_pubkey.push(pubkey.to_bytes());
@@ -1068,6 +1070,7 @@ impl BlocksMetadataRow {
                     rewards_post_balance.push(reward.post_balance);
                     rewards_type.push(Some(reward.reward_type.to_string()));
                     rewards_commission.push(reward.commission);
+                    rewards_commission_bps.push(None);
                 }
 
                 let rewards_present =
@@ -1088,6 +1091,7 @@ impl BlocksMetadataRow {
                     rewards_post_balance,
                     rewards_type,
                     rewards_commission,
+                    rewards_commission_bps,
                     rewards_num_partitions: rewards.num_partitions,
                 })
             }
@@ -1181,6 +1185,7 @@ struct TransactionRow {
     meta_reward_post_balance: Vec<u64>,
     meta_reward_type: Vec<Option<String>>,
     meta_reward_commission: Vec<Option<u8>>,
+    meta_reward_commission_bps: Vec<Option<u16>>,
     meta_loaded_addresses_writable: Vec<[u8; 32]>,
     meta_loaded_addresses_readonly: Vec<[u8; 32]>,
     meta_return_data_present: u8,
@@ -1267,6 +1272,7 @@ impl TransactionRow {
             rewards_post_balance,
             rewards_type,
             rewards_commission,
+            rewards_commission_bps,
         ) = map_rewards(meta.rewards.as_ref());
 
         let (return_present, return_program, return_data) =
@@ -1348,6 +1354,7 @@ impl TransactionRow {
             meta_reward_post_balance: rewards_post_balance,
             meta_reward_type: rewards_type,
             meta_reward_commission: rewards_commission,
+            meta_reward_commission_bps: rewards_commission_bps,
             meta_loaded_addresses_writable: loaded_writable,
             meta_loaded_addresses_readonly: loaded_readonly,
             meta_return_data_present: return_present,
@@ -1469,6 +1476,7 @@ type RewardColumns = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 
 fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> RewardColumns {
@@ -1478,6 +1486,7 @@ fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> Rewa
     let mut post_balance = Vec::new();
     let mut reward_type = Vec::new();
     let mut commission = Vec::new();
+    let mut commission_bps = Vec::new();
 
     if let Some(rewards) = rewards {
         pubkeys.reserve(rewards.len());
@@ -1485,12 +1494,14 @@ fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> Rewa
         post_balance.reserve(rewards.len());
         reward_type.reserve(rewards.len());
         commission.reserve(rewards.len());
+        commission_bps.reserve(rewards.len());
         for reward in rewards.iter() {
             pubkeys.push(reward.pubkey.clone());
             lamports.push(reward.lamports);
             post_balance.push(reward.post_balance);
             reward_type.push(reward.reward_type.map(|t| t.to_string()));
             commission.push(reward.commission);
+            commission_bps.push(None);
         }
     }
 
@@ -1501,6 +1512,7 @@ fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> Rewa
         post_balance,
         reward_type,
         commission,
+        commission_bps,
     )
 }
 

@@ -483,20 +483,24 @@ async fn resolve_initial_from_slot(
 ) -> Result<(Option<u64>, Option<FromSlotMode>)> {
     match args.dragonsmouth_from_slot {
         Some(FromSlotSpec::LatestDb) => {
-            let latest = fetch_latest_slot_from_blocks(clickhouse, &args.blocks_table)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "dragonsmouth-from-slot '*' requires at least one row in {}",
+            match fetch_latest_slot_from_blocks(clickhouse, &args.blocks_table).await? {
+                Some(latest) => {
+                    info!(
+                        slot = latest,
+                        table = %args.blocks_table,
+                        "resolved dragonsmouth-from-slot='*' to latest slot in blocks_metadata"
+                    );
+                    Ok((Some(latest), Some(FromSlotMode::LatestDb)))
+                }
+                None => {
+                    info!(
+                        table = %args.blocks_table,
+                        "dragonsmouth-from-slot='*' found no rows in {}; falling back to gRPC-reported available slot",
                         args.blocks_table
-                    )
-                })?;
-            info!(
-                slot = latest,
-                table = %args.blocks_table,
-                "resolved dragonsmouth-from-slot='*' to latest slot in blocks_metadata"
-            );
-            Ok((Some(latest), Some(FromSlotMode::LatestDb)))
+                    );
+                    Ok((None, Some(FromSlotMode::LatestDb)))
+                }
+            }
         }
         Some(FromSlotSpec::Slot(0)) => Ok((Some(0), Some(FromSlotMode::Zero))),
         Some(FromSlotSpec::Slot(slot)) => Ok((Some(slot), Some(FromSlotMode::Strict))),
@@ -539,6 +543,7 @@ pub(crate) fn build_subscribe_request(
         "blocks".to_string(),
         SubscribeRequestFilterBlocks {
             account_include: Vec::new(),
+            cuckoo_account_include: None,
             include_transactions: Some(true),
             include_accounts: Some(false),
             include_entries: Some(include_entries),
@@ -877,6 +882,7 @@ fn map_block_metadata(block: &SubscribeUpdateBlock) -> Result<BlockMetadataRow> 
     let mut rewards_post_balance = Vec::new();
     let mut rewards_type = Vec::new();
     let mut rewards_commission = Vec::new();
+    let mut rewards_commission_bps = Vec::new();
     let mut rewards_num_partitions = None;
 
     if let Some(rewards) = block.rewards.as_ref() {
@@ -887,6 +893,7 @@ fn map_block_metadata(block: &SubscribeUpdateBlock) -> Result<BlockMetadataRow> 
             rewards_post_balance.push(reward.post_balance);
             rewards_type.push(reward_type_to_string(reward.reward_type));
             rewards_commission.push(parse_commission(&reward.commission));
+            rewards_commission_bps.push(parse_commission_bps(&reward.commission_bps));
         }
         rewards_num_partitions = rewards.num_partitions.as_ref().map(|p| p.num_partitions);
     }
@@ -906,6 +913,7 @@ fn map_block_metadata(block: &SubscribeUpdateBlock) -> Result<BlockMetadataRow> 
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards_num_partitions,
     })
 }
@@ -974,6 +982,9 @@ fn map_transaction(
         .message
         .as_ref()
         .context("missing transaction message")?;
+    if message.config.is_some() && !message.address_table_lookups.is_empty() {
+        return Err(anyhow!("v1 transaction contains address table lookups"));
+    }
 
     let message_hash = compute_message_hash(message)?;
     let header = message.header.as_ref().context("missing message header")?;
@@ -1039,6 +1050,7 @@ fn map_transaction(
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
     ) = convert_rewards(&meta.rewards);
 
     // gRPC does not distinguish between absent and empty rewards. Treat empty as present.
@@ -1057,7 +1069,26 @@ fn map_transaction(
         block_time,
         message_hash,
         is_vote: u8::from(tx_info.is_vote),
-        tx_version: if message.versioned { Some(0) } else { None },
+        tx_version: if message.config.is_some() {
+            Some(1)
+        } else if message.versioned {
+            Some(0)
+        } else {
+            None
+        },
+        tx_config_priority_fee: message
+            .config
+            .as_ref()
+            .and_then(|config| config.priority_fee),
+        tx_config_compute_unit_limit: message
+            .config
+            .as_ref()
+            .and_then(|config| config.compute_unit_limit),
+        tx_config_loaded_accounts_data_size_limit: message
+            .config
+            .as_ref()
+            .and_then(|config| config.loaded_accounts_data_size_limit),
+        tx_config_heap_size: message.config.as_ref().and_then(|config| config.heap_size),
         tx_signatures,
         tx_num_required_signatures: header
             .num_required_signatures
@@ -1121,6 +1152,7 @@ fn map_transaction(
         meta_reward_post_balance,
         meta_reward_type,
         meta_reward_commission,
+        meta_reward_commission_bps,
         meta_loaded_addresses_writable,
         meta_loaded_addresses_readonly,
         meta_return_data_present,
@@ -1153,6 +1185,7 @@ fn create_versioned_message(
         Address, Hash, Message as LegacyMessage, MessageHeader, VersionedMessage,
         compiled_instruction::CompiledInstruction,
         v0::{Message as MessageV0, MessageAddressTableLookup},
+        v1::{Message as MessageV1, TransactionConfig},
     };
 
     let header = message.header.as_ref().context("missing message header")?;
@@ -1197,7 +1230,23 @@ fn create_versioned_message(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if message.versioned {
+    if let Some(config) = &message.config {
+        if !message.address_table_lookups.is_empty() {
+            return Err(anyhow!("v1 transaction contains address table lookups"));
+        }
+        Ok(VersionedMessage::V1(MessageV1 {
+            header,
+            config: TransactionConfig {
+                priority_fee: config.priority_fee,
+                compute_unit_limit: config.compute_unit_limit,
+                loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
+                heap_size: config.heap_size,
+            },
+            lifetime_specifier: recent_blockhash,
+            account_keys,
+            instructions,
+        }))
+    } else if message.versioned {
         let address_table_lookups = message
             .address_table_lookups
             .iter()
@@ -1256,6 +1305,7 @@ type RewardsConversion = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
 );
 
 fn convert_instructions(
@@ -1421,6 +1471,7 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
     let mut post_balances = Vec::with_capacity(rewards.len());
     let mut reward_types = Vec::with_capacity(rewards.len());
     let mut commissions = Vec::with_capacity(rewards.len());
+    let mut commission_bps = Vec::with_capacity(rewards.len());
 
     for reward in rewards {
         pubkeys.push(reward.pubkey.clone());
@@ -1428,9 +1479,17 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
         post_balances.push(reward.post_balance);
         reward_types.push(reward_type_to_string(reward.reward_type));
         commissions.push(parse_commission(&reward.commission));
+        commission_bps.push(parse_commission_bps(&reward.commission_bps));
     }
 
-    (pubkeys, lamports, post_balances, reward_types, commissions)
+    (
+        pubkeys,
+        lamports,
+        post_balances,
+        reward_types,
+        commissions,
+        commission_bps,
+    )
 }
 
 fn convert_pubkeys(keys: &[Vec<u8>]) -> Result<Vec<Array<u8, 32>>> {
@@ -1482,6 +1541,13 @@ fn parse_commission(value: &str) -> Option<u8> {
     value.parse::<u8>().ok()
 }
 
+fn parse_commission_bps(value: &str) -> Option<u16> {
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<u16>().ok()
+}
+
 fn decode_transaction_error(
     err: Option<&yellowstone_grpc_proto::prelude::TransactionError>,
 ) -> Result<(u8, Option<String>)> {
@@ -1508,13 +1574,22 @@ mod tests {
     use super::{
         BlockMetadataRow, FromSlotMode, grpc_health_status_is_serving, grpc_health_status_label,
         grpc_status_summary, is_oversized_grpc_message, map_transaction, max_block_slot,
-        next_subscribe_from_slot, next_subscribe_from_slot_mode,
+        next_subscribe_from_slot, next_subscribe_from_slot_mode, parse_commission_bps,
     };
     use serde_big_array::Array;
+
+    #[test]
+    fn parses_reward_commission_bps() {
+        assert_eq!(parse_commission_bps("300"), Some(300));
+        assert_eq!(parse_commission_bps("10000"), Some(10_000));
+        assert_eq!(parse_commission_bps(""), None);
+        assert_eq!(parse_commission_bps("invalid"), None);
+        assert_eq!(parse_commission_bps("65536"), None);
+    }
     use tonic::Status;
     use yellowstone_grpc_proto::prelude::{
-        CompiledInstruction, Message, MessageHeader, SubscribeUpdateTransactionInfo, Transaction,
-        TransactionStatusMeta,
+        CompiledInstruction, Message, MessageAddressTableLookup, MessageHeader, Reward, RewardType,
+        SubscribeUpdateTransactionInfo, Transaction, TransactionConfig, TransactionStatusMeta,
     };
 
     fn build_test_transaction_info(cost_units: Option<u64>) -> SubscribeUpdateTransactionInfo {
@@ -1538,6 +1613,7 @@ mod tests {
                     }],
                     versioned: false,
                     address_table_lookups: Vec::new(),
+                    config: None,
                 }),
             }),
             meta: Some(TransactionStatusMeta {
@@ -1581,6 +1657,97 @@ mod tests {
 
         assert_eq!(row.meta_compute_units_consumed, Some(123));
         assert!(row.meta_cost_units.is_none());
+    }
+
+    #[test]
+    fn map_transaction_treats_config_presence_as_v1_and_preserves_all_fields() {
+        let mut tx_info = build_test_transaction_info(None);
+        let message = tx_info
+            .transaction
+            .as_mut()
+            .and_then(|transaction| transaction.message.as_mut())
+            .expect("test message");
+        message.versioned = false;
+        message.config = Some(TransactionConfig {
+            priority_fee: Some(42),
+            compute_unit_limit: Some(1_000_000),
+            loaded_accounts_data_size_limit: Some(65_536),
+            heap_size: Some(32_768),
+        });
+
+        let row = map_transaction(42, Some(1_700_000_000), &tx_info).expect("map v1");
+        assert_eq!(row.tx_version, Some(1));
+        assert_eq!(row.tx_recent_blockhash.0, [3; 32]);
+        assert_eq!(row.tx_config_priority_fee, Some(42));
+        assert_eq!(row.tx_config_compute_unit_limit, Some(1_000_000));
+        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, Some(65_536));
+        assert_eq!(row.tx_config_heap_size, Some(32_768));
+    }
+
+    #[test]
+    fn map_transaction_preserves_empty_v1_config_and_deactivated_stake() {
+        let mut tx_info = build_test_transaction_info(None);
+        let message = tx_info
+            .transaction
+            .as_mut()
+            .and_then(|transaction| transaction.message.as_mut())
+            .expect("test message");
+        message.versioned = true;
+        message.config = Some(TransactionConfig {
+            priority_fee: None,
+            compute_unit_limit: None,
+            loaded_accounts_data_size_limit: None,
+            heap_size: None,
+        });
+        tx_info.meta.as_mut().expect("test meta").rewards = vec![Reward {
+            pubkey: "11111111111111111111111111111111".to_string(),
+            lamports: 1,
+            post_balance: 2,
+            reward_type: RewardType::DeactivatedStake as i32,
+            commission: String::new(),
+            commission_bps: String::new(),
+        }];
+
+        let row = map_transaction(42, None, &tx_info).expect("map empty v1");
+        assert_eq!(row.tx_version, Some(1));
+        assert_eq!(row.tx_config_priority_fee, None);
+        assert_eq!(row.tx_config_compute_unit_limit, None);
+        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, None);
+        assert_eq!(row.tx_config_heap_size, None);
+        assert_eq!(
+            row.meta_reward_type,
+            vec![Some("DeactivatedStake".to_string())]
+        );
+    }
+
+    #[test]
+    fn map_transaction_rejects_v1_address_table_lookups() {
+        let mut tx_info = build_test_transaction_info(None);
+        let message = tx_info
+            .transaction
+            .as_mut()
+            .and_then(|transaction| transaction.message.as_mut())
+            .expect("test message");
+        message.config = Some(TransactionConfig {
+            priority_fee: None,
+            compute_unit_limit: None,
+            loaded_accounts_data_size_limit: None,
+            heap_size: None,
+        });
+        message.address_table_lookups = vec![MessageAddressTableLookup {
+            account_key: vec![4; 32],
+            writable_indexes: vec![0],
+            readonly_indexes: vec![],
+        }];
+
+        let err = match map_transaction(42, None, &tx_info) {
+            Ok(_) => panic!("v1 lookup transaction must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("v1 transaction contains address table lookups")
+        );
     }
 
     #[test]
@@ -1676,6 +1843,7 @@ mod tests {
             rewards_post_balance: Vec::new(),
             rewards_type: Vec::new(),
             rewards_commission: Vec::new(),
+            rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
         }
     }
