@@ -22,15 +22,18 @@ use tracing::error;
 
 use crate::clickhouse::{
     NumericFilter, PaginationToken, QueryTimings, ResolvedSignatureFilter, SignatureFilter,
-    SignatureSlot, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
-    TransactionStatusFilter, TransactionsForAddressQuery,
+    SignatureSlot, SolMode, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
+    TokenTransferTypes, TransactionStatusFilter, TransactionsForAddressQuery,
+    TransferDirectionFilter, TransferPositionFilter, TransferRecord, TransfersByAddressQuery,
 };
 use crate::handlers::{
     RouteMetric,
     types::{
         GetTransactionsForAddressFilters, GetTransactionsForAddressOptions,
-        TransactionsForAddressDetails, TransactionsForAddressFullInfo,
-        TransactionsForAddressResult, TransactionsForAddressSignaturesInfo, reject_unknown_fields,
+        GetTransfersByAddressOptions, TransactionsForAddressDetails,
+        TransactionsForAddressFullInfo, TransactionsForAddressResult,
+        TransactionsForAddressSignaturesInfo, TransfersByAddressInfo, TransfersByAddressResult,
+        reject_unknown_fields,
     },
 };
 use crate::hydration::{TransactionHydrationError, hydrate_transaction_record};
@@ -57,6 +60,8 @@ const GET_TRANSACTION_INVALID_SIGNATURE_MESSAGE: &str =
     "Invalid params: signature is not a valid transaction signature";
 const GET_TRANSACTION_DENYLISTED_SIGNATURES: [&str; 1] =
     ["1111111111111111111111111111111111111111111111111111111111111111"];
+const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111111";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug)]
 struct ParsedGetTransactionConfig {
@@ -239,6 +244,200 @@ async fn respond_with_hydrated_transaction(
             attach_timings(&mut resp);
             Ok(resp)
         }
+    }
+}
+
+fn parse_transfer_pagination_token(token: &str) -> Result<TransferPositionFilter, &'static str> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("Invalid params: paginationToken is empty");
+    }
+
+    let mut parts = token.split(':');
+    let slot = parts
+        .next()
+        .ok_or(
+            "Invalid params: paginationToken must be slot:transactionIdx:instructionIdx:innerInstructionIdx:type",
+        )?
+        .parse::<u64>()
+        .map_err(|_| "Invalid params: paginationToken slot is not a number")?;
+    let transaction_idx = parts
+        .next()
+        .ok_or(
+            "Invalid params: paginationToken must be slot:transactionIdx:instructionIdx:innerInstructionIdx:type",
+        )?
+        .parse::<u32>()
+        .map_err(|_| "Invalid params: paginationToken transactionIdx is not a number")?;
+    let instruction_idx = parts
+        .next()
+        .ok_or(
+            "Invalid params: paginationToken must be slot:transactionIdx:instructionIdx:innerInstructionIdx:type",
+        )?
+        .parse::<u32>()
+        .map_err(|_| "Invalid params: paginationToken instructionIdx is not a number")?;
+    let inner_instruction_idx = parts
+        .next()
+        .ok_or(
+            "Invalid params: paginationToken must be slot:transactionIdx:instructionIdx:innerInstructionIdx:type",
+        )?
+        .parse::<u32>()
+        .map_err(|_| "Invalid params: paginationToken innerInstructionIdx is not a number")?;
+    let transfer_type = parts
+        .next()
+        .ok_or(
+            "Invalid params: paginationToken must be slot:transactionIdx:instructionIdx:innerInstructionIdx:type",
+        )?;
+    if transfer_type.is_empty() || parts.next().is_some() {
+        return Err(
+            "Invalid params: paginationToken must be slot:transactionIdx:instructionIdx:innerInstructionIdx:type",
+        );
+    }
+    let transfer_type = TokenTransferTypes::try_from(transfer_type).map_err(|_| {
+        "Invalid params: paginationToken type must be one of transfer, mint, burn, wrap, closeAccount, changeOwner, withdrawWithheldFee"
+    })?;
+
+    Ok(TransferPositionFilter {
+        slot,
+        slot_idx: transaction_idx,
+        transfer_idx: instruction_idx,
+        inner_instruction_idx,
+        transfer_type,
+    })
+}
+
+fn parse_transfer_direction_filter(
+    value: Option<String>,
+) -> Result<TransferDirectionFilter, String> {
+    match value
+        .as_deref()
+        .unwrap_or("any")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "any" => Ok(TransferDirectionFilter::Any),
+        "in" => Ok(TransferDirectionFilter::In),
+        "out" => Ok(TransferDirectionFilter::Out),
+        other => Err(format!("Invalid params: unsupported direction '{other}'")),
+    }
+}
+
+fn parse_sol_mode(value: Option<&str>) -> Result<SolMode, String> {
+    match value
+        .unwrap_or("merged")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "merged" => Ok(SolMode::Merged),
+        "separate" => Ok(SolMode::Separate),
+        other => Err(format!("Invalid params: unsupported solMode '{other}'")),
+    }
+}
+
+fn map_transfer_record_to_response(
+    record: TransferRecord,
+    sol_mode: SolMode,
+    confirmation_status: &str,
+) -> TransfersByAddressInfo {
+    let mut mint = record.mint.unwrap_or_else(|| NATIVE_SOL_MINT.to_string());
+    if sol_mode == SolMode::Merged && mint == WSOL_MINT {
+        mint = NATIVE_SOL_MINT.to_string();
+    }
+    let decimals = record
+        .decimals
+        .or_else(|| (mint == NATIVE_SOL_MINT).then_some(9));
+    let ui_amount = format_ui_amount(&record.amount, decimals);
+    let (from_token_account, to_token_account) = if mint == NATIVE_SOL_MINT {
+        (None, None)
+    } else {
+        (record.from_token_account, record.to_token_account)
+    };
+
+    TransfersByAddressInfo {
+        signature: record.signature,
+        slot: record.slot,
+        block_time: record.block_time,
+        transfer_type: record.transfer_type,
+        from_user_account: record.from_user_account,
+        to_user_account: record.to_user_account,
+        from_token_account,
+        to_token_account,
+        mint,
+        amount: record.amount,
+        fee_amount: record.fee_amount,
+        decimals,
+        ui_amount,
+        confirmation_status: confirmation_status.to_string(),
+        transaction_idx: record.slot_idx,
+        instruction_idx: record.transfer_idx,
+        inner_instruction_idx: record.inner_instruction_idx,
+    }
+}
+
+fn transfer_pagination_token(record: &TransferRecord) -> String {
+    let transfer_type =
+        TokenTransferTypes::try_from(record.transfer_type.as_str()).unwrap_or_default();
+    format!(
+        "{}:{}:{}:{}:{}",
+        record.slot,
+        record.slot_idx,
+        record.transfer_idx,
+        record.inner_instruction_idx,
+        <&'static str>::from(transfer_type)
+    )
+}
+
+fn paginate_transfer_records(
+    mut records: Vec<TransferRecord>,
+    limit: u64,
+) -> (Vec<TransferRecord>, Option<String>) {
+    let limit = limit as usize;
+    if records.len() <= limit {
+        return (records, None);
+    }
+
+    records.truncate(limit);
+    let pagination_token = records.last().map(transfer_pagination_token);
+    (records, pagination_token)
+}
+
+fn format_ui_amount(amount: &str, decimals: Option<u8>) -> String {
+    let decimals = decimals.unwrap_or(0) as usize;
+    if decimals == 0 {
+        return amount.to_string();
+    }
+
+    let amount = amount.trim();
+    let negative = amount.starts_with('-');
+    let digits = amount.trim_start_matches('-').trim_start_matches('+');
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return amount.to_string();
+    }
+
+    let mut whole = if digits.len() > decimals {
+        digits[..digits.len() - decimals].to_string()
+    } else {
+        "0".to_string()
+    };
+    let mut fraction = if digits.len() > decimals {
+        digits[digits.len() - decimals..].to_string()
+    } else {
+        format!("{:0>width$}", digits, width = decimals)
+    };
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    if fraction.is_empty() {
+        if negative && whole != "0" {
+            whole.insert(0, '-');
+        }
+        whole
+    } else {
+        if negative && whole != "0" {
+            whole.insert(0, '-');
+        }
+        format!("{whole}.{fraction}")
     }
 }
 
@@ -1863,6 +2062,282 @@ pub(crate) async fn handle_get_transactions_for_address(
     Ok(resp)
 }
 
+pub(crate) async fn handle_get_transfers_by_address(
+    state: Arc<AppState>,
+    id: Value,
+    params: Option<Vec<Value>>,
+) -> Result<Response, StatusCode> {
+    let mut route = RouteMetric::for_state("getTransfersByAddress", state.as_ref());
+
+    let Some(mut params) = params.filter(|v| !v.is_empty()) else {
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            "Invalid params: missing address",
+            None,
+        ));
+    };
+
+    let address_value = params.remove(0);
+    let address = match address_value.as_str() {
+        Some(value) => value,
+        None => {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(
+                id,
+                -32602,
+                "Invalid params: address must be a string",
+                None,
+            ));
+        }
+    };
+
+    if Pubkey::from_str(address).is_err() {
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            "Invalid param: Invalid",
+            None,
+        ));
+    }
+
+    let options = match params.into_iter().next() {
+        Some(options_value) => {
+            if options_value.is_null() {
+                GetTransfersByAddressOptions::default()
+            } else {
+                match serde_json::from_value::<GetTransfersByAddressOptions>(options_value) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        route.invalid_params();
+                        return Ok(json_rpc_error_response(
+                            id,
+                            -32602,
+                            format!("Invalid params: failed to parse options ({e})"),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+        None => GetTransfersByAddressOptions::default(),
+    };
+
+    let sort_order = match options
+        .sort_order
+        .as_deref()
+        .unwrap_or("desc")
+        .to_lowercase()
+        .as_str()
+    {
+        "asc" => SortOrder::Asc,
+        "desc" => SortOrder::Desc,
+        other => {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(
+                id,
+                -32602,
+                format!("Invalid params: unsupported sortOrder '{other}'"),
+                None,
+            ));
+        }
+    };
+
+    let max_limit = state.max_signatures_limit.min(100);
+    let requested_limit = options.limit.unwrap_or(100);
+    if requested_limit == 0 {
+        route.invalid_params();
+        return Ok(json_rpc_error_response(
+            id,
+            -32602,
+            format!("Invalid limit; max {}", max_limit),
+            None,
+        ));
+    }
+    let limit = requested_limit.min(max_limit);
+
+    if let Some(commitment) = options.commitment.as_deref() {
+        match commitment.trim().to_ascii_lowercase().as_str() {
+            "finalized" | "confirmed" => {}
+            "processed" => {
+                route.invalid_params();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32602,
+                    "Only confirmed or finalized commitments are supported",
+                    Some(json!({ "requestedCommitment": commitment })),
+                ));
+            }
+            other => {
+                route.invalid_params();
+                return Ok(json_rpc_error_response(
+                    id,
+                    -32602,
+                    format!("Invalid params: unsupported commitment '{other}'"),
+                    None,
+                ));
+            }
+        }
+    }
+
+    let sol_mode = match parse_sol_mode(options.sol_mode.as_deref()) {
+        Ok(value) => value,
+        Err(message) => {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(id, -32602, message, None));
+        }
+    };
+
+    if let Some(min_context_slot) = options.min_context_slot {
+        let commitment = options
+            .commitment
+            .as_deref()
+            .unwrap_or("finalized")
+            .trim()
+            .to_ascii_lowercase();
+        let min_commitment = match commitment.as_str() {
+            "confirmed" => CommitmentLevel::Confirmed,
+            _ => CommitmentLevel::Finalized,
+        };
+
+        let (context_slot, context_source) = match state
+            .resolve_latest_slot_with_source("get_transfers_by_address_min_context", min_commitment)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                metrics::backend_error("get_latest_finalized_slot");
+                error!(
+                    "Failed to fetch latest slot for getTransfersByAddress minContextSlot check: {}",
+                    e
+                );
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        };
+        match context_source {
+            LatestSlotSource::ClickHouse => route.source_clickhouse(),
+            #[cfg(feature = "grpc-head-cache")]
+            LatestSlotSource::HeadCache => route.source_head_cache(),
+        }
+
+        if context_slot < min_context_slot {
+            let code = JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32;
+            route.rpc_error();
+            return Ok(json_rpc_error_response(
+                id,
+                code,
+                "Minimum context slot has not been reached",
+                Some(json!({ "contextSlot": context_slot })),
+            ));
+        }
+    }
+
+    let pagination = match options.pagination_token.as_deref() {
+        Some(token) => match parse_transfer_pagination_token(token) {
+            Ok(token) => Some(token),
+            Err(message) => {
+                route.invalid_params();
+                return Ok(json_rpc_error_response(id, -32602, message, None));
+            }
+        },
+        None => None,
+    };
+
+    let filters = options.filters.unwrap_or_default();
+    let direction = match parse_transfer_direction_filter(options.direction) {
+        Ok(value) => value,
+        Err(message) => {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(id, -32602, message, None));
+        }
+    };
+
+    for (name, value) in [
+        ("mint", options.mint.as_deref()),
+        ("with", options.with_account.as_deref()),
+    ] {
+        if let Some(value) = value
+            && Pubkey::from_str(value).is_err()
+        {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(
+                id,
+                -32602,
+                format!("Invalid params: {name} must be a valid pubkey"),
+                None,
+            ));
+        }
+    }
+
+    let amount_filter = filters.amount.map(|filter| NumericFilter {
+        gte: filter.gte,
+        gt: filter.gt,
+        lte: filter.lte,
+        lt: filter.lt,
+        eq: filter.eq,
+    });
+    let slot_filter = filters.slot.map(|filter| NumericFilter {
+        gte: filter.gte,
+        gt: filter.gt,
+        lte: filter.lte,
+        lt: filter.lt,
+        eq: filter.eq,
+    });
+    let block_time_filter = filters.block_time.map(|filter| NumericFilter {
+        gte: filter.gte,
+        gt: filter.gt,
+        lte: filter.lte,
+        lt: filter.lt,
+        eq: filter.eq,
+    });
+    let query = TransfersByAddressQuery {
+        address: address.to_string(),
+        limit,
+        sort_order,
+        sol_mode,
+        pagination,
+        amount_filter,
+        slot_filter,
+        block_time_filter,
+        direction,
+        mint: options.mint.clone(),
+        with_account: options.with_account.clone(),
+    };
+
+    route.source_clickhouse();
+    let (records, timings) = match state.clickhouse.get_transfers_by_address(&query).await {
+        Ok(result) => result,
+        Err(e) => {
+            metrics::backend_error("get_transfers_by_address");
+            error!(
+                "Failed to query ClickHouse for getTransfersByAddress: {}",
+                e
+            );
+            return Ok(json_rpc_internal_error_response(id));
+        }
+    };
+
+    let (records, pagination_token) = paginate_transfer_records(records, limit);
+    let confirmation_status = options.commitment.as_deref().unwrap_or("finalized");
+    let data = records
+        .into_iter()
+        .map(|record| map_transfer_record_to_response(record, sol_mode, confirmation_status))
+        .collect::<Vec<_>>();
+
+    route.success();
+    let mut resp = json_rpc_success_response(
+        id,
+        TransfersByAddressResult {
+            data,
+            pagination_token,
+        },
+    );
+    add_downstream_header(&mut resp, &timings);
+    Ok(resp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1913,6 +2388,369 @@ mod tests {
         .expect_err("unknown field should fail");
 
         assert!(err.contains("unexpected"));
+    }
+
+    #[test]
+    fn token_transfer_types_parse_supported_values() {
+        assert_eq!(
+            TokenTransferTypes::try_from("transfer"),
+            Ok(TokenTransferTypes::Transfer)
+        );
+        assert_eq!(
+            TokenTransferTypes::try_from("changeOwner"),
+            Ok(TokenTransferTypes::ChangeOwner)
+        );
+        assert_eq!(
+            TokenTransferTypes::try_from("withdrawWithheldFee"),
+            Ok(TokenTransferTypes::WithdrawWithheldFee)
+        );
+
+        assert!(TokenTransferTypes::try_from("unsupported").is_err());
+    }
+
+    #[test]
+    fn parse_transfer_pagination_token_accepts_helius_transfer_types() {
+        for transfer_type in [
+            "transfer",
+            "mint",
+            "burn",
+            "wrap",
+            "closeAccount",
+            "changeOwner",
+            "withdrawWithheldFee",
+        ] {
+            let parsed = parse_transfer_pagination_token(&format!("10:2:3:0:{transfer_type}"))
+                .expect("pagination token should parse");
+
+            assert_eq!(parsed.slot, 10);
+            assert_eq!(parsed.slot_idx, 2);
+            assert_eq!(parsed.transfer_idx, 3);
+            assert_eq!(parsed.inner_instruction_idx, 0);
+            assert_eq!(
+                parsed.transfer_type,
+                TokenTransferTypes::try_from(transfer_type).expect("transfer type should parse")
+            );
+        }
+    }
+
+    #[test]
+    fn parse_transfer_pagination_token_rejects_unknown_transfer_type() {
+        let err = parse_transfer_pagination_token("10:2:3:0:splTransfer")
+            .expect_err("unsupported transfer type should fail");
+
+        assert_eq!(
+            err,
+            "Invalid params: paginationToken type must be one of transfer, mint, burn, wrap, closeAccount, changeOwner, withdrawWithheldFee"
+        );
+    }
+
+    #[test]
+    fn parse_transfer_pagination_token_rejects_empty_token() {
+        let err =
+            parse_transfer_pagination_token("  ").expect_err("empty pagination token should fail");
+
+        assert_eq!(err, "Invalid params: paginationToken is empty");
+    }
+
+    #[test]
+    fn parse_transfer_pagination_token_rejects_missing_or_extra_parts() {
+        let missing_inner_idx = parse_transfer_pagination_token("10:2:3:transfer")
+            .expect_err("missing inner instruction index should fail");
+        let extra_part = parse_transfer_pagination_token("10:2:3:0:transfer:extra")
+            .expect_err("extra pagination token part should fail");
+
+        assert_eq!(
+            missing_inner_idx,
+            "Invalid params: paginationToken innerInstructionIdx is not a number"
+        );
+        assert_eq!(
+            extra_part,
+            "Invalid params: paginationToken must be slot:transactionIdx:instructionIdx:innerInstructionIdx:type"
+        );
+    }
+
+    #[test]
+    fn parse_transfer_pagination_token_rejects_non_numeric_positions() {
+        let invalid_slot = parse_transfer_pagination_token("abc:2:3:0:transfer")
+            .expect_err("invalid slot should fail");
+        let invalid_transaction_idx = parse_transfer_pagination_token("10:abc:3:0:transfer")
+            .expect_err("invalid transaction index should fail");
+        let invalid_instruction_idx = parse_transfer_pagination_token("10:2:abc:0:transfer")
+            .expect_err("invalid instruction index should fail");
+        let invalid_inner_idx = parse_transfer_pagination_token("10:2:3:abc:transfer")
+            .expect_err("invalid inner instruction index should fail");
+
+        assert_eq!(
+            invalid_slot,
+            "Invalid params: paginationToken slot is not a number"
+        );
+        assert_eq!(
+            invalid_transaction_idx,
+            "Invalid params: paginationToken transactionIdx is not a number"
+        );
+        assert_eq!(
+            invalid_instruction_idx,
+            "Invalid params: paginationToken instructionIdx is not a number"
+        );
+        assert_eq!(
+            invalid_inner_idx,
+            "Invalid params: paginationToken innerInstructionIdx is not a number"
+        );
+    }
+
+    #[test]
+    fn parse_transfer_direction_filter_defaults_to_any_and_normalizes_values() {
+        assert_eq!(
+            parse_transfer_direction_filter(None).expect("default direction should parse"),
+            TransferDirectionFilter::Any
+        );
+        assert_eq!(
+            parse_transfer_direction_filter(Some(" IN ".to_string()))
+                .expect("in direction should parse"),
+            TransferDirectionFilter::In
+        );
+        assert_eq!(
+            parse_transfer_direction_filter(Some("out".to_string()))
+                .expect("out direction should parse"),
+            TransferDirectionFilter::Out
+        );
+    }
+
+    #[test]
+    fn parse_transfer_direction_filter_rejects_unknown_value() {
+        let err = parse_transfer_direction_filter(Some("sideways".to_string()))
+            .expect_err("unsupported direction should fail");
+
+        assert_eq!(err, "Invalid params: unsupported direction 'sideways'");
+    }
+
+    #[test]
+    fn parse_sol_mode_defaults_to_merged_and_accepts_supported_modes() {
+        assert_eq!(
+            parse_sol_mode(None).expect("default sol mode should parse"),
+            SolMode::Merged
+        );
+        assert_eq!(
+            parse_sol_mode(Some(" merged ")).expect("merged sol mode should parse"),
+            SolMode::Merged
+        );
+        assert_eq!(
+            parse_sol_mode(Some("SEPARATE")).expect("separate sol mode should parse"),
+            SolMode::Separate
+        );
+    }
+
+    #[test]
+    fn parse_sol_mode_rejects_unknown_value() {
+        let err = parse_sol_mode(Some("split")).expect_err("unsupported sol mode should fail");
+
+        assert_eq!(err, "Invalid params: unsupported solMode 'split'");
+    }
+
+    #[test]
+    fn map_transfer_record_to_response_classifies_mint_and_burn_accounts() {
+        let owner = "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC".to_string();
+        let token_account = "6Tst7EUiwCnoiiJbess1mhiBbq4gPoBR4iu8pDb8fZf3".to_string();
+        let mint_record = TransferRecord {
+            signature: "sig".to_string(),
+            slot: 1,
+            slot_idx: 2,
+            transfer_idx: 3,
+            inner_instruction_idx: 0,
+            block_time: Some(4),
+            transfer_type: "mint".to_string(),
+            amount: "100".to_string(),
+            fee_amount: None,
+            mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
+            decimals: Some(6),
+            from_user_account: None,
+            to_user_account: Some(owner.clone()),
+            from_token_account: None,
+            to_token_account: Some(token_account.clone()),
+        };
+        let mapped =
+            map_transfer_record_to_response(mint_record.clone(), SolMode::Merged, "finalized");
+        assert_eq!(mapped.transfer_type, "mint");
+        assert_eq!(mapped.from_user_account, None);
+        assert_eq!(mapped.to_user_account.as_deref(), Some(owner.as_str()));
+        assert_eq!(mapped.from_token_account, None);
+        assert_eq!(
+            mapped.to_token_account.as_deref(),
+            Some(token_account.as_str())
+        );
+
+        let burn = TransferRecord {
+            transfer_type: "burn".to_string(),
+            from_user_account: Some(owner.clone()),
+            to_user_account: None,
+            from_token_account: Some(token_account.clone()),
+            to_token_account: None,
+            ..mint_record
+        };
+        let mapped = map_transfer_record_to_response(burn, SolMode::Merged, "finalized");
+        assert_eq!(mapped.transfer_type, "burn");
+        assert_eq!(mapped.from_user_account.as_deref(), Some(owner.as_str()));
+        assert_eq!(mapped.to_user_account, None);
+        assert_eq!(
+            mapped.from_token_account.as_deref(),
+            Some(token_account.as_str())
+        );
+        assert_eq!(mapped.to_token_account, None);
+    }
+
+    #[test]
+    fn map_transfer_record_to_response_includes_counterparty_token_account_for_spl_transfers() {
+        let owner = "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC".to_string();
+        let counterparty = "9vR6ssB1BdzhAgVEoQoeZdbsqknBA2PkFYDsjvbAS5jP".to_string();
+        let from_token = "CrExqHvA6Nws8ZRH7kGoTurbsb6Rm7RKFSKbVe6dA1m7".to_string();
+        let to_token = "HcvK3EJ74iM9g11cUgsaPvLSrhCvCwcrWxBNd87LsC1x".to_string();
+        let record = TransferRecord {
+            signature: "sig".to_string(),
+            slot: 1,
+            slot_idx: 2,
+            transfer_idx: 3,
+            inner_instruction_idx: 0,
+            block_time: Some(4),
+            transfer_type: "transfer".to_string(),
+            amount: "2500000".to_string(),
+            fee_amount: None,
+            mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
+            decimals: Some(6),
+            from_user_account: Some(owner.clone()),
+            to_user_account: Some(counterparty.clone()),
+            from_token_account: Some(from_token.clone()),
+            to_token_account: Some(to_token.clone()),
+        };
+        let mapped = map_transfer_record_to_response(record, SolMode::Merged, "finalized");
+        assert_eq!(mapped.transfer_type, "transfer");
+        assert_eq!(mapped.from_user_account.as_deref(), Some(owner.as_str()));
+        assert_eq!(
+            mapped.to_user_account.as_deref(),
+            Some(counterparty.as_str())
+        );
+        assert_eq!(
+            mapped.from_token_account.as_deref(),
+            Some(from_token.as_str())
+        );
+        assert_eq!(mapped.to_token_account.as_deref(), Some(to_token.as_str()));
+    }
+
+    #[test]
+    fn map_transfer_record_to_response_omits_token_accounts_for_native_sol() {
+        let record = TransferRecord {
+            signature: "sig".to_string(),
+            slot: 1,
+            slot_idx: 2,
+            transfer_idx: 3,
+            inner_instruction_idx: 0,
+            block_time: Some(4),
+            transfer_type: "transfer".to_string(),
+            amount: "1000".to_string(),
+            fee_amount: None,
+            mint: Some(NATIVE_SOL_MINT.to_string()),
+            decimals: Some(9),
+            from_user_account: Some("9vR6ssB1BdzhAgVEoQoeZdbsqknBA2PkFYDsjvbAS5jP".to_string()),
+            to_user_account: Some("HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC".to_string()),
+            from_token_account: None,
+            to_token_account: None,
+        };
+        let mapped = map_transfer_record_to_response(record, SolMode::Merged, "finalized");
+        assert_eq!(mapped.from_token_account, None);
+        assert_eq!(mapped.to_token_account, None);
+    }
+
+    #[test]
+    fn map_transfer_record_to_response_exposes_withheld_fee() {
+        let record = TransferRecord {
+            signature: "sig".to_string(),
+            slot: 1,
+            slot_idx: 2,
+            transfer_idx: 3,
+            inner_instruction_idx: 0,
+            block_time: Some(4),
+            transfer_type: "transfer".to_string(),
+            amount: "9999999999999999".to_string(),
+            fee_amount: Some("1000000000000001".to_string()),
+            mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
+            decimals: Some(6),
+            from_user_account: None,
+            to_user_account: None,
+            from_token_account: None,
+            to_token_account: None,
+        };
+
+        let mapped = map_transfer_record_to_response(record, SolMode::Separate, "finalized");
+
+        assert_eq!(mapped.fee_amount.as_deref(), Some("1000000000000001"));
+        assert_eq!(
+            serde_json::to_value(mapped).expect("transfer response should serialize")["feeAmount"],
+            "1000000000000001"
+        );
+    }
+
+    #[test]
+    fn paginate_transfer_records_only_returns_token_when_extra_row_exists() {
+        fn record(slot_idx: u32) -> TransferRecord {
+            TransferRecord {
+                signature: format!("sig-{slot_idx}"),
+                slot: 10,
+                slot_idx,
+                transfer_idx: 2,
+                inner_instruction_idx: 0,
+                block_time: None,
+                transfer_type: "transfer".to_string(),
+                amount: "1000".to_string(),
+                fee_amount: None,
+                mint: Some(NATIVE_SOL_MINT.to_string()),
+                decimals: Some(9),
+                from_user_account: None,
+                to_user_account: None,
+                from_token_account: None,
+                to_token_account: None,
+            }
+        }
+
+        let (page, token) = paginate_transfer_records(vec![record(3), record(2)], 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(token, None);
+
+        let (page, token) = paginate_transfer_records(vec![record(3), record(2), record(1)], 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(
+            token.as_deref(),
+            Some("10:2:2:0:transfer"),
+            "cursor should point at the last returned row, not the extra lookahead row"
+        );
+    }
+
+    #[test]
+    fn format_ui_amount_returns_raw_amount_without_decimals() {
+        assert_eq!(format_ui_amount("1234500", None), "1234500");
+        assert_eq!(format_ui_amount("1234500", Some(0)), "1234500");
+    }
+
+    #[test]
+    fn format_ui_amount_places_decimal_point_and_trims_trailing_zeroes() {
+        assert_eq!(format_ui_amount("1234500", Some(6)), "1.2345");
+        assert_eq!(format_ui_amount("1000000", Some(6)), "1");
+    }
+
+    #[test]
+    fn format_ui_amount_left_pads_fractional_amounts() {
+        assert_eq!(format_ui_amount("42", Some(6)), "0.000042");
+        assert_eq!(format_ui_amount("1", Some(2)), "0.01");
+    }
+
+    #[test]
+    fn format_ui_amount_preserves_negative_sign_for_nonzero_whole_amounts() {
+        assert_eq!(format_ui_amount("-1234500", Some(6)), "-1.2345");
+        assert_eq!(format_ui_amount("-1000000", Some(6)), "-1");
+    }
+
+    #[test]
+    fn format_ui_amount_returns_trimmed_raw_amount_for_invalid_digits() {
+        assert_eq!(format_ui_amount(" 12x ", Some(2)), "12x");
+        assert_eq!(format_ui_amount("-", Some(2)), "-");
     }
 
     #[test]

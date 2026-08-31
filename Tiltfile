@@ -117,6 +117,8 @@ data:
 {signatures}
   token_owner_activity.sql: |
 {token_owner_activity}
+  transfers.sql: |
+{transfers}
 """.format(
     namespace=namespace,
     transactions=_indent_block(read_file("ddl/local/transactions.sql"), 4),
@@ -126,6 +128,7 @@ data:
     gsfa_hot=_indent_block(read_file("ddl/local/gsfa_hot.sql"), 4),
     signatures=_indent_block(read_file("ddl/local/signatures.sql"), 4),
     token_owner_activity=_indent_block(read_file("ddl/local/token_owner_activity.sql"), 4),
+    transfers=_indent_block(read_file("ddl/local/transfers.sql"), 4),
 )
 )
 
@@ -297,7 +300,8 @@ for f in \\
   ddl/local/gsfa.sql \\
   ddl/local/gsfa_hot.sql \\
   ddl/local/signatures.sql \\
-  ddl/local/token_owner_activity.sql
+  ddl/local/token_owner_activity.sql \\
+  ddl/local/transfers.sql
 do
   echo "[apply-clickhouse-schema] Applying $f..."
   cat "$f" | kubectl -n "$ns" exec -i "$pod" -c clickhouse -- clickhouse-client --user "$ch_user" --password "$ch_password" --multiquery
@@ -313,6 +317,7 @@ echo "[apply-clickhouse-schema] Done."
         "ddl/local/gsfa_hot.sql",
         "ddl/local/signatures.sql",
         "ddl/local/token_owner_activity.sql",
+        "ddl/local/transfers.sql",
     ],
     resource_deps=["clickhouse"],
     trigger_mode=TRIGGER_MODE_MANUAL,

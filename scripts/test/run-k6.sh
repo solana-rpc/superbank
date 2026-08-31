@@ -20,6 +20,7 @@ Environment (common):
   RPC_URL                  Superbank RPC endpoint (default: http://localhost:8899)
   REFERENCE_RPC_URL        Reference RPC endpoint for validation scenarios (optional)
   TFA_REFERENCE_RPC_URL    Reference RPC endpoint for getTransactionsForAddress validation (optional)
+  TBA_REFERENCE_RPC_URL    Reference RPC endpoint for getTransfersByAddress validation (optional)
   VALIDATE_LATEST_BLOCKHASH Set to 0 to skip reference isBlockhashValid validation (default: 1)
 
 Pools (defaults point at sample data in this repo):
@@ -259,6 +260,18 @@ run_validation_suite() {
       export REFERENCE_RPC_URL
     else
       skip "validate:getTransactionsForAddress" "TFA_REFERENCE_RPC_URL not set"
+    fi
+
+    if [[ -n "${TBA_REFERENCE_RPC_URL:-}" ]]; then
+      local original_reference_rpc_url="${REFERENCE_RPC_URL}"
+      REFERENCE_RPC_URL="${TBA_REFERENCE_RPC_URL}"
+      export REFERENCE_RPC_URL
+      run_k6 "validate:getTransfersByAddress" \
+        "tests/k6/scenarios/validation/superbank-rpc-validate-get-transfers-by-address.js"
+      REFERENCE_RPC_URL="${original_reference_rpc_url}"
+      export REFERENCE_RPC_URL
+    else
+      skip "validate:getTransfersByAddress" "TBA_REFERENCE_RPC_URL not set"
     fi
   fi
 

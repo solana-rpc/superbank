@@ -127,6 +127,26 @@ export function makeGetTransactionsForAddressRequest(address, options = {}, requ
 }
 
 /**
+ * Build a JSON-RPC request payload for getTransfersByAddress
+ * @param {string} address - Solana address
+ * @param {object} options - Request options
+ * @param {number} [requestId] - JSON-RPC request id override
+ * @returns {string} JSON stringified payload
+ */
+export function makeGetTransfersByAddressRequest(address, options = {}, requestId = null) {
+  const params = [address];
+  if (options && Object.keys(options).length > 0) {
+    params.push(options);
+  }
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id: requestId === null ? Math.floor(Math.random() * 1_000_000_000) : requestId,
+    method: 'getTransfersByAddress',
+    params,
+  });
+}
+
+/**
  * Build a JSON-RPC request payload for getBlockTime
  * @param {number} slot - Solana slot
  * @param {number} [requestId] - JSON-RPC request id override

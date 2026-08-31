@@ -13,6 +13,7 @@ mod rows;
 mod sharding;
 mod signatures;
 mod transactions;
+mod transfers;
 mod types;
 mod util;
 
@@ -20,10 +21,11 @@ pub use client::{ClickHouseClient, ClickHouseClientOptions, InflationRewardQuery
 #[allow(unused_imports)]
 pub use types::TransactionsForAddressRecord;
 pub use types::{
-    BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings, SignatureFilter,
-    SignatureRecord, SignatureStatusRecord, SortOrder, StoredAccountsTransactionRecord,
+    BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings, RawAmount, SignatureFilter,
+    SignatureRecord, SignatureStatusRecord, SolMode, SortOrder, StoredAccountsTransactionRecord,
     StoredBlockPayload, StoredBlockRecord, StoredTransactionRecord, TokenAccountsFilter,
-    TransactionStatusFilter, TransactionsForAddressQuery,
+    TokenTransferTypes, TransactionStatusFilter, TransactionsForAddressQuery,
+    TransferDirectionFilter, TransferPositionFilter, TransferRecord, TransfersByAddressQuery,
 };
 
 pub(crate) use types::{

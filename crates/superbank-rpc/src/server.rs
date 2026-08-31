@@ -63,6 +63,7 @@ fn build_shard_routing_config(args: &RpcConfig) -> Option<ShardRoutingConfig> {
         gsfa_local_table: args.clickhouse_gsfa_local_table.clone(),
         signatures_local_table: args.clickhouse_signatures_local_table.clone(),
         token_owner_activity_local_table: args.clickhouse_token_owner_activity_local_table.clone(),
+        transfers_local_table: args.clickhouse_transfers_local_table.clone(),
         transactions_local_table: args.clickhouse_transactions_local_table.clone(),
         blocks_metadata_local_table: args.clickhouse_blocks_metadata_local_table.clone(),
     })
@@ -92,6 +93,9 @@ fn ignored_distributed_shard_settings(args: &RpcConfig) -> Vec<&'static str> {
     }
     if has_nonempty_setting(args.clickhouse_token_owner_activity_local_table.as_deref()) {
         ignored.push("CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE");
+    }
+    if has_nonempty_setting(args.clickhouse_transfers_local_table.as_deref()) {
+        ignored.push("CLICKHOUSE_TRANSFERS_LOCAL_TABLE");
     }
     if has_nonempty_setting(args.clickhouse_transactions_local_table.as_deref()) {
         ignored.push("CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE");
@@ -205,7 +209,6 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         ));
     }
 
-    // Initialize ClickHouse client
     let routing_policy = build_routing_policy(&args)?;
     let ignored_shard_settings = ignored_distributed_shard_settings(&args);
     if !ignored_shard_settings.is_empty() {
@@ -216,6 +219,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     }
     let shard_routing = build_shard_routing_config(&args);
 
+    // Initialize ClickHouse client
     let mut clickhouse = ClickHouseClient::new(
         &args.clickhouse_url,
         &args.clickhouse_database,
@@ -738,6 +742,7 @@ mod tests {
         cfg.clickhouse_signatures_local_table = Some("default.signatures_local".to_string());
         cfg.clickhouse_token_owner_activity_local_table =
             Some("default.token_owner_activity_local".to_string());
+        cfg.clickhouse_transfers_local_table = Some("default.transfers_local".to_string());
         cfg.clickhouse_transactions_local_table = Some("default.transactions_local".to_string());
         cfg.clickhouse_blocks_metadata_local_table =
             Some("default.blocks_metadata_local".to_string());
@@ -756,6 +761,7 @@ mod tests {
                 "CLICKHOUSE_GSFA_LOCAL_TABLE",
                 "CLICKHOUSE_SIGNATURES_LOCAL_TABLE",
                 "CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE",
+                "CLICKHOUSE_TRANSFERS_LOCAL_TABLE",
                 "CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE",
                 "CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE",
                 "CLICKHOUSE_SHARD_HTTP_PORT",

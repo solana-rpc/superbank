@@ -1,7 +1,7 @@
 # superbank-rpc k6 Load Tests
 
 Comprehensive load testing suite for superbank-rpc methods, including stress tests for many supported RPCs.
-Includes basic tests plus validation tests for `getSignaturesForAddress`, `getTransaction`, `getBlock`, `getTransactionCount`, `getInflationReward`, a dedicated endpoint-comparison scenario for `getTransactionsForAddress`, a disk-cache parity scenario (`superbank-rpc-disk-cache-parity.js`) that diffs a disk-cache-enabled target against a reference across every method the disk tier serves, and a disk-cache performance comparison scenario (`superbank-rpc-disk-cache-compare.js`) that reports latency deltas and speedup ratios versus a non-disk reference.
+Includes basic tests plus validation tests for `getSignaturesForAddress`, `getTransaction`, `getBlock`, `getTransactionCount`, `getInflationReward`, dedicated endpoint-comparison scenarios for `getTransactionsForAddress` and `getTransfersByAddress`, a disk-cache parity scenario (`superbank-rpc-disk-cache-parity.js`) that diffs a disk-cache-enabled target against a reference across every method the disk tier serves, and a disk-cache performance comparison scenario (`superbank-rpc-disk-cache-compare.js`) that reports latency deltas and speedup ratios versus a non-disk reference.
 
 ## Quick Start
 
@@ -68,6 +68,12 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-latest-blockhash
 
 # Validation + latency comparison for getTransactionsForAddress
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for-address.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e REFERENCE_RPC_URL=http://localhost:8898 \
+  -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
+
+# Validation + latency comparison for getTransfersByAddress
+k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transfers-by-address.js \
   -e RPC_URL=http://localhost:8899 \
   -e REFERENCE_RPC_URL=http://localhost:8898 \
   -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
@@ -195,6 +201,11 @@ Compare Superbank RPC responses to a reference RPC. Responses must match exactly
 The `getTransactionsForAddress` comparison scenario is intended for Superbank-to-Superbank comparisons,
 not official Solana RPC endpoints, because the method is custom.
 
+The `getTransfersByAddress` method was first implemented by Helius and inspired Superbank's
+method shape, but Superbank's implementation is not backward-compatible with Helius. The same
+request parameters can return different response projections, so the exact-response validation
+scenario should use another Superbank-compatible endpoint as its reference.
+
 ```bash
 # getSignaturesForAddress validation
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-signatures.js \
@@ -228,6 +239,12 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for
   -e REFERENCE_RPC_URL=http://localhost:8898 \
   -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
 # This alternates call order per iteration and reports which endpoint is faster by avg latency.
+
+# getTransfersByAddress validation + latency comparison
+k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transfers-by-address.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e REFERENCE_RPC_URL=http://localhost:8898 \
+  -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
 
 # Include full transaction payloads and version fields in the comparison
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for-address.js \
@@ -478,6 +495,7 @@ server-side JSON-RPC failures are promoted to HTTP `503`; those responses count 
 | `RPC_URLS` | (none) | Comma/space-separated list of RPC endpoints to rotate per iteration |
 | `REFERENCE_RPC_URL` | (none) | Reference RPC endpoint URL for validation tests |
 | `TFA_REFERENCE_RPC_URL` | (none) | Reference Superbank endpoint URL for `getTransactionsForAddress` validation |
+| `TBA_REFERENCE_RPC_URL` | (none) | Reference Superbank endpoint URL for `getTransfersByAddress` validation |
 | `VALIDATE_LATEST_BLOCKHASH` | `1` | Set to `0` to skip `validate:getLatestBlockhash` when no live `isBlockhashValid` reference is available |
 | `LIMIT` | `25` | `getSignaturesForAddress` limit parameter |
 | `ADDRESS_FILE` | (none) | Path to file with known Solana addresses |
@@ -525,6 +543,17 @@ server-side JSON-RPC failures are promoted to HTTP `503`; those responses count 
 | `TFA_PAGINATION_TOKEN` | (none) | getTransactionsForAddress `paginationToken` |
 | `TFA_STATUS` | (none) | getTransactionsForAddress `filters.status` |
 | `TFA_TOKEN_ACCOUNTS` | (none) | getTransactionsForAddress `filters.tokenAccounts` |
+| `TRANSFERS_SORT_ORDER` | `desc` | getTransfersByAddress `sortOrder` (`asc`, `desc`) |
+| `TRANSFERS_LIMIT` | `100` | getTransfersByAddress `limit` |
+| `TRANSFERS_COMMITMENT` | `finalized` | getTransfersByAddress commitment (`confirmed`, `finalized`) |
+| `TRANSFERS_MIN_CONTEXT_SLOT` | (none) | getTransfersByAddress `minContextSlot` |
+| `TRANSFERS_SOL_MODE` | `merged` | getTransfersByAddress `solMode` (`merged`, `separate`) |
+| `TRANSFERS_PAGINATION_TOKEN` | (none) | getTransfersByAddress `paginationToken` (`slot:transactionIdx:instructionIdx:innerInstructionIdx:type`) |
+| `TRANSFERS_DIRECTION` | `any` | getTransfersByAddress top-level `direction` (`in`, `out`, `any`) |
+| `TRANSFERS_MINT` | (none) | getTransfersByAddress top-level `mint` |
+| `TRANSFERS_WITH` | (none) | getTransfersByAddress top-level `with` account |
+| `TRANSFERS_AMOUNT_GTE` | (none) | getTransfersByAddress `filters.amount.gte` |
+| `TRANSFERS_AMOUNT_LTE` | (none) | getTransfersByAddress `filters.amount.lte` |
 | `RPC_TIMEOUT` | (none) | Fallback per-request timeout for scenarios that support it |
 | `HOT_ADDRESS` | (USDC mint) | Hot address for the hot pagination scenarios |
 | `HOT_LIMIT` | `1000` | Page size for hot pagination |
@@ -798,7 +827,8 @@ tests/k6/
 │   │   ├── superbank-rpc-validate-get-inflation-reward.js
 │   │   ├── superbank-rpc-validate-get-latest-blockhash.js
 │   │   ├── superbank-rpc-validate-get-transaction-count.js
-│   │   └── superbank-rpc-validate-get-transactions-for-address.js # TFA endpoint comparison
+│   │   ├── superbank-rpc-validate-get-transactions-for-address.js # TFA endpoint comparison
+│   │   └── superbank-rpc-validate-get-transfers-by-address.js # TBA endpoint comparison
 │   ├── stress/
 │   │   ├── stress-test.js          # Stress test (find breaking point)
 │   │   ├── stress-test-get-inflation-reward.js

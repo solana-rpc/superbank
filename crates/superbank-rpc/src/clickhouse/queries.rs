@@ -246,6 +246,24 @@ pub(crate) const TOKEN_OWNER_REQUIRED_COLUMNS: [&str; 9] = [
     "balance_changed",
 ];
 
+pub(crate) const TRANSFERS_REQUIRED_COLUMNS: [&str; 15] = [
+    "signature",
+    "slot",
+    "slot_idx",
+    "transfer_idx",
+    "inner_instruction_idx",
+    "block_time",
+    "transfer_type",
+    "amount",
+    "mint",
+    "decimals",
+    "from_user_account",
+    "to_user_account",
+    "from_token_account",
+    "to_token_account",
+    "fee_amount",
+];
+
 pub(crate) struct TransactionsForAddressTables<'a> {
     pub(crate) gsfa_table: &'a str,
     pub(crate) gsfa_bucket_modulus: u64,

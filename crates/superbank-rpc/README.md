@@ -23,6 +23,7 @@ writer that matches the same schemas).
 - `getInflationReward`
 - `getEpochSchedule`
 - `getTransactionsForAddress` (custom)
+- `getTransfersByAddress` (custom)
 
 Notes:
 - JSON-RPC batch envelopes are supported. Batch execution is bounded by
@@ -87,6 +88,21 @@ Notes:
   these aliases cannot be combined with same-side slot filters (`lt`/`lte` for `beforeSlot`,
   `gt`/`gte` for `untilSlot`).
   Token account filters require the token-owner activity table (see below).
+- `getTransfersByAddress` returns successful indexed SOL/SPL transfers with
+  top-level `with`, `direction=in|out`, `mint`, `solMode=merged|separate`, `sortOrder=asc|desc`,
+  `limit`, `paginationToken` (`slot:transactionIdx:instructionIdx:innerInstructionIdx:type`),
+  `commitment`, `minContextSlot`, and `filters.amount|slot|blockTime`. Amounts are raw integer
+  strings (lamports for SOL, token base units for SPL), with `uiAmount` derived from decimals.
+  `filters.amount` accepts an unsigned JSON integer or a base-10 string; decimal and floating
+  values are rejected so values above JavaScript's safe-integer range remain exact. `feeAmount` is
+  a raw Token-2022 `TransferCheckedWithFee` fee when known, otherwise `null`.
+  The index is derived from pre/post balance deltas, so the opposite user account is nullable when
+  no counterparty can be inferred. This method requires the transfers table (see below).
+  Creating the materialized view only indexes future inserts. Do not describe the endpoint as
+  historically complete until an operator has completed and recorded verified backfill coverage;
+  see [`docs/get-transfers-by-address-operations.md`](../../docs/get-transfers-by-address-operations.md).
+  Response `paginationToken` is non-null only when another matching page exists after all filters
+  are applied; the token points to the last row returned by the current page.
 
 ## ClickHouse schemas
 
@@ -104,10 +120,12 @@ Required files in the chosen set:
 Optional:
 - `gsfa_hot.sql` when using hot-address routing.
 - `token_owner_activity.sql` when using token-owner filters in `getTransactionsForAddress`.
+- `transfers.sql` when using `getTransfersByAddress`.
 
 Apply `transactions.sql` before the materialized-view schemas (`gsfa*.sql`, `signatures.sql`, and
-`token_owner_activity.sql`) because those views read from the transactions table. If you use
-`gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then apply `gsfa_hot.sql`.
+`token_owner_activity.sql`, `transfers.sql`) because those views read from the
+transactions table. If you use `gsfa_hot.sql`, apply `gsfa_nohot.sql` instead of `gsfa.sql`, then
+apply `gsfa_hot.sql`.
 
 For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL first, deploy
 `superbank-rpc` next (disk-cache schema 3 intentionally rebuilds existing caches), and only then
@@ -414,6 +432,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-gsfa-hot-local-table` | `CLICKHOUSE_GSFA_HOT_LOCAL_TABLE` | `default.gsfa_hot_local` | Shard-direct only. Local hot table queried by hot-address fanout. |
 | `--clickhouse-signatures-local-table` | `CLICKHOUSE_SIGNATURES_LOCAL_TABLE` | — | Shard-direct only. |
 | `--clickhouse-token-owner-activity-local-table` | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE` | — | Shard-direct only. |
+| `--clickhouse-transfers-local-table` | `CLICKHOUSE_TRANSFERS_LOCAL_TABLE` | — | Shard-direct only. |
 | `--clickhouse-transactions-local-table` | `CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE` | — | Shard-direct only. |
 | `--clickhouse-blocks-metadata-local-table` | `CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE` | — | Shard-direct only. |
 | `--clickhouse-shard-http-port` | `CLICKHOUSE_SHARD_HTTP_PORT` | — | Shard-direct only. |
@@ -429,6 +448,8 @@ Table selection (environment variables, read at startup):
 | `CLICKHOUSE_GSFA_HOT_TABLE` | `default.gsfa_hot` | — |
 | `CLICKHOUSE_SIGNATURE_STATUSES_TABLE` | `default.signatures` | — |
 | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE` | `default.token_owner_activity` | — |
+| `CLICKHOUSE_TRANSFERS_TABLE` | `default.transfers` | Transfers ledger used by `getTransfersByAddress`. |
+| `CLICKHOUSE_TRANSFERS_BY_ADDRESS_TABLE` | — | Legacy alias for `CLICKHOUSE_TRANSFERS_TABLE`. |
 
 Shard routing:
 When `CLICKHOUSE_SCOPE=distributed`, superbank-rpc sends every ClickHouse query through `CLICKHOUSE_URL`. It does not read `CLICKHOUSE_TOPOLOGY_CONFIG`, discover `system.clusters`, connect to shard endpoints, query local tables, or validate local schemas. Explicit shard-local settings are ignored with a startup warning.
@@ -493,6 +514,7 @@ Additional env flags:
 
 - Scope: `superbank-rpc` applies `use_query_condition_cache=1` only on selected historical address-filtered reads:
   - `getTransactionsForAddress`
+  - `getTransfersByAddress`
   - the transactions-table fallback path for `getSignaturesForAddress`
 - Point lookups and slot-range reads do not opt in.
 - This setting is enabled separately from the query-result cache via:

@@ -27,6 +27,7 @@ use super::constants::DEFAULT_BUCKET_MODULUS;
 use super::gsfa::GsfaShardRouter;
 use super::queries::{
     GSFA_REQUIRED_COLUMNS, SIGNATURES_REQUIRED_COLUMNS, TOKEN_OWNER_REQUIRED_COLUMNS,
+    TRANSFERS_REQUIRED_COLUMNS,
 };
 use super::sharding::{
     BucketColumn, ClusterRow, DescribeTableRow, RoutingPolicy, RoutingScope, RoutingTransport,
@@ -416,11 +417,14 @@ pub struct ClickHouseClient {
     pub(crate) gsfa_hot_pubkeys: HashSet<Pubkey>,
     pub(crate) signature_statuses_table: String,
     pub(crate) token_owner_activity_table: String,
+    pub(crate) transfers_table: String,
     pub(crate) signatures_local_table: Option<String>,
     pub(crate) token_owner_activity_local_table: Option<String>,
+    pub(crate) transfers_local_table: Option<String>,
     pub(crate) transactions_local_table: Option<String>,
     pub(crate) blocks_metadata_local_table: Option<String>,
     pub(crate) token_owner_activity_available: bool,
+    pub(crate) transfers_available: bool,
     pub(crate) bucket_moduli: BucketModuli,
     pub(crate) allow_query_settings: bool,
     pub(crate) query_cache: QueryCacheConfig,
@@ -666,6 +670,9 @@ impl ClickHouseClient {
             .unwrap_or_else(|_| "default.signatures".to_string());
         let token_owner_activity_table = std::env::var("CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE")
             .unwrap_or_else(|_| "default.token_owner_activity".to_string());
+        let transfers_table = std::env::var("CLICKHOUSE_TRANSFERS_TABLE")
+            .or_else(|_| std::env::var("CLICKHOUSE_TRANSFERS_BY_ADDRESS_TABLE"))
+            .unwrap_or_else(|_| "default.transfers".to_string());
 
         let signatures_local_table = shard_routing.as_ref().and_then(|config| {
             config
@@ -678,6 +685,12 @@ impl ClickHouseClient {
                 .token_owner_activity_local_table
                 .clone()
                 .or_else(|| derive_local_table_name(&token_owner_activity_table, None))
+        });
+        let transfers_local_table = shard_routing.as_ref().and_then(|config| {
+            config
+                .transfers_local_table
+                .clone()
+                .or_else(|| derive_local_table_name(&transfers_table, None))
         });
         let transactions_local_table = shard_routing.as_ref().and_then(|config| {
             config
@@ -709,6 +722,9 @@ impl ClickHouseClient {
             if config.token_owner_activity_local_table.is_none() {
                 config.token_owner_activity_local_table = token_owner_activity_local_table.clone();
             }
+            if config.transfers_local_table.is_none() {
+                config.transfers_local_table = transfers_local_table.clone();
+            }
             if config.transactions_local_table.is_none() {
                 config.transactions_local_table = transactions_local_table.clone();
             }
@@ -734,11 +750,14 @@ impl ClickHouseClient {
             gsfa_hot_pubkeys: HashSet::new(),
             signature_statuses_table,
             token_owner_activity_table,
+            transfers_table,
             signatures_local_table,
             token_owner_activity_local_table,
+            transfers_local_table,
             transactions_local_table,
             blocks_metadata_local_table,
             token_owner_activity_available: true,
+            transfers_available: true,
             bucket_moduli: BucketModuli::default(),
             allow_query_settings: !std::env::var("CLICKHOUSE_DISABLE_QUERY_SETTINGS")
                 .map(|value| env_truthy(&value))
@@ -942,6 +961,14 @@ impl ClickHouseClient {
         self.allow_query_settings
     }
 
+    pub(crate) async fn with_timeout<T>(
+        &self,
+        operation: &'static str,
+        fut: impl std::future::Future<Output = ProcessingResult<T>>,
+    ) -> ProcessingResult<T> {
+        self.with_http_query_timeout(operation, fut).await
+    }
+
     pub(crate) async fn with_http_query_timeout<T>(
         &self,
         operation: &'static str,
@@ -951,9 +978,6 @@ impl ClickHouseClient {
             .await
     }
 
-    /// [`Self::with_http_query_timeout`] with an explicit deadline, for operations whose
-    /// budget differs from the interactive query timeout (e.g. disk-cache
-    /// backfill range scans).
     pub(crate) async fn with_http_query_timeout_duration<T>(
         &self,
         operation: &'static str,
@@ -1443,6 +1467,68 @@ impl ClickHouseClient {
             }
         }
 
+        let transfers_table = &self.transfers_table;
+        match self.startup_table_check {
+            ClickHouseStartupTableCheck::Count => {
+                match self
+                    .with_timeout("startup_transfers_count", async {
+                        self.client
+                            .query(&format!("SELECT COUNT(*) FROM {}", transfers_table))
+                            .fetch_one::<u64>()
+                            .await
+                            .map_err(|e| ProcessingError::database(e.to_string(), e))
+                    })
+                    .await
+                {
+                    Ok(count) => {
+                        self.transfers_available = true;
+                        tracing::info!(
+                            "📊 Database initialized - {} table: {} rows",
+                            transfers_table,
+                            count
+                        );
+                    }
+                    Err(e) => {
+                        self.transfers_available = false;
+                        tracing::warn!(
+                            "Transfers-by-address table '{}' unavailable; getTransfersByAddress disabled. Error: {}",
+                            transfers_table,
+                            e
+                        );
+                    }
+                }
+            }
+            ClickHouseStartupTableCheck::Exists => {
+                match self
+                    .with_timeout("startup_transfers_exists", async {
+                        self.client
+                            .query(&format!("SELECT count() FROM {} WHERE 0", transfers_table))
+                            .fetch_one::<u64>()
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| ProcessingError::database(e.to_string(), e))
+                    })
+                    .await
+                {
+                    Ok(()) => {
+                        self.transfers_available = true;
+                        tracing::info!(
+                            "📊 Database initialized - {} table accessible",
+                            transfers_table
+                        );
+                    }
+                    Err(e) => {
+                        self.transfers_available = false;
+                        tracing::warn!(
+                            "Transfers-by-address table '{}' unavailable; getTransfersByAddress disabled. Error: {}",
+                            transfers_table,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         let blocks_metadata_table = &self.blocks_metadata_table;
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
@@ -1632,6 +1718,22 @@ impl ClickHouseClient {
                             e
                         );
                         self.token_owner_activity_local_table = None;
+                    }
+
+                    if let Some(local_table) = config.transfers_local_table.clone()
+                        && let Err(e) = validate_table_schema_on_shards(
+                            topology.as_ref(),
+                            &local_table,
+                            &TRANSFERS_REQUIRED_COLUMNS,
+                            self.query_timeout,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "Transfers shard routing disabled; local table validation failed: {}",
+                            e
+                        );
+                        self.transfers_local_table = None;
                     }
 
                     if hot_routing_configured {
@@ -2157,6 +2259,7 @@ mod tests {
                     token_owner_activity_local_table: Some(
                         "default.token_owner_activity_local".to_string(),
                     ),
+                    transfers_local_table: Some("default.transfers_local".to_string()),
                     transactions_local_table: Some("default.transactions_local".to_string()),
                     blocks_metadata_local_table: Some("default.blocks_metadata_local".to_string()),
                 }),
@@ -2198,6 +2301,7 @@ mod tests {
                     gsfa_local_table: None,
                     signatures_local_table: None,
                     token_owner_activity_local_table: None,
+                    transfers_local_table: None,
                     transactions_local_table: None,
                     blocks_metadata_local_table: None,
                 }),
@@ -2457,6 +2561,7 @@ nodes:
             gsfa_local_table: None,
             signatures_local_table: None,
             token_owner_activity_local_table: None,
+            transfers_local_table: None,
             transactions_local_table: None,
             blocks_metadata_local_table: None,
         };

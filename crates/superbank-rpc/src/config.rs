@@ -369,6 +369,11 @@ pub struct RpcConfig {
     #[arg(long, env = "CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE")]
     pub(crate) clickhouse_token_owner_activity_local_table: Option<String>,
 
+    /// Local transfers table used in shard-direct scope.
+    /// Defaults to CLICKHOUSE_TRANSFERS_TABLE + _local.
+    #[arg(long, env = "CLICKHOUSE_TRANSFERS_LOCAL_TABLE")]
+    pub(crate) clickhouse_transfers_local_table: Option<String>,
+
     /// Local transactions table used in shard-direct scope.
     /// Defaults to CLICKHOUSE_TRANSACTION_TABLE + _local.
     #[arg(long, env = "CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE")]

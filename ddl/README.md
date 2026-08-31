@@ -16,14 +16,19 @@ Each folder contains the same file basenames:
 - `gsfa_hot.sql`
 - `signatures.sql`
 - `token_owner_activity.sql`
+- `transfers.sql`
 
 Pick one folder and apply the matching schema set consistently.
 The schema files include idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements for
 additive upgrades. Apply DDL before deploying binaries that write or query newly added columns;
 running these repository files never occurs automatically against an existing deployment.
 Apply `transactions.sql` before materialized-view files such as `gsfa*.sql`, `signatures.sql`, and
-`token_owner_activity.sql`; those views select from the transactions table and will fail if it does
-not exist yet.
+`token_owner_activity.sql`/`transfers.sql`; those views select from the transactions
+table and will fail if it does not exist yet.
+`transfers.sql` starts indexing with subsequent transaction inserts; it does not backfill existing
+transactions. Treat `getTransfersByAddress` as historically complete only after verified coverage
+has been recorded using the operational design in
+[`docs/get-transfers-by-address-operations.md`](../docs/get-transfers-by-address-operations.md).
 `gsfa_nohot.sql` is an alternative to `gsfa.sql`; do not apply both for the same schema set.
 `entries.sql` is required for Superbank Fumarole/gRPC source defaults and for PoH entry ingestion
 from Old Faithful / Jetstreamer. RPC and Bigtable sources do not populate `entries`.

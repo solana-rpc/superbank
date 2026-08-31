@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::clickhouse::RawAmount;
 use crate::solana_sdk::transaction::TransactionVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -149,6 +150,46 @@ pub(crate) struct GetTransactionsForAddressOptions {
     pub(crate) filters: Option<GetTransactionsForAddressFilters>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct GetTransfersByAddressFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) amount: Option<ComparisonFilter<RawAmount>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) slot: Option<ComparisonFilter<u64>>,
+    #[serde(rename = "blockTime")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) block_time: Option<ComparisonFilter<i64>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct GetTransfersByAddressOptions {
+    #[serde(rename = "with")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) with_account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mint: Option<String>,
+    #[serde(rename = "solMode")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sol_mode: Option<String>,
+    #[serde(rename = "sortOrder")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sort_order: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) limit: Option<u64>,
+    #[serde(rename = "paginationToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pagination_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) commitment: Option<String>,
+    #[serde(rename = "minContextSlot")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) min_context_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) filters: Option<GetTransfersByAddressFilters>,
+}
+
 pub(crate) const MAX_GET_BLOCKS_RANGE: u64 = 500_000;
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +240,42 @@ pub(crate) struct TransactionsForAddressFullInfo {
 #[derive(Debug, Serialize)]
 pub(crate) struct TransactionsForAddressResult<T> {
     pub(crate) data: Vec<T>,
+    #[serde(rename = "paginationToken")]
+    pub(crate) pagination_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TransfersByAddressInfo {
+    pub(crate) signature: String,
+    pub(crate) slot: u64,
+    #[serde(rename = "blockTime")]
+    pub(crate) block_time: Option<i64>,
+    #[serde(rename = "type")]
+    pub(crate) transfer_type: String,
+    pub(crate) from_user_account: Option<String>,
+    pub(crate) to_user_account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) from_token_account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to_token_account: Option<String>,
+    pub(crate) mint: String,
+    pub(crate) amount: String,
+    pub(crate) fee_amount: Option<String>,
+    pub(crate) decimals: Option<u8>,
+    pub(crate) ui_amount: String,
+    pub(crate) confirmation_status: String,
+    #[serde(rename = "transactionIdx")]
+    pub(crate) transaction_idx: u32,
+    #[serde(rename = "instructionIdx")]
+    pub(crate) instruction_idx: u32,
+    #[serde(rename = "innerInstructionIdx")]
+    pub(crate) inner_instruction_idx: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TransfersByAddressResult {
+    pub(crate) data: Vec<TransfersByAddressInfo>,
     #[serde(rename = "paginationToken")]
     pub(crate) pagination_token: Option<String>,
 }

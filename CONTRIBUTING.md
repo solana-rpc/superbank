@@ -176,12 +176,13 @@ Validation scenarios compare Superbank RPC responses against a reference endpoin
 REFERENCE_RPC_URL=https://api.mainnet-beta.solana.com scripts/test/run-k6.sh
 ```
 
-`getTransactionsForAddress` is a Superbank-specific method, so its validation scenario uses
-`TFA_REFERENCE_RPC_URL` instead of the standard Solana reference endpoint:
+`getTransactionsForAddress` and `getTransfersByAddress` are Superbank-specific methods, so its validation scenarios use
+`TFA_REFERENCE_RPC_URL` and `TBA_REFERENCE_RPC_URL` instead of the standard Solana reference endpoint:
 
 ```bash
 REFERENCE_RPC_URL=https://api.mainnet-beta.solana.com \
 TFA_REFERENCE_RPC_URL=http://localhost:8898 \
+TBA_REFERENCE_RPC_URL=http://localhost:8898 \
 scripts/test/run-k6.sh
 ```
 
