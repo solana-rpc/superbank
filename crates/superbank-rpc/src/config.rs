@@ -3,7 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::str::FromStr;
+use std::{path::PathBuf, str::FromStr};
 
 use crate::solana_sdk::pubkey::Pubkey;
 use clap::{ArgAction, Parser};
@@ -54,6 +54,10 @@ pub enum PyroscopeCompression {
     about = "Solana RPC server serving data from ClickHouse"
 )]
 pub struct RpcConfig {
+    /// Path to the shared YAML configuration file.
+    #[arg(long, env = "SUPERBANK_CONFIG", value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
+
     /// Maximum accepted JSON-RPC request body size (bytes).
     #[arg(long, env = "RPC_MAX_BODY_BYTES", default_value_t = 1_048_576)]
     pub(crate) rpc_max_body_bytes: usize,
@@ -135,6 +139,10 @@ pub struct RpcConfig {
     /// Port to bind the Prometheus metrics server.
     #[arg(long, env = "METRICS_PORT", default_value = "9900")]
     pub(crate) metrics_port: u16,
+
+    /// Path to this RPC target cluster's genesis.bin, read at startup for epoch math.
+    #[arg(long, env = "GENESIS_PATH")]
+    pub(crate) genesis_path: Option<String>,
 
     // --- Optional Superbank gRPC streaming API ---
     #[cfg(feature = "grpc-streaming")]
@@ -750,6 +758,17 @@ mod config_tests {
     }
 
     #[test]
+    fn shared_config_path_flag_parses() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--config", "superbank.yaml"]);
+
+        assert_eq!(
+            cfg.config.as_deref(),
+            Some(std::path::Path::new("superbank.yaml"))
+        );
+    }
+
+    #[test]
     fn inflation_reward_limits_parse() {
         let cfg = RpcConfig::parse_from([
             "superbank-rpc",
@@ -918,6 +937,27 @@ mod config_tests {
         assert!(!cfg.metrics_capture_x_rpc_node());
         assert!(!cfg.metrics_capture_x_subscription_id());
         assert!(!cfg.metrics_capture_x_account_id());
+    }
+}
+
+#[cfg(test)]
+mod genesis_path_config_tests {
+    use clap::Parser;
+
+    use super::RpcConfig;
+
+    #[test]
+    fn genesis_path_flag_parses() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--genesis-path",
+            "/etc/superbank/genesis.bin",
+        ]);
+
+        assert_eq!(
+            cfg.genesis_path.as_deref(),
+            Some("/etc/superbank/genesis.bin")
+        );
     }
 }
 

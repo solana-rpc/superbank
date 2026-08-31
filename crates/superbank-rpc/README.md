@@ -113,7 +113,6 @@ For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL fi
 `superbank-rpc` next (disk-cache schema 3 intentionally rebuilds existing caches), and only then
 deploy ingestion with transaction version 1 enabled. Rolling back the RPC binary is safe only
 before v1 or `DeactivatedStake` rows have arrived.
-
 ## Run
 
 ```bash
@@ -121,6 +120,53 @@ RPC_HOST=0.0.0.0 RPC_PORT=8899 \
 CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
 cargo run -p superbank-rpc --
 ```
+
+### Cluster genesis for inflation-reward epoch math
+
+`getInflationReward` needs the epoch schedule for the same Solana cluster represented by the
+ClickHouse data. Operators of a cluster with warmup epochs must mount that cluster's exact
+`genesis.bin` read-only into the RPC container or host and set `GENESIS_PATH` to the mounted path.
+Do not reuse a genesis file from another network: doing so calculates payout-epoch bounds for the
+wrong slots. If `GENESIS_PATH` is unset, superbank-rpc uses the production no-warmup fallback,
+which is appropriate for mainnet and devnet.
+
+For example, an operator-managed container mount can be configured as:
+
+```bash
+docker run --rm \
+  -v /srv/solana/mainnet-beta/genesis.bin:/etc/superbank/genesis.bin:ro \
+  -e GENESIS_PATH=/etc/superbank/genesis.bin \
+  superbank:0.5.0
+```
+
+This setting currently affects internal `getInflationReward` epoch math only; RPC schedule and
+epoch-info behavior remain separate follow-up work.
+
+## Exact method and parameter filters
+
+`superbank-rpc` can reject configured method and parameter combinations before they enter handler
+dispatch or use any cache or ClickHouse resources. Pass the shared YAML configuration with
+`--config superbank.yaml` or `SUPERBANK_CONFIG=superbank.yaml` and add:
+
+```yaml
+rpc-parameter-filters:
+  - [getTransactionsForAddress, So11111111111111111111111111111111111111112]
+  - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
+```
+
+Each entry contains the case-sensitive method followed by its complete parameter array. Method
+names cannot have leading or trailing whitespace. Matching is structural and exact: parameter
+count, array order, JSON types, and values must match; mapping key order does not matter. Extra
+parameters do not match. A method-only entry matches an explicitly empty `params: []` array;
+omitted `params` is distinct.
+
+A matching call preserves the request ID in a JSON-RPC error with code `-32602` and message
+`Invalid params: request blocked by parameter filter`. Its error `data` echoes the matched
+`method` and complete `params` array. It remains HTTP `200 OK`, including when
+`--emit-http-errors` is enabled, because it is a client error rather than a server-side failure.
+In a mixed batch, allowed calls still execute and matched calls receive individual errors in their
+original positions. Filters are validated and indexed once at startup, so changing the file
+requires restarting `superbank-rpc`.
 
 ## Optional Superbank gRPC streaming (`grpc-streaming`)
 
@@ -378,6 +424,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--port` | `RPC_PORT` | `8899` | — |
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
+| `--genesis-path` | `GENESIS_PATH` | unset | Path to the target cluster's mounted `genesis.bin`. The server fails startup if a configured file cannot be read or decoded. Leave unset only for the no-warmup fallback. |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |
 | `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Only available with `--features grpc-streaming`; enables the gRPC endpoint at runtime. |
 | `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Only available with `--features grpc-streaming`. |

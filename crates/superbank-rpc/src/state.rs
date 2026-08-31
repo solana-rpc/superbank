@@ -8,12 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use solana_commitment_config::CommitmentLevel;
+use solana_epoch_schedule::EpochSchedule;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify, Semaphore};
 
 use crate::clickhouse::ClickHouseClient;
 use crate::metrics;
 use crate::processing::ProcessingError;
+use crate::request_filter::RpcParameterFilterSet;
 use crate::util::{current_time_millis, ttl_millis};
 
 #[cfg(feature = "disk-cache")]
@@ -31,6 +33,7 @@ pub(crate) struct MetricsHeaderCaptureConfig {
 
 pub(crate) struct AppState {
     pub(crate) clickhouse: ClickHouseClient,
+    pub(crate) rpc_parameter_filters: RpcParameterFilterSet,
     pub(crate) max_signatures_limit: u64,
     pub(crate) rpc_max_batch_size: usize,
     pub(crate) rpc_batch_concurrency_limit: usize,
@@ -42,6 +45,7 @@ pub(crate) struct AppState {
     pub(crate) emit_http_errors: bool,
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
+    pub(crate) epoch_schedule: EpochSchedule,
     #[cfg(feature = "grpc-head-cache")]
     pub(crate) head_cache: Option<Arc<HeadCache>>,
     /// Finalized recent-slot cache on local disk; consulted between the head

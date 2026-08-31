@@ -43,6 +43,7 @@ members = [
     "crates/superbank",
     "crates/superbank-rpc",
     "crates/superbank-solparq",
+    "crates/superbank-verify",
 ]
 
 resolver = "2"
@@ -50,4 +51,5 @@ default-members = [
     "crates/superbank",
     "crates/superbank-rpc",
     "crates/superbank-solparq",
+    "crates/superbank-verify",
 ]

@@ -74,3 +74,4 @@ jobs:
             dist/superbank-rpc_*/superbank-rpc
             dist/superbank-solparq_*/superbank-solparq
             dist/superbank-solparq-read_*/superbank-solparq-read
+            dist/superbank-verify_*/superbank-verify
