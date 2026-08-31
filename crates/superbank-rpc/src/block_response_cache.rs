@@ -13,6 +13,7 @@ use moka::future::Cache;
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct BlockResponseCacheKey {
     pub(crate) slot: u64,
+    pub(crate) commitment: solana_commitment_config::CommitmentLevel,
     pub(crate) encoding: u8,
     pub(crate) transaction_details: u8,
     pub(crate) show_rewards: bool,
@@ -126,6 +127,7 @@ mod tests {
     fn key(slot: u64) -> BlockResponseCacheKey {
         BlockResponseCacheKey {
             slot,
+            commitment: solana_commitment_config::CommitmentLevel::Finalized,
             encoding: 0,
             transaction_details: 3,
             show_rewards: false,
@@ -159,6 +161,34 @@ mod tests {
         assert!(first_evaluated);
         assert!(!second_evaluated);
         assert_eq!(cache.get(&key(1)).await, Some(Bytes::from_static(b"one")));
+    }
+
+    #[tokio::test]
+    async fn confirmed_and_finalized_results_do_not_share_a_cache_entry() {
+        let cache = BlockResponseCache::new(1024);
+        let confirmed = BlockResponseCacheKey {
+            commitment: solana_commitment_config::CommitmentLevel::Confirmed,
+            ..key(1)
+        };
+        let finalized = key(1);
+
+        cache
+            .get_or_try_insert_with(confirmed, async {
+                Ok::<_, ()>(Bytes::from_static(b"confirmed"))
+            })
+            .await
+            .expect("confirmed value");
+        cache
+            .get_or_try_insert_with(finalized.clone(), async {
+                Ok::<_, ()>(Bytes::from_static(b"finalized"))
+            })
+            .await
+            .expect("finalized value");
+
+        assert_eq!(
+            cache.get(&finalized).await,
+            Some(Bytes::from_static(b"finalized"))
+        );
     }
 
     #[tokio::test]

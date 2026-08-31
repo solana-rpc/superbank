@@ -8,9 +8,7 @@ use crate::solana_sdk::pubkey::Pubkey;
 use axum::{body::Bytes, http::StatusCode, response::Response};
 use serde_json::{Value, json};
 use solana_clock::{DEFAULT_SLOTS_PER_EPOCH, MAX_PROCESSING_AGE};
-use solana_commitment_config::CommitmentConfig;
-#[cfg(feature = "grpc-head-cache")]
-use solana_commitment_config::CommitmentLevel;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
@@ -77,7 +75,7 @@ impl GetBlockFetchPlan {
         !matches!(self.transaction_details, TransactionDetails::None)
     }
 
-    fn cache_key(self, slot: u64) -> BlockResponseCacheKey {
+    fn cache_key(self, slot: u64, commitment: CommitmentLevel) -> BlockResponseCacheKey {
         let encoding = match self.encoding {
             UiTransactionEncoding::Binary => 0,
             UiTransactionEncoding::Base58 => 1,
@@ -93,6 +91,7 @@ impl GetBlockFetchPlan {
         };
         BlockResponseCacheKey {
             slot,
+            commitment,
             encoding,
             transaction_details,
             show_rewards: self.show_rewards,
@@ -1541,10 +1540,13 @@ pub(crate) async fn handle_get_block(
         ));
     }
 
-    let response_cache_key = fetch_plan.cache_key(slot);
-    if state.block_response_cache.enabled() {
+    let response_cache_key = (commitment.commitment == CommitmentLevel::Finalized)
+        .then(|| fetch_plan.cache_key(slot, commitment.commitment));
+    if let Some(response_cache_key) = response_cache_key.as_ref()
+        && state.block_response_cache.enabled()
+    {
         route.response_cache_read();
-        if let Some(result_bytes) = state.block_response_cache.get(&response_cache_key).await {
+        if let Some(result_bytes) = state.block_response_cache.get(response_cache_key).await {
             route.source_response_cache();
             route.success();
             return Ok(json_rpc_success_response_from_result_bytes(
@@ -1589,8 +1591,7 @@ pub(crate) async fn handle_get_block(
                 payload,
                 fetch_plan,
                 BlockResponseOptions {
-                    cache_key: (commitment.commitment == CommitmentLevel::Finalized)
-                        .then(|| response_cache_key.clone()),
+                    cache_key: response_cache_key.clone(),
                     timings: None,
                 },
             )
@@ -1623,7 +1624,7 @@ pub(crate) async fn handle_get_block(
                     *payload,
                     fetch_plan,
                     BlockResponseOptions {
-                        cache_key: Some(response_cache_key.clone()),
+                        cache_key: response_cache_key.clone(),
                         timings: None,
                     },
                 )
@@ -1766,7 +1767,7 @@ pub(crate) async fn handle_get_block(
         block_payload,
         fetch_plan,
         BlockResponseOptions {
-            cache_key: Some(response_cache_key),
+            cache_key: response_cache_key,
             timings: Some(timings),
         },
     )
