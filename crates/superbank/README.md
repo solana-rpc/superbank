@@ -277,7 +277,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--fumarole-consumer-group` / `FUMAROLE_CONSUMER_GROUP` (required for fumarole source)
 - `--fumarole-create-consumer-group[=true|false]` / `FUMAROLE_CREATE_CONSUMER_GROUP` (default: false)
 - `--fumarole-data-plane-tcp-connections` / `FUMAROLE_DATA_PLANE_TCP_CONNECTIONS` (default: 4; maximum: 20)
-- `--fumarole-concurrent-download-limit-per-tcp` / `FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP` (default: 2)
+- `--fumarole-concurrent-download-limit-per-tcp` / `FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP` (deprecated compatibility option; default: 1; values other than 1 are ignored because the Fumarole client fixes this concurrency at 1)
 - `--fumarole-data-channel-capacity` / `FUMAROLE_DATA_CHANNEL_CAPACITY` (default: 4096; Fumarole client data channel capacity)
 - `--fumarole-memory-soft-limit-bytes` / `FUMAROLE_MEMORY_SOFT_LIMIT_BYTES` (default: 25769803776; Fumarole backpressure guard soft limit, set 0 to disable)
 - `--fumarole-commit-interval-secs` / `FUMAROLE_COMMIT_INTERVAL_SECS` (default: 10)

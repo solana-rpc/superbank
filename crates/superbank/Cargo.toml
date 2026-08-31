@@ -47,8 +47,8 @@ tokio-util.workspace = true
 tonic = "0.14.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
-yellowstone-fumarole-client = "0.5.0"
-yellowstone-grpc-client = "13.3.0"
+yellowstone-fumarole-client = "0.7.1"
+yellowstone-grpc-client = "13.4.0"
 yellowstone-grpc-proto = "12.6.0"
 wincode = { version = "0.2.5", features = ["derive", "solana-short-vec"] }
 wincode05 = { package = "wincode", version = "0.5.0" }
@@ -56,3 +56,4 @@ wincode05 = { package = "wincode", version = "0.5.0" }
 [dev-dependencies]
 solana-address = "1.1.0"
 solana-hash = "4.3.0"
+tokio = { version = "1.46.1", features = ["full", "test-util"] }
