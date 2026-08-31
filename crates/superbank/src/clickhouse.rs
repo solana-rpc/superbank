@@ -24,6 +24,10 @@ pub(crate) struct TransactionRow {
     pub(crate) message_hash: Array<u8, 32>,
     pub(crate) is_vote: u8,
     pub(crate) tx_version: Option<u8>,
+    pub(crate) tx_config_priority_fee: Option<u64>,
+    pub(crate) tx_config_compute_unit_limit: Option<u32>,
+    pub(crate) tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    pub(crate) tx_config_heap_size: Option<u32>,
     pub(crate) tx_signatures: Vec<Array<u8, 64>>,
     pub(crate) tx_num_required_signatures: u8,
     pub(crate) tx_num_readonly_signed_accounts: u8,
@@ -74,6 +78,7 @@ pub(crate) struct TransactionRow {
     pub(crate) meta_reward_post_balance: Vec<u64>,
     pub(crate) meta_reward_type: Vec<Option<String>>,
     pub(crate) meta_reward_commission: Vec<Option<u8>>,
+    pub(crate) meta_reward_commission_bps: Vec<Option<u16>>,
     pub(crate) meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     pub(crate) meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
     pub(crate) meta_return_data_present: u8,
@@ -99,6 +104,7 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_post_balance: Vec<u64>,
     pub(crate) rewards_type: Vec<Option<String>>,
     pub(crate) rewards_commission: Vec<Option<u8>>,
+    pub(crate) rewards_commission_bps: Vec<Option<u16>>,
     pub(crate) rewards_num_partitions: Option<u64>,
 }
 
@@ -145,7 +151,7 @@ pub(crate) fn build_clickhouse_client(args: &Args) -> ClickHouseClient {
     let mut client = ClickHouseClient::default()
         .with_url(&args.clickhouse_url)
         .with_database(&args.clickhouse_database)
-        .with_option(
+        .with_setting(
             "async_insert",
             if args.clickhouse_async_insert {
                 "1"
@@ -597,7 +603,7 @@ mod tests {
     fn build_clickhouse_client_disables_async_insert_by_default() {
         let client = build_clickhouse_client(&sample_args());
 
-        assert_eq!(client.get_option("async_insert"), Some("0"));
+        assert_eq!(client.get_setting("async_insert"), Some("0"));
     }
 
     #[test]
@@ -607,7 +613,7 @@ mod tests {
 
         let client = build_clickhouse_client(&args);
 
-        assert_eq!(client.get_option("async_insert"), Some("1"));
+        assert_eq!(client.get_setting("async_insert"), Some("1"));
     }
 
     #[test]

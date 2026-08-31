@@ -83,6 +83,10 @@ pub struct Config {
     /// fewer archived rows than declared); re-ingest re-inserts and dedups.
     pub backfill_include_undercounts: bool,
     pub delete_archived_data_range: bool,
+    /// Sweep the ClickHouse delete range from slot `0` rather than flooring it at
+    /// the lowest archived start slot. Server mode only; off by default. See
+    /// [`crate::archive::safe_delete_archived_data_range`].
+    pub delete_archived_data_from_slot_zero: bool,
     pub server_mode: bool,
     pub ops_port: u16,
     pub metrics_port: u16,
@@ -133,6 +137,11 @@ impl Config {
         if cli.server_mode && cli.archive_slot_range.is_some() {
             return Err(anyhow!(
                 "--archive-slot-range is only supported for one-shot archives and cannot be used with --server-mode"
+            ));
+        }
+        if cli.delete_archived_data_from_slot_zero && !cli.server_mode {
+            return Err(anyhow!(
+                "--delete-archived-data-from-slot-zero is only supported with --server-mode"
             ));
         }
 
@@ -208,6 +217,7 @@ impl Config {
             backfill_superbank_bin: cli.backfill_superbank_bin,
             backfill_include_undercounts: cli.backfill_include_undercounts,
             delete_archived_data_range: cli.delete_archived_data_range,
+            delete_archived_data_from_slot_zero: cli.delete_archived_data_from_slot_zero,
             server_mode: cli.server_mode,
             ops_port: cli.ops_port,
             metrics_port: cli.metrics_port,
@@ -498,6 +508,18 @@ struct Cli {
         default_value_t = false
     )]
     delete_archived_data_range: bool,
+
+    /// Sweep the ClickHouse delete range from slot `0` instead of flooring it at
+    /// the lowest archived start slot. Only valid with `--server-mode`. Off by
+    /// default so the never-archived leading window (slots before an aligned
+    /// kind's first `align_up` boundary) is preserved; enable it only when that
+    /// leading window should be purged too.
+    #[arg(
+        long = "delete-archived-data-from-slot-zero",
+        env = "SOLPARQ_DELETE_ARCHIVED_DATA_FROM_SLOT_ZERO",
+        default_value_t = false
+    )]
+    delete_archived_data_from_slot_zero: bool,
 
     /// Attempt to repair overcount transaction mismatches before archiving by
     /// running `OPTIMIZE ... FINAL DEDUPLICATE` on affected epoch partitions,

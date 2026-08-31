@@ -31,7 +31,7 @@ use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof,
 };
 
-use crate::cli::{Args, FromSlotSpec};
+use crate::cli::{Args, FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP, FromSlotSpec};
 use crate::clickhouse::{InsertTables, build_clickhouse_client, fetch_latest_slot_from_blocks};
 use crate::commitment::parse_commitment_level;
 use crate::ingest::grpc::{BufferedRows, process_update};
@@ -47,6 +47,15 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
     let commitment = parse_commitment_level(&args.commitment)? as i32;
     let clickhouse = build_clickhouse_client(args);
 
+    if args.fumarole_concurrent_download_limit_per_tcp != FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP
+    {
+        warn!(
+            requested = args.fumarole_concurrent_download_limit_per_tcp,
+            effective = FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP,
+            "fumarole-concurrent-download-limit-per-tcp is deprecated and ignored by the Fumarole client"
+        );
+    }
+
     info!(
         source = "fumarole",
         endpoint = %endpoint,
@@ -56,7 +65,8 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
         grpc_max_decoding_bytes = args.grpc_max_decoding_bytes,
         grpc_idle_timeout_secs = args.grpc_idle_timeout_secs,
         fumarole_data_plane_tcp_connections = args.fumarole_data_plane_tcp_connections,
-        fumarole_concurrent_download_limit_per_tcp = args.fumarole_concurrent_download_limit_per_tcp,
+        fumarole_requested_concurrent_download_limit_per_tcp = args.fumarole_concurrent_download_limit_per_tcp,
+        fumarole_effective_concurrent_download_limit_per_tcp = FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP,
         fumarole_data_channel_capacity = args.fumarole_data_channel_capacity,
         fumarole_memory_soft_limit_bytes = args.fumarole_memory_soft_limit_bytes,
         fumarole_commit_interval_secs = args.fumarole_commit_interval_secs,
@@ -305,10 +315,6 @@ fn build_subscribe_config(args: &Args) -> Result<FumaroleSubscribeConfig> {
     Ok(FumaroleSubscribeConfig {
         num_data_plane_tcp_connections: NonZeroU8::new(args.fumarole_data_plane_tcp_connections)
             .context("fumarole data-plane-tcp-connections must be greater than 0")?,
-        concurrent_download_limit_per_tcp: NonZeroUsize::new(
-            args.fumarole_concurrent_download_limit_per_tcp,
-        )
-        .context("fumarole concurrent-download-limit-per-tcp must be greater than 0")?,
         data_channel_capacity: NonZeroUsize::new(args.fumarole_data_channel_capacity)
             .context("fumarole data-channel-capacity must be greater than 0")?,
         commit_interval: Duration::from_secs(args.fumarole_commit_interval_secs),

@@ -3,10 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::solana_sdk::transaction::TransactionVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::transaction::TransactionVersion;
 use solana_transaction_status::{EncodedTransaction, UiTransactionStatusMeta};
 
 #[derive(Debug, Deserialize, Default)]
@@ -253,6 +253,8 @@ pub(crate) struct InflationRewardInfo {
     pub(crate) amount: u64,
     pub(crate) post_balance: u64,
     pub(crate) commission: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) commission_bps: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]

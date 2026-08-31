@@ -20,7 +20,7 @@ const MAX_CACHE_CAPACITY: usize = 1_000_000;
 pub(crate) enum CacheStart<T> {
     Hit(T),
     Wait(OwnedNotified),
-    Leader(Arc<Notify>),
+    Leader(SignatureSlotCacheLeader),
 }
 
 #[derive(Debug)]
@@ -35,6 +35,62 @@ pub(crate) struct SignatureSlotCache {
     ttl_missing: Duration,
     capacity: usize,
     inner: Mutex<HashMap<SignatureBytes, Entry<Option<SignatureSlot>>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SignatureSlotCacheLeader {
+    cache: Arc<SignatureSlotCache>,
+    key: SignatureBytes,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl SignatureSlotCacheLeader {
+    pub(crate) async fn finish(mut self, value: Option<SignatureSlot>) {
+        self.cache
+            .finish_leader(self.key, self.notify.clone(), value)
+            .await;
+        self.armed = false;
+    }
+
+    pub(crate) async fn fail(mut self) {
+        self.cache
+            .remove_in_flight(self.key, self.notify.clone())
+            .await;
+        self.armed = false;
+    }
+}
+
+impl Drop for SignatureSlotCacheLeader {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let cache = self.cache.clone();
+        let key = self.key;
+        let notify = self.notify.clone();
+
+        // Cancellation normally happens while polling on a Tokio runtime. Avoid scheduling when
+        // the cache lock is immediately available, but fall back to an async cleanup task if a
+        // concurrent cache operation owns it.
+        if let Ok(mut guard) = cache.inner.try_lock() {
+            SignatureSlotCache::remove_matching_entry(&mut guard, key, &notify);
+            drop(guard);
+            notify.notify_waiters();
+            return;
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                cache.remove_in_flight(key, notify).await;
+            });
+        } else {
+            // There can be no active async waiter without a runtime. Wake any retained waiter so
+            // runtime teardown does not leave it blocked on this notification.
+            notify.notify_waiters();
+        }
+    }
 }
 
 impl SignatureSlotCache {
@@ -73,7 +129,7 @@ impl SignatureSlotCache {
     }
 
     pub(crate) async fn get_or_start(
-        &self,
+        self: &Arc<Self>,
         key: SignatureBytes,
     ) -> CacheStart<Option<SignatureSlot>> {
         let now = Instant::now();
@@ -103,10 +159,15 @@ impl SignatureSlotCache {
                 notify: notify.clone(),
             },
         );
-        CacheStart::Leader(notify)
+        CacheStart::Leader(SignatureSlotCacheLeader {
+            cache: self.clone(),
+            key,
+            notify,
+            armed: true,
+        })
     }
 
-    pub(crate) async fn finish(
+    async fn finish_leader(
         &self,
         key: SignatureBytes,
         notify: Arc<Notify>,
@@ -120,23 +181,36 @@ impl SignatureSlotCache {
         let expires_at = Instant::now() + ttl;
 
         let mut guard = self.inner.lock().await;
-        guard.insert(key, Entry::Ready { value, expires_at });
-        self.evict_if_needed(&mut guard);
+        if matches!(
+            guard.get(&key),
+            Some(Entry::InFlight { notify: current }) if Arc::ptr_eq(current, &notify)
+        ) {
+            guard.insert(key, Entry::Ready { value, expires_at });
+            self.evict_if_needed(&mut guard);
+        }
         drop(guard);
 
         notify.notify_waiters();
     }
 
-    pub(crate) async fn fail(&self, key: SignatureBytes, notify: Arc<Notify>) {
+    async fn remove_in_flight(&self, key: SignatureBytes, notify: Arc<Notify>) {
         let mut guard = self.inner.lock().await;
-        if let Some(Entry::InFlight { notify: current }) = guard.get(&key)
-            && Arc::ptr_eq(current, &notify)
-        {
-            guard.remove(&key);
-        }
+        Self::remove_matching_entry(&mut guard, key, &notify);
         drop(guard);
 
         notify.notify_waiters();
+    }
+
+    fn remove_matching_entry(
+        guard: &mut HashMap<SignatureBytes, Entry<Option<SignatureSlot>>>,
+        key: SignatureBytes,
+        notify: &Arc<Notify>,
+    ) {
+        if let Some(Entry::InFlight { notify: current }) = guard.get(&key)
+            && Arc::ptr_eq(current, notify)
+        {
+            guard.remove(&key);
+        }
     }
 
     fn evict_if_needed(&self, guard: &mut HashMap<SignatureBytes, Entry<Option<SignatureSlot>>>) {
@@ -180,12 +254,16 @@ impl SignatureSlotCache {
     }
 
     #[cfg(test)]
-    pub(crate) async fn prime_for_tests(&self, key: SignatureBytes, value: Option<SignatureSlot>) {
-        let notify = match self.get_or_start(key).await {
-            CacheStart::Leader(notify) => notify,
+    pub(crate) async fn prime_for_tests(
+        self: &Arc<Self>,
+        key: SignatureBytes,
+        value: Option<SignatureSlot>,
+    ) {
+        let leader = match self.get_or_start(key).await {
+            CacheStart::Leader(leader) => leader,
             other => panic!("expected cache leader, got {other:?}"),
         };
-        self.finish(key, notify, value).await;
+        leader.finish(value).await;
     }
 }
 
@@ -202,8 +280,8 @@ mod tests {
         ));
         let key: SignatureBytes = [9u8; 64];
 
-        let leader_notify = match cache.get_or_start(key).await {
-            CacheStart::Leader(notify) => notify,
+        let leader = match cache.get_or_start(key).await {
+            CacheStart::Leader(leader) => leader,
             other => panic!("expected leader, got {other:?}"),
         };
         let wait = match cache.get_or_start(key).await {
@@ -220,15 +298,11 @@ mod tests {
             }
         });
 
-        cache
-            .finish(
-                key,
-                leader_notify,
-                Some(SignatureSlot {
-                    slot: 42,
-                    slot_idx: 7,
-                }),
-            )
+        leader
+            .finish(Some(SignatureSlot {
+                slot: 42,
+                slot_idx: 7,
+            }))
             .await;
 
         let value = waiter.await.expect("waiter join");
@@ -238,16 +312,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_signature_slot_leader_wakes_waiters_and_allows_retry() {
+        let cache = Arc::new(SignatureSlotCache::new(
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            128,
+        ));
+        let key: SignatureBytes = [7u8; 64];
+
+        let leader = match cache.get_or_start(key).await {
+            CacheStart::Leader(leader) => leader,
+            other => panic!("expected cache leader, got {other:?}"),
+        };
+        let wait = match cache.get_or_start(key).await {
+            CacheStart::Wait(wait) => wait,
+            other => panic!("expected cache waiter, got {other:?}"),
+        };
+
+        // Force the cancellation guard down its contended-lock cleanup path. This is the case that
+        // needs an async cleanup task instead of removing the in-flight entry directly in `Drop`.
+        let cache_lock = cache.inner.lock().await;
+        drop(leader);
+        drop(cache_lock);
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("cancelled leader should wake existing waiters");
+
+        let retry_leader = match cache.get_or_start(key).await {
+            CacheStart::Leader(leader) => leader,
+            other => panic!("expected a new leader after cancellation, got {other:?}"),
+        };
+        retry_leader.fail().await;
+    }
+
+    #[tokio::test]
     async fn signature_slot_cache_expires() {
-        let cache =
-            SignatureSlotCache::new(Duration::from_millis(50), Duration::from_millis(50), 128);
+        let cache = Arc::new(SignatureSlotCache::new(
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            128,
+        ));
         let key: SignatureBytes = [1u8; 64];
 
-        let notify = match cache.get_or_start(key).await {
-            CacheStart::Leader(notify) => notify,
+        let leader = match cache.get_or_start(key).await {
+            CacheStart::Leader(leader) => leader,
             other => panic!("expected leader, got {other:?}"),
         };
-        cache.finish(key, notify, None).await;
+        leader.finish(None).await;
 
         match cache.get_or_start(key).await {
             CacheStart::Hit(None) => {}

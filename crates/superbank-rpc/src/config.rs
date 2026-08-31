@@ -5,8 +5,8 @@
 
 use std::str::FromStr;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use clap::{ArgAction, Parser};
-use solana_sdk::pubkey::Pubkey;
 
 const METRICS_CAPTURE_HEADER_X_ENDPOINT: &str = "X-Endpoint";
 const METRICS_CAPTURE_HEADER_X_RPC_NODE: &str = "X-RPC-Node";
@@ -344,36 +344,43 @@ pub struct RpcConfig {
     )]
     pub(crate) clickhouse_tcp_access_check_timeout_ms: u64,
 
-    /// ClickHouse cluster name used to discover shard topology (supports macros like {cluster}).
+    /// ClickHouse cluster name used to discover shard topology in shard-direct scope.
+    /// Supports macros such as {cluster}.
     #[arg(long, env = "CLICKHOUSE_CLUSTER", default_value = "{cluster}")]
     pub(crate) clickhouse_cluster: String,
 
-    /// Optional authoritative YAML topology file for shard-direct ClickHouse connections.
-    /// When set, superbank-rpc skips system.clusters discovery and uses the YAML mapping directly.
+    /// Optional authoritative YAML topology file for shard-local ClickHouse connections.
+    /// In shard-direct scope, this skips system.clusters discovery and uses the YAML mapping.
+    /// Distributed scope ignores this setting.
     #[arg(long, env = "CLICKHOUSE_TOPOLOGY_CONFIG")]
     pub(crate) clickhouse_topology_config: Option<String>,
 
-    /// Local gsfa table name on each shard (required for CLICKHOUSE_SCOPE=shard-direct).
+    /// Local gsfa table used by shard-direct address queries.
     #[arg(long, env = "CLICKHOUSE_GSFA_LOCAL_TABLE")]
     pub(crate) clickhouse_gsfa_local_table: Option<String>,
 
-    /// Local signatures table name on each shard (defaults to CLICKHOUSE_SIGNATURE_STATUSES_TABLE + _local).
+    /// Local signatures table used in shard-direct scope.
+    /// Defaults to CLICKHOUSE_SIGNATURE_STATUSES_TABLE + _local.
     #[arg(long, env = "CLICKHOUSE_SIGNATURES_LOCAL_TABLE")]
     pub(crate) clickhouse_signatures_local_table: Option<String>,
 
-    /// Local token owner activity table name on each shard (defaults to CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE + _local).
+    /// Local token owner activity table used in shard-direct scope.
+    /// Defaults to CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE + _local.
     #[arg(long, env = "CLICKHOUSE_TOKEN_OWNER_ACTIVITY_LOCAL_TABLE")]
     pub(crate) clickhouse_token_owner_activity_local_table: Option<String>,
 
-    /// Local transactions table name on each shard (defaults to CLICKHOUSE_TRANSACTION_TABLE + _local).
+    /// Local transactions table used in shard-direct scope.
+    /// Defaults to CLICKHOUSE_TRANSACTION_TABLE + _local.
     #[arg(long, env = "CLICKHOUSE_TRANSACTIONS_LOCAL_TABLE")]
     pub(crate) clickhouse_transactions_local_table: Option<String>,
 
-    /// Local blocks metadata table name on each shard (defaults to CLICKHOUSE_BLOCKS_METADATA_TABLE + _local).
+    /// Local blocks metadata table used in shard-direct scope.
+    /// Defaults to CLICKHOUSE_BLOCKS_METADATA_TABLE + _local.
     #[arg(long, env = "CLICKHOUSE_BLOCKS_METADATA_LOCAL_TABLE")]
     pub(crate) clickhouse_blocks_metadata_local_table: Option<String>,
 
-    /// Override shard HTTP port for shard-local HTTP queries (defaults to port in CLICKHOUSE_URL).
+    /// Override the shard HTTP port in shard-direct scope.
+    /// Defaults to the port in CLICKHOUSE_URL.
     #[arg(long, env = "CLICKHOUSE_SHARD_HTTP_PORT")]
     pub(crate) clickhouse_shard_http_port: Option<u16>,
 
@@ -394,7 +401,7 @@ pub struct RpcConfig {
     )]
     pub(crate) clickhouse_gsfa_hot_table: String,
 
-    /// Local GSFA hot table backing CLICKHOUSE_GSFA_HOT_TABLE on each shard.
+    /// Local GSFA hot table used by shard-direct hot-address fanout.
     #[arg(
         long,
         env = "CLICKHOUSE_GSFA_HOT_LOCAL_TABLE",

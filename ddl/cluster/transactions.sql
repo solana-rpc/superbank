@@ -13,6 +13,10 @@ CREATE TABLE IF NOT EXISTS default.transactions_local ON CLUSTER '{cluster}'
     message_hash      FixedString(32),
     is_vote           UInt8,
     tx_version                         Nullable(UInt8),
+    tx_config_priority_fee             Nullable(UInt64),
+    tx_config_compute_unit_limit       Nullable(UInt32),
+    tx_config_loaded_accounts_data_size_limit Nullable(UInt32),
+    tx_config_heap_size                Nullable(UInt32),
     tx_signatures                      Array(FixedString(64)),
     tx_num_required_signatures         UInt8,
     tx_num_readonly_signed_accounts    UInt8,
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS default.transactions_local ON CLUSTER '{cluster}'
     meta_reward_post_balance           Array(UInt64) CODEC(ZSTD(1)),
     meta_reward_type                   Array(Nullable(String)) CODEC(ZSTD(1)),
     meta_reward_commission             Array(Nullable(UInt8)),
+    meta_reward_commission_bps         Array(Nullable(UInt16)),
     meta_loaded_addresses_writable     Array(FixedString(32)),
     meta_loaded_addresses_readonly     Array(FixedString(32)),
     meta_return_data_present           UInt8,
@@ -85,6 +90,10 @@ CREATE TABLE IF NOT EXISTS default.transactions ON CLUSTER '{cluster}'
     message_hash      FixedString(32),
     is_vote           UInt8,
     tx_version                         Nullable(UInt8),
+    tx_config_priority_fee             Nullable(UInt64),
+    tx_config_compute_unit_limit       Nullable(UInt32),
+    tx_config_loaded_accounts_data_size_limit Nullable(UInt32),
+    tx_config_heap_size                Nullable(UInt32),
     tx_signatures                      Array(FixedString(64)),
     tx_num_required_signatures         UInt8,
     tx_num_readonly_signed_accounts    UInt8,
@@ -135,6 +144,7 @@ CREATE TABLE IF NOT EXISTS default.transactions ON CLUSTER '{cluster}'
     meta_reward_post_balance           Array(UInt64) CODEC(ZSTD(1)),
     meta_reward_type                   Array(Nullable(String)) CODEC(ZSTD(1)),
     meta_reward_commission             Array(Nullable(UInt8)),
+    meta_reward_commission_bps         Array(Nullable(UInt16)),
     meta_loaded_addresses_writable     Array(FixedString(32)),
     meta_loaded_addresses_readonly     Array(FixedString(32)),
     meta_return_data_present           UInt8,
@@ -144,3 +154,19 @@ CREATE TABLE IF NOT EXISTS default.transactions ON CLUSTER '{cluster}'
     meta_cost_units                    Nullable(UInt64)
 )
 ENGINE = Distributed('{cluster}', 'default', 'transactions_local', intDiv(slot, 432000));
+
+ALTER TABLE default.transactions_local ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS meta_reward_commission_bps Array(Nullable(UInt16)) AFTER meta_reward_commission;
+ALTER TABLE default.transactions ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS meta_reward_commission_bps Array(Nullable(UInt16)) AFTER meta_reward_commission;
+
+ALTER TABLE default.transactions_local ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS tx_config_priority_fee Nullable(UInt64) AFTER tx_version,
+    ADD COLUMN IF NOT EXISTS tx_config_compute_unit_limit Nullable(UInt32) AFTER tx_config_priority_fee,
+    ADD COLUMN IF NOT EXISTS tx_config_loaded_accounts_data_size_limit Nullable(UInt32) AFTER tx_config_compute_unit_limit,
+    ADD COLUMN IF NOT EXISTS tx_config_heap_size Nullable(UInt32) AFTER tx_config_loaded_accounts_data_size_limit;
+ALTER TABLE default.transactions ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS tx_config_priority_fee Nullable(UInt64) AFTER tx_version,
+    ADD COLUMN IF NOT EXISTS tx_config_compute_unit_limit Nullable(UInt32) AFTER tx_config_priority_fee,
+    ADD COLUMN IF NOT EXISTS tx_config_loaded_accounts_data_size_limit Nullable(UInt32) AFTER tx_config_compute_unit_limit,
+    ADD COLUMN IF NOT EXISTS tx_config_heap_size Nullable(UInt32) AFTER tx_config_loaded_accounts_data_size_limit;
