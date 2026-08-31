@@ -5,7 +5,7 @@
 
 //! Superbank JSON-RPC server library.
 
-// Compatibility namespace for the SDK modules used by the RPC implementation.  The
+// Compatibility namespace for the SDK modules used by the RPC implementation. The
 // concrete types come from Agave's split crates, which keeps message and transaction
 // types aligned with transaction-status instead of pulling in the monolithic SDK.
 #[allow(unused_imports)]
@@ -42,6 +42,7 @@ mod processing;
 mod config;
 #[cfg(feature = "disk-cache")]
 mod disk_cache;
+mod genesis;
 #[cfg(feature = "grpc-streaming")]
 mod grpc;
 mod handlers;
