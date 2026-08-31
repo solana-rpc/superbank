@@ -2272,6 +2272,7 @@ mod tests {
                     token_owner_activity_local_table: Some(
                         "default.token_owner_activity_local".to_string(),
                     ),
+                    transfers_local_table: Some("default.transfers_local".to_string()),
                     transactions_local_table: Some("default.transactions_local".to_string()),
                     blocks_metadata_local_table: Some("default.blocks_metadata_local".to_string()),
                 }),
@@ -2313,6 +2314,7 @@ mod tests {
                     gsfa_local_table: None,
                     signatures_local_table: None,
                     token_owner_activity_local_table: None,
+                    transfers_local_table: None,
                     transactions_local_table: None,
                     blocks_metadata_local_table: None,
                 }),

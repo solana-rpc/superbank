@@ -6,8 +6,8 @@
 use std::str::FromStr;
 use std::time::Instant;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
@@ -449,8 +449,11 @@ mod tests {
     fn amount_filter_uses_exact_unsigned_integer_conversion() {
         let mut query = base_query(SolMode::Separate);
         query.amount_filter = Some(NumericFilter {
+            gte: None,
+            gt: None,
+            lte: None,
+            lt: None,
             eq: Some(super::super::RawAmount::new(9_007_199_254_740_993)),
-            ..NumericFilter::default()
         });
 
         let sql = build_transfers_by_address_query("default.transfers", &query, "")
