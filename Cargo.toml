@@ -21,6 +21,8 @@ authors = [
     "aspnxdd <43625217+aspnxdd@users.noreply.github.com>",
 ]
 
+# Shared by the ingestor and Solparq. Keep RPC dependencies explicit until a
+# workspace-wide dependency policy is agreed.
 [workspace.dependencies]
 anyhow = "1.0"
 axum = "0.8"
@@ -31,7 +33,6 @@ prometheus-client = "0.23.1"
 prometheus-client-derive-encode = "0.4.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
-superbank-solparq = { path = "crates/superbank-solparq" }
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
