@@ -30,7 +30,7 @@ pub(crate) struct RpcParameterFilterSet {
 
 impl RpcParameterFilterSet {
     pub(crate) fn load(path: Option<&Path>) -> Result<Self, String> {
-        let Some(path) = path else {
+        let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
             return Ok(Self::default());
         };
 
@@ -78,6 +78,13 @@ impl RpcParameterFilterSet {
             if method.trim().is_empty() {
                 return Err(Self::entry_error(path, index, "method must not be empty"));
             }
+            if method != method.trim() {
+                return Err(Self::entry_error(
+                    path,
+                    index,
+                    "method must not have leading or trailing whitespace",
+                ));
+            }
 
             let candidates = filters
                 .by_method_and_arity
@@ -107,6 +114,8 @@ impl RpcParameterFilterSet {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::json;
 
     use super::RpcParameterFilterSet;
@@ -139,6 +148,15 @@ mod tests {
             Some(&[json!("address"), json!({"mode": "full"}), json!(true)])
         ));
         assert!(!filters.matches("getThing", None));
+    }
+
+    #[test]
+    fn method_only_entry_matches_only_explicit_empty_params() {
+        let filters = filters(vec![vec![json!("getThing")]]);
+
+        assert!(filters.matches("getThing", Some(&[])));
+        assert!(!filters.matches("getThing", None));
+        assert!(!filters.matches("getThing", Some(&[Value::Null])));
     }
 
     #[test]
@@ -190,5 +208,39 @@ rpc-parameter-filters:
 
         let filters = RpcParameterFilterSet::load(Some(&path)).expect("load config");
         assert!(filters.matches("getThing", Some(&[json!("address")])));
+    }
+
+    #[test]
+    fn empty_config_path_is_treated_as_unset() {
+        let filters = RpcParameterFilterSet::load(Some(Path::new("")))
+            .expect("empty config path should be ignored");
+
+        assert_eq!(filters.len(), 0);
+    }
+
+    #[test]
+    fn config_read_and_parse_failures_include_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_path = dir.path().join("missing.yaml");
+        let missing_err = RpcParameterFilterSet::load(Some(&missing_path))
+            .expect_err("missing config should fail");
+        assert!(missing_err.contains("failed to read config file"));
+        assert!(missing_err.contains(missing_path.to_string_lossy().as_ref()));
+
+        let invalid_path = dir.path().join("invalid.yaml");
+        std::fs::write(&invalid_path, "rpc-parameter-filters: not-an-array")
+            .expect("write invalid config");
+        let invalid_err = RpcParameterFilterSet::load(Some(&invalid_path))
+            .expect_err("invalid config should fail");
+        assert!(invalid_err.contains("failed to parse config file"));
+        assert!(invalid_err.contains(invalid_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn methods_with_leading_or_trailing_whitespace_are_rejected() {
+        let err = RpcParameterFilterSet::from_entries(vec![vec![json!("getThing ")]], None)
+            .expect_err("whitespace in method should fail validation");
+
+        assert!(err.contains("leading or trailing whitespace"));
     }
 }

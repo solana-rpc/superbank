@@ -15,7 +15,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use solana_rpc_client_api::custom_error::{
     JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE, JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY,
 };
@@ -56,8 +56,9 @@ const ROUTE_HEADER_LABEL_MISSING: &str = "missing";
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
 const JSON_RPC_REQUEST_TIMEOUT_CODE: i64 = -32000;
 const JSON_RPC_REQUEST_TIMEOUT_MESSAGE: &str = "Request timeout";
-const JSON_RPC_METHOD_NOT_ALLOWED_CODE: i32 = -32601;
-const JSON_RPC_METHOD_NOT_ALLOWED_MESSAGE: &str = "Method not allowed";
+const JSON_RPC_PARAMETER_FILTER_CODE: i32 = -32602;
+const JSON_RPC_PARAMETER_FILTER_MESSAGE: &str =
+    "Invalid params: request blocked by parameter filter";
 const HEADER_X_ENDPOINT: &str = "X-Endpoint";
 const HEADER_X_RPC_NODE: &str = "X-RPC-Node";
 const HEADER_X_SUBSCRIPTION_ID: &str = "X-Subscription-ID";
@@ -643,27 +644,25 @@ fn json_rpc_error_value(
 
 fn observe_parameter_filter_match(method: &str) {
     if let Some(tracker) = metrics::track_request(metrics_method_label(method)) {
-        tracker.observe(StatusCode::METHOD_NOT_ALLOWED);
+        tracker.observe(StatusCode::OK);
     }
 }
 
-fn parameter_filter_response(id: Value) -> Response {
-    let mut response = json_rpc_error_response(
+fn parameter_filter_response(id: Value, method: String, params: Vec<Value>) -> Response {
+    json_rpc_error_response(
         id,
-        JSON_RPC_METHOD_NOT_ALLOWED_CODE,
-        JSON_RPC_METHOD_NOT_ALLOWED_MESSAGE,
-        None,
-    );
-    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-    response
+        JSON_RPC_PARAMETER_FILTER_CODE,
+        JSON_RPC_PARAMETER_FILTER_MESSAGE,
+        Some(json!({ "method": method, "params": params })),
+    )
 }
 
-fn parameter_filter_response_value(id: Value) -> Value {
+fn parameter_filter_response_value(id: Value, method: String, params: Vec<Value>) -> Value {
     json_rpc_error_value(
         id,
-        JSON_RPC_METHOD_NOT_ALLOWED_CODE,
-        JSON_RPC_METHOD_NOT_ALLOWED_MESSAGE,
-        None,
+        JSON_RPC_PARAMETER_FILTER_CODE,
+        JSON_RPC_PARAMETER_FILTER_MESSAGE,
+        Some(json!({ "method": method, "params": params })),
     )
 }
 
@@ -1087,21 +1086,22 @@ async fn handle_single_request(
         }
     };
 
+    let NormalizedJsonRpcRequest { id, method, params } = request;
     if state
         .rpc_parameter_filters
-        .matches(&request.method, request.params.as_deref())
+        .matches(&method, params.as_deref())
     {
-        let method = request.method;
-        let id = request.id.unwrap_or(Value::Null);
+        let id = id.unwrap_or(Value::Null);
+        let params = params.unwrap_or_default();
         return metrics::with_request_metric_labels(request_metric_labels, async move {
             observe_parameter_filter_match(&method);
-            Ok(parameter_filter_response(id))
+            Ok(parameter_filter_response(id, method, params))
         })
         .await;
     }
 
     let timeout = state.rpc_request_timeout;
-    let dispatch_request = request.into_dispatch_request();
+    let dispatch_request = NormalizedJsonRpcRequest { id, method, params }.into_dispatch_request();
     let response = metrics::with_request_metric_labels(
         request_metric_labels,
         Box::pin(dispatch_json_rpc_request(
@@ -1125,7 +1125,6 @@ async fn execute_batch_requests(
 
     let mut responses: Vec<Option<BatchItemResponse>> = (0..batch_len).map(|_| None).collect();
     let mut join_set: JoinSet<BatchTaskOutput> = JoinSet::new();
-    let mut parameter_filter_matched = false;
 
     for (idx, request_value) in requests.into_iter().enumerate() {
         match parse_json_rpc_request(request_value) {
@@ -1137,8 +1136,9 @@ async fn execute_batch_requests(
                     observe_parameter_filter_match(&request.method);
                     responses[idx] = Some(parameter_filter_response_value(
                         request.id.unwrap_or(Value::Null),
+                        request.method,
+                        request.params.unwrap_or_default(),
                     ));
-                    parameter_filter_matched = true;
                     continue;
                 }
 
@@ -1213,11 +1213,7 @@ async fn execute_batch_requests(
         response_values.push(value);
     }
 
-    let mut response = Json(Value::Array(response_values)).into_response();
-    if parameter_filter_matched {
-        *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-    }
-    Ok(response)
+    Ok(Json(Value::Array(response_values)).into_response())
 }
 
 async fn handle_batch_request(

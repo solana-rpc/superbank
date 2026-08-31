@@ -188,6 +188,18 @@ fn test_state_with_parameter_filters(entries: Vec<Vec<Value>>) -> Arc<AppState> 
     Arc::new(state)
 }
 
+fn test_state_with_parameter_filters_and_metrics_header_capture(
+    entries: Vec<Vec<Value>>,
+    capture: MetricsHeaderCaptureConfig,
+) -> Arc<AppState> {
+    let mut state = match Arc::try_unwrap(test_state_with_parameter_filters(entries)) {
+        Ok(state) => state,
+        Err(_) => panic!("test_state should have a single Arc owner"),
+    };
+    state.metrics_header_capture = capture;
+    Arc::new(state)
+}
+
 fn test_state_with_metrics_header_capture(capture: MetricsHeaderCaptureConfig) -> Arc<AppState> {
     let mut state = match Arc::try_unwrap(test_state()) {
         Ok(state) => state,
@@ -3524,13 +3536,8 @@ async fn handle_json_rpc_method_not_found_returns_json_rpc_error() {
 }
 
 #[tokio::test]
-async fn parameter_filter_returns_http_405_before_handler_dispatch() {
+async fn parameter_filter_preserves_json_rpc_client_error_over_http_in_all_modes() {
     let address = "So11111111111111111111111111111111111111112";
-    let state = test_state_with_parameter_filters(vec![vec![
-        json!("getTransactionsForAddress"),
-        json!(address),
-        json!({"transactionDetails": "signatures"}),
-    ]]);
     let request = json!({
         "jsonrpc": "2.0",
         "id": 42,
@@ -3538,15 +3545,37 @@ async fn parameter_filter_returns_http_405_before_handler_dispatch() {
         "params": [address, {"transactionDetails": "signatures"}]
     });
 
-    let response = handle_json_rpc_value(state, &request).await;
+    for emit_http_errors in [false, true] {
+        let state = test_state_with_parameter_filters(vec![vec![
+            json!("getTransactionsForAddress"),
+            json!(address),
+            json!({"transactionDetails": "signatures"}),
+        ]]);
+        let state = if emit_http_errors {
+            test_state_with_emit_http_errors(state)
+        } else {
+            state
+        };
 
-    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    let parsed = parse_json_rpc_response(response).await;
-    assert_eq!(parsed.id, json!(42));
-    let err = parsed.error.expect("error present");
-    assert_eq!(err.code, -32601);
-    assert_eq!(err.message, "Method not allowed");
-    assert!(err.data.is_none());
+        let response = handle_json_rpc_value(state, &request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed = parse_json_rpc_response(response).await;
+        assert_eq!(parsed.id, json!(42));
+        let err = parsed.error.expect("error present");
+        assert_eq!(err.code, -32602);
+        assert_eq!(
+            err.message,
+            "Invalid params: request blocked by parameter filter"
+        );
+        assert_eq!(
+            err.data,
+            Some(json!({
+                "method": "getTransactionsForAddress",
+                "params": [address, {"transactionDetails": "signatures"}],
+            }))
+        );
+    }
 }
 
 #[tokio::test]
@@ -3572,7 +3601,7 @@ async fn parameter_filter_requires_complete_param_equality() {
             .error
             .expect("handler error proves dispatch occurred")
             .message,
-        "Method not allowed"
+        "Invalid params: request blocked by parameter filter"
     );
 }
 
@@ -3735,36 +3764,119 @@ async fn handle_json_rpc_batch_preserves_input_order() {
 }
 
 #[tokio::test]
-async fn parameter_filter_marks_mixed_batch_405_and_executes_allowed_items() {
-    let state =
-        test_state_with_parameter_filters(vec![vec![json!("blockedMethod"), json!("blocked")]]);
+async fn parameter_filter_preserves_mixed_batch_order_and_http_status_in_all_modes() {
     let request = json!([
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "blockedMethod",
-            "params": ["blocked"]
+            "method": "getSlot",
+            "params": [{"commitment": "finalized"}]
         },
         {
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "unknownMethod",
-            "params": []
+            "method": "getSlot"
+        }
+    ]);
+
+    for emit_http_errors in [false, true] {
+        let state = test_state_with_parameter_filters(vec![vec![
+            json!("getSlot"),
+            json!({"commitment": "finalized"}),
+        ]]);
+        let state = if emit_http_errors {
+            test_state_with_emit_http_errors(state)
+        } else {
+            state
+        };
+
+        let response = handle_json_rpc_value(state, &request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed = parse_json_value_response(response).await;
+        let results = parsed.as_array().expect("batch response array");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["id"], json!(1));
+        assert_eq!(results[0]["error"]["code"], json!(-32602));
+        assert_eq!(
+            results[0]["error"]["message"],
+            json!("Invalid params: request blocked by parameter filter")
+        );
+        assert_eq!(
+            results[0]["error"]["data"],
+            json!({
+                "method": "getSlot",
+                "params": [{"commitment": "finalized"}],
+            })
+        );
+        assert_eq!(results[1]["id"], json!(2));
+        assert_eq!(results[1]["result"], json!(1));
+    }
+}
+
+#[tokio::test]
+async fn parameter_filter_does_not_match_omitted_or_null_params() {
+    let state = test_state_with_parameter_filters(vec![vec![json!("getSlot")]]);
+    let request = json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSlot"
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "getSlot",
+            "params": null
         }
     ]);
 
     let response = handle_json_rpc_value(state, &request).await;
 
-    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.status(), StatusCode::OK);
     let parsed = parse_json_value_response(response).await;
     let results = parsed.as_array().expect("batch response array");
-    assert_eq!(results.len(), 2);
     assert_eq!(results[0]["id"], json!(1));
-    assert_eq!(results[0]["error"]["message"], json!("Method not allowed"));
+    assert_eq!(results[0]["result"], json!(1));
     assert_eq!(results[1]["id"], json!(2));
-    assert_eq!(
-        results[1]["error"]["message"],
-        json!("Method not found: unknownMethod")
+    assert_eq!(results[1]["result"], json!(1));
+}
+
+#[tokio::test]
+async fn parameter_filter_metrics_record_http_200() {
+    let state = test_state_with_parameter_filters_and_metrics_header_capture(
+        vec![vec![json!("getSlot")]],
+        MetricsHeaderCaptureConfig {
+            capture_x_endpoint: true,
+            ..Default::default()
+        },
+    );
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSlot",
+        "params": []
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Endpoint",
+        HeaderValue::from_static("parameter-filter-metrics"),
+    );
+
+    let response = handle_json_rpc_value_with_headers(state, headers, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(metrics::export_metrics().expect("metrics export"))
+        .expect("metrics should be valid UTF-8");
+    let parameter_filter_metric = text.lines().any(|line| {
+        line.starts_with("superbank_rpc_requests_total{")
+            && line.contains("method=\"getSlot\"")
+            && line.contains("status=\"200\"")
+            && line.contains("x_endpoint=\"parameter-filter-metrics\"")
+    });
+    assert!(
+        parameter_filter_metric,
+        "metrics output missing parameter-filter HTTP 200 sample: {text}"
     );
 }
 

@@ -114,16 +114,19 @@ rpc-parameter-filters:
   - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
 ```
 
-Each entry contains the case-sensitive method followed by its complete parameter array. Matching
-is structural and exact: parameter count, array order, JSON types, and values must match; mapping
-key order does not matter. Extra parameters do not match. A method-only entry matches an explicitly
-empty `params: []` array; omitted `params` is distinct.
+Each entry contains the case-sensitive method followed by its complete parameter array. Method
+names cannot have leading or trailing whitespace. Matching is structural and exact: parameter
+count, array order, JSON types, and values must match; mapping key order does not matter. Extra
+parameters do not match. A method-only entry matches an explicitly empty `params: []` array;
+omitted `params` is distinct.
 
-A matching call returns HTTP `405 Method Not Allowed` and preserves the request ID in a JSON-RPC
-error with code `-32601` and message `Method not allowed`. In a mixed batch, allowed calls still
-execute and matched calls receive individual errors in their original positions; the batch HTTP
-status is 405 if any item matched. Filters are validated and indexed once at startup, so changing
-the file requires restarting `superbank-rpc`.
+A matching call preserves the request ID in a JSON-RPC error with code `-32602` and message
+`Invalid params: request blocked by parameter filter`. Its error `data` echoes the matched
+`method` and complete `params` array. It remains HTTP `200 OK`, including when
+`--emit-http-errors` is enabled, because it is a client error rather than a server-side failure.
+In a mixed batch, allowed calls still execute and matched calls receive individual errors in their
+original positions. Filters are validated and indexed once at startup, so changing the file
+requires restarting `superbank-rpc`.
 
 ## Optional Superbank gRPC streaming (`grpc-streaming`)
 
