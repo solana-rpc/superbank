@@ -614,7 +614,7 @@ Methods served from disk when covered: `getBlock`, `getBlocks`, `getBlocksWithLi
 
 The source ClickHouse user needs read access to the copied tables and their metadata. The local ClickHouse user needs permission to create and drop the dedicated database, create and alter its tables, and read and insert its data. The local HTTP endpoint must use `localhost` or a loopback IP. It can use a different port when the source ClickHouse server is on the same host.
 
-The local database is semi-ephemeral. Superbank marks databases that it owns and refuses to modify a nonempty unmarked database. A source schema change rebuilds only a marked cache database. `DISK_CACHE_RETAIN_SLOTS` is required. The forwarder fills backward to the configured retention floor when the cache starts partially filled or the retention window increases. `DISK_CACHE_MAX_BYTES` can set a tighter limit. Retention drops complete old slot partitions.
+The local database is semi-ephemeral. Superbank marks databases that it owns and refuses to modify a nonempty unmarked database. A source schema change rebuilds only a marked cache database. `DISK_CACHE_RETAIN_SLOTS` is required. The forwarder fills backward to the configured retention floor when the cache starts partially filled or the retention window increases. `DISK_CACHE_MAX_BYTES` enforces the primary cache database's active-part budget after each fill by evicting complete old partitions; it can purge the newest partition and mark the cache unready when no retained partition fits. Retention drops complete old slot partitions.
 
 ```bash
 # Build with the independent disk-cache feature
@@ -638,15 +638,17 @@ Key configuration options:
 | `--disk-cache-clickhouse-database` | `DISK_CACHE_CLICKHOUSE_DATABASE` | `superbank_disk_cache` | Dedicated database owned by the cache |
 | `--disk-cache-required` | `DISK_CACHE_REQUIRED` | `false` | Require local initialization at startup and local health for `/health` |
 | `--disk-cache-retain-slots` | `DISK_CACHE_RETAIN_SLOTS` | — | Finalized slots to retain; required when enabled |
-| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | MergeTree byte budget; `0` means unlimited |
+| `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Enforced active-part budget for the primary cache database; `0` means unlimited. A too-small budget can purge the newest partition and leave the cache unready. |
 | `--disk-cache-partition-slots` | `DISK_CACHE_PARTITION_SLOTS` | automatic | Width of local slot partitions |
 | `--disk-cache-memory-tables` | `DISK_CACHE_MEMORY_TABLES` | empty | Memory-engine allowlist; only `blocks_metadata` is accepted |
+| `--disk-cache-block-index-enabled` | `DISK_CACHE_BLOCK_INDEX_ENABLED` | `false` | Durable block-time history plus a bounded in-process read tier; requires `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES` |
+| `--disk-cache-block-index-max-memory-bytes` | `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES` | — | Required memory budget; must fit one 8,125,000-byte segment |
 | `--disk-cache-backfill-enabled` | `DISK_CACHE_BACKFILL_ENABLED` | `true` | Source-to-local forward and repair task |
 | `--disk-cache-backfill-slots-per-query` | `DISK_CACHE_BACKFILL_SLOTS_PER_QUERY` | `8` | Slots streamed and validated in one range |
 | `--disk-cache-backfill-concurrency` | `DISK_CACHE_BACKFILL_CONCURRENCY` | `4` | Concurrent independent ranges; accepted range is 1–64 |
 | `--disk-cache-backfill-max-slots-per-sec` | `DISK_CACHE_BACKFILL_MAX_SLOTS_PER_SEC` | `50` | Global admission rate across all ranges |
 
-If `DISK_CACHE_MEMORY_TABLES=blocks_metadata`, also set `DISK_CACHE_MEMORY_RETAIN_SLOTS` and `DISK_CACHE_MEMORY_MAX_BYTES`. Memory coverage resets after a local ClickHouse restart. See the [RPC server reference](../crates/superbank-rpc/README.md#optional-local-clickhouse-forward-cache-disk-cache) for every forwarding, timeout, retention, and Memory-engine option.
+If `DISK_CACHE_MEMORY_TABLES=blocks_metadata`, also set `DISK_CACHE_MEMORY_RETAIN_SLOTS` and `DISK_CACHE_MEMORY_MAX_BYTES`. Memory coverage resets after a local ClickHouse restart before the forwarder republishes it. The primary cache budget does not include the separately owned block-index database. See the [RPC server reference](../crates/superbank-rpc/README.md#optional-local-clickhouse-forward-cache-disk-cache) for every forwarding, timeout, retention, and Memory-engine option.
 
 By default, local initialization is fail-open. The RPC server starts against the source cluster and retries the local cache in the background. Set `DISK_CACHE_REQUIRED=true` to make initialization and health strict.
 

@@ -55,6 +55,10 @@ pub(crate) enum DiskCacheError {
         expected: u64,
         actual: u64,
     },
+    #[error(
+        "disk cache byte budget {max_bytes} remains exceeded after eviction: {actual_bytes} bytes"
+    )]
+    ByteBudgetExceeded { max_bytes: u64, actual_bytes: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +95,37 @@ pub(crate) fn automatic_partition_slots(retain_slots: u64) -> u64 {
     let width = retain_slots.saturating_add(127) / 128;
     let rounded = (width.saturating_add(999) / 1_000).saturating_mul(1_000);
     rounded.clamp(10_000, 432_000)
+}
+
+fn partition_floor_at_or_above(slot: u64, partition_slots: u64) -> u64 {
+    let partition = slot / partition_slots;
+    let floor = partition.saturating_mul(partition_slots);
+    if floor < slot {
+        partition.saturating_add(1).saturating_mul(partition_slots)
+    } else {
+        floor
+    }
+}
+
+fn byte_budget_eviction_floor(
+    head: u64,
+    old_floor: u64,
+    bytes: u64,
+    max_bytes: u64,
+    partition_slots: u64,
+) -> u64 {
+    let target = max_bytes.saturating_mul(BYTE_BUDGET_LOW_WATER_PERCENT) / 100;
+    let covered = head.saturating_sub(old_floor).saturating_add(1).max(1);
+    let bytes_per_slot = (bytes / covered).max(1);
+    let keep = (target / bytes_per_slot).max(1);
+    let desired_floor = head.saturating_sub(keep.saturating_sub(1));
+    partition_floor_at_or_above(desired_floor, partition_slots)
+}
+
+fn partition_floor_after(slot: u64, partition_slots: u64) -> u64 {
+    (slot / partition_slots)
+        .saturating_add(1)
+        .saturating_mul(partition_slots)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +302,7 @@ impl DiskCache {
         });
         let cache = Self { inner };
         cache.reload_coverage().await?;
+        cache.maybe_evict().await?;
         cache.set_ready(true);
         cache.publish_coverage_metrics();
         info!(
@@ -392,6 +428,7 @@ impl DiskCache {
         let snapshot = schema::inspect_source_schema(source, &schema_config).await?;
         if snapshot.fingerprint == self.source_schema().fingerprint {
             if !self.ready() && self.ping().await {
+                self.maybe_evict().await?;
                 self.set_ready(true);
             }
             return Ok(false);
@@ -408,6 +445,7 @@ impl DiskCache {
             *self.inner.query_client.write().expect("query client lock") = query_client;
             *self.inner.schema.write().expect("schema lock") = Arc::new(snapshot);
             self.reload_coverage().await?;
+            self.maybe_evict().await?;
             Ok::<(), DiskCacheError>(())
         }
         .await;
@@ -1009,33 +1047,61 @@ impl DiskCache {
             crate::metrics::disk_cache_size_bytes(bytes);
             if bytes >= self.inner.cfg.max_bytes {
                 byte_budget_bound = true;
-                let target = self
-                    .inner
-                    .cfg
-                    .max_bytes
-                    .saturating_mul(BYTE_BUDGET_LOW_WATER_PERCENT)
-                    / 100;
-                let covered = head.saturating_sub(old_floor).saturating_add(1).max(1);
-                let bytes_per_slot = (bytes / covered).max(1);
-                let keep = (target / bytes_per_slot).max(1);
-                new_floor = new_floor.max(head.saturating_sub(keep.saturating_sub(1)));
+                new_floor = new_floor.max(byte_budget_eviction_floor(
+                    head,
+                    old_floor,
+                    bytes,
+                    self.inner.cfg.max_bytes,
+                    self.inner.cfg.partition_slots,
+                ));
             }
         }
+        let mut evicted = self
+            .evict_below(
+                new_floor,
+                if byte_budget_bound { "bytes" } else { "window" },
+            )
+            .await?;
+
+        if byte_budget_bound {
+            let bytes = self.cache_bytes().await?;
+            crate::metrics::disk_cache_size_bytes(bytes);
+            if bytes >= self.inner.cfg.max_bytes {
+                let purge_floor = partition_floor_after(head, self.inner.cfg.partition_slots);
+                evicted |= self.evict_below(purge_floor, "bytes").await?;
+
+                let bytes = self.cache_bytes().await?;
+                crate::metrics::disk_cache_size_bytes(bytes);
+                if bytes >= self.inner.cfg.max_bytes {
+                    self.set_ready(false);
+                    return Err(DiskCacheError::ByteBudgetExceeded {
+                        max_bytes: self.inner.cfg.max_bytes,
+                        actual_bytes: bytes,
+                    });
+                }
+            }
+        }
+
+        Ok(evicted)
+    }
+
+    async fn evict_below(
+        &self,
+        new_floor: u64,
+        reason: &'static str,
+    ) -> Result<bool, DiskCacheError> {
+        let old_floor = self.min_retained_slot();
         if new_floor <= old_floor {
             return Ok(false);
         }
-
+        self.drop_partitions_below(new_floor).await?;
         self.inner.min_retained.store(new_floor, Ordering::Relaxed);
         self.inner
             .coverage
             .write()
             .expect("coverage lock")
             .remove_below(new_floor);
-        self.drop_partitions_below(new_floor).await?;
-        crate::metrics::disk_cache_evicted(
-            if byte_budget_bound { "bytes" } else { "window" },
-            new_floor - old_floor,
-        );
+        crate::metrics::disk_cache_evicted(reason, new_floor - old_floor);
         self.publish_coverage_metrics();
         Ok(true)
     }
@@ -1215,6 +1281,17 @@ mod tests {
         assert_eq!(automatic_partition_slots(432_000), 10_000);
         assert_eq!(automatic_partition_slots(4_320_000), 34_000);
         assert_eq!(automatic_partition_slots(u64::MAX), 432_000);
+    }
+
+    #[test]
+    fn byte_budget_eviction_rounds_up_to_complete_partitions() {
+        assert_eq!(partition_floor_at_or_above(1_000, 1_000), 1_000);
+        assert_eq!(partition_floor_at_or_above(1_001, 1_000), 2_000);
+        assert_eq!(partition_floor_after(1_999, 1_000), 2_000);
+        assert_eq!(
+            byte_budget_eviction_floor(1_999, 0, 2_000, 1_000, 1_000),
+            2_000
+        );
     }
 
     #[test]

@@ -163,6 +163,15 @@ pub(crate) async fn run(
             last_schema_check = Instant::now();
         }
 
+        if let Err(err) = cache.maybe_evict().await {
+            cache.set_ready(false);
+            warn!("disk cache: retention check failed: {err}");
+            if wait_or_shutdown(&mut shutdown, cfg.repair_interval).await {
+                break;
+            }
+            continue;
+        }
+
         let Some(window) = claimable_window(&source, &cfg).await else {
             if wait_or_shutdown(&mut shutdown, cfg.repair_interval).await {
                 break;
@@ -247,9 +256,11 @@ pub(crate) async fn run(
         }
 
         if succeeded {
-            cache.set_ready(true);
             if let Err(err) = cache.maybe_evict().await {
+                cache.set_ready(false);
                 warn!("disk cache: retention check failed: {err}");
+            } else {
+                cache.set_ready(true);
             }
         } else if failed {
             cache.set_ready(false);

@@ -549,6 +549,10 @@ pub struct RpcConfig {
     #[arg(long, env = "DISK_CACHE_BLOCK_INDEX_ENABLED", default_value_t = false)]
     pub(crate) disk_cache_block_index_enabled: bool,
 
+    /// Maximum bytes retained by the block index's in-process segment cache.
+    #[arg(long, env = "DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) disk_cache_block_index_max_memory_bytes: Option<u64>,
+
     #[cfg(feature = "disk-cache")]
     #[arg(long, env = "DISK_CACHE_BLOCK_INDEX_SLOTS_PER_QUERY", default_value_t = 250_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) disk_cache_block_index_slots_per_query: u64,
@@ -1093,6 +1097,7 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_memory_retain_slots, None);
         assert_eq!(cfg.disk_cache_memory_max_bytes, None);
         assert!(!cfg.disk_cache_block_index_enabled);
+        assert_eq!(cfg.disk_cache_block_index_max_memory_bytes, None);
         assert_eq!(cfg.disk_cache_block_index_slots_per_query, 250_000);
         assert_eq!(cfg.disk_cache_block_index_max_slots_per_sec, 25_000);
         assert_eq!(cfg.disk_cache_block_index_query_timeout_ms, 300_000);
@@ -1121,6 +1126,8 @@ mod disk_cache_config_tests {
             "--disk-cache-max-bytes",
             "2199023255552",
             "--disk-cache-block-index-enabled",
+            "--disk-cache-block-index-max-memory-bytes",
+            "536870912",
             "--disk-cache-block-index-slots-per-query",
             "100000",
             "--disk-cache-block-index-max-slots-per-sec",
@@ -1140,6 +1147,10 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_partition_slots, Some(10_000));
         assert_eq!(cfg.disk_cache_max_bytes, 2_199_023_255_552);
         assert!(cfg.disk_cache_block_index_enabled);
+        assert_eq!(
+            cfg.disk_cache_block_index_max_memory_bytes,
+            Some(536_870_912)
+        );
         assert_eq!(cfg.disk_cache_block_index_slots_per_query, 100_000);
         assert_eq!(cfg.disk_cache_block_index_max_slots_per_sec, 10_000);
         assert_eq!(cfg.disk_cache_block_index_query_timeout_ms, 120_000);

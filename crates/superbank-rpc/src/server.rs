@@ -643,6 +643,21 @@ fn validate_disk_cache_args(args: &RpcConfig) -> Result<(), RpcError> {
                 .to_string(),
         ));
     }
+    if args.disk_cache_block_index_enabled && args.disk_cache_block_index_max_memory_bytes.is_none()
+    {
+        return Err(RpcError::Config(
+            "DISK_CACHE_BLOCK_INDEX_ENABLED requires DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES"
+                .to_string(),
+        ));
+    }
+    if let Some(max_memory_bytes) = args.disk_cache_block_index_max_memory_bytes
+        && max_memory_bytes < crate::disk_cache::block_index::minimum_memory_bytes()
+    {
+        return Err(RpcError::Config(format!(
+            "DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES must be at least {} bytes",
+            crate::disk_cache::block_index::minimum_memory_bytes()
+        )));
+    }
     if let (Some(memory), Some(retain)) = (
         args.disk_cache_memory_retain_slots,
         args.disk_cache_retain_slots,
@@ -688,6 +703,9 @@ async fn start_disk_cache(
             .disk_cache_block_index_enabled
             .then(|| BlockIndexConfig {
                 database: format!("{}_block_index", args.disk_cache_clickhouse_database.trim()),
+                max_memory_bytes: args
+                    .disk_cache_block_index_max_memory_bytes
+                    .expect("validated block-index memory budget"),
                 slots_per_query: args.disk_cache_block_index_slots_per_query,
                 max_slots_per_sec: args.disk_cache_block_index_max_slots_per_sec,
                 query_timeout: Duration::from_millis(args.disk_cache_block_index_query_timeout_ms),
@@ -1225,5 +1243,35 @@ mod tests {
                 .to_string()
                 .contains("DISK_CACHE_PATH")
         );
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn block_index_requires_an_explicit_memory_budget() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        cfg.disk_cache_enabled = true;
+        cfg.disk_cache_retain_slots = Some(1_000);
+        cfg.disk_cache_block_index_enabled = true;
+
+        assert!(
+            validate_disk_cache_args(&cfg)
+                .expect_err("unbounded block index must fail")
+                .to_string()
+                .contains("DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES")
+        );
+
+        cfg.disk_cache_block_index_max_memory_bytes = Some(1);
+        assert!(
+            validate_disk_cache_args(&cfg)
+                .expect_err("undersized block index budget must fail")
+                .to_string()
+                .contains("must be at least")
+        );
+
+        cfg.disk_cache_block_index_max_memory_bytes = Some(64 * 1024 * 1024);
+        validate_disk_cache_args(&cfg).expect("bounded block index config");
     }
 }

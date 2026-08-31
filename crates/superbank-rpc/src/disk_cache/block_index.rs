@@ -23,9 +23,19 @@ const NULL_TIME: i64 = i64::MIN + 2;
 const DATA_TABLE: &str = "block_times";
 const COVERAGE_TABLE: &str = "coverage";
 
+fn segment_memory_bytes() -> u64 {
+    SEGMENT_SLOTS * std::mem::size_of::<AtomicI64>() as u64
+        + SEGMENT_SLOTS.div_ceil(64) * std::mem::size_of::<AtomicU64>() as u64
+}
+
+pub(crate) fn minimum_memory_bytes() -> u64 {
+    segment_memory_bytes()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BlockIndexConfig {
     pub(crate) database: String,
+    pub(crate) max_memory_bytes: u64,
     pub(crate) slots_per_query: u64,
     pub(crate) max_slots_per_sec: u64,
     pub(crate) query_timeout: Duration,
@@ -69,6 +79,7 @@ pub(crate) struct BlockIndex {
     cfg: BlockIndexConfig,
     local: ClickHouseClient,
     segments: RwLock<HashMap<u64, Segment>>,
+    durable_coverage: RwLock<CoverageMap>,
     coverage: RwLock<CoverageMap>,
 }
 
@@ -77,6 +88,12 @@ impl BlockIndex {
         cfg: BlockIndexConfig,
         admin: &ClickHouseClient,
     ) -> Result<Self, DiskCacheError> {
+        if cfg.max_memory_bytes < segment_memory_bytes() {
+            return Err(DiskCacheError::Config(format!(
+                "DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES must be at least {} bytes",
+                segment_memory_bytes()
+            )));
+        }
         let database = quote_identifier(&cfg.database)?;
         admin
             .client
@@ -115,6 +132,7 @@ impl BlockIndex {
             cfg,
             local,
             segments: RwLock::new(HashMap::new()),
+            durable_coverage: RwLock::new(CoverageMap::new()),
             coverage: RwLock::new(CoverageMap::new()),
         })
     }
@@ -123,6 +141,13 @@ impl BlockIndex {
         self.coverage
             .read()
             .expect("block-index coverage lock")
+            .contiguous_tip_span()
+    }
+
+    fn durable_tip_span(&self) -> Option<(u64, u64)> {
+        self.durable_coverage
+            .read()
+            .expect("block-index durable coverage lock")
             .contiguous_tip_span()
     }
 
@@ -211,17 +236,8 @@ impl BlockIndex {
         })
     }
 
-    fn segment(&self, segment_id: u64) -> Segment {
-        if let Some(segment) = self
-            .segments
-            .read()
-            .expect("block-index segments lock")
-            .get(&segment_id)
-            .cloned()
-        {
-            return segment;
-        }
-        let segment: Segment = Arc::new(SegmentData {
+    fn new_segment() -> Segment {
+        Arc::new(SegmentData {
             times: (0..SEGMENT_SLOTS)
                 .map(|_| AtomicI64::new(UNKNOWN))
                 .collect::<Vec<_>>()
@@ -230,25 +246,45 @@ impl BlockIndex {
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-        });
-        self.segments
-            .write()
-            .expect("block-index segments lock")
-            .entry(segment_id)
-            .or_insert_with(|| segment.clone())
-            .clone()
+        })
     }
 
-    fn publish_memory(&self, start: u64, end: u64, rows: &[BlockTimeRangeRow]) {
-        if end < start {
-            return;
+    fn reserve_segments(&self, start: u64, end: u64) -> Option<Vec<Segment>> {
+        let first = start / SEGMENT_SLOTS;
+        let last = end / SEGMENT_SLOTS;
+        let mut segments = self.segments.write().expect("block-index segments lock");
+        let missing = (first..=last)
+            .filter(|segment_id| !segments.contains_key(segment_id))
+            .count();
+        let max_segments = usize::try_from(self.cfg.max_memory_bytes / segment_memory_bytes())
+            .unwrap_or(usize::MAX);
+        if missing > max_segments.saturating_sub(segments.len()) {
+            return None;
         }
+        for segment_id in first..=last {
+            segments.entry(segment_id).or_insert_with(Self::new_segment);
+        }
+        Some(
+            (first..=last)
+                .filter_map(|segment_id| segments.get(&segment_id).cloned())
+                .collect(),
+        )
+    }
+
+    fn publish_memory(&self, start: u64, end: u64, rows: &[BlockTimeRangeRow]) -> bool {
+        if end < start {
+            return true;
+        }
+        let first_segment = start / SEGMENT_SLOTS;
+        let Some(segments) = self.reserve_segments(start, end) else {
+            return false;
+        };
         let mut cursor = start;
         let mut row_index = 0;
         while cursor <= end {
             let segment_id = cursor / SEGMENT_SLOTS;
             let segment_end = end.min((segment_id + 1) * SEGMENT_SLOTS - 1);
-            let segment = self.segment(segment_id);
+            let segment = &segments[(segment_id - first_segment) as usize];
             while row_index < rows.len() && rows[row_index].slot < cursor {
                 row_index += 1;
             }
@@ -268,6 +304,7 @@ impl BlockIndex {
             .expect("block-index coverage lock")
             .insert_range(start, end);
         self.publish_metrics();
+        true
     }
 
     fn publish_metrics(&self) {
@@ -277,8 +314,7 @@ impl BlockIndex {
             .read()
             .expect("block-index segments lock")
             .len() as u64
-            * (SEGMENT_SLOTS * std::mem::size_of::<i64>() as u64
-                + SEGMENT_SLOTS.div_ceil(64) * std::mem::size_of::<u64>() as u64);
+            * segment_memory_bytes();
         crate::metrics::block_index_state(floor, head, bytes);
     }
 
@@ -295,6 +331,10 @@ impl BlockIndex {
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         for range in ranges {
+            self.durable_coverage
+                .write()
+                .expect("block-index durable coverage lock")
+                .insert_range(range.range_start, range.range_end);
             let rows = self
                 .local
                 .client
@@ -306,7 +346,7 @@ impl BlockIndex {
                 .fetch_all::<BlockTimeRangeRow>()
                 .await
                 .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
-            self.publish_memory(range.range_start, range.range_end, &rows);
+            let _ = self.publish_memory(range.range_start, range.range_end, &rows);
         }
         Ok(())
     }
@@ -356,7 +396,18 @@ impl BlockIndex {
             .end()
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
-        self.publish_memory(start, end, rows);
+        self.durable_coverage
+            .write()
+            .expect("block-index durable coverage lock")
+            .insert_range(start, end);
+        if !self.publish_memory(start, end, rows) {
+            tracing::debug!(
+                start,
+                end,
+                max_memory_bytes = self.cfg.max_memory_bytes,
+                "block index: durable range is outside the bounded in-process cache"
+            );
+        }
         Ok(())
     }
 
@@ -392,7 +443,7 @@ impl BlockIndex {
                     continue;
                 }
             };
-            let (start, end) = match self.tip_span() {
+            let (start, end) = match self.durable_tip_span() {
                 Some((_, head)) if head < latest => {
                     (head + 1, latest.min(head + self.cfg.slots_per_query))
                 }
@@ -490,12 +541,14 @@ mod tests {
         BlockIndex {
             cfg: BlockIndexConfig {
                 database: "test_block_index".to_string(),
+                max_memory_bytes: segment_memory_bytes(),
                 slots_per_query: 50_000,
                 max_slots_per_sec: 25_000,
                 query_timeout: Duration::from_secs(300),
             },
             local,
             segments: RwLock::new(HashMap::new()),
+            durable_coverage: RwLock::new(CoverageMap::new()),
             coverage: RwLock::new(CoverageMap::new()),
         }
     }
@@ -518,7 +571,7 @@ mod tests {
     #[test]
     fn narrow_rows_preserve_times_produced_slots_and_skips() {
         let index = test_index();
-        index.publish_memory(
+        assert!(index.publish_memory(
             42,
             44,
             &[
@@ -531,7 +584,7 @@ mod tests {
                     block_time: None,
                 },
             ],
-        );
+        ));
 
         assert_eq!(
             index.block_time(42),
@@ -541,5 +594,23 @@ mod tests {
         assert_eq!(index.block_time(44), BlockTimeLookup::Found(None));
         assert_eq!(index.block_time(45), BlockTimeLookup::NotCovered);
         assert_eq!(index.slots_in_range(42, 44), Some(vec![42, 44]));
+    }
+
+    #[test]
+    fn in_process_cache_does_not_allocate_past_its_segment_budget() {
+        let index = test_index();
+        assert!(index.publish_memory(0, 0, &[]));
+        assert!(!index.publish_memory(SEGMENT_SLOTS, SEGMENT_SLOTS, &[]));
+
+        assert_eq!(
+            index
+                .segments
+                .read()
+                .expect("block-index segments lock")
+                .len(),
+            1
+        );
+        assert_eq!(index.tip_span(), Some((0, 0)));
+        assert_eq!(index.block_time(SEGMENT_SLOTS), BlockTimeLookup::NotCovered);
     }
 }
