@@ -13,6 +13,7 @@ export const rpcGetTransactionLatency = new Trend('rpc_getTransaction_latency', 
 export const rpcGetBlockLatency = new Trend('rpc_getBlock_latency', true);
 export const rpcGetBlockHeightLatency = new Trend('rpc_getBlockHeight_latency', true);
 export const rpcGetSlotLatency = new Trend('rpc_getSlot_latency', true);
+export const rpcGetEpochInfoLatency = new Trend('rpc_getEpochInfo_latency', true);
 export const rpcGetTransactionCountLatency = new Trend(
   'rpc_getTransactionCount_latency',
   true
@@ -141,6 +142,7 @@ export const metrics = {
   rpcGetBlockLatency,
   rpcGetBlockHeightLatency,
   rpcGetSlotLatency,
+  rpcGetEpochInfoLatency,
   rpcGetLatestBlockhashLatency,
   rpcGetBlockTimeLatency,
   rpcGetBlocksLatency,

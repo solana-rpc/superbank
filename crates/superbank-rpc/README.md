@@ -11,6 +11,8 @@ writer that matches the same schemas).
 - `getBlock`
 - `getBlockHeight`
 - `getSlot`
+- `getEpochInfo`
+- `getEpochSchedule`
 - `getTransactionCount`
 - `getLatestBlockhash`
 - `isBlockhashValid`
@@ -51,11 +53,14 @@ Notes:
 - `processed` commitment is supported for a subset of methods when compiled with
   `--features grpc-head-cache` and enabled at runtime with `HEAD_CACHE_ENABLED=true`
   (see "Optional gRPC head cache" below).
-- `getBlockHeight`, `getSlot`, and `getTransactionCount` accept an optional single config object as the sole param:
+- `getBlockHeight`, `getSlot`, `getEpochInfo`, and `getTransactionCount` accept an optional single config object as the sole param:
   - `commitment`: `processed|confirmed|finalized` (defaults to `finalized`; `processed` requires the head cache)
   - `minContextSlot`: optional `u64`; if the server's current context slot is below this value, the
     call fails with JSON-RPC error `-32016` ("Minimum context slot has not been reached") and
     includes `contextSlot` in the error `data`.
+- This branch must merge through the shared, warmup-aware epoch-schedule work in PR #51 before
+  `getEpochInfo` can merge. Do not add method-local epoch math: the shared schedule is the source
+  of truth for warmup networks.
 - `minimumLedgerSlot` currently reports the lowest slot retained in Superbank's ClickHouse-backed
   block storage. This is a pragmatic approximation of Solana's validator-local ledger metadata,
   not an exact blockstore-equivalent implementation.

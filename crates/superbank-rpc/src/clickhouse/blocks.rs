@@ -971,6 +971,21 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(u64, QueryTimings)> {
+        #[cfg(test)]
+        if let Some(transaction_count) = self.transaction_count_for_tests {
+            return Ok((
+                transaction_count,
+                QueryTimings {
+                    elapsed_ms: 0,
+                    received_bytes: 0,
+                    decoded_bytes: 0,
+                    rows_read: Some(0),
+                    rows_read_unknown: true,
+                    rows_returned: 1,
+                },
+            ));
+        }
+
         let settings_clause = self.select_settings_clause(
             "get_transaction_count_by_slot",
             QueryFreshnessClass::TipSensitive,
@@ -986,6 +1001,21 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(u64, QueryTimings)> {
+        #[cfg(test)]
+        if let Some(transaction_count) = self.transaction_count_for_tests {
+            return Ok((
+                transaction_count,
+                QueryTimings {
+                    elapsed_ms: 0,
+                    received_bytes: 0,
+                    decoded_bytes: 0,
+                    rows_read: Some(0),
+                    rows_read_unknown: true,
+                    rows_returned: 1,
+                },
+            ));
+        }
+
         let settings_clause = self.select_settings_clause(
             "get_transaction_count_before_slot",
             QueryFreshnessClass::TipSensitive,

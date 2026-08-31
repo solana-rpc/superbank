@@ -33,6 +33,9 @@ k6 run tests/k6/scenarios/basic/superbank-rpc-get-signatures-hot-pagination.js \
 # Basic getTransaction test
 k6 run tests/k6/scenarios/basic/superbank-rpc-get-transaction.js -e RPC_URL=http://localhost:8899 -e SIGNATURE_FILE=./tests/k6/data/pools/signatures.txt
 
+# Basic getEpochInfo test
+k6 run tests/k6/scenarios/basic/superbank-rpc-get-epoch-info.js -e RPC_URL=http://localhost:8899
+
 # Head-cache WebSocket test (subscribe to upstream Solana WS for fresh signatures)
 k6 run tests/k6/scenarios/basic/superbank-rpc-head-cache-ws-get-transaction.js \
   -e RPC_URL=http://localhost:8899 \
@@ -507,6 +510,8 @@ server-side JSON-RPC failures are promoted to HTTP `503`; those responses count 
 | `BLOCK_HEIGHT_MIN_CONTEXT_SLOT` | (none) | getBlockHeight `minContextSlot` |
 | `SLOT_COMMITMENT` | (none) | getSlot commitment (`processed`, `confirmed`, `finalized`) |
 | `SLOT_MIN_CONTEXT_SLOT` | (none) | getSlot `minContextSlot` |
+| `EPOCH_INFO_COMMITMENT` | (none) | getEpochInfo commitment (`processed`, `confirmed`, `finalized`) |
+| `EPOCH_INFO_MIN_CONTEXT_SLOT` | (none) | getEpochInfo `minContextSlot` |
 | `TRANSACTION_COUNT_COMMITMENT` | (none) | getTransactionCount commitment (`processed`, `confirmed`, `finalized`) |
 | `TRANSACTION_COUNT_MIN_CONTEXT_SLOT` | (none) | getTransactionCount `minContextSlot` |
 | `LATEST_BLOCKHASH_COMMITMENT` | (none) | getLatestBlockhash commitment (`processed`, `confirmed`, `finalized`) |

@@ -268,6 +268,17 @@ pub(crate) struct EpochSchedule {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EpochInfo {
+    pub(crate) absolute_slot: u64,
+    pub(crate) block_height: u64,
+    pub(crate) epoch: u64,
+    pub(crate) slot_index: u64,
+    pub(crate) slots_in_epoch: u64,
+    pub(crate) transaction_count: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct GetLatestBlockhashResult {
     pub(crate) context: RpcContextSlot,
     pub(crate) value: GetLatestBlockhashValue,
