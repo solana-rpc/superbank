@@ -249,62 +249,93 @@ impl BlockIndex {
         })
     }
 
-    fn reserve_segments(&self, start: u64, end: u64) -> Option<Vec<Segment>> {
+    fn reserve_segments(&self, start: u64, end: u64) -> HashMap<u64, Segment> {
         let first = start / SEGMENT_SLOTS;
         let last = end / SEGMENT_SLOTS;
         let mut segments = self.segments.write().expect("block-index segments lock");
-        let missing = (first..=last)
-            .filter(|segment_id| !segments.contains_key(segment_id))
-            .count();
         let max_segments = usize::try_from(self.cfg.max_memory_bytes / segment_memory_bytes())
             .unwrap_or(usize::MAX);
-        if missing > max_segments.saturating_sub(segments.len()) {
-            return None;
+        let mut evicted_through = None;
+
+        for segment_id in (first..=last).rev() {
+            if segments.contains_key(&segment_id) {
+                continue;
+            }
+            if segments.len() >= max_segments {
+                let Some(oldest) = segments.keys().copied().min() else {
+                    break;
+                };
+                if segment_id <= oldest {
+                    continue;
+                }
+                segments.remove(&oldest);
+                evicted_through =
+                    Some(evicted_through.map_or(oldest, |value: u64| value.max(oldest)));
+            }
+            segments.insert(segment_id, Self::new_segment());
         }
-        for segment_id in first..=last {
-            segments.entry(segment_id).or_insert_with(Self::new_segment);
+
+        let reserved = (first..=last)
+            .filter_map(|segment_id| {
+                segments
+                    .get(&segment_id)
+                    .cloned()
+                    .map(|segment| (segment_id, segment))
+            })
+            .collect();
+        drop(segments);
+
+        if let Some(evicted_through) = evicted_through {
+            self.coverage
+                .write()
+                .expect("block-index coverage lock")
+                .remove_below(
+                    evicted_through
+                        .saturating_add(1)
+                        .saturating_mul(SEGMENT_SLOTS),
+                );
         }
-        Some(
-            (first..=last)
-                .filter_map(|segment_id| segments.get(&segment_id).cloned())
-                .collect(),
-        )
+        reserved
     }
 
     fn publish_memory(&self, start: u64, end: u64, rows: &[BlockTimeRangeRow]) -> bool {
         if end < start {
             return true;
         }
-        let first_segment = start / SEGMENT_SLOTS;
-        let Some(segments) = self.reserve_segments(start, end) else {
-            return false;
-        };
+        let segments = self.reserve_segments(start, end);
+        let mut published_all = true;
         let mut cursor = start;
         let mut row_index = 0;
         while cursor <= end {
             let segment_id = cursor / SEGMENT_SLOTS;
             let segment_end = end.min((segment_id + 1) * SEGMENT_SLOTS - 1);
-            let segment = &segments[(segment_id - first_segment) as usize];
             while row_index < rows.len() && rows[row_index].slot < cursor {
                 row_index += 1;
             }
-            while row_index < rows.len() && rows[row_index].slot <= segment_end {
-                let row = &rows[row_index];
-                let offset = row.slot % SEGMENT_SLOTS;
-                segment.times[offset as usize]
-                    .store(row.block_time.unwrap_or(NULL_TIME), Ordering::Relaxed);
-                segment.produced[(offset / 64) as usize]
-                    .fetch_or(1u64 << (offset % 64), Ordering::Relaxed);
-                row_index += 1;
+            if let Some(segment) = segments.get(&segment_id) {
+                while row_index < rows.len() && rows[row_index].slot <= segment_end {
+                    let row = &rows[row_index];
+                    let offset = row.slot % SEGMENT_SLOTS;
+                    segment.times[offset as usize]
+                        .store(row.block_time.unwrap_or(NULL_TIME), Ordering::Relaxed);
+                    segment.produced[(offset / 64) as usize]
+                        .fetch_or(1u64 << (offset % 64), Ordering::Relaxed);
+                    row_index += 1;
+                }
+                self.coverage
+                    .write()
+                    .expect("block-index coverage lock")
+                    .insert_range(cursor, segment_end);
+            } else {
+                published_all = false;
+                while row_index < rows.len() && rows[row_index].slot <= segment_end {
+                    row_index += 1;
+                }
             }
             cursor = segment_end.saturating_add(1);
         }
-        self.coverage
-            .write()
-            .expect("block-index coverage lock")
-            .insert_range(start, end);
         self.publish_metrics();
-        true
+        published_all
     }
 
     fn publish_metrics(&self) {
@@ -597,10 +628,23 @@ mod tests {
     }
 
     #[test]
-    fn in_process_cache_does_not_allocate_past_its_segment_budget() {
+    fn in_process_cache_keeps_the_newest_segments_within_budget() {
         let index = test_index();
         assert!(index.publish_memory(0, 0, &[]));
-        assert!(!index.publish_memory(SEGMENT_SLOTS, SEGMENT_SLOTS, &[]));
+        assert!(!index.publish_memory(
+            SEGMENT_SLOTS - 1,
+            SEGMENT_SLOTS,
+            &[
+                BlockTimeRangeRow {
+                    slot: SEGMENT_SLOTS - 1,
+                    block_time: Some(1),
+                },
+                BlockTimeRangeRow {
+                    slot: SEGMENT_SLOTS,
+                    block_time: Some(2),
+                },
+            ],
+        ));
 
         assert_eq!(
             index
@@ -610,7 +654,14 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(index.tip_span(), Some((0, 0)));
-        assert_eq!(index.block_time(SEGMENT_SLOTS), BlockTimeLookup::NotCovered);
+        assert_eq!(index.tip_span(), Some((SEGMENT_SLOTS, SEGMENT_SLOTS)));
+        assert_eq!(index.block_time(0), BlockTimeLookup::NotCovered);
+        assert_eq!(
+            index.block_time(SEGMENT_SLOTS),
+            BlockTimeLookup::Found(Some(2))
+        );
+
+        assert!(!index.publish_memory(0, 0, &[]));
+        assert_eq!(index.tip_span(), Some((SEGMENT_SLOTS, SEGMENT_SLOTS)));
     }
 }
