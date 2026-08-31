@@ -3,12 +3,13 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use solana_sdk::{
+use crate::solana_sdk::{
     hash::Hash,
     message::{
         Message, MessageHeader, VersionedMessage,
         compiled_instruction::CompiledInstruction,
         v0::{Message as V0Message, MessageAddressTableLookup},
+        v1::{Message as V1Message, TransactionConfig},
     },
     pubkey::Pubkey,
     signature::Signature,
@@ -139,6 +140,30 @@ pub(crate) fn build_versioned_transaction(
                 address_table_lookups,
             })
         }
+        Some(1) => {
+            if record.tx_address_table_lookups_present
+                || !record.tx_address_table_lookup_account_key.is_empty()
+                || !record.tx_address_table_lookup_writable_indexes.is_empty()
+                || !record.tx_address_table_lookup_readonly_indexes.is_empty()
+            {
+                return Err(TransactionHydrationError::InvalidStoredTransaction(
+                    "v1 transaction contains address table lookups".to_string(),
+                ));
+            }
+            VersionedMessage::V1(V1Message {
+                header,
+                config: TransactionConfig {
+                    priority_fee: record.tx_config_priority_fee,
+                    compute_unit_limit: record.tx_config_compute_unit_limit,
+                    loaded_accounts_data_size_limit: record
+                        .tx_config_loaded_accounts_data_size_limit,
+                    heap_size: record.tx_config_heap_size,
+                },
+                lifetime_specifier: recent_blockhash,
+                account_keys,
+                instructions,
+            })
+        }
         Some(version) => {
             return Err(TransactionHydrationError::Encode(
                 solana_transaction_status::EncodeError::UnsupportedTransactionVersion(version),
@@ -215,6 +240,13 @@ pub(crate) fn build_accounts_versioned_transaction(
             recent_blockhash: Hash::default(),
             instructions,
             address_table_lookups: Vec::new(),
+        }),
+        Some(1) => VersionedMessage::V1(V1Message {
+            header,
+            config: TransactionConfig::empty(),
+            lifetime_specifier: Hash::default(),
+            account_keys,
+            instructions,
         }),
         Some(version) => {
             return Err(TransactionHydrationError::from(

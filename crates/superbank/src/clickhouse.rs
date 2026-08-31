@@ -24,6 +24,10 @@ pub(crate) struct TransactionRow {
     pub(crate) message_hash: Array<u8, 32>,
     pub(crate) is_vote: u8,
     pub(crate) tx_version: Option<u8>,
+    pub(crate) tx_config_priority_fee: Option<u64>,
+    pub(crate) tx_config_compute_unit_limit: Option<u32>,
+    pub(crate) tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    pub(crate) tx_config_heap_size: Option<u32>,
     pub(crate) tx_signatures: Vec<Array<u8, 64>>,
     pub(crate) tx_num_required_signatures: u8,
     pub(crate) tx_num_readonly_signed_accounts: u8,
@@ -74,6 +78,7 @@ pub(crate) struct TransactionRow {
     pub(crate) meta_reward_post_balance: Vec<u64>,
     pub(crate) meta_reward_type: Vec<Option<String>>,
     pub(crate) meta_reward_commission: Vec<Option<u8>>,
+    pub(crate) meta_reward_commission_bps: Vec<Option<u16>>,
     pub(crate) meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     pub(crate) meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
     pub(crate) meta_return_data_present: u8,
@@ -99,6 +104,7 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_post_balance: Vec<u64>,
     pub(crate) rewards_type: Vec<Option<String>>,
     pub(crate) rewards_commission: Vec<Option<u8>>,
+    pub(crate) rewards_commission_bps: Vec<Option<u16>>,
     pub(crate) rewards_num_partitions: Option<u64>,
 }
 
@@ -145,7 +151,7 @@ pub(crate) fn build_clickhouse_client(args: &Args) -> ClickHouseClient {
     let mut client = ClickHouseClient::default()
         .with_url(&args.clickhouse_url)
         .with_database(&args.clickhouse_database)
-        .with_option(
+        .with_setting(
             "async_insert",
             if args.clickhouse_async_insert {
                 "1"
@@ -184,25 +190,27 @@ pub(crate) async fn fetch_latest_slot_from_blocks(
     Ok(row.max_slot)
 }
 
+/// Distinct slots already present in the blocks table within the inclusive
+/// `[start, end]` range. Used by RPC discovery to skip slots that have already
+/// been ingested.
 pub(crate) async fn fetch_present_slots_in_range(
     clickhouse: &ClickHouseClient,
     blocks_table: &str,
     start: u64,
     end: u64,
 ) -> Result<Vec<u64>> {
-    #[derive(Debug, Deserialize, Row)]
-    struct SlotRow {
-        slot: u64,
-    }
-
-    let query = format!("SELECT slot FROM {blocks_table} WHERE slot >= {start} AND slot <= {end}");
-    let rows = clickhouse
+    let query = format!(
+        "SELECT DISTINCT slot FROM {blocks_table} WHERE slot BETWEEN ? AND ? ORDER BY slot"
+    );
+    clickhouse
         .query(&query)
-        .fetch_all::<SlotRow>()
+        .bind(start)
+        .bind(end)
+        .fetch_all::<u64>()
         .await
-        .with_context(|| format!("query present slots in [{start}, {end}] from {blocks_table}"))?;
-
-    Ok(rows.into_iter().map(|row| row.slot).collect())
+        .with_context(|| {
+            format!("query present slots from {blocks_table} between {start} and {end}")
+        })
 }
 
 pub(crate) async fn flush_buffers(
@@ -542,6 +550,7 @@ mod tests {
             rpc_progress_every_slots: 100,
             rpc_discovery_chunk_slots: 10_000,
             rpc_skip_ingested_slots: false,
+            rpc_slot_list: None,
             bigtable_range: None,
             bigtable_slot_file: None,
             bigtable_instance: "solana-ledger".to_string(),
@@ -556,6 +565,18 @@ mod tests {
             bigtable_insert_concurrency: 1,
             bigtable_decode_concurrency: 4,
             bigtable_progress_every_slots: 10_000,
+            solparq_archive_location: None,
+            solparq_archive_path: None,
+            solparq_archive_s3_endpoint: None,
+            solparq_archive_s3_bucket_name: None,
+            solparq_archive_s3_bucket_path: None,
+            solparq_archive_s3_auth_key: None,
+            solparq_archive_s3_auth_secret_key: None,
+            solparq_archive_s3_region: "us-east-1".to_string(),
+            solparq_from_slot: None,
+            solparq_to_slot: None,
+            solparq_tables: Vec::new(),
+            solparq_clickhouse_settings: String::new(),
             clickhouse_url: "http://localhost:8123".to_string(),
             metrics_host: "0.0.0.0".to_string(),
             metrics_port: 9901,
@@ -582,7 +603,7 @@ mod tests {
     fn build_clickhouse_client_disables_async_insert_by_default() {
         let client = build_clickhouse_client(&sample_args());
 
-        assert_eq!(client.get_option("async_insert"), Some("0"));
+        assert_eq!(client.get_setting("async_insert"), Some("0"));
     }
 
     #[test]
@@ -592,7 +613,7 @@ mod tests {
 
         let client = build_clickhouse_client(&args);
 
-        assert_eq!(client.get_option("async_insert"), Some("1"));
+        assert_eq!(client.get_setting("async_insert"), Some("1"));
     }
 
     #[test]

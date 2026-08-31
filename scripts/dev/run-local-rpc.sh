@@ -63,6 +63,12 @@ fi
 : "${RPC_MAX_BODY_BYTES:=1048576}"
 : "${RPC_REQUEST_TIMEOUT_MS:=10000}"
 : "${RPC_CONCURRENCY_LIMIT:=512}"
+: "${GET_INFLATION_REWARD_MAX_ADDRESSES:=100}"
+: "${GET_INFLATION_REWARD_MAX_CONCURRENCY:=20}"
+: "${GET_INFLATION_REWARD_QUERY_TIMEOUT_MS:=5000}"
+: "${GET_INFLATION_REWARD_MAX_THREADS:=2}"
+: "${GET_INFLATION_REWARD_MAX_MEMORY_BYTES:=536870912}"
+: "${GET_INFLATION_REWARD_MAX_BYTES_TO_READ:=536870912}"
 : "${HYDRATION_CPU_CONCURRENCY:=8}"
 
 : "${CLICKHOUSE_URL:=http://localhost:8123}"
@@ -224,6 +230,12 @@ export CLICKHOUSE_GSFA_STRICT_PAGINATION=1
   --rpc-max-body-bytes "${RPC_MAX_BODY_BYTES}" \
   --rpc-request-timeout-ms "${RPC_REQUEST_TIMEOUT_MS}" \
   --rpc-concurrency-limit "${RPC_CONCURRENCY_LIMIT}" \
+  --get-inflation-reward-max-addresses "${GET_INFLATION_REWARD_MAX_ADDRESSES}" \
+  --get-inflation-reward-max-concurrency "${GET_INFLATION_REWARD_MAX_CONCURRENCY}" \
+  --get-inflation-reward-query-timeout-ms "${GET_INFLATION_REWARD_QUERY_TIMEOUT_MS}" \
+  --get-inflation-reward-max-threads "${GET_INFLATION_REWARD_MAX_THREADS}" \
+  --get-inflation-reward-max-memory-bytes "${GET_INFLATION_REWARD_MAX_MEMORY_BYTES}" \
+  --get-inflation-reward-max-bytes-to-read "${GET_INFLATION_REWARD_MAX_BYTES_TO_READ}" \
   --host "${RPC_HOST}" \
   --port "${RPC_PORT}" \
   --metrics-host "${METRICS_HOST}" \

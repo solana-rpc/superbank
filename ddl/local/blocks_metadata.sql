@@ -20,8 +20,13 @@ CREATE TABLE IF NOT EXISTS default.blocks_metadata
     rewards_post_balance         Array(UInt64),
     rewards_type                 Array(Nullable(String)),
     rewards_commission           Array(Nullable(UInt8)),
+    rewards_commission_bps       Array(Nullable(UInt16)),
     rewards_num_partitions       Nullable(UInt64)
 )
 ENGINE = ReplacingMergeTree(slot)
 PARTITION BY intDiv(slot, 432000)
 ORDER BY (slot);
+
+ALTER TABLE default.blocks_metadata
+    ADD COLUMN IF NOT EXISTS rewards_commission_bps Array(Nullable(UInt16))
+    AFTER rewards_commission;

@@ -115,7 +115,7 @@ impl ClickHouseClient {
                     waited = true;
                     wait.await;
                 }
-                CacheStart::Leader(notify) => {
+                CacheStart::Leader(leader) => {
                     let result = self
                         .get_signature_slot_by_signature_uncached(
                             signature_hash,
@@ -126,15 +126,11 @@ impl ClickHouseClient {
 
                     match result {
                         Ok((value, timings)) => {
-                            self.signature_slot_cache
-                                .finish(signature_bytes, notify, value)
-                                .await;
+                            leader.finish(value).await;
                             return Ok((value, timings));
                         }
                         Err(err) => {
-                            self.signature_slot_cache
-                                .fail(signature_bytes, notify)
-                                .await;
+                            leader.fail().await;
                             return Err(err);
                         }
                     }
@@ -149,7 +145,7 @@ impl ClickHouseClient {
         sig_bucket: u64,
         signature_literal: &str,
     ) -> ProcessingResult<(Option<SignatureSlot>, QueryTimings)> {
-        self.with_timeout("get_signature_slot", async {
+        self.with_http_query_timeout("get_signature_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct SignatureSlotRow {
                 slot: u64,
@@ -246,7 +242,7 @@ impl ClickHouseClient {
         &self,
         signatures: &[String],
     ) -> ProcessingResult<(Vec<SignatureStatusRecord>, QueryTimings)> {
-        self.with_timeout("get_signature_statuses", async {
+        self.with_http_query_timeout("get_signature_statuses", async {
             if signatures.is_empty() {
                 return Ok((
                     Vec::new(),

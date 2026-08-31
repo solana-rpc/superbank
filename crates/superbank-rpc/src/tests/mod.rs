@@ -3,6 +3,14 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::solana_sdk;
+use crate::solana_sdk::{
+    hash::Hash,
+    instruction::InstructionError,
+    message::VersionedMessage,
+    signature::{Keypair, Signer},
+    transaction::{Transaction, TransactionError},
+};
 use axum::{
     body::{Bytes, to_bytes},
     extract::State,
@@ -11,13 +19,6 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use solana_sdk::{
-    hash::Hash,
-    instruction::InstructionError,
-    message::VersionedMessage,
-    signature::{Keypair, Signer},
-    transaction::{Transaction, TransactionError},
-};
 use solana_transaction_status::{
     BlockEncodingOptions, ConfirmedBlock, EncodedTransaction, TransactionBinaryEncoding,
     TransactionDetails, TransactionWithStatusMeta, UiConfirmedBlock, UiTransactionEncoding,
@@ -46,7 +47,7 @@ use crate::handlers::signatures::{
     handle_get_signature_statuses, handle_get_signatures_for_address,
 };
 use crate::handlers::transactions::handle_get_transactions_for_address;
-use crate::handlers::types::MAX_GET_BLOCKS_RANGE;
+use crate::handlers::types::{InflationRewardInfo, MAX_GET_BLOCKS_RANGE};
 use crate::hydration::BlockHydrationError;
 use crate::hydration::build_transaction_status_meta;
 use crate::hydration::build_transaction_status_meta_for_accounts;
@@ -70,9 +71,9 @@ use solana_rpc_client_api::custom_error::{
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::HeadCache;
 #[cfg(feature = "grpc-head-cache")]
-use solana_commitment_config::CommitmentLevel;
+use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
 #[cfg(feature = "grpc-head-cache")]
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
+use solana_commitment_config::CommitmentLevel;
 
 const TEST_MAX_LIMIT: u64 = 1000;
 
@@ -157,6 +158,8 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -236,6 +239,8 @@ fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -291,6 +296,8 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache: cache,
         latest_block_height_cache: height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -338,6 +345,8 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -387,6 +396,8 @@ fn test_state_with_head_cache_and_clickhouse_url(
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -443,6 +454,8 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         max_signatures_limit: TEST_MAX_LIMIT,
         rpc_max_batch_size: 64,
         rpc_batch_concurrency_limit: 8,
+        get_inflation_reward_max_addresses: Some(100),
+        get_inflation_reward_sem: Some(Arc::new(Semaphore::new(1))),
         latest_slot_cache,
         latest_block_height_cache,
         rpc_request_timeout: Duration::from_millis(10_000),
@@ -509,6 +522,10 @@ fn base_transaction_record() -> StoredTransactionRecord {
         block_time: Some(123),
         is_vote: false,
         tx_version: None,
+        tx_config_priority_fee: None,
+        tx_config_compute_unit_limit: None,
+        tx_config_loaded_accounts_data_size_limit: None,
+        tx_config_heap_size: None,
         tx_signatures: vec![[0u8; 64]],
         tx_num_required_signatures: 1,
         tx_num_readonly_signed_accounts: 0,
@@ -559,6 +576,7 @@ fn base_transaction_record() -> StoredTransactionRecord {
         meta_reward_post_balance: Vec::new(),
         meta_reward_type: Vec::new(),
         meta_reward_commission: Vec::new(),
+        meta_reward_commission_bps: Vec::new(),
         meta_loaded_addresses_writable: Vec::new(),
         meta_loaded_addresses_readonly: Vec::new(),
         meta_return_data_present: false,
@@ -567,6 +585,47 @@ fn base_transaction_record() -> StoredTransactionRecord {
         meta_compute_units_consumed: None,
         meta_cost_units: None,
     }
+}
+
+fn transaction_variant_record(
+    version: Option<u8>,
+    with_v1_config: bool,
+) -> StoredTransactionRecord {
+    let mut record = base_transaction_record();
+    let signature_byte = match version {
+        None => 11,
+        Some(0) => 12,
+        Some(1) if with_v1_config => 13,
+        Some(1) => 14,
+        Some(other) => other,
+    };
+    record.signature = [signature_byte; 64];
+    record.tx_signatures = vec![[signature_byte; 64]];
+    record.tx_version = version;
+    record.tx_account_keys = vec![[1; 32], [2; 32]];
+    record.tx_num_readonly_unsigned_accounts = 1;
+    record.tx_recent_blockhash = [9; 32];
+    record.tx_instructions_program_id_index = vec![1];
+    record.tx_instructions_accounts = vec![vec![0]];
+    record.tx_instructions_data = vec![vec![7, 8, 9]];
+    record.meta_pre_balances = vec![10, 20];
+    record.meta_post_balances = vec![9, 21];
+    if version == Some(1) && with_v1_config {
+        record.tx_config_priority_fee = Some(42);
+        record.tx_config_compute_unit_limit = Some(1_000_000);
+        record.tx_config_loaded_accounts_data_size_limit = Some(65_536);
+        record.tx_config_heap_size = Some(32_768);
+    }
+    record
+}
+
+fn transaction_variant_records() -> [StoredTransactionRecord; 4] {
+    [
+        transaction_variant_record(None, false),
+        transaction_variant_record(Some(0), false),
+        transaction_variant_record(Some(1), true),
+        transaction_variant_record(Some(1), false),
+    ]
 }
 
 fn base_block_record(slot: u64) -> StoredBlockRecord {
@@ -586,6 +645,7 @@ fn base_block_record(slot: u64) -> StoredBlockRecord {
             rewards_post_balance: Vec::new(),
             rewards_type: Vec::new(),
             rewards_commission: Vec::new(),
+            rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
         },
         transactions: Vec::new(),
@@ -688,7 +748,7 @@ fn hydrate_transaction_record_base64_round_trip() {
     let mut meta = solana_transaction_status::TransactionStatusMeta::default();
     let message = match &versioned.message {
         VersionedMessage::Legacy(message) => message,
-        VersionedMessage::V0(_) => panic!("expected legacy message"),
+        VersionedMessage::V0(_) | VersionedMessage::V1(_) => panic!("expected legacy message"),
     };
     meta.pre_balances = vec![0; message.account_keys.len()];
     meta.post_balances = vec![0; message.account_keys.len()];
@@ -700,6 +760,10 @@ fn hydrate_transaction_record_base64_round_trip() {
         block_time: Some(123),
         is_vote: false,
         tx_version: None,
+        tx_config_priority_fee: None,
+        tx_config_compute_unit_limit: None,
+        tx_config_loaded_accounts_data_size_limit: None,
+        tx_config_heap_size: None,
         tx_signatures: versioned
             .signatures
             .iter()
@@ -770,6 +834,7 @@ fn hydrate_transaction_record_base64_round_trip() {
         meta_reward_post_balance: Vec::new(),
         meta_reward_type: Vec::new(),
         meta_reward_commission: Vec::new(),
+        meta_reward_commission_bps: Vec::new(),
         meta_loaded_addresses_writable: Vec::new(),
         meta_loaded_addresses_readonly: Vec::new(),
         meta_return_data_present: false,
@@ -2522,6 +2587,75 @@ async fn get_inflation_reward_rejects_invalid_address() {
 }
 
 #[tokio::test]
+async fn get_inflation_reward_rejects_more_than_configured_address_limit() {
+    let state = test_state();
+    let address = Hash::new_from_array([51; 32]).to_string();
+    let addresses = vec![address; 101];
+
+    let response = handle_get_inflation_reward(
+        state,
+        json!(1),
+        Some(vec![json!(addresses), json!({ "epoch": 0u64 })]),
+    )
+    .await
+    .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32602);
+    assert_eq!(
+        err.message,
+        "Invalid params: too many addresses; maximum is 100"
+    );
+}
+
+#[tokio::test]
+async fn get_inflation_reward_sheds_when_method_concurrency_is_exhausted() {
+    let state = test_state();
+    let _permit = state
+        .get_inflation_reward_sem
+        .as_ref()
+        .expect("concurrency admission enabled")
+        .clone()
+        .try_acquire_owned()
+        .expect("test permit");
+    let address = Hash::new_from_array([52; 32]).to_string();
+
+    let response = handle_get_inflation_reward(
+        state,
+        json!(1),
+        Some(vec![json!([address]), json!({ "epoch": 0u64 })]),
+    )
+    .await
+    .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    let err = parsed.error.expect("error present");
+    assert_eq!(err.code, -32005);
+    assert_eq!(err.message, "Node is unhealthy");
+}
+
+#[tokio::test]
+async fn get_inflation_reward_skips_method_admission_when_disabled() {
+    let mut state = test_state();
+    Arc::get_mut(&mut state)
+        .expect("test state should not be shared")
+        .get_inflation_reward_sem = None;
+
+    let response = handle_get_inflation_reward(
+        state,
+        json!(1),
+        Some(vec![json!([]), json!({ "epoch": 0u64 })]),
+    )
+    .await
+    .expect("response");
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none());
+    assert_eq!(parsed.result, Some(json!([])));
+}
+
+#[tokio::test]
 async fn get_inflation_reward_rejects_processed_commitment() {
     let state = test_state();
 
@@ -3313,6 +3447,10 @@ fn build_v0_transaction_allows_missing_lookup_flag_when_empty() {
         block_time: None,
         is_vote: false,
         tx_version: Some(0),
+        tx_config_priority_fee: None,
+        tx_config_compute_unit_limit: None,
+        tx_config_loaded_accounts_data_size_limit: None,
+        tx_config_heap_size: None,
         tx_signatures: vec![[0u8; 64]],
         tx_num_required_signatures: 1,
         tx_num_readonly_signed_accounts: 0,
@@ -3363,6 +3501,7 @@ fn build_v0_transaction_allows_missing_lookup_flag_when_empty() {
         meta_reward_post_balance: Vec::new(),
         meta_reward_type: Vec::new(),
         meta_reward_commission: Vec::new(),
+        meta_reward_commission_bps: Vec::new(),
         meta_loaded_addresses_writable: Vec::new(),
         meta_loaded_addresses_readonly: Vec::new(),
         meta_return_data_present: false,
@@ -3378,6 +3517,200 @@ fn build_v0_transaction_allows_missing_lookup_flag_when_empty() {
             assert!(message.address_table_lookups.is_empty());
         }
         other => panic!("unexpected message variant: {:?}", other),
+    }
+}
+
+#[test]
+fn build_v1_transaction_preserves_config_and_lifetime_specifier() {
+    let mut record = base_transaction_record();
+    record.tx_version = Some(1);
+    record.tx_recent_blockhash = [9; 32];
+    record.tx_config_priority_fee = Some(42);
+    record.tx_config_compute_unit_limit = Some(1_000_000);
+    record.tx_config_loaded_accounts_data_size_limit = Some(65_536);
+    record.tx_config_heap_size = Some(32_768);
+
+    let tx = build_versioned_transaction(&record).expect("build v1 transaction");
+    match tx.message {
+        VersionedMessage::V1(message) => {
+            assert_eq!(message.lifetime_specifier.to_bytes(), [9; 32]);
+            assert_eq!(message.config.priority_fee, Some(42));
+            assert_eq!(message.config.compute_unit_limit, Some(1_000_000));
+            assert_eq!(message.config.loaded_accounts_data_size_limit, Some(65_536));
+            assert_eq!(message.config.heap_size, Some(32_768));
+            assert_eq!(VersionedMessage::V1(message).serialize()[0], 0x81);
+        }
+        other => panic!("unexpected message variant: {other:?}"),
+    }
+}
+
+#[test]
+fn build_v1_transaction_rejects_address_table_lookups() {
+    let mut record = base_transaction_record();
+    record.tx_version = Some(1);
+    record.tx_address_table_lookups_present = true;
+    assert!(build_versioned_transaction(&record).is_err());
+}
+
+#[test]
+fn transaction_variant_fixtures_preserve_wire_bytes_and_versions() {
+    for record in transaction_variant_records() {
+        let transaction = build_versioned_transaction(&record).expect("build fixture transaction");
+        let message_bytes = transaction.message.serialize();
+        match (&transaction.message, record.tx_version) {
+            (VersionedMessage::Legacy(_), None) => assert_ne!(message_bytes[0], 0x80),
+            (VersionedMessage::V0(_), Some(0)) => assert_eq!(message_bytes[0], 0x80),
+            (VersionedMessage::V1(message), Some(1)) => {
+                assert_eq!(message_bytes[0], 0x81);
+                assert_eq!(message.lifetime_specifier.to_bytes(), [9; 32]);
+                assert_eq!(message.config.priority_fee, record.tx_config_priority_fee);
+                assert_eq!(
+                    message.config.compute_unit_limit,
+                    record.tx_config_compute_unit_limit
+                );
+                assert_eq!(
+                    message.config.loaded_accounts_data_size_limit,
+                    record.tx_config_loaded_accounts_data_size_limit
+                );
+                assert_eq!(message.config.heap_size, record.tx_config_heap_size);
+            }
+            (message, version) => panic!("unexpected fixture variant {message:?} for {version:?}"),
+        }
+
+        let encoded =
+            hydrate_transaction_record(&record, UiTransactionEncoding::Base64, record.tx_version)
+                .expect("encode fixture transaction");
+        let EncodedTransaction::Binary(blob, TransactionBinaryEncoding::Base64) =
+            encoded.transaction.transaction
+        else {
+            panic!("expected base64 transaction")
+        };
+        assert_eq!(
+            STANDARD.decode(blob).expect("decode base64"),
+            wincode::serialize(&transaction).expect("serialize expected transaction")
+        );
+    }
+}
+
+#[test]
+fn v1_json_exposes_transaction_config_including_empty_config() {
+    for (encoding, with_config) in [
+        (UiTransactionEncoding::Json, true),
+        (UiTransactionEncoding::Json, false),
+        (UiTransactionEncoding::JsonParsed, true),
+        (UiTransactionEncoding::JsonParsed, false),
+    ] {
+        let record = transaction_variant_record(Some(1), with_config);
+        let encoded =
+            hydrate_transaction_record(&record, encoding, Some(1)).expect("encode v1 JSON variant");
+        let value = serde_json::to_value(encoded).expect("serialize encoded transaction");
+        assert_eq!(value.pointer("/version"), Some(&json!(1)), "{value:#}");
+        let config = value
+            .pointer("/transaction/message/transactionConfig")
+            .expect("v1 transactionConfig");
+        if with_config {
+            assert_eq!(config.get("priorityFee"), Some(&json!(42)));
+            assert_eq!(config.get("computeUnitLimit"), Some(&json!(1_000_000)));
+            assert_eq!(
+                config.get("loadedAccountsDataSizeLimit"),
+                Some(&json!(65_536))
+            );
+            assert_eq!(config.get("heapSize"), Some(&json!(32_768)));
+        } else {
+            assert_eq!(
+                config,
+                &json!({
+                    "priorityFee": null,
+                    "computeUnitLimit": null,
+                    "loadedAccountsDataSizeLimit": null,
+                    "heapSize": null
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn v1_requires_max_supported_transaction_version_one() {
+    let record = transaction_variant_record(Some(1), true);
+    for max_version in [None, Some(0)] {
+        let err = hydrate_transaction_record(&record, UiTransactionEncoding::Json, max_version)
+            .expect_err("v1 must be rejected");
+        assert!(err.to_string().contains("transaction version 1"), "{err}");
+    }
+    hydrate_transaction_record(&record, UiTransactionEncoding::Json, Some(1))
+        .expect("max version 1 accepts v1");
+}
+
+#[test]
+fn block_full_and_accounts_modes_preserve_v1_version() {
+    let mut block = base_block_record(77);
+    block.metadata.executed_transaction_count = 4;
+    block.transactions = transaction_variant_records().into_iter().collect();
+
+    let full = hydrate_block_record(
+        block.clone(),
+        UiTransactionEncoding::Json,
+        TransactionDetails::Full,
+        false,
+        Some(1),
+    )
+    .expect("hydrate full variant block");
+    let full = serde_json::to_value(full).expect("serialize full block");
+    assert_eq!(
+        full.pointer("/transactions/0/version"),
+        Some(&json!("legacy"))
+    );
+    assert_eq!(full.pointer("/transactions/1/version"), Some(&json!(0)));
+    assert_eq!(full.pointer("/transactions/2/version"), Some(&json!(1)));
+    assert_eq!(
+        full.pointer(
+            "/transactions/2/transaction/message/transactionConfig/loadedAccountsDataSizeLimit"
+        ),
+        Some(&json!(65_536))
+    );
+
+    let accounts = hydrate_block_payload(
+        StoredBlockPayload::Accounts {
+            metadata: block.metadata,
+            transactions: block.transactions.into_iter().map(Into::into).collect(),
+        },
+        UiTransactionEncoding::Json,
+        TransactionDetails::Accounts,
+        false,
+        Some(1),
+    )
+    .expect("hydrate accounts variant block");
+    let accounts = serde_json::to_value(accounts).expect("serialize accounts block");
+    assert_eq!(accounts.pointer("/transactions/2/version"), Some(&json!(1)));
+    assert!(
+        accounts
+            .pointer("/transactions/2/transaction/accountKeys")
+            .is_some()
+    );
+    assert!(
+        accounts
+            .pointer("/transactions/2/transaction/message/transactionConfig")
+            .is_none(),
+        "accounts mode must not invent exposed config values"
+    );
+}
+
+#[test]
+fn block_full_rejects_v1_when_max_version_is_omitted_or_zero() {
+    let mut block = base_block_record(77);
+    block.metadata.executed_transaction_count = 1;
+    block.transactions = vec![transaction_variant_record(Some(1), true)];
+    for max_version in [None, Some(0)] {
+        let err = hydrate_block_record(
+            block.clone(),
+            UiTransactionEncoding::Json,
+            TransactionDetails::Full,
+            false,
+            max_version,
+        )
+        .expect_err("unsupported v1 block");
+        assert!(err.to_string().contains("transaction version 1"), "{err}");
     }
 }
 
@@ -4763,6 +5096,68 @@ async fn get_transaction_processed_served_from_head_cache() {
 
 #[cfg(feature = "grpc-head-cache")]
 #[tokio::test]
+async fn get_transaction_head_cache_enforces_v1_max_version_and_returns_config() {
+    let address = Pubkey::new_from_array([1; 32]);
+    let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+    let signature_bytes = [71; 64];
+    let signature = Signature::from(signature_bytes);
+    let signature_str = bs58::encode(signature_bytes).into_string();
+    let mut record = transaction_variant_record(Some(1), true);
+    record.slot = 123;
+    record.signature = signature_bytes;
+    record.tx_signatures = vec![signature_bytes];
+    record.tx_account_keys[0] = address.to_bytes();
+    cache.insert_for_tests(signature, record, 0, &[address], CommitmentLevel::Processed);
+    let state = test_state_with_head_cache(cache);
+
+    for max_version in [None, Some(0)] {
+        let mut config = json!({ "commitment": "processed", "encoding": "json" });
+        if let Some(max_version) = max_version {
+            config["maxSupportedTransactionVersion"] = json!(max_version);
+        }
+        let response = crate::handlers::transactions::handle_get_transaction(
+            state.clone(),
+            json!(1),
+            Some(vec![json!(&signature_str), config]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        let error = parsed.error.expect("unsupported version error");
+        assert!(
+            error
+                .message
+                .contains("Transaction version (1) is not supported"),
+            "{}",
+            error.message
+        );
+    }
+
+    let response = crate::handlers::transactions::handle_get_transaction(
+        state,
+        json!(1),
+        Some(vec![
+            json!(&signature_str),
+            json!({
+                "commitment": "processed",
+                "encoding": "json",
+                "maxSupportedTransactionVersion": 1
+            }),
+        ]),
+    )
+    .await
+    .expect("response");
+    let parsed = parse_json_rpc_response(response).await;
+    let result = parsed.result.expect("v1 result");
+    assert_eq!(result.pointer("/version"), Some(&json!(1)));
+    assert_eq!(
+        result.pointer("/transaction/message/transactionConfig/priorityFee"),
+        Some(&json!(42))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
 async fn get_transaction_with_slot_returns_null_on_head_cache_slot_mismatch() {
     let address = Pubkey::new_from_array([0u8; 32]);
 
@@ -5348,6 +5743,73 @@ async fn get_transactions_for_address_processed_head_only_pagination_token_is_sl
             .and_then(|v| v.as_str())
             .map(str::to_string),
         Some("10:3".to_string())
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_transactions_for_address_head_cache_preserves_v1_and_enforces_max_version() {
+    let address = Pubkey::new_from_array([21; 32]);
+    let address_str = address.to_string();
+    let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+    let signature_bytes = [72; 64];
+    let signature = Signature::from(signature_bytes);
+    let mut record = transaction_variant_record(Some(1), true);
+    record.slot = 20;
+    record.signature = signature_bytes;
+    record.tx_signatures = vec![signature_bytes];
+    record.tx_account_keys[0] = address.to_bytes();
+    cache.insert_for_tests(signature, record, 4, &[address], CommitmentLevel::Processed);
+    let state = test_state_with_head_cache(cache);
+
+    for max_version in [None, Some(0)] {
+        let mut config = json!({
+            "transactionDetails": "full",
+            "commitment": "processed",
+            "limit": 1
+        });
+        if let Some(max_version) = max_version {
+            config["maxSupportedTransactionVersion"] = json!(max_version);
+        }
+        let response = handle_get_transactions_for_address(
+            state.clone(),
+            json!(1),
+            Some(vec![json!(&address_str), config]),
+        )
+        .await
+        .expect("response");
+        let parsed = parse_json_rpc_response(response).await;
+        let error = parsed.error.expect("unsupported version error");
+        assert!(
+            error
+                .message
+                .contains("Transaction version (1) is not supported"),
+            "{}",
+            error.message
+        );
+    }
+
+    let response = handle_get_transactions_for_address(
+        state,
+        json!(1),
+        Some(vec![
+            json!(address_str),
+            json!({
+                "transactionDetails": "full",
+                "commitment": "processed",
+                "limit": 1,
+                "maxSupportedTransactionVersion": 1
+            }),
+        ]),
+    )
+    .await
+    .expect("response");
+    let parsed = parse_json_rpc_response(response).await;
+    let result = parsed.result.expect("v1 result");
+    assert_eq!(result.pointer("/data/0/version"), Some(&json!(1)));
+    assert_eq!(
+        result.pointer("/data/0/transaction/message/transactionConfig/heapSize"),
+        Some(&json!(32_768))
     );
 }
 
@@ -5997,6 +6459,100 @@ fn build_transaction_status_meta_emits_empty_lists_when_present() {
 }
 
 #[test]
+fn build_transaction_status_meta_preserves_commission_bps() {
+    let mut record = base_transaction_record();
+    record.meta_rewards_present = true;
+    record.meta_reward_pubkey = vec![solana_sdk::pubkey::Pubkey::new_unique().to_string()];
+    record.meta_reward_lamports = vec![10];
+    record.meta_reward_post_balance = vec![20];
+    record.meta_reward_type = vec![Some("Staking".to_string())];
+    record.meta_reward_commission = vec![None];
+    record.meta_reward_commission_bps = vec![Some(300)];
+
+    let meta = build_transaction_status_meta(&record)
+        .expect("build meta")
+        .expect("meta present");
+    let reward = &meta.rewards.expect("rewards")[0];
+
+    assert_eq!(reward.commission, None);
+    assert_eq!(reward.commission_bps, Some(300));
+}
+
+#[test]
+fn deactivated_stake_rewards_hydrate_from_both_stored_spellings() {
+    for spelling in ["DeactivatedStake", "deactivated-stake"] {
+        let mut record = base_transaction_record();
+        record.meta_pre_balances = vec![1];
+        record.meta_post_balances = vec![1];
+        record.meta_rewards_present = true;
+        record.meta_reward_pubkey = vec![solana_sdk::pubkey::Pubkey::new_unique().to_string()];
+        record.meta_reward_lamports = vec![10];
+        record.meta_reward_post_balance = vec![20];
+        record.meta_reward_type = vec![Some(spelling.to_string())];
+        record.meta_reward_commission = vec![None];
+        record.meta_reward_commission_bps = vec![None];
+
+        let encoded = hydrate_transaction_record(&record, UiTransactionEncoding::Json, None)
+            .expect("hydrate transaction reward");
+        let value = serde_json::to_value(encoded).expect("serialize transaction reward");
+        assert_eq!(
+            value.pointer("/meta/rewards/0/rewardType"),
+            Some(&json!("DeactivatedStake")),
+            "{spelling}"
+        );
+
+        let mut block = base_block_record(10);
+        block.metadata.rewards_present = true;
+        block.metadata.rewards_pubkey = vec![[9; 32]];
+        block.metadata.rewards_lamports = vec![10];
+        block.metadata.rewards_post_balance = vec![20];
+        block.metadata.rewards_type = vec![Some(spelling.to_string())];
+        block.metadata.rewards_commission = vec![None];
+        block.metadata.rewards_commission_bps = vec![None];
+        let block = hydrate_block_record(
+            block,
+            UiTransactionEncoding::Json,
+            TransactionDetails::Signatures,
+            true,
+            None,
+        )
+        .expect("hydrate block reward");
+        let value = serde_json::to_value(block).expect("serialize block reward");
+        assert_eq!(
+            value.pointer("/rewards/0/rewardType"),
+            Some(&json!("DeactivatedStake")),
+            "{spelling}"
+        );
+    }
+}
+
+#[test]
+fn inflation_reward_serialization_omits_unavailable_commission_bps() {
+    let reward = InflationRewardInfo {
+        epoch: 1005,
+        effective_slot: 434_592_000,
+        amount: 1,
+        post_balance: 2,
+        commission: None,
+        commission_bps: None,
+    };
+    let value = serde_json::to_value(&reward).expect("serialize reward");
+    assert!(
+        !value
+            .as_object()
+            .expect("object")
+            .contains_key("commissionBps")
+    );
+
+    let value = serde_json::to_value(InflationRewardInfo {
+        commission_bps: Some(300),
+        ..reward
+    })
+    .expect("serialize reward");
+    assert_eq!(value["commissionBps"], 300);
+}
+
+#[test]
 fn build_transaction_status_meta_for_accounts_emits_empty_rewards_when_absent() {
     let mut record = base_transaction_record();
     record.meta_pre_balances = vec![1];
@@ -6056,6 +6612,38 @@ fn hydrate_block_record_rejects_reward_length_mismatch() {
             assert!(msg.contains("reward length mismatch"));
         }
         other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn hydrate_block_record_supports_legacy_and_populated_commission_bps() {
+    for commission_bps in [Vec::new(), vec![Some(300)]] {
+        let mut record = base_block_record(10);
+        record.metadata.rewards_present = true;
+        record.metadata.rewards_pubkey.push([9u8; 32]);
+        record.metadata.rewards_lamports.push(1);
+        record.metadata.rewards_post_balance.push(2);
+        record
+            .metadata
+            .rewards_type
+            .push(Some("Staking".to_string()));
+        record.metadata.rewards_commission.push(None);
+        record.metadata.rewards_commission_bps = commission_bps.clone();
+
+        let block = hydrate_block_record(
+            record,
+            UiTransactionEncoding::Json,
+            TransactionDetails::Signatures,
+            true,
+            None,
+        )
+        .expect("hydrate block");
+        let reward = &block.rewards.expect("rewards")[0];
+
+        assert_eq!(
+            reward.commission_bps,
+            commission_bps.first().copied().flatten()
+        );
     }
 }
 
@@ -6445,7 +7033,7 @@ mod disk_cache_tier {
     }
 
     #[tokio::test]
-    async fn get_signature_statuses_skips_disk_without_search_history() {
+    async fn get_signature_statuses_served_from_disk_without_search_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let disk = open_disk_cache(&dir);
         let signatures = write_block(&disk, 100, 99, 2);
@@ -6471,10 +7059,18 @@ mod disk_cache_tier {
                 .expect("statuses");
             let statuses = value.as_array().expect("array");
             assert_eq!(statuses.len(), 2);
-            assert!(
-                statuses.iter().all(Value::is_null),
-                "{case}: expected no historical lookup, got {statuses:?}"
-            );
+            for status in statuses {
+                assert_eq!(
+                    status.get("confirmationStatus").and_then(Value::as_str),
+                    Some("finalized"),
+                    "{case}: {status:?}"
+                );
+                assert_eq!(
+                    status.get("slot").and_then(Value::as_u64),
+                    Some(100),
+                    "{case}: {status:?}"
+                );
+            }
         }
     }
 
@@ -6518,6 +7114,57 @@ mod disk_cache_tier {
 
     fn empty_head_cache() -> Arc<HeadCache> {
         Arc::new(HeadCache::new(64, TEST_MAX_LIMIT as usize))
+    }
+
+    fn head_cache_with_finalized_tip(slot: u64) -> Arc<HeadCache> {
+        let cache = empty_head_cache();
+        let address = Pubkey::new_from_array([91u8; 32]);
+        let signature_bytes = [92u8; 64];
+        let signature = Signature::from(signature_bytes);
+        let mut record = base_transaction_record();
+        record.slot = slot;
+        record.signature = signature_bytes;
+        record.tx_signatures = vec![signature_bytes];
+        record.tx_account_keys = vec![address.to_bytes()];
+        cache.insert_for_tests(signature, record, 0, &[address], CommitmentLevel::Finalized);
+        cache
+    }
+
+    #[tokio::test]
+    async fn get_signature_statuses_disk_hit_marks_response_source_without_history_search() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = open_disk_cache(&dir);
+        let signatures = write_block(&disk, 100, 99, 1);
+        let state = state_with_head_and_disk(head_cache_with_finalized_tip(101), disk);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [[signatures[0].clone()]]
+        });
+
+        let response = handle_json_rpc_value(state, &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("X-Superbank-Sources")
+                .and_then(|value| value.to_str().ok()),
+            Some("head-cache,disk-cache")
+        );
+
+        let parsed = parse_json_rpc_response(response).await;
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        let status = parsed
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/value/0"))
+            .expect("disk status");
+        assert_eq!(status.get("slot").and_then(Value::as_u64), Some(100));
+        assert_eq!(
+            status.get("confirmationStatus").and_then(Value::as_str),
+            Some("finalized")
+        );
     }
 
     #[tokio::test]

@@ -12,10 +12,10 @@
 //! result SETS than ClickHouse, not just staleness. One shared derivation is used
 //! by live, backfill, and repair writes so all sources agree.
 
+use crate::solana_sdk::pubkey::Pubkey;
+use crate::solana_sdk::signature::Signature;
 use once_cell::sync::Lazy;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
 
 use crate::clickhouse::{
     NumericFilter, ResolvedSignatureFilter, SignatureRecord, SignatureSlot, SlotBoundary,
@@ -183,6 +183,32 @@ impl DiskCacheInner {
             slot_idx: value.idx,
             err: value.err,
         })
+    }
+
+    pub(crate) fn get_sig_statuses_sync(
+        &self,
+        signatures: &[Signature],
+    ) -> Vec<Option<DiskSigStatus>> {
+        let cf = match self.cf(schema::CF_SIG) {
+            Ok(cf) => cf,
+            Err(_) => return vec![None; signatures.len()],
+        };
+        self.db
+            .batched_multi_get_cf(&cf, signatures, false)
+            .into_iter()
+            .map(|result| {
+                let raw = result.ok().flatten()?;
+                let value = codec::decode_sig_value(&raw)?;
+                if value.slot < self.min_retained() {
+                    return None;
+                }
+                Some(DiskSigStatus {
+                    slot: value.slot,
+                    slot_idx: value.idx,
+                    err: value.err,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn signature_position_sync(&self, signature: &Signature) -> Option<SignatureSlot> {
@@ -483,11 +509,15 @@ impl DiskCacheInner {
             Ok(cf) => cf,
             Err(_) => return vec![None; positions.len()],
         };
-        positions
+        let keys: Vec<_> = positions
             .iter()
-            .map(|&(slot, idx)| {
-                self.db
-                    .get_pinned_cf(&tx_cf, schema::tx_key(slot, idx))
+            .map(|&(slot, idx)| schema::tx_key(slot, idx))
+            .collect();
+        self.db
+            .batched_multi_get_cf(&tx_cf, &keys, false)
+            .into_iter()
+            .map(|result| {
+                result
                     .ok()
                     .flatten()
                     .and_then(|raw| codec::decode_record::<StoredTransactionRecord>(&raw))
@@ -819,6 +849,10 @@ mod tests {
             block_time: Some(1_700_000_000),
             is_vote: false,
             tx_version: None,
+            tx_config_priority_fee: None,
+            tx_config_compute_unit_limit: None,
+            tx_config_loaded_accounts_data_size_limit: None,
+            tx_config_heap_size: None,
             tx_signatures: vec![[9u8; 64]],
             tx_num_required_signatures: 1,
             tx_num_readonly_signed_accounts: 0,
@@ -869,6 +903,7 @@ mod tests {
             meta_reward_post_balance: Vec::new(),
             meta_reward_type: Vec::new(),
             meta_reward_commission: Vec::new(),
+            meta_reward_commission_bps: Vec::new(),
             meta_loaded_addresses_writable: Vec::new(),
             meta_loaded_addresses_readonly: Vec::new(),
             meta_return_data_present: false,
@@ -946,19 +981,22 @@ mod tests {
     #[test]
     fn mv_parity_memo_extraction_uses_combined_account_keys() {
         use std::str::FromStr;
-        let memo_program = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
-            .unwrap()
-            .to_bytes();
+        for program in [
+            "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+            "Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH",
+        ] {
+            let memo_program = Pubkey::from_str(program).unwrap().to_bytes();
 
-        let mut record = base_record();
-        // Memo program resolved through a loaded address (index 1 = loaded writable).
-        record.tx_account_keys = vec![pubkey_bytes(1)];
-        record.meta_loaded_addresses_writable = vec![memo_program];
-        record.tx_instructions_program_id_index = vec![1];
-        record.tx_instructions_data = vec![b"hello".to_vec()];
+            let mut record = base_record();
+            // Memo program resolved through a loaded address (index 1 = loaded writable).
+            record.tx_account_keys = vec![pubkey_bytes(1)];
+            record.meta_loaded_addresses_writable = vec![memo_program];
+            record.tx_instructions_program_id_index = vec![1];
+            record.tx_instructions_data = vec![b"hello".to_vec()];
 
-        let entries = derive_index_entries(&record);
-        assert_eq!(entries.memo.as_deref(), Some("[5] hello"));
+            let entries = derive_index_entries(&record);
+            assert_eq!(entries.memo.as_deref(), Some("[5] hello"), "{program}");
+        }
     }
 
     #[test]
