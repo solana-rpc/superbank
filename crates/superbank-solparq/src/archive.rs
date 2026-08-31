@@ -1,0 +1,1525 @@
+use std::{
+    collections::HashSet,
+    fmt,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use tokio::fs;
+use tracing::{debug, info, warn};
+
+use crate::{
+    backfill,
+    clickhouse::{
+        ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, DiskUsage, SlotRange,
+        TableSize, ValidationReport,
+    },
+    config::Config,
+    manifest::{
+        ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, ManifestProducer,
+        REPORT_FORMAT_VERSION, SkippedArchiveTable,
+    },
+    storage::{self, ArchiveDestination},
+};
+
+pub const HOURLY_SLOTS: u64 = 9_000;
+pub const EPOCH_SLOTS: u64 = 432_000;
+pub const DEFAULT_CUSTOM_SLOTS: u64 = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ArchiveSlotRange {
+    pub start_slot: u64,
+    pub end_slot: u64,
+}
+
+impl ArchiveSlotRange {
+    pub fn new(start_slot: u64, end_slot: u64) -> Result<Self> {
+        if start_slot > end_slot {
+            return Err(anyhow!(
+                "archive slot range start must be less than or equal to end"
+            ));
+        }
+        Ok(Self {
+            start_slot,
+            end_slot,
+        })
+    }
+}
+
+impl FromStr for ArchiveSlotRange {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (start, end) = value
+            .trim()
+            .split_once('-')
+            .ok_or_else(|| "archive slot range must use START-END format".to_string())?;
+        let start_slot = start
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid archive slot range start in '{value}'"))?;
+        let end_slot = end
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid archive slot range end in '{value}'"))?;
+        Self::new(start_slot, end_slot).map_err(|err| err.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ArchiveKind {
+    Hourly,
+    Epoch,
+    Custom { slots: u64 },
+}
+
+impl ArchiveKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ArchiveKind::Hourly => "hourly",
+            ArchiveKind::Epoch => "epoch",
+            ArchiveKind::Custom { .. } => "custom",
+        }
+    }
+
+    pub fn slot_count(self) -> u64 {
+        match self {
+            ArchiveKind::Hourly => HOURLY_SLOTS,
+            ArchiveKind::Epoch => EPOCH_SLOTS,
+            ArchiveKind::Custom { slots } => slots,
+        }
+    }
+
+    fn first_start_slot(self, earliest_slot: u64) -> u64 {
+        match self {
+            ArchiveKind::Epoch => align_up(earliest_slot, EPOCH_SLOTS),
+            ArchiveKind::Hourly | ArchiveKind::Custom { .. } => earliest_slot,
+        }
+    }
+}
+
+impl FromStr for ArchiveKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "hourly" => Ok(ArchiveKind::Hourly),
+            "epoch" => Ok(ArchiveKind::Epoch),
+            "custom" => Ok(ArchiveKind::Custom {
+                slots: DEFAULT_CUSTOM_SLOTS,
+            }),
+            _ if normalized.starts_with("custom:") => {
+                let slots = normalized
+                    .trim_start_matches("custom:")
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid custom archive slot count in '{value}'"))?;
+                if slots == 0 {
+                    return Err("custom archive slot count must be greater than zero".to_string());
+                }
+                Ok(ArchiveKind::Custom { slots })
+            }
+            _ => Err(format!(
+                "unsupported archive range type '{value}' (valid: hourly, epoch, custom, custom:<slots>)"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for ArchiveKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArchiveKind::Hourly => formatter.write_str("hourly"),
+            ArchiveKind::Epoch => formatter.write_str("epoch"),
+            ArchiveKind::Custom { slots } => write!(formatter, "custom:{slots}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ClickHouseBounds {
+    pub earliest_slot: u64,
+    pub latest_slot: u64,
+    /// Count of distinct slots that actually have data, not the
+    /// `latest_slot - earliest_slot + 1` span. Slot production can skip slots,
+    /// so the span overstates how many slots are really present.
+    pub distinct_slots: u64,
+}
+
+impl ClickHouseBounds {
+    pub fn slots_available(self) -> u64 {
+        self.distinct_slots
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchivePlan {
+    pub kind: ArchiveKind,
+    pub epoch: u64,
+    pub start_slot: u64,
+    pub end_slot: u64,
+}
+
+impl ArchivePlan {
+    pub fn archive_id(&self) -> String {
+        format!(
+            "{}_{}_{}-{}",
+            self.kind.label(),
+            self.epoch,
+            self.start_slot,
+            self.end_slot
+        )
+    }
+
+    pub fn file_name(&self) -> String {
+        format!("{}.parquet", self.archive_id())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedArchiveName {
+    pub kind_label: String,
+    pub epoch: u64,
+    pub start_slot: u64,
+    pub end_slot: u64,
+}
+
+pub fn parse_archive_name(file_name: &str) -> Option<ParsedArchiveName> {
+    let stem = file_name.strip_suffix(".parquet").unwrap_or(file_name);
+    let mut parts = stem.split('_');
+    let kind_label = parts.next()?.to_string();
+    let epoch = parts.next()?.parse().ok()?;
+    let range = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (start, end) = range.split_once('-')?;
+    Some(ParsedArchiveName {
+        kind_label,
+        epoch,
+        start_slot: start.parse().ok()?,
+        end_slot: end.parse().ok()?,
+    })
+}
+
+pub fn plan_next_archive(
+    kind: ArchiveKind,
+    bounds: ClickHouseBounds,
+    last_archive_name: Option<&str>,
+    continue_from_last_archive: bool,
+    custom_aligned: bool,
+) -> Result<Option<ArchivePlan>> {
+    if bounds.latest_slot < bounds.earliest_slot {
+        return Ok(None);
+    }
+
+    let start_slot = match last_archive_name.filter(|_| continue_from_last_archive) {
+        Some(file_name) => {
+            let parsed = parse_archive_name(file_name)
+                .ok_or_else(|| anyhow!("unable to parse last archive name '{file_name}'"))?;
+            if parsed.kind_label != kind.label() {
+                return Err(anyhow!(
+                    "last archive name '{file_name}' does not match archive type '{}'",
+                    kind.label()
+                ));
+            }
+            if parsed.end_slot < bounds.earliest_slot {
+                kind.first_start_slot(bounds.earliest_slot)
+            } else {
+                parsed
+                    .end_slot
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("last archive end slot overflowed"))?
+            }
+        }
+        None => kind.first_start_slot(bounds.earliest_slot),
+    };
+
+    // With `--custom-aligned`, snap custom archives onto fixed slot-count
+    // boundaries (custom:1000 -> 1000, 2000, 3000, ...) so every archive covers a
+    // whole `[k*slots, (k+1)*slots)` window. Continuation already lands on a
+    // boundary; `align_up` also bootstraps from an unaligned earliest slot or a
+    // pre-alignment archive history, skipping the leading partial window. Once
+    // aligned, the `end_slot > latest_slot` check below makes the run wait until
+    // the full window is present in ClickHouse before archiving.
+    let start_slot = match kind {
+        ArchiveKind::Custom { slots } if custom_aligned => align_up(start_slot, slots),
+        _ => start_slot,
+    };
+
+    let slot_count = kind.slot_count();
+    let end_slot = start_slot
+        .checked_add(slot_count - 1)
+        .ok_or_else(|| anyhow!("archive end slot overflowed"))?;
+
+    if end_slot > bounds.latest_slot {
+        return Ok(None);
+    }
+
+    Ok(Some(ArchivePlan {
+        kind,
+        epoch: start_slot / EPOCH_SLOTS,
+        start_slot,
+        end_slot,
+    }))
+}
+
+pub fn plan_archive_slot_range(
+    kind: ArchiveKind,
+    bounds: ClickHouseBounds,
+    slot_range: ArchiveSlotRange,
+) -> Result<Option<ArchivePlan>> {
+    if bounds.latest_slot < bounds.earliest_slot {
+        return Ok(None);
+    }
+    if slot_range.start_slot > slot_range.end_slot {
+        return Err(anyhow!(
+            "archive slot range start must be less than or equal to end"
+        ));
+    }
+    if slot_range.start_slot < bounds.earliest_slot || slot_range.end_slot > bounds.latest_slot {
+        return Ok(None);
+    }
+
+    Ok(Some(ArchivePlan {
+        kind,
+        epoch: slot_range.start_slot / EPOCH_SLOTS,
+        start_slot: slot_range.start_slot,
+        end_slot: slot_range.end_slot,
+    }))
+}
+
+/// Compute the ClickHouse slot range that is safe to delete after an archive is
+/// created.
+///
+/// Deletion starts from the **lowest archived start slot** across the configured
+/// archive types, not from slot `0`. Aligned kinds do not archive from the
+/// earliest ingested slot: `epoch` (and `custom` with `--custom-aligned`) begins
+/// its first archive at an `align_up` boundary, so the window between the
+/// earliest ingested slot and that boundary is never captured by any archive.
+/// Flooring the delete start at the lowest archived start slot keeps that
+/// never-archived prefix in ClickHouse; any slot at or above it exists in at
+/// least one archive and can be safely reclaimed.
+///
+/// `--delete-archived-data-from-slot-zero` (server mode only) opts back into the
+/// original behaviour of sweeping from slot `0`, for setups that intentionally
+/// want the leading, never-archived window purged too.
+///
+/// The range end (`safe_end_slot`) is the highest slot that *every* configured
+/// archive type has archived — the minimum of each type's latest archive end
+/// slot, capped at the current archive's end slot. This preserves the rule that
+/// data is only deleted once no archive type still needs it in ClickHouse. If
+/// any configured type has not produced an archive yet, nothing is safe to
+/// delete.
+pub fn safe_delete_archived_data_range(
+    config: &Config,
+    current_end_slot: u64,
+    latest_archive_names: &[(ArchiveKind, Option<String>)],
+) -> Result<Option<crate::clickhouse::SlotRange>> {
+    if !config.delete_archived_data_range {
+        return Ok(None);
+    }
+
+    let mut safe_end_slot = current_end_slot;
+    let mut floor_start_slot = u64::MAX;
+    for kind in config.archive_kinds.iter().copied() {
+        let Some(latest_archive_name) = latest_archive_names
+            .iter()
+            .find(|(latest_kind, _)| *latest_kind == kind)
+            .and_then(|(_, latest_archive_name)| latest_archive_name.as_deref())
+        else {
+            return Ok(None);
+        };
+        let parsed = parse_archive_name(latest_archive_name).ok_or_else(|| {
+            anyhow!("unable to parse latest archive name '{latest_archive_name}'")
+        })?;
+        if parsed.kind_label != kind.label() {
+            return Err(anyhow!(
+                "latest archive name '{latest_archive_name}' does not match archive type '{}'",
+                kind.label()
+            ));
+        }
+        safe_end_slot = safe_end_slot.min(parsed.end_slot);
+        floor_start_slot = floor_start_slot.min(parsed.start_slot);
+    }
+
+    // Floor the delete start at the lowest archived start slot so slots that no
+    // archive type ever captured (the pre-`align_up` leading window) are kept,
+    // unless the operator explicitly opts into sweeping from slot 0. Clamp to
+    // `safe_end_slot` so the range is never inverted. `floor_start_slot` is set
+    // at least once here: the loop returns early for any kind without an archive,
+    // so reaching this point means every configured kind contributed a start.
+    let start_slot = if config.delete_archived_data_from_slot_zero {
+        0
+    } else {
+        floor_start_slot.min(safe_end_slot)
+    };
+
+    Ok(Some(crate::clickhouse::SlotRange::new(
+        start_slot,
+        safe_end_slot,
+    )))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveRunReport {
+    pub timestamp_unix: u64,
+    pub archive_created: bool,
+    pub archive_skipped_reason: Option<String>,
+    pub archive_name: Option<String>,
+    pub archive_kind: ArchiveKind,
+    pub archive_epoch: Option<u64>,
+    pub archive_slot_start: Option<u64>,
+    pub archive_slot_end: Option<u64>,
+    pub db_bounds: Option<ClickHouseBounds>,
+    pub destination: String,
+    pub archive_tables: Vec<ArchiveRunTable>,
+    pub validation: Option<ValidationReport>,
+    pub deleted_clickhouse_range: bool,
+    pub cleaned_archives: Vec<String>,
+    /// Operational measurements captured during the run, surfaced as Prometheus
+    /// metrics by [`crate::metrics::AppState::record_report`]. Empty/`None` for
+    /// runs that skip archive creation.
+    pub run_metrics: ArchiveRunMetrics,
+}
+
+/// The `report.json` document written next to each archive. Wraps the run report
+/// with the same build-identity block the manifest carries (`producer`,
+/// `format_version`) plus the resolved hostname and human-readable timestamp, so
+/// a report can be traced to the exact binary and node that produced it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveReportDocument {
+    pub report_version: u32,
+    pub producer: ManifestProducer,
+    pub hostname: String,
+    /// Human-readable UTC form of `timestamp_unix`.
+    pub timestamp_utc: String,
+    #[serde(flatten)]
+    pub report: ArchiveRunReport,
+}
+
+impl ArchiveReportDocument {
+    pub fn new(report: ArchiveRunReport) -> Self {
+        let timestamp_utc = format_unix_timestamp_utc(report.timestamp_unix);
+        Self {
+            report_version: REPORT_FORMAT_VERSION,
+            producer: ManifestProducer::current(),
+            hostname: node_hostname(),
+            timestamp_utc,
+            report,
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).map_err(|err| anyhow!(err))
+    }
+}
+
+/// Per-run operational measurements consumed by the metrics layer.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ArchiveRunMetrics {
+    /// Wall-clock duration of individual archive phases (validate, write, …).
+    pub phase_durations: Vec<PhaseDuration>,
+    /// Row counts written per archive table.
+    pub archived_table_rows: Vec<ArchivedTableRows>,
+    /// Total bytes written for the archive bundle. Only populated for local
+    /// destinations; ClickHouse-driven S3 exports do not report bytes written.
+    pub archived_bytes_total: Option<u64>,
+    /// Current Solana network tip (finalized) observed for this run, if the RPC
+    /// probe succeeded. Enables the chain-tip lag metric.
+    pub chain_tip_slot: Option<u64>,
+    /// Outcome of an overcount transaction-mismatch repair attempt, if one ran.
+    pub mismatch_repair: Option<MismatchRepair>,
+    /// Outcome of a `--backfill-gaps` RPC backfill attempt, if one ran.
+    pub gap_backfill: Option<GapBackfill>,
+    /// ClickHouse disk space at the time of this run, from `system.disks`. Empty
+    /// if the probe failed; best-effort like `chain_tip_slot`.
+    pub disk_usage: Vec<DiskUsage>,
+    /// Disk-space footprint of each archive-relevant DB table at the time of
+    /// this run, from `system.tables`. Empty if the probe failed; best-effort
+    /// like `chain_tip_slot`.
+    pub table_sizes: Vec<TableSize>,
+}
+
+/// Result of a `--repair-mismatches` dedup pass over overcount slots.
+#[derive(Debug, Clone, Serialize)]
+pub struct MismatchRepair {
+    pub partitions_optimized: u64,
+    pub overcount_slots_before: u64,
+    pub overcount_slots_after: u64,
+}
+
+/// Result of a `--backfill-gaps` RPC backfill pass over missing slots.
+#[derive(Debug, Clone, Serialize)]
+pub struct GapBackfill {
+    /// Slots handed to the backfill subprocess.
+    pub slots_targeted: u64,
+    /// Missing blocks still absent after re-validation (0 = fully repaired).
+    pub missing_blocks_after: u64,
+    /// Whether the backfill subprocess exited successfully.
+    pub succeeded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PhaseDuration {
+    pub phase: String,
+    pub seconds: f64,
+}
+
+impl PhaseDuration {
+    fn new(phase: impl Into<String>, elapsed: Duration) -> Self {
+        Self {
+            phase: phase.into(),
+            seconds: elapsed.as_secs_f64(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchivedTableRows {
+    pub table: String,
+    pub rows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchiveRunTable {
+    pub kind: ArchiveTableKind,
+    pub table_name: String,
+    pub required: bool,
+}
+
+impl ArchiveRunTable {
+    fn from_db_table(table: &ArchiveDbTable) -> Self {
+        Self {
+            kind: table.kind,
+            table_name: table.table_name.clone(),
+            required: table.required,
+        }
+    }
+}
+
+impl ArchiveRunReport {
+    pub fn skipped(kind: ArchiveKind, destination: String, reason: impl Into<String>) -> Self {
+        Self {
+            timestamp_unix: unix_timestamp(),
+            archive_created: false,
+            archive_skipped_reason: Some(reason.into()),
+            archive_name: None,
+            archive_kind: kind,
+            archive_epoch: None,
+            archive_slot_start: None,
+            archive_slot_end: None,
+            db_bounds: None,
+            destination,
+            archive_tables: Vec::new(),
+            validation: None,
+            deleted_clickhouse_range: false,
+            cleaned_archives: Vec::new(),
+            run_metrics: ArchiveRunMetrics::default(),
+        }
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("timestamp_unix: {}", self.timestamp_unix));
+        lines.push(format!(
+            "timestamp_utc: {}",
+            format_unix_timestamp_utc(self.timestamp_unix)
+        ));
+        lines.push(format!("hostname: {}", node_hostname()));
+        lines.push(format!("archive_created: {}", self.archive_created));
+        if let Some(reason) = &self.archive_skipped_reason {
+            lines.push(format!("archive_skipped_reason: {reason}"));
+        }
+        if let Some(name) = &self.archive_name {
+            lines.push(format!("archive_name: {name}"));
+        }
+        lines.push(format!("archive_kind: {}", self.archive_kind));
+        if let Some(epoch) = self.archive_epoch {
+            lines.push(format!("archive_epoch: {epoch}"));
+        }
+        if let Some(start) = self.archive_slot_start {
+            lines.push(format!("archive_slot_start: {start}"));
+        }
+        if let Some(end) = self.archive_slot_end {
+            lines.push(format!("archive_slot_end: {end}"));
+        }
+        if let Some(bounds) = self.db_bounds {
+            lines.push(format!("db_earliest_slot: {}", bounds.earliest_slot));
+            lines.push(format!("db_latest_slot: {}", bounds.latest_slot));
+            lines.push(format!("db_slots_available: {}", bounds.slots_available()));
+        }
+        lines.push(format!("destination: {}", self.destination));
+        if !self.archive_tables.is_empty() {
+            lines.push(format!(
+                "archive_tables: {}",
+                self.archive_tables
+                    .iter()
+                    .map(|table| format!(
+                        "{}:{}:{}",
+                        table.kind.as_str(),
+                        table.table_name,
+                        if table.required {
+                            "required"
+                        } else {
+                            "optional"
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        lines.push(format!(
+            "deleted_clickhouse_range: {}",
+            self.deleted_clickhouse_range
+        ));
+        if !self.cleaned_archives.is_empty() {
+            lines.push(format!(
+                "cleaned_archives: {}",
+                self.cleaned_archives.join(",")
+            ));
+        }
+        if !self.run_metrics.archived_table_rows.is_empty() {
+            lines.push(format!(
+                "archived_rows: {}",
+                self.run_metrics
+                    .archived_table_rows
+                    .iter()
+                    .map(|entry| format!("{}:{}", entry.table, entry.rows))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if let Some(bytes) = self.run_metrics.archived_bytes_total {
+            lines.push(format!("archived_bytes_total: {bytes}"));
+        }
+        if !self.run_metrics.phase_durations.is_empty() {
+            lines.push(format!(
+                "phase_durations_seconds: {}",
+                self.run_metrics
+                    .phase_durations
+                    .iter()
+                    .map(|entry| format!("{}:{:.3}", entry.phase, entry.seconds))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if let Some(chain_tip_slot) = self.run_metrics.chain_tip_slot {
+            lines.push(format!("chain_tip_slot: {chain_tip_slot}"));
+        }
+        if !self.run_metrics.disk_usage.is_empty() {
+            lines.push(format!(
+                "disk_usage: {}",
+                self.run_metrics
+                    .disk_usage
+                    .iter()
+                    .map(|disk| format!(
+                        "{}:{}:{}/{}",
+                        disk.name,
+                        disk.path,
+                        disk.used_bytes(),
+                        disk.total_bytes
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if !self.run_metrics.table_sizes.is_empty() {
+            lines.push(format!(
+                "table_sizes: {}",
+                self.run_metrics
+                    .table_sizes
+                    .iter()
+                    .map(|table| format!(
+                        "{}:{} bytes/{} rows",
+                        table.table_name, table.bytes, table.rows
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if let Some(repair) = &self.run_metrics.mismatch_repair {
+            lines.push(format!(
+                "mismatch_repair: partitions={} overcount_before={} overcount_after={}",
+                repair.partitions_optimized,
+                repair.overcount_slots_before,
+                repair.overcount_slots_after
+            ));
+        }
+        if let Some(backfill) = &self.run_metrics.gap_backfill {
+            lines.push(format!(
+                "gap_backfill: slots_targeted={} missing_after={} succeeded={}",
+                backfill.slots_targeted, backfill.missing_blocks_after, backfill.succeeded
+            ));
+        }
+        if let Some(validation) = &self.validation {
+            lines.push(format!(
+                "validation_missing_blocks: {}",
+                validation.missing_blocks.len()
+            ));
+            lines.push(format!(
+                "validation_missing_block_ranges: {}",
+                ValidationReport::format_ranges(&validation.missing_block_ranges)
+            ));
+            lines.push(format!(
+                "validation_not_produced_slot_ranges: {}",
+                ValidationReport::format_ranges(&validation.not_produced_slot_ranges)
+            ));
+            lines.push(format!(
+                "validation_transaction_mismatches: {}",
+                validation.transaction_mismatches.len()
+            ));
+            lines.push(format!(
+                "validation_transaction_mismatch_ranges: {}",
+                ValidationReport::format_ranges(&validation.transaction_mismatch_ranges)
+            ));
+            lines.push(format!(
+                "validation_transaction_undercount_ranges: {}",
+                ValidationReport::format_ranges(&validation.transaction_undercount_ranges)
+            ));
+            lines.push(format!(
+                "validation_transaction_overcount_ranges: {}",
+                ValidationReport::format_ranges(&validation.transaction_overcount_ranges)
+            ));
+            if let Some(error) = &validation.rpc_check_error {
+                lines.push(format!("validation_rpc_check_error: {error}"));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+pub async fn run_once(config: &Config) -> Result<ArchiveRunReport> {
+    run_once_for_kind(config, config.archive_kinds[0]).await
+}
+
+pub async fn run_once_for_kind(config: &Config, kind: ArchiveKind) -> Result<ArchiveRunReport> {
+    // Best-effort network tip probe up front so every report (created or
+    // skipped) can expose chain-tip lag. A failing probe leaves the tip
+    // unknown rather than aborting the archive run.
+    let chain_tip_slot =
+        match crate::clickhouse::fetch_solana_tip_slot(&config.solana_rpc_url).await {
+            Ok(slot) => Some(slot),
+            Err(err) => {
+                debug!(
+                    archive_kind = kind.to_string(),
+                    %err, "failed to probe Solana network tip"
+                );
+                None
+            }
+        };
+    // Best-effort ClickHouse resource probes (disk space, table sizes), same
+    // rationale as the chain-tip probe above: every report should expose these
+    // without letting a failed probe abort the archive run.
+    let (disk_usage, table_sizes) = match ClickHouseClient::from_config(config) {
+        Ok(client) => {
+            let disk_usage = match client.fetch_disk_usage().await {
+                Ok(disk_usage) => disk_usage,
+                Err(err) => {
+                    debug!(
+                        archive_kind = kind.to_string(),
+                        %err, "failed to fetch ClickHouse disk usage"
+                    );
+                    Vec::new()
+                }
+            };
+            let archive_tables = DbTables::from_config(config).archive_tables();
+            let table_sizes = match client.fetch_table_sizes(&archive_tables).await {
+                Ok(table_sizes) => table_sizes,
+                Err(err) => {
+                    debug!(
+                        archive_kind = kind.to_string(),
+                        %err, "failed to fetch ClickHouse table sizes"
+                    );
+                    Vec::new()
+                }
+            };
+            (disk_usage, table_sizes)
+        }
+        Err(err) => {
+            debug!(
+                archive_kind = kind.to_string(),
+                %err, "failed to build ClickHouse client for resource probes"
+            );
+            (Vec::new(), Vec::new())
+        }
+    };
+    let started = Instant::now();
+    let mut report = run_once_for_kind_inner(config, kind).await?;
+    report.run_metrics.chain_tip_slot = chain_tip_slot;
+    report.run_metrics.disk_usage = disk_usage;
+    report.run_metrics.table_sizes = table_sizes;
+    report
+        .run_metrics
+        .phase_durations
+        .push(PhaseDuration::new("total", started.elapsed()));
+    Ok(report)
+}
+
+async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<ArchiveRunReport> {
+    let destination = storage::destination(config, kind).await?;
+    debug!(
+        archive_kind = kind.to_string(),
+        destination = destination.describe(),
+        "resolved archive destination"
+    );
+    let client = ClickHouseClient::from_config(config)?;
+    let tables = DbTables::from_config(config);
+    info!(
+        archive_kind = kind.to_string(),
+        transactions_table = tables.transactions_table,
+        blocks_table = tables.blocks_table,
+        "checking ClickHouse archive source"
+    );
+    let available_archive_tables = client.check_tables(&tables).await?;
+    let archive_tables = available_archive_tables
+        .iter()
+        .map(ArchiveRunTable::from_db_table)
+        .collect::<Vec<_>>();
+    let skipped_archive_tables = skipped_archive_tables(&tables, &available_archive_tables);
+    info!(
+        archive_kind = kind.to_string(),
+        archive_tables = available_archive_tables.len(),
+        skipped_optional_archive_tables = skipped_archive_tables.len(),
+        "resolved DB archive table set"
+    );
+
+    let Some(bounds) = client.fetch_bounds(&tables.transactions_table).await? else {
+        let mut report = ArchiveRunReport::skipped(
+            kind,
+            destination.describe(),
+            "no transactions found in ClickHouse",
+        );
+        report.archive_tables = archive_tables;
+        return Ok(report);
+    };
+    info!(
+        archive_kind = kind.to_string(),
+        earliest_slot = bounds.earliest_slot,
+        latest_slot = bounds.latest_slot,
+        slots_available = bounds.slots_available(),
+        "ClickHouse archive source has slots available"
+    );
+
+    let (plan, skipped_reason) = if let Some(slot_range) = config.archive_slot_range {
+        info!(
+            archive_kind = kind.to_string(),
+            start_slot = slot_range.start_slot,
+            end_slot = slot_range.end_slot,
+            "using explicit one-shot archive slot range"
+        );
+        (
+            plan_archive_slot_range(kind, bounds, slot_range)?,
+            "requested archive slot range is not fully available in ClickHouse",
+        )
+    } else {
+        let last_archive = storage::latest_archive_name(config, kind).await?;
+        debug!(
+            archive_kind = kind.to_string(),
+            last_archive = last_archive.as_deref().unwrap_or("none"),
+            continue_from_last_archive = config.continue_from_last_archive,
+            "loaded latest archive state"
+        );
+        if !config.continue_from_last_archive {
+            info!(
+                archive_kind = kind.to_string(),
+                last_archive = last_archive.as_deref().unwrap_or("none"),
+                "archive continuation disabled; planning from oldest ClickHouse slot"
+            );
+        }
+        (
+            plan_next_archive(
+                kind,
+                bounds,
+                last_archive.as_deref(),
+                config.continue_from_last_archive,
+                config.custom_aligned,
+            )?,
+            "not enough ClickHouse slots available for the next archive",
+        )
+    };
+    let Some(plan) = plan else {
+        let mut report = ArchiveRunReport::skipped(kind, destination.describe(), skipped_reason);
+        report.db_bounds = Some(bounds);
+        report.archive_tables = archive_tables;
+        return Ok(report);
+    };
+    let archive_name = plan.archive_id();
+    info!(
+        archive_kind = kind.to_string(),
+        archive_name = plan.file_name(),
+        start_slot = plan.start_slot,
+        end_slot = plan.end_slot,
+        "archive task is ready to run"
+    );
+
+    if storage::archive_has_done_marker(config, kind, &archive_name).await? {
+        info!(
+            archive_kind = kind.to_string(),
+            archive_name, "archive already has done marker; treating as successful"
+        );
+        let (deleted_clickhouse_range, cleaned_archives) = if config.dry_run {
+            info!(
+                archive_kind = kind.to_string(),
+                archive_name,
+                "dry-run: skipping ClickHouse range deletion and archive cleanup for already-done archive"
+            );
+            (false, Vec::new())
+        } else {
+            let deleted_clickhouse_range = maybe_delete_archived_data_range(
+                config,
+                kind,
+                &client,
+                &available_archive_tables,
+                &plan,
+            )
+            .await?;
+            let cleaned_archives = storage::cleanup_archives(config, kind).await?;
+            (deleted_clickhouse_range, cleaned_archives)
+        };
+        let report = ArchiveRunReport {
+            timestamp_unix: unix_timestamp(),
+            archive_created: true,
+            archive_skipped_reason: Some("archive already has done marker".to_string()),
+            archive_name: Some(archive_name.clone()),
+            archive_kind: kind,
+            archive_epoch: Some(plan.epoch),
+            archive_slot_start: Some(plan.start_slot),
+            archive_slot_end: Some(plan.end_slot),
+            db_bounds: Some(bounds),
+            destination: destination.describe(),
+            archive_tables,
+            validation: None,
+            deleted_clickhouse_range,
+            cleaned_archives,
+            run_metrics: ArchiveRunMetrics::default(),
+        };
+        if !config.dry_run {
+            let document = ArchiveReportDocument::new(report.clone());
+            storage::write_report(config, kind, &archive_name, &document.to_json()?).await?;
+        }
+        return Ok(report);
+    }
+    let mut phase_durations = Vec::new();
+    let validate_started = Instant::now();
+    let mut validation = client
+        .validate_archive_range(
+            &tables,
+            &config.solana_rpc_url,
+            plan.start_slot,
+            plan.end_slot,
+        )
+        .await?;
+    phase_durations.push(PhaseDuration::new("validate", validate_started.elapsed()));
+
+    // Attempt to repair overcount mismatches (duplicate rows) via ClickHouse
+    // dedup before deciding whether to archive. Undercount mismatches are left
+    // for re-ingestion. Re-validate after so the archive/skip decision uses the
+    // post-repair state.
+    let mismatch_repair = if config.dry_run {
+        if config.repair_mismatches && !validation.transaction_overcount_ranges.is_empty() {
+            info!(
+                archive_kind = kind.to_string(),
+                overcount_slots = count_slots(&validation.transaction_overcount_ranges),
+                "dry-run: skipping overcount mismatch repair (no ClickHouse changes made)"
+            );
+        }
+        None
+    } else if config.repair_mismatches && !validation.transaction_overcount_ranges.is_empty() {
+        let repair_started = Instant::now();
+        let partitions = epoch_partitions(&validation.transaction_overcount_ranges);
+        let overcount_slots_before = count_slots(&validation.transaction_overcount_ranges);
+        info!(
+            archive_kind = kind.to_string(),
+            partitions = partitions.len(),
+            overcount_slots = overcount_slots_before,
+            "repairing overcount transaction mismatches via dedup"
+        );
+        for partition in &partitions {
+            client
+                .deduplicate_partition(
+                    &config.transactions_local_table,
+                    config.clickhouse_cluster.as_deref(),
+                    *partition,
+                )
+                .await?;
+        }
+        validation = client
+            .validate_archive_range(
+                &tables,
+                &config.solana_rpc_url,
+                plan.start_slot,
+                plan.end_slot,
+            )
+            .await?;
+        let overcount_slots_after = count_slots(&validation.transaction_overcount_ranges);
+        phase_durations.push(PhaseDuration::new("repair", repair_started.elapsed()));
+        info!(
+            archive_kind = kind.to_string(),
+            partitions = partitions.len(),
+            overcount_slots_before,
+            overcount_slots_after,
+            "mismatch repair completed"
+        );
+        Some(MismatchRepair {
+            partitions_optimized: partitions.len() as u64,
+            overcount_slots_before,
+            overcount_slots_after,
+        })
+    } else {
+        None
+    };
+
+    // Backfill blocks that are missing locally (produced on-chain per getBlocks
+    // but absent from ClickHouse) by re-ingesting them via the `superbank` RPC
+    // ingestor, then re-validate so the archive/skip decision reflects the fill.
+    // Best-effort: a failed backfill falls through to the normal warning gate.
+    let gap_backfill = if !config.backfill_gaps {
+        None
+    } else {
+        let target_slots =
+            backfill::backfill_target_slots(&validation, config.backfill_include_undercounts);
+        if target_slots.is_empty() {
+            None
+        } else if config.dry_run {
+            info!(
+                archive_kind = kind.to_string(),
+                slots_targeted = target_slots.len(),
+                "dry-run: skipping gap backfill (no ClickHouse changes made)"
+            );
+            None
+        } else {
+            let backfill_started = Instant::now();
+            let slots_targeted = target_slots.len() as u64;
+            info!(
+                archive_kind = kind.to_string(),
+                slots_targeted, "backfilling missing blocks before archive"
+            );
+            let succeeded = match backfill::run_backfill(config, &tables, &target_slots).await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(
+                        archive_kind = kind.to_string(),
+                        error = %err,
+                        "gap backfill failed; proceeding to the validation gate"
+                    );
+                    false
+                }
+            };
+            validation = client
+                .validate_archive_range(
+                    &tables,
+                    &config.solana_rpc_url,
+                    plan.start_slot,
+                    plan.end_slot,
+                )
+                .await?;
+            let missing_blocks_after = validation.missing_blocks.len() as u64;
+            phase_durations.push(PhaseDuration::new("backfill", backfill_started.elapsed()));
+            info!(
+                archive_kind = kind.to_string(),
+                slots_targeted, missing_blocks_after, succeeded, "gap backfill completed"
+            );
+            Some(GapBackfill {
+                slots_targeted,
+                missing_blocks_after,
+                succeeded,
+            })
+        }
+    };
+
+    debug!(
+        archive_kind = kind.to_string(),
+        missing_blocks = validation.missing_blocks.len(),
+        transaction_mismatches = validation.transaction_mismatches.len(),
+        rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or("none"),
+        "archive validation completed"
+    );
+    log_validation_gaps(kind, &validation);
+    if config.allow_rpc_validation_failure
+        && validation.rpc_check_error.is_some()
+        && !validation.has_data_warnings()
+    {
+        warn!(
+            archive_kind = kind.to_string(),
+            rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or_default(),
+            "Solana RPC produced-slots cross-check failed but --allow-rpc-validation-failure is set; archiving without missing-block verification"
+        );
+    }
+    if validation.blocks_archive(config.allow_rpc_validation_failure) && !config.force_archive {
+        if config.server_mode {
+            let mut report = ArchiveRunReport::skipped(
+                kind,
+                destination.describe(),
+                server_mode_skip_reason(&validation, config),
+            );
+            report.db_bounds = Some(bounds);
+            report.archive_tables = archive_tables;
+            report.validation = Some(validation);
+            report.run_metrics.phase_durations = phase_durations;
+            report.run_metrics.mismatch_repair = mismatch_repair;
+            report.run_metrics.gap_backfill = gap_backfill;
+            return Ok(report);
+        }
+        if config.dry_run {
+            let mut report = ArchiveRunReport::skipped(
+                kind,
+                destination.describe(),
+                "validation warnings require --force-archive (dry-run: not prompting)",
+            );
+            report.db_bounds = Some(bounds);
+            report.archive_tables = archive_tables;
+            report.validation = Some(validation);
+            report.run_metrics.phase_durations = phase_durations;
+            report.run_metrics.mismatch_repair = mismatch_repair;
+            report.run_metrics.gap_backfill = gap_backfill;
+            return Ok(report);
+        }
+        if !confirm_validation_warnings(&plan, &validation)? {
+            let mut report = ArchiveRunReport::skipped(
+                kind,
+                destination.describe(),
+                "user declined archive after validation warnings",
+            );
+            report.db_bounds = Some(bounds);
+            report.archive_tables = archive_tables;
+            report.validation = Some(validation);
+            report.run_metrics.phase_durations = phase_durations;
+            report.run_metrics.mismatch_repair = mismatch_repair;
+            report.run_metrics.gap_backfill = gap_backfill;
+            return Ok(report);
+        }
+    }
+
+    if config.dry_run {
+        info!(
+            archive_kind = kind.to_string(),
+            archive_name,
+            start_slot = plan.start_slot,
+            end_slot = plan.end_slot,
+            "dry-run: archive would be created; counting rows without writing any files"
+        );
+        let count_started = Instant::now();
+        let archived_table_rows =
+            count_would_be_archived_rows(&client, &available_archive_tables, &plan).await?;
+        phase_durations.push(PhaseDuration::new("dry_run_count", count_started.elapsed()));
+        let mut report = ArchiveRunReport::skipped(
+            kind,
+            destination.describe(),
+            "dry-run: archive would be created; no files written and no ClickHouse changes made",
+        );
+        report.archive_name = Some(archive_name.clone());
+        report.archive_epoch = Some(plan.epoch);
+        report.archive_slot_start = Some(plan.start_slot);
+        report.archive_slot_end = Some(plan.end_slot);
+        report.db_bounds = Some(bounds);
+        report.archive_tables = archive_tables;
+        report.validation = Some(validation);
+        report.run_metrics.phase_durations = phase_durations;
+        report.run_metrics.archived_table_rows = archived_table_rows;
+        report.run_metrics.mismatch_repair = mismatch_repair;
+        report.run_metrics.gap_backfill = gap_backfill;
+        return Ok(report);
+    }
+
+    if storage::remove_archive_bundle(config, kind, &archive_name).await? {
+        info!(
+            archive_kind = kind.to_string(),
+            archive_name, "removed existing archive bundle without done marker before recreating"
+        );
+    }
+
+    info!(
+        archive_kind = kind.to_string(),
+        archive_name,
+        start_slot = plan.start_slot,
+        end_slot = plan.end_slot,
+        "creating archive"
+    );
+    let mut manifest_tables = Vec::new();
+    let mut archived_bytes_total: Option<u64> = None;
+    let write_started = Instant::now();
+    match &destination {
+        ArchiveDestination::Local { directory } => {
+            let staging_dir = storage::local_staging_bundle_dir(directory, &archive_name);
+            if staging_dir.exists() {
+                fs::remove_dir_all(&staging_dir).await?;
+            }
+            fs::create_dir_all(&staging_dir).await?;
+            for table in &available_archive_tables {
+                let path = staging_dir.join(table.file_name());
+                info!(
+                    archive_kind = kind.to_string(),
+                    archive_name,
+                    archive_table = table.kind.as_str(),
+                    table_name = table.table_name.as_str(),
+                    path = path.display().to_string(),
+                    "creating archive table parquet"
+                );
+                client
+                    .stream_local_table_parquet(table, plan.start_slot, plan.end_slot, &path)
+                    .await?;
+                let row_count = client
+                    .count_table_rows(table, plan.start_slot, plan.end_slot)
+                    .await?;
+                manifest_tables.push(ArchiveManifestTable::from_table(table, row_count));
+            }
+            let checksum_file_names = manifest_tables
+                .iter()
+                .map(|table| table.file_name.clone())
+                .collect::<Vec<_>>();
+            storage::write_local_sha256sums(&staging_dir, &checksum_file_names).await?;
+            let manifest = ArchiveManifest::new(
+                archive_name.clone(),
+                kind,
+                plan.epoch,
+                plan.start_slot,
+                plan.end_slot,
+                manifest_tables.clone(),
+                skipped_archive_tables.clone(),
+            );
+            let manifest_json = serde_json::to_vec_pretty(&manifest).map_err(|err| anyhow!(err))?;
+            fs::write(staging_dir.join(MANIFEST_FILE_NAME), manifest_json).await?;
+            archived_bytes_total = Some(staging_bundle_bytes(&staging_dir).await);
+            fs::rename(
+                &staging_dir,
+                storage::local_bundle_dir(directory, &archive_name),
+            )
+            .await?;
+        }
+        ArchiveDestination::S3 { prefix, .. } => {
+            let s3 = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| anyhow!("S3 destination requested without S3 config"))?;
+            for table in &available_archive_tables {
+                info!(
+                    archive_kind = kind.to_string(),
+                    archive_name,
+                    archive_table = table.kind.as_str(),
+                    table_name = table.table_name.as_str(),
+                    "creating S3 archive table parquet"
+                );
+                let sql =
+                    crate::clickhouse::build_s3_archive_sql(crate::clickhouse::S3ArchiveSql {
+                        table,
+                        start_slot: plan.start_slot,
+                        end_slot: plan.end_slot,
+                        endpoint: &s3.endpoint,
+                        bucket: &s3.bucket_name,
+                        bucket_path: prefix,
+                        archive_name: &archive_name,
+                        access_key: &s3.auth_key,
+                        secret_key: &s3.auth_secret_key,
+                        settings: &config.clickhouse_archive_settings,
+                        dedup: config.archive_dedup_export,
+                    });
+                client.execute(&sql).await?;
+                let row_count = client
+                    .count_table_rows(table, plan.start_slot, plan.end_slot)
+                    .await?;
+                manifest_tables.push(ArchiveManifestTable::from_table(table, row_count));
+            }
+            if config.s3_write_checksums {
+                let checksum_file_names = manifest_tables
+                    .iter()
+                    .map(|table| table.file_name.clone())
+                    .collect::<Vec<_>>();
+                storage::write_s3_sha256sums(config, kind, &archive_name, &checksum_file_names)
+                    .await?;
+            }
+            let manifest = ArchiveManifest::new(
+                archive_name.clone(),
+                kind,
+                plan.epoch,
+                plan.start_slot,
+                plan.end_slot,
+                manifest_tables.clone(),
+                skipped_archive_tables.clone(),
+            );
+            storage::write_manifest(config, kind, &archive_name, &manifest).await?;
+        }
+    }
+    phase_durations.push(PhaseDuration::new("write", write_started.elapsed()));
+
+    let report_timestamp = unix_timestamp();
+    storage::write_done_marker(
+        config,
+        kind,
+        &archive_name,
+        &node_hostname(),
+        &format_unix_timestamp_utc(report_timestamp),
+    )
+    .await?;
+
+    let delete_started = Instant::now();
+    let deleted_clickhouse_range =
+        maybe_delete_archived_data_range(config, kind, &client, &available_archive_tables, &plan)
+            .await?;
+    phase_durations.push(PhaseDuration::new("delete_range", delete_started.elapsed()));
+
+    let cleanup_started = Instant::now();
+    let cleaned_archives = storage::cleanup_archives(config, kind).await?;
+    phase_durations.push(PhaseDuration::new("cleanup", cleanup_started.elapsed()));
+
+    let archived_table_rows = manifest_tables
+        .iter()
+        .map(|table| ArchivedTableRows {
+            table: table.table_name.clone(),
+            rows: table.row_count,
+        })
+        .collect::<Vec<_>>();
+    let report = ArchiveRunReport {
+        timestamp_unix: report_timestamp,
+        archive_created: true,
+        archive_skipped_reason: None,
+        archive_name: Some(archive_name.clone()),
+        archive_kind: kind,
+        archive_epoch: Some(plan.epoch),
+        archive_slot_start: Some(plan.start_slot),
+        archive_slot_end: Some(plan.end_slot),
+        db_bounds: Some(bounds),
+        destination: destination.describe(),
+        archive_tables,
+        validation: Some(validation),
+        deleted_clickhouse_range,
+        cleaned_archives,
+        run_metrics: ArchiveRunMetrics {
+            phase_durations,
+            archived_table_rows,
+            archived_bytes_total,
+            chain_tip_slot: None,
+            mismatch_repair,
+            gap_backfill,
+            disk_usage: Vec::new(),
+            table_sizes: Vec::new(),
+        },
+    };
+    let document = ArchiveReportDocument::new(report.clone());
+    storage::write_report(config, kind, &archive_name, &document.to_json()?).await?;
+    info!(
+        archive_kind = kind.to_string(),
+        archive_name,
+        cleaned_archives = report.cleaned_archives.len(),
+        "archive task completed"
+    );
+    Ok(report)
+}
+
+async fn maybe_delete_archived_data_range(
+    config: &Config,
+    kind: ArchiveKind,
+    client: &ClickHouseClient,
+    available_archive_tables: &[ArchiveDbTable],
+    plan: &ArchivePlan,
+) -> Result<bool> {
+    if !config.delete_archived_data_range {
+        return Ok(false);
+    }
+
+    let latest_archive_names = storage::latest_archive_names(config).await?;
+    let safe_delete_range =
+        safe_delete_archived_data_range(config, plan.end_slot, &latest_archive_names)?;
+    if let Some(range) = safe_delete_range {
+        info!(
+            archive_kind = kind.to_string(),
+            start_slot = range.start_slot,
+            end_slot = range.end_slot,
+            current_archive_start_slot = plan.start_slot,
+            current_archive_end_slot = plan.end_slot,
+            "deleting archived ClickHouse data range covered by all configured archive types"
+        );
+        client
+            .delete_archived_range_for_tables(
+                available_archive_tables,
+                range.start_slot,
+                range.end_slot,
+            )
+            .await?;
+        Ok(true)
+    } else {
+        info!(
+            archive_kind = kind.to_string(),
+            start_slot = plan.start_slot,
+            end_slot = plan.end_slot,
+            "deferring ClickHouse data cleanup until all configured archive types cover this range"
+        );
+        Ok(false)
+    }
+}
+
+fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {
+    info!(
+        archive_kind = kind.to_string(),
+        missing_block_gap_count = validation.missing_block_ranges.len(),
+        missing_block_ranges = ValidationReport::format_ranges(&validation.missing_block_ranges),
+        not_produced_gap_count = validation.not_produced_slot_ranges.len(),
+        not_produced_slot_ranges =
+            ValidationReport::format_ranges(&validation.not_produced_slot_ranges),
+        transaction_mismatch_gap_count = validation.transaction_mismatch_ranges.len(),
+        transaction_mismatch_ranges =
+            ValidationReport::format_ranges(&validation.transaction_mismatch_ranges),
+        rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or("none"),
+        "archive validation gap summary"
+    );
+}
+
+fn skipped_archive_tables(
+    tables: &DbTables,
+    available_archive_tables: &[ArchiveDbTable],
+) -> Vec<SkippedArchiveTable> {
+    let available = available_archive_tables
+        .iter()
+        .map(|table| (table.kind, table.table_name.as_str()))
+        .collect::<HashSet<_>>();
+    tables
+        .archive_tables()
+        .into_iter()
+        .filter(|table| !available.contains(&(table.kind, table.table_name.as_str())))
+        .map(|table| SkippedArchiveTable::unavailable(&table))
+        .collect()
+}
+
+/// Explains why a server-mode run skipped, pointing at the narrowest remedy:
+/// the RPC-failure escape hatch when that is the only blocker, otherwise
+/// `--force-archive`.
+fn server_mode_skip_reason(validation: &ValidationReport, config: &Config) -> &'static str {
+    if !config.allow_rpc_validation_failure
+        && validation.rpc_check_error.is_some()
+        && !validation.has_data_warnings()
+    {
+        "Solana RPC cross-check failed; set --allow-rpc-validation-failure to archive without it (or --force-archive to override all validation warnings) in server mode"
+    } else {
+        "validation warnings require --force-archive in server mode"
+    }
+}
+
+fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport) -> Result<bool> {
+    eprintln!(
+        "WARNING: validation found issues for {} (missing_blocks={}, transaction_mismatches={}, rpc_check_error={}).",
+        plan.file_name(),
+        validation.missing_blocks.len(),
+        validation.transaction_mismatches.len(),
+        validation.rpc_check_error.as_deref().unwrap_or("none")
+    );
+
+    if !io::stdin().is_terminal() {
+        eprintln!("stdin is not interactive; rerun with --force-archive to archive anyway.");
+        return Ok(false);
+    }
+
+    eprint!("Create the archive anyway? Type 'yes' to continue: ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Read-only row counts for a would-be dry-run archive, table by table. Used
+/// in place of the real write path so a dry run can still report how many
+/// rows each table would contribute without streaming any Parquet data.
+async fn count_would_be_archived_rows(
+    client: &ClickHouseClient,
+    tables: &[ArchiveDbTable],
+    plan: &ArchivePlan,
+) -> Result<Vec<ArchivedTableRows>> {
+    let mut rows = Vec::with_capacity(tables.len());
+    for table in tables {
+        let row_count = client
+            .count_table_rows(table, plan.start_slot, plan.end_slot)
+            .await?;
+        rows.push(ArchivedTableRows {
+            table: table.table_name.clone(),
+            rows: row_count,
+        });
+    }
+    Ok(rows)
+}
+
+/// Sum the byte sizes of the files in a staged local archive bundle.
+///
+/// Best-effort: unreadable entries are skipped so byte accounting never fails
+/// an otherwise-successful archive.
+async fn staging_bundle_bytes(staging_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(mut entries) = fs::read_dir(staging_dir).await else {
+        return 0;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(metadata) = entry.metadata().await
+            && metadata.is_file()
+        {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
+/// Distinct epoch partition ids (`intDiv(slot, EPOCH_SLOTS)`, the transactions
+/// table `PARTITION BY`) covered by the given slot ranges.
+pub fn epoch_partitions(ranges: &[SlotRange]) -> Vec<u64> {
+    let mut partitions = ranges
+        .iter()
+        .flat_map(|range| (range.start_slot / EPOCH_SLOTS)..=(range.end_slot / EPOCH_SLOTS))
+        .collect::<Vec<_>>();
+    partitions.sort_unstable();
+    partitions.dedup();
+    partitions
+}
+
+fn count_slots(ranges: &[SlotRange]) -> u64 {
+    ranges.iter().map(|range| range.slot_count).sum()
+}
+
+fn align_up(value: u64, width: u64) -> u64 {
+    if value.is_multiple_of(width) {
+        value
+    } else {
+        (value / width + 1) * width
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+fn format_unix_timestamp_utc(timestamp_unix: u64) -> String {
+    DateTime::<Utc>::from_timestamp(timestamp_unix as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "invalid timestamp".to_string())
+}
+
+fn node_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|hostname| !hostname.trim().is_empty())
+        .or_else(system_hostname)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn system_hostname() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let hostname = String::from_utf8(output.stdout).ok()?;
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        None
+    } else {
+        Some(hostname.to_string())
+    }
+}
+
+pub fn report_path_for_local_archive(directory: PathBuf, archive_name: &str) -> PathBuf {
+    directory.join(format!(".{archive_name}.report.json"))
+}

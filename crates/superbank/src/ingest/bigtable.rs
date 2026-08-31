@@ -6,7 +6,6 @@
 #![allow(deprecated)]
 
 use std::{
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,8 +17,6 @@ use anyhow::{Context, Result, anyhow};
 use solana_storage_bigtable::{CredentialType, LedgerStorage, LedgerStorageConfig};
 use solana_transaction_status::ConfirmedBlock;
 use tokio::{
-    fs::File,
-    io::{AsyncBufReadExt, BufReader},
     sync::{Semaphore, mpsc, watch},
     task::JoinSet,
 };
@@ -33,7 +30,7 @@ use crate::clickhouse::{
 use crate::commitment::parse_commitment_config;
 use crate::ingest::rpc::{map_bigtable_block_metadata, map_bigtable_transactions};
 use crate::metrics;
-use crate::range::{RangeSpec, parse_range_spec};
+use crate::range::{RangeSpec, load_slot_list, parse_range_spec};
 use crate::rpc_client::build_rpc_client;
 use crate::shutdown::spawn_shutdown_watch;
 
@@ -77,45 +74,6 @@ struct BigtableInserterArgs {
     shutdown_rx: watch::Receiver<u64>,
     fatal: Arc<AtomicBool>,
     retry_config: Arc<RetryConfig>,
-}
-
-async fn load_slot_list(path: &Path) -> Result<Vec<u64>> {
-    let file = File::open(path)
-        .await
-        .with_context(|| format!("open slot list {}", path.display()))?;
-    let mut lines = BufReader::new(file).lines();
-    let mut slots = Vec::new();
-    let mut line_number = 0usize;
-
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .with_context(|| format!("read slot list {}", path.display()))?
-    {
-        line_number = line_number.saturating_add(1);
-        for token in line.split_whitespace() {
-            if token.starts_with('#') {
-                break;
-            }
-            let slot = token.parse::<u64>().with_context(|| {
-                format!(
-                    "invalid slot '{}' on line {} in {}",
-                    token,
-                    line_number,
-                    path.display()
-                )
-            })?;
-            slots.push(slot);
-        }
-    }
-
-    if slots.is_empty() {
-        return Err(anyhow!("slot list {} was empty", path.display()));
-    }
-
-    slots.sort_unstable();
-    slots.dedup();
-    Ok(slots)
 }
 
 pub(crate) async fn run_bigtable_ingest(args: &Args) -> Result<()> {

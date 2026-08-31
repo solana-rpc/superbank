@@ -35,6 +35,36 @@ builds:
       - SUPERBANK_GIT_SHA={{ .Commit }}
       - RUSTFLAGS=-C force-frame-pointers=yes
 
+  - id: superbank-solparq
+    builder: rust
+    command: zigbuild
+    binary: superbank-solparq
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+      - --package=superbank-solparq
+      - --bin=superbank-solparq
+    env:
+      - SUPERBANK_GIT_SHA={{ .Commit }}
+
+  - id: superbank-solparq-read
+    builder: rust
+    command: zigbuild
+    binary: superbank-solparq-read
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+      - --package=superbank-solparq
+      - --bin=superbank-solparq-read
+    env:
+      - SUPERBANK_GIT_SHA={{ .Commit }}
+
 archives:
   - id: superbank
     ids: [superbank]
@@ -45,6 +75,18 @@ archives:
   - id: superbank-rpc
     ids: [superbank-rpc]
     name_template: superbank-rpc-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
+    formats: [tar.gz]
+    files: []
+
+  - id: superbank-solparq
+    ids: [superbank-solparq]
+    name_template: superbank-solparq-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
+    formats: [tar.gz]
+    files: []
+
+  - id: superbank-solparq-read
+    ids: [superbank-solparq-read]
+    name_template: superbank-solparq-read-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
     formats: [tar.gz]
     files: []
 

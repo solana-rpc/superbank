@@ -3,10 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::solana_sdk::transaction::TransactionVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::transaction::TransactionVersion;
 use solana_transaction_status::{EncodedTransaction, UiTransactionStatusMeta};
 
 #[derive(Debug, Deserialize, Default)]
@@ -154,7 +154,6 @@ pub(crate) const MAX_GET_BLOCKS_RANGE: u64 = 500_000;
 #[derive(Debug, Deserialize)]
 pub(crate) struct GetSignatureStatusesConfig {
     #[serde(rename = "searchTransactionHistory")]
-    #[allow(dead_code)]
     pub(crate) search_transaction_history: Option<bool>,
 }
 
@@ -254,6 +253,18 @@ pub(crate) struct InflationRewardInfo {
     pub(crate) amount: u64,
     pub(crate) post_balance: u64,
     pub(crate) commission: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) commission_bps: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EpochSchedule {
+    pub(crate) slots_per_epoch: u64,
+    pub(crate) leader_schedule_slot_offset: u64,
+    pub(crate) warmup: bool,
+    pub(crate) first_normal_epoch: u64,
+    pub(crate) first_normal_slot: u64,
 }
 
 #[derive(Debug, Serialize)]

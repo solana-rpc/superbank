@@ -1,0 +1,10 @@
+# Tiltfile for local Superbank development (Docker Compose)
+
+docker_compose("docker-compose.yaml")
+
+dc_resource("clickhouse", labels=["database"])
+dc_resource("clickhouse-ddl", labels=["database"])
+dc_resource("superbank-rpc", labels=["rpc"])
+
+if "ingest-rpc" in os.getenv("COMPOSE_PROFILES", "").split(","):
+    dc_resource("superbank-ingest-rpc", labels=["ingest"], auto_init=False)

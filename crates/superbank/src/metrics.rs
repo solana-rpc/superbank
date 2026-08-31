@@ -383,6 +383,17 @@ pub(crate) fn observe_transaction_insert(table: &str, rows: usize) {
     metrics().observe_transaction_insert(rows as u64);
 }
 
+/// Record rows restored into an arbitrary ClickHouse table by the solparq
+/// archive-restore source. Feeds the per-table flush-rows counter and refreshes
+/// the last-successful-flush timestamp that `/health` watches.
+pub(crate) fn observe_restored_rows(table: &str, rows: u64) {
+    let metrics = metrics();
+    metrics.observe_flush_rows(table, rows);
+    metrics
+        .last_successful_flush_timestamp_seconds
+        .set(current_timestamp_seconds());
+}
+
 pub(crate) fn set_fumarole_data_channel_capacity(capacity: usize) {
     metrics().set_fumarole_data_channel_capacity(capacity);
 }

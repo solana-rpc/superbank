@@ -349,6 +349,13 @@ k6 run tests/k6/scenarios/stress/stress-test-get-blocks.js \
 k6 run tests/k6/scenarios/stress/stress-test-get-first-available-block.js \
   -e RPC_URL=http://localhost:8899
 
+# getInflationReward (successful admitted calls plus expected -32005 shedding)
+k6 run tests/k6/scenarios/stress/stress-test-get-inflation-reward.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt \
+  -e INFLATION_REWARD_EPOCH=280 \
+  -e INFLATION_REWARD_ADDRESS_COUNT=18
+
 # getLatestBlockhash
 k6 run tests/k6/scenarios/stress/stress-test-get-latest-blockhash.js \
   -e RPC_URL=http://localhost:8899
@@ -488,7 +495,7 @@ server-side JSON-RPC failures are promoted to HTTP `503`; those responses count 
 | `SLOT_SLOTS_PER_EPOCH` | `432000` | Slots per epoch when using epoch-based slot generation |
 | `TX_ENCODING` | `json` | getTransaction encoding (`json`, `jsonParsed`, `base64`, `base58`) |
 | `TX_COMMITMENT` | (none) | getTransaction commitment (`confirmed`, `finalized`) |
-| `MAX_SUPPORTED_TX_VERSION` | `0` | getTransaction `maxSupportedTransactionVersion` |
+| `MAX_SUPPORTED_TX_VERSION` | `1` | getTransaction `maxSupportedTransactionVersion` |
 | `BLOCK_ENCODING` | (none) | getBlock encoding (`json`, `jsonParsed`, `base64`, `base58`) |
 | `BLOCK_TRANSACTION_DETAILS` | (none) | getBlock `transactionDetails` (`full`, `accounts`, `signatures`, `none`) |
 | `BLOCK_REWARDS` | (none) | getBlock `rewards` (`true` or `false`) |
@@ -794,6 +801,7 @@ tests/k6/
 │   │   └── superbank-rpc-validate-get-transactions-for-address.js # TFA endpoint comparison
 │   ├── stress/
 │   │   ├── stress-test.js          # Stress test (find breaking point)
+│   │   ├── stress-test-get-inflation-reward.js
 │   │   ├── stress-test-get-block.js
 │   │   ├── stress-test-get-block-height.js
 │   │   ├── stress-test-get-block-time.js

@@ -3,9 +3,12 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use solana_account_decoder_client_types::token::UiTokenAmount;
 #[allow(deprecated)]
-use solana_sdk::{instruction::InstructionError, pubkey::Pubkey, transaction::TransactionError};
+use crate::solana_sdk;
+use crate::solana_sdk::{
+    instruction::InstructionError, pubkey::Pubkey, transaction::TransactionError,
+};
+use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_transaction_context::transaction::TransactionReturnData;
 use solana_transaction_status::{
     InnerInstruction, InnerInstructions, Reward, RewardType, TransactionStatusMeta,
@@ -130,12 +133,13 @@ pub(crate) fn build_transaction_status_meta(
             || !record.meta_reward_post_balance.is_empty()
             || !record.meta_reward_type.is_empty()
             || !record.meta_reward_commission.is_empty()
+            || !record.meta_reward_commission_bps.is_empty()
         {
             return Err(TransactionHydrationError::InvalidStoredMetadata(
                 "rewards populated without meta_rewards_present".to_string(),
             ));
         }
-        None
+        Some(Vec::new())
     };
 
     let loaded_addresses = solana_sdk::message::v0::LoadedAddresses {
@@ -276,6 +280,7 @@ pub(crate) fn build_transaction_status_meta_for_accounts(
             &record.meta_reward_post_balance,
             &record.meta_reward_type,
             &record.meta_reward_commission,
+            &record.meta_reward_commission_bps,
         )?)
     } else {
         if !record.meta_reward_pubkey.is_empty()
@@ -283,12 +288,13 @@ pub(crate) fn build_transaction_status_meta_for_accounts(
             || !record.meta_reward_post_balance.is_empty()
             || !record.meta_reward_type.is_empty()
             || !record.meta_reward_commission.is_empty()
+            || !record.meta_reward_commission_bps.is_empty()
         {
             return Err(TransactionHydrationError::InvalidStoredMetadata(
                 "rewards populated without meta_rewards_present".to_string(),
             ));
         }
-        None
+        Some(Vec::new())
     };
 
     let loaded_addresses = solana_sdk::message::v0::LoadedAddresses {
@@ -376,6 +382,7 @@ fn meta_is_missing(record: &StoredTransactionRecord) -> bool {
         || !record.meta_reward_post_balance.is_empty()
         || !record.meta_reward_type.is_empty()
         || !record.meta_reward_commission.is_empty()
+        || !record.meta_reward_commission_bps.is_empty()
     {
         return false;
     }
@@ -440,6 +447,7 @@ fn accounts_meta_is_missing(record: &StoredAccountsTransactionRecord) -> bool {
         || !record.meta_reward_post_balance.is_empty()
         || !record.meta_reward_type.is_empty()
         || !record.meta_reward_commission.is_empty()
+        || !record.meta_reward_commission_bps.is_empty()
     {
         return false;
     }
@@ -860,6 +868,7 @@ fn build_rewards(
         &record.meta_reward_post_balance,
         &record.meta_reward_type,
         &record.meta_reward_commission,
+        &record.meta_reward_commission_bps,
     )
 }
 
@@ -869,19 +878,22 @@ fn build_rewards_from_fields(
     post_balances: &[u64],
     reward_types: &[Option<String>],
     commissions: &[Option<u8>],
+    commission_bps: &[Option<u16>],
 ) -> Result<Vec<Reward>, TransactionHydrationError> {
     let len = pubkeys.len();
     if lamports.len() != len
         || post_balances.len() != len
         || reward_types.len() != len
         || commissions.len() != len
+        || (!commission_bps.is_empty() && commission_bps.len() != len)
     {
         return Err(TransactionHydrationError::InvalidStoredMetadata(format!(
-            "reward length mismatch (pubkey={len}, lamports={}, post_balance={}, reward_type={}, commission={})",
+            "reward length mismatch (pubkey={len}, lamports={}, post_balance={}, reward_type={}, commission={}, commission_bps={})",
             lamports.len(),
             post_balances.len(),
             reward_types.len(),
-            commissions.len()
+            commissions.len(),
+            commission_bps.len()
         )));
     }
 
@@ -893,7 +905,7 @@ fn build_rewards_from_fields(
             post_balance: post_balances[idx],
             reward_type: parse_reward_type(&reward_types[idx])?,
             commission: commissions[idx],
-            commission_bps: None,
+            commission_bps: commission_bps.get(idx).copied().flatten(),
         });
     }
 
@@ -918,6 +930,10 @@ pub(crate) fn parse_reward_type(
         Ok(Some(RewardType::Staking))
     } else if value.eq_ignore_ascii_case("voting") {
         Ok(Some(RewardType::Voting))
+    } else if value.eq_ignore_ascii_case("deactivatedstake")
+        || value.eq_ignore_ascii_case("deactivated-stake")
+    {
+        Ok(Some(RewardType::DeactivatedStake))
     } else {
         Err(TransactionHydrationError::InvalidStoredMetadata(format!(
             "unknown reward type '{value}'"
@@ -945,6 +961,8 @@ mod tests {
             ("voting", RewardType::Voting),
             ("Voting", RewardType::Voting),
             ("VOTING", RewardType::Voting),
+            ("DeactivatedStake", RewardType::DeactivatedStake),
+            ("deactivated-stake", RewardType::DeactivatedStake),
         ];
 
         for (input, expected) in cases {
