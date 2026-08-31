@@ -9,7 +9,6 @@ use std::time::Instant;
 use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
 use serde::Deserialize;
 use serde_big_array::Array;
-use solana_clock::DEFAULT_SLOTS_PER_EPOCH;
 use solana_epoch_rewards_hasher::EpochRewardsHasher;
 use solana_epoch_schedule::EpochSchedule;
 
