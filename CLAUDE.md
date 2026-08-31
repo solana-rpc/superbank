@@ -12,9 +12,10 @@ Superbank is a Rust workspace that ingests Solana ledger data into ClickHouse an
 Source [Fumarole / gRPC / RPC / Bigtable] --> superbank (ingestor) --> ClickHouse --> superbank-rpc (JSON-RPC + optional gRPC server)
 ```
 
-Two main crates in the workspace:
+Three crates in the workspace:
 - **`crates/superbank`** — Ingestor binary. Pulls Solana data from Yellowstone Fumarole, Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable and writes to ClickHouse.
 - **`crates/superbank-rpc`** — Axum-based JSON-RPC server. Reads from ClickHouse and serves Solana-compatible RPC. Has optional `grpc-head-cache`, `disk-cache`, `grpc-streaming`, and `pyroscope` features.
+- **`crates/superbank-verify`** — Proof-of-History validator. Recomputes the PoH hash chain (or cheap structural invariants) from the stored `blocks_metadata`/`entries`/`transactions` tables for genesis-to-tip or arbitrary slot/epoch ranges.
 
 Other key paths:
 - `ddl/` — ClickHouse schemas (local, cluster, replicated variants)
@@ -25,8 +26,8 @@ Other key paths:
 ## Build & Development Commands
 
 ```bash
-# Build both crates
-cargo build -p superbank -p superbank-rpc
+# Build the workspace binaries
+cargo build -p superbank -p superbank-rpc -p superbank-verify
 
 # Run ingestor
 cargo run -p superbank -- --config superbank.yaml

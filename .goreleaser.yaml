@@ -65,6 +65,21 @@ builds:
     env:
       - SUPERBANK_GIT_SHA={{ .Commit }}
 
+  - id: superbank-verify
+    builder: rust
+    command: zigbuild
+    binary: superbank-verify
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+      - --package=superbank-verify
+      - --bin=superbank-verify
+    env:
+      - SUPERBANK_GIT_SHA={{ .Commit }}
+
 archives:
   - id: superbank
     ids: [superbank]
@@ -87,6 +102,12 @@ archives:
   - id: superbank-solparq-read
     ids: [superbank-solparq-read]
     name_template: superbank-solparq-read-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
+    formats: [tar.gz]
+    files: []
+
+  - id: superbank-verify
+    ids: [superbank-verify]
+    name_template: superbank-verify-{{ .Tag }}-{{ .Os }}-{{ .Arch }}
     formats: [tar.gz]
     files: []
 

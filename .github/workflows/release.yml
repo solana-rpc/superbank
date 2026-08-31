@@ -76,7 +76,7 @@ jobs:
 
           expected = sys.argv[1]
           metadata_path = sys.argv[2]
-          packages = {"superbank-workspace", "superbank", "superbank-rpc"}
+          packages = {"superbank-workspace", "superbank", "superbank-rpc", "superbank-solparq", "superbank-verify"}
           with open(metadata_path, encoding="utf-8") as f:
               metadata = json.load(f)
 
