@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use crate::clickhouse::ClickHouseClient;
 use crate::metrics;
 use crate::processing::ProcessingError;
+use crate::request_filter::RpcParameterFilterSet;
 use crate::util::{current_time_millis, ttl_millis};
 
 #[cfg(feature = "disk-cache")]
@@ -32,6 +33,7 @@ pub(crate) struct MetricsHeaderCaptureConfig {
 
 pub(crate) struct AppState {
     pub(crate) clickhouse: ClickHouseClient,
+    pub(crate) rpc_parameter_filters: RpcParameterFilterSet,
     pub(crate) max_signatures_limit: u64,
     pub(crate) rpc_max_batch_size: usize,
     pub(crate) rpc_batch_concurrency_limit: usize,

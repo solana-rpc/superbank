@@ -15,7 +15,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use solana_rpc_client_api::custom_error::{
     JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE, JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY,
 };
@@ -56,6 +56,9 @@ const ROUTE_HEADER_LABEL_MISSING: &str = "missing";
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
 const JSON_RPC_REQUEST_TIMEOUT_CODE: i64 = -32000;
 const JSON_RPC_REQUEST_TIMEOUT_MESSAGE: &str = "Request timeout";
+const JSON_RPC_PARAMETER_FILTER_CODE: i32 = -32602;
+const JSON_RPC_PARAMETER_FILTER_MESSAGE: &str =
+    "Invalid params: request blocked by parameter filter";
 const HEADER_X_ENDPOINT: &str = "X-Endpoint";
 const HEADER_X_RPC_NODE: &str = "X-RPC-Node";
 const HEADER_X_SUBSCRIPTION_ID: &str = "X-Subscription-ID";
@@ -639,6 +642,30 @@ fn json_rpc_error_value(
     Value::Object(response)
 }
 
+fn observe_parameter_filter_match(method: &str) {
+    if let Some(tracker) = metrics::track_request(metrics_method_label(method)) {
+        tracker.observe(StatusCode::OK);
+    }
+}
+
+fn parameter_filter_response(id: Value, method: String, params: Vec<Value>) -> Response {
+    json_rpc_error_response(
+        id,
+        JSON_RPC_PARAMETER_FILTER_CODE,
+        JSON_RPC_PARAMETER_FILTER_MESSAGE,
+        Some(json!({ "method": method, "params": params })),
+    )
+}
+
+fn parameter_filter_response_value(id: Value, method: String, params: Vec<Value>) -> Value {
+    json_rpc_error_value(
+        id,
+        JSON_RPC_PARAMETER_FILTER_CODE,
+        JSON_RPC_PARAMETER_FILTER_MESSAGE,
+        Some(json!({ "method": method, "params": params })),
+    )
+}
+
 fn is_http_503_eligible_json_rpc_error(code: i64, message: Option<&str>) -> bool {
     if code == JSON_RPC_INTERNAL_ERROR_CODE {
         return true;
@@ -1059,8 +1086,22 @@ async fn handle_single_request(
         }
     };
 
+    let NormalizedJsonRpcRequest { id, method, params } = request;
+    if state
+        .rpc_parameter_filters
+        .matches(&method, params.as_deref())
+    {
+        let id = id.unwrap_or(Value::Null);
+        let params = params.unwrap_or_default();
+        return metrics::with_request_metric_labels(request_metric_labels, async move {
+            observe_parameter_filter_match(&method);
+            Ok(parameter_filter_response(id, method, params))
+        })
+        .await;
+    }
+
     let timeout = state.rpc_request_timeout;
-    let dispatch_request = request.into_dispatch_request();
+    let dispatch_request = NormalizedJsonRpcRequest { id, method, params }.into_dispatch_request();
     let response = metrics::with_request_metric_labels(
         request_metric_labels,
         Box::pin(dispatch_json_rpc_request(
@@ -1088,6 +1129,19 @@ async fn execute_batch_requests(
     for (idx, request_value) in requests.into_iter().enumerate() {
         match parse_json_rpc_request(request_value) {
             Ok(request) => {
+                if state
+                    .rpc_parameter_filters
+                    .matches(&request.method, request.params.as_deref())
+                {
+                    observe_parameter_filter_match(&request.method);
+                    responses[idx] = Some(parameter_filter_response_value(
+                        request.id.unwrap_or(Value::Null),
+                        request.method,
+                        request.params.unwrap_or_default(),
+                    ));
+                    continue;
+                }
+
                 let response_id = request.id.clone().unwrap_or(Value::Null);
                 let dispatch_request = request.into_dispatch_request();
                 let state = state.clone();

@@ -28,6 +28,7 @@ use crate::handlers::handle_json_rpc_with_headers;
 use crate::metrics;
 use crate::metrics::metrics_handler;
 use crate::processing::ProcessingError;
+use crate::request_filter::RpcParameterFilterSet;
 use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHeaderCaptureConfig};
 
 #[cfg(feature = "grpc-streaming")]
@@ -184,6 +185,12 @@ fn epoch_schedule_from_config(args: &RpcConfig) -> RpcResult<EpochSchedule> {
 
 pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     info!("Starting Solana RPC server on {}:{}", args.host, args.port);
+    let rpc_parameter_filters =
+        RpcParameterFilterSet::load(args.config.as_deref()).map_err(RpcError::Config)?;
+    info!(
+        filters = rpc_parameter_filters.len(),
+        "RPC parameter filters loaded"
+    );
     info!(
         transport = ?args.clickhouse_transport,
         scope = ?args.clickhouse_scope,
@@ -403,6 +410,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 
     let state = Arc::new(AppState {
         clickhouse,
+        rpc_parameter_filters,
         max_signatures_limit: args.max_signatures_limit,
         rpc_max_batch_size: args.rpc_max_batch_size.max(1),
         rpc_batch_concurrency_limit: args.rpc_batch_concurrency_limit.max(1),

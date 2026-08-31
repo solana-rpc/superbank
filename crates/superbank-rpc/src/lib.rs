@@ -38,6 +38,7 @@ mod solana_sdk {
 mod clickhouse;
 mod metrics;
 mod processing;
+mod request_filter;
 
 mod config;
 #[cfg(feature = "disk-cache")]

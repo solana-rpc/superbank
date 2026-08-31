@@ -1,5 +1,13 @@
 # Superbank ingestor example configuration.
 # Copy to superbank.yaml and pass via --config / SUPERBANK_CONFIG.
+#
+# Optional superbank-rpc exact request filters. Pass this same file to
+# superbank-rpc with --config / SUPERBANK_CONFIG. Each entry contains the
+# method followed by its complete params array. Matching calls return HTTP 405
+# with a JSON-RPC "Method not allowed" error and do not reach RPC handlers.
+# rpc-parameter-filters:
+#   - [getTransactionsForAddress, So11111111111111111111111111111111111111112]
+#   - [getTransactionsForAddress, So11111111111111111111111111111111111111112, {transactionDetails: signatures}]
 
 source: "grpc" # fumarole | grpc | rpc | bigtable | solparq
 
