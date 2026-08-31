@@ -39,9 +39,9 @@ use crate::clickhouse::{
 use crate::handlers::blocks::{
     handle_get_block, handle_get_block_height, handle_get_block_time, handle_get_blocks,
     handle_get_blocks_with_limit, handle_get_epoch_info, handle_get_epoch_schedule,
-    handle_get_first_available_block,
-    handle_get_health, handle_get_inflation_reward, handle_get_latest_blockhash, handle_get_slot,
-    handle_get_transaction_count, handle_is_blockhash_valid, handle_minimum_ledger_slot,
+    handle_get_first_available_block, handle_get_health, handle_get_inflation_reward,
+    handle_get_latest_blockhash, handle_get_slot, handle_get_transaction_count,
+    handle_is_blockhash_valid, handle_minimum_ledger_slot,
 };
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::handlers::signatures::{
@@ -176,6 +176,17 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
 
 fn test_state() -> Arc<AppState> {
     test_state_with_token_owner_activity_available(true)
+}
+
+fn test_state_with_transaction_count(transaction_count: u64) -> Arc<AppState> {
+    let mut state = match Arc::try_unwrap(test_state()) {
+        Ok(state) => state,
+        Err(_) => panic!("test_state should have a single Arc owner"),
+    };
+    state
+        .clickhouse
+        .set_transaction_count_for_tests(transaction_count);
+    Arc::new(state)
 }
 
 fn test_state_with_metrics_header_capture(capture: MetricsHeaderCaptureConfig) -> Arc<AppState> {
@@ -358,6 +369,21 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
+}
+
+#[cfg(feature = "grpc-head-cache")]
+fn test_state_with_head_cache_and_transaction_count(
+    head_cache: Arc<HeadCache>,
+    transaction_count: u64,
+) -> Arc<AppState> {
+    let mut state = match Arc::try_unwrap(test_state_with_head_cache(head_cache)) {
+        Ok(state) => state,
+        Err(_) => panic!("test state should have a single Arc owner"),
+    };
+    state
+        .clickhouse
+        .set_transaction_count_for_tests(transaction_count);
+    Arc::new(state)
 }
 
 #[cfg(feature = "grpc-head-cache")]
@@ -4252,6 +4278,163 @@ async fn get_epoch_info_confirmed_uses_head_overlay_context() {
         err.data.and_then(|d| d.get("contextSlot").cloned()),
         Some(json!(105u64))
     );
+}
+
+#[tokio::test]
+async fn get_epoch_info_default_response_is_consistent_and_emits_headers() {
+    let state = test_state_with_transaction_count(777);
+    let context_slot = 432_005;
+    state
+        .latest_slot_cache
+        .value
+        .store(context_slot, Ordering::Relaxed);
+    state
+        .latest_slot_cache
+        .last_updated_ms
+        .store(current_time_millis(), Ordering::Relaxed);
+    state
+        .latest_block_height_cache
+        .value
+        .store(430_005, Ordering::Relaxed);
+    state
+        .latest_block_height_cache
+        .last_updated_ms
+        .store(current_time_millis(), Ordering::Relaxed);
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getEpochInfo",
+        "params": []
+    });
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("X-Superbank-Sources")
+            .and_then(|value| value.to_str().ok()),
+        Some("clickhouse")
+    );
+    let metrics_header = response
+        .headers()
+        .get("X-Superbank-Metrics")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none(), "{:?}", parsed.error);
+    assert!(
+        metrics_header
+            .as_deref()
+            .is_some_and(|value| value.starts_with("rows_read=unknown;rows_returned=1;")),
+        "unexpected metrics header: {metrics_header:?}"
+    );
+    assert_eq!(
+        parsed.result,
+        Some(json!({
+            "absoluteSlot": context_slot,
+            "blockHeight": 430_005,
+            "epoch": 1,
+            "slotIndex": 5,
+            "slotsInEpoch": 432_000,
+            "transactionCount": 777
+        }))
+    );
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_epoch_info_processed_head_response_uses_selected_slot_height_and_overlay() {
+    let cache = Arc::new(HeadCache::new(32, 1024));
+    cache.note_block_metadata(head_cache_metadata(100, 95, 3));
+    cache.note_block_metadata(head_cache_metadata(105, 100, 5));
+    cache.note_block_height(105, 1_005);
+    cache.note_slot_commitment(105, CommitmentLevel::Processed);
+
+    // This newer processed tip is disconnected from the ClickHouse boundary.
+    // It must neither become the transaction-count context nor donate its
+    // unrelated height to the selected slot 105.
+    cache.note_block_metadata(head_cache_metadata(106, 102, 7));
+    cache.note_block_height(106, 10_006);
+    cache.note_slot_commitment(106, CommitmentLevel::Processed);
+
+    let state = test_state_with_head_cache_and_transaction_count(cache, 40);
+    state.latest_slot_cache.value.store(95, Ordering::Relaxed);
+    state
+        .latest_slot_cache
+        .last_updated_ms
+        .store(current_time_millis(), Ordering::Relaxed);
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getEpochInfo",
+        "params": [{ "commitment": "processed" }]
+    });
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("X-Superbank-Sources")
+            .and_then(|value| value.to_str().ok()),
+        Some("both")
+    );
+    assert!(
+        response
+            .headers()
+            .get("X-Superbank-Metrics")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("rows_read=unknown;rows_returned=1;"))
+    );
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert!(parsed.error.is_none(), "{:?}", parsed.error);
+    assert_eq!(
+        parsed.result,
+        Some(json!({
+            "absoluteSlot": 105,
+            "blockHeight": 1_005,
+            "epoch": 0,
+            "slotIndex": 105,
+            "slotsInEpoch": 432_000,
+            "transactionCount": 48
+        }))
+    );
+}
+
+#[tokio::test]
+async fn get_epoch_info_returns_backend_error_when_transaction_count_query_fails() {
+    let state = test_state_with_clickhouse_url("http://127.0.0.1:1");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getEpochInfo",
+        "params": []
+    });
+    let response = handle_json_rpc_value(state, &request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("X-Superbank-Sources")
+            .and_then(|value| value.to_str().ok()),
+        Some("clickhouse")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("X-Superbank-Metrics")
+            .and_then(|value| value.to_str().ok()),
+        Some("rows_read=0;rows_returned=0;data_read_bytes=0")
+    );
+
+    let parsed = parse_json_rpc_response(response).await;
+    assert_eq!(parsed.error.expect("backend error").code, -32603);
 }
 
 #[tokio::test]

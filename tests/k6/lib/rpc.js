@@ -14,6 +14,7 @@ import {
   rpcGetBlockLatency,
   rpcGetBlockHeightLatency,
   rpcGetSlotLatency,
+  rpcGetEpochInfoLatency,
   rpcGetTransactionCountLatency,
   rpcGetLatestBlockhashLatency,
   rpcGetBlockTimeLatency,
@@ -268,6 +269,28 @@ export function makeGetSlotRequest(options = {}, requestId = null) {
     jsonrpc: '2.0',
     id: requestId === null ? Math.floor(Math.random() * 1_000_000_000) : requestId,
     method: 'getSlot',
+    params,
+  });
+}
+
+/**
+ * Build a JSON-RPC request payload for getEpochInfo.
+ * @param {object} options - Request options
+ * @param {string} [options.commitment] - processed | confirmed | finalized
+ * @param {number} [options.minContextSlot] - Minimum context slot (optional)
+ * @param {number} [requestId] - JSON-RPC request id override
+ * @returns {string} JSON stringified payload
+ */
+export function makeGetEpochInfoRequest(options = {}, requestId = null) {
+  const params = [];
+  if (options && Object.keys(options).length > 0) {
+    params.push(options);
+  }
+
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id: requestId === null ? Math.floor(Math.random() * 1_000_000_000) : requestId,
+    method: 'getEpochInfo',
     params,
   });
 }
@@ -662,6 +685,21 @@ export function getSlot(options = {}) {
   const payload = makeGetSlotRequest(options);
   const { response, body, success } = executeRequest(payload, {
     latencyMetric: rpcGetSlotLatency,
+  });
+  const checksPass = runChecks(response, body);
+
+  return { response, body, success, checksPass };
+}
+
+/**
+ * Execute getEpochInfo and run all checks
+ * @param {object} options - Request options
+ * @returns {object} { response, body, success, checksPass }
+ */
+export function getEpochInfo(options = {}) {
+  const payload = makeGetEpochInfoRequest(options);
+  const { response, body, success } = executeRequest(payload, {
+    latencyMetric: rpcGetEpochInfoLatency,
   });
   const checksPass = runChecks(response, body);
 

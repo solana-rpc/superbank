@@ -165,6 +165,22 @@ impl HeadCache {
         latest
     }
 
+    /// Returns the height observed for one exact slot when that slot satisfies
+    /// the requested commitment.
+    pub(crate) fn block_height_for_slot_at_least(
+        &self,
+        slot: u64,
+        min_commitment: CommitmentLevel,
+    ) -> Option<u64> {
+        commitment_meets(self.slot_commitment(slot), min_commitment)
+            .then(|| {
+                self.slot_block_height
+                    .get(&slot)
+                    .map(|height| *height.value())
+            })
+            .flatten()
+    }
+
     pub(crate) fn latest_blockhash_info_at_least(
         &self,
         min_commitment: CommitmentLevel,

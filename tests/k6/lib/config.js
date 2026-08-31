@@ -85,6 +85,13 @@ export const config = {
     return Number.isFinite(value) ? value : null;
   })(),
 
+  // getEpochInfo options
+  epochInfoCommitment: __ENV.EPOCH_INFO_COMMITMENT || null,
+  epochInfoMinContextSlot: (() => {
+    const value = Number(__ENV.EPOCH_INFO_MIN_CONTEXT_SLOT);
+    return Number.isFinite(value) ? value : null;
+  })(),
+
   // getTransactionCount options
   transactionCountCommitment: __ENV.TRANSACTION_COUNT_COMMITMENT || null,
   transactionCountMinContextSlot: (() => {
@@ -197,6 +204,17 @@ export function transactionCountOptions() {
   }
   if (config.transactionCountMinContextSlot !== null) {
     options.minContextSlot = config.transactionCountMinContextSlot;
+  }
+  return options;
+}
+
+export function epochInfoOptions() {
+  const options = {};
+  if (config.epochInfoCommitment) {
+    options.commitment = config.epochInfoCommitment;
+  }
+  if (config.epochInfoMinContextSlot !== null) {
+    options.minContextSlot = config.epochInfoMinContextSlot;
   }
   return options;
 }

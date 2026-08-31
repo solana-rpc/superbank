@@ -12,6 +12,7 @@ writer that matches the same schemas).
 - `getBlockHeight`
 - `getSlot`
 - `getEpochInfo`
+- `getEpochSchedule`
 - `getTransactionCount`
 - `getLatestBlockhash`
 - `isBlockhashValid`
@@ -57,6 +58,9 @@ Notes:
   - `minContextSlot`: optional `u64`; if the server's current context slot is below this value, the
     call fails with JSON-RPC error `-32016` ("Minimum context slot has not been reached") and
     includes `contextSlot` in the error `data`.
+- This branch must merge through the shared, warmup-aware epoch-schedule work in PR #51 before
+  `getEpochInfo` can merge. Do not add method-local epoch math: the shared schedule is the source
+  of truth for warmup networks.
 - `minimumLedgerSlot` currently reports the lowest slot retained in Superbank's ClickHouse-backed
   block storage. This is a pragmatic approximation of Solana's validator-local ledger metadata,
   not an exact blockstore-equivalent implementation.

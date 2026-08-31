@@ -444,6 +444,8 @@ pub struct ClickHouseClient {
     pub(crate) startup_table_check: ClickHouseStartupTableCheck,
     #[cfg(test)]
     pub(crate) latest_finalized_slot_for_tests: Option<Option<u64>>,
+    #[cfg(test)]
+    pub(crate) transaction_count_for_tests: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -761,6 +763,8 @@ impl ClickHouseClient {
             startup_table_check,
             #[cfg(test)]
             latest_finalized_slot_for_tests: None,
+            #[cfg(test)]
+            transaction_count_for_tests: None,
         }
     }
 
@@ -776,6 +780,11 @@ impl ClickHouseClient {
     #[cfg(test)]
     pub fn set_latest_finalized_slot_for_tests(&mut self, latest_slot: Option<u64>) {
         self.latest_finalized_slot_for_tests = Some(latest_slot);
+    }
+
+    #[cfg(test)]
+    pub fn set_transaction_count_for_tests(&mut self, transaction_count: u64) {
+        self.transaction_count_for_tests = Some(transaction_count);
     }
 
     pub(crate) fn scope_shard_direct(&self) -> bool {

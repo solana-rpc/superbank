@@ -801,21 +801,21 @@ pub(crate) async fn handle_get_epoch_info(
             }
         },
         #[cfg(feature = "grpc-head-cache")]
-        TransactionCountPlan::ClickHouseBeforeSlotPlusHead { .. } => match state
-            .head_cache
-            .as_ref()
-            .and_then(|cache| cache.latest_block_height_at_least(commitment.commitment))
-        {
-            Some(height) => height,
-            None => {
-                route.source_none();
-                error!(
-                    slot = context_slot,
-                    "Head block height unavailable for getEpochInfo"
-                );
-                return Ok(json_rpc_internal_error_response(id));
+        TransactionCountPlan::ClickHouseBeforeSlotPlusHead { .. } => {
+            match state.head_cache.as_ref().and_then(|cache| {
+                cache.block_height_for_slot_at_least(context_slot, commitment.commitment)
+            }) {
+                Some(height) => height,
+                None => {
+                    route.source_none();
+                    error!(
+                        slot = context_slot,
+                        "Head block height unavailable for getEpochInfo"
+                    );
+                    return Ok(json_rpc_internal_error_response(id));
+                }
             }
-        },
+        }
     };
 
     // Transaction count through the resolved slot, following getTransactionCount.
