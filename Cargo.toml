@@ -21,8 +21,7 @@ authors = [
     "aspnxdd <43625217+aspnxdd@users.noreply.github.com>",
 ]
 
-# Shared by the ingestor and Solparq. Keep RPC dependencies explicit until a
-# workspace-wide dependency policy is agreed.
+# Versions and baseline features shared by workspace members.
 [workspace.dependencies]
 anyhow = "1.0"
 axum = "0.8"
