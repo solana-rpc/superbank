@@ -24,6 +24,10 @@ pub(crate) struct TransactionRow {
     pub(crate) block_time: Option<i64>,
     pub(crate) is_vote: bool,
     pub(crate) tx_version: Option<u8>,
+    pub(crate) tx_config_priority_fee: Option<u64>,
+    pub(crate) tx_config_compute_unit_limit: Option<u32>,
+    pub(crate) tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    pub(crate) tx_config_heap_size: Option<u32>,
     pub(crate) tx_signatures: Vec<Array<u8, 64>>,
     pub(crate) tx_num_required_signatures: u8,
     pub(crate) tx_num_readonly_signed_accounts: u8,
@@ -74,6 +78,7 @@ pub(crate) struct TransactionRow {
     pub(crate) meta_reward_post_balance: Vec<u64>,
     pub(crate) meta_reward_type: Vec<Option<String>>,
     pub(crate) meta_reward_commission: Vec<Option<u8>>,
+    pub(crate) meta_reward_commission_bps: Vec<Option<u16>>,
     pub(crate) meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     pub(crate) meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
     pub(crate) meta_return_data_present: bool,
@@ -99,6 +104,7 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_post_balance: Vec<u64>,
     pub(crate) rewards_type: Vec<Option<String>>,
     pub(crate) rewards_commission: Vec<Option<u8>>,
+    pub(crate) rewards_commission_bps: Vec<Option<u16>>,
     pub(crate) rewards_num_partitions: Option<u64>,
 }
 
@@ -158,6 +164,7 @@ pub(crate) struct BlockAccountsTransactionRow {
     pub(crate) meta_reward_post_balance: Vec<u64>,
     pub(crate) meta_reward_type: Vec<Option<String>>,
     pub(crate) meta_reward_commission: Vec<Option<u8>>,
+    pub(crate) meta_reward_commission_bps: Vec<Option<u16>>,
     pub(crate) meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     pub(crate) meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
 }
@@ -167,6 +174,10 @@ pub(crate) struct BlockFullTransactionRow {
     pub(crate) slot_idx: u32,
     pub(crate) is_vote: bool,
     pub(crate) tx_version: Option<u8>,
+    pub(crate) tx_config_priority_fee: Option<u64>,
+    pub(crate) tx_config_compute_unit_limit: Option<u32>,
+    pub(crate) tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    pub(crate) tx_config_heap_size: Option<u32>,
     pub(crate) tx_signatures: Vec<Array<u8, 64>>,
     pub(crate) tx_num_required_signatures: u8,
     pub(crate) tx_num_readonly_signed_accounts: u8,
@@ -217,6 +228,7 @@ pub(crate) struct BlockFullTransactionRow {
     pub(crate) meta_reward_post_balance: Vec<u64>,
     pub(crate) meta_reward_type: Vec<Option<String>>,
     pub(crate) meta_reward_commission: Vec<Option<u8>>,
+    pub(crate) meta_reward_commission_bps: Vec<Option<u16>>,
     pub(crate) meta_loaded_addresses_writable: Vec<Array<u8, 32>>,
     pub(crate) meta_loaded_addresses_readonly: Vec<Array<u8, 32>>,
     pub(crate) meta_return_data_present: bool,
@@ -240,6 +252,10 @@ pub(crate) fn map_transaction_row(row: TransactionRow) -> StoredTransactionRecor
         block_time: row.block_time,
         is_vote: row.is_vote,
         tx_version: row.tx_version,
+        tx_config_priority_fee: row.tx_config_priority_fee,
+        tx_config_compute_unit_limit: row.tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit: row.tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size: row.tx_config_heap_size,
         tx_signatures: row.tx_signatures.into_iter().map(|sig| sig.0).collect(),
         tx_num_required_signatures: row.tx_num_required_signatures,
         tx_num_readonly_signed_accounts: row.tx_num_readonly_signed_accounts,
@@ -326,6 +342,7 @@ pub(crate) fn map_transaction_row(row: TransactionRow) -> StoredTransactionRecor
         meta_reward_post_balance: row.meta_reward_post_balance,
         meta_reward_type: row.meta_reward_type,
         meta_reward_commission: row.meta_reward_commission,
+        meta_reward_commission_bps: row.meta_reward_commission_bps,
         meta_loaded_addresses_writable: row
             .meta_loaded_addresses_writable
             .into_iter()
@@ -360,6 +377,7 @@ pub(crate) fn map_block_metadata_base_row(row: BlockMetadataBaseRow) -> BlockMet
         rewards_post_balance: Vec::new(),
         rewards_type: Vec::new(),
         rewards_commission: Vec::new(),
+        rewards_commission_bps: Vec::new(),
         rewards_num_partitions: row.rewards_num_partitions,
     }
 }
@@ -432,6 +450,7 @@ pub(crate) fn map_block_accounts_transaction_row(
         meta_reward_post_balance: row.meta_reward_post_balance,
         meta_reward_type: row.meta_reward_type,
         meta_reward_commission: row.meta_reward_commission,
+        meta_reward_commission_bps: row.meta_reward_commission_bps,
         meta_loaded_addresses_writable: row
             .meta_loaded_addresses_writable
             .into_iter()
@@ -463,6 +482,10 @@ pub(crate) fn map_block_full_transaction_row(
         block_time: None,
         is_vote: row.is_vote,
         tx_version: row.tx_version,
+        tx_config_priority_fee: row.tx_config_priority_fee,
+        tx_config_compute_unit_limit: row.tx_config_compute_unit_limit,
+        tx_config_loaded_accounts_data_size_limit: row.tx_config_loaded_accounts_data_size_limit,
+        tx_config_heap_size: row.tx_config_heap_size,
         tx_signatures,
         tx_num_required_signatures: row.tx_num_required_signatures,
         tx_num_readonly_signed_accounts: row.tx_num_readonly_signed_accounts,
@@ -549,6 +572,7 @@ pub(crate) fn map_block_full_transaction_row(
         meta_reward_post_balance: row.meta_reward_post_balance,
         meta_reward_type: row.meta_reward_type,
         meta_reward_commission: row.meta_reward_commission,
+        meta_reward_commission_bps: row.meta_reward_commission_bps,
         meta_loaded_addresses_writable: row
             .meta_loaded_addresses_writable
             .into_iter()
@@ -645,6 +669,7 @@ pub(crate) fn map_block_metadata_row(row: BlockMetadataRow) -> BlockMetadataReco
         rewards_post_balance: row.rewards_post_balance,
         rewards_type: row.rewards_type,
         rewards_commission: row.rewards_commission,
+        rewards_commission_bps: row.rewards_commission_bps,
         rewards_num_partitions: row.rewards_num_partitions,
     }
 }

@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
 use futures_util::StreamExt;
 use solana_commitment_config::CommitmentLevel;
-use solana_sdk::{hash::Hash, pubkey::Pubkey};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yellowstone_block_machine::dragonsmouth::{
@@ -306,6 +306,7 @@ fn apply_block_meta(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards_num_partitions,
     ) = match parse_block_rewards(slot, meta.rewards.as_ref()) {
         Some(parts) => parts,
@@ -327,6 +328,7 @@ fn apply_block_meta(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards_num_partitions,
     });
 }
@@ -356,6 +358,7 @@ type ParsedRewards = (
     Vec<u64>,
     Vec<Option<String>>,
     Vec<Option<u8>>,
+    Vec<Option<u16>>,
     Option<u64>,
 );
 
@@ -371,6 +374,7 @@ fn parse_block_rewards(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
         ));
     };
@@ -380,6 +384,7 @@ fn parse_block_rewards(
     let mut rewards_post_balance = Vec::with_capacity(rewards.rewards.len());
     let mut rewards_type = Vec::with_capacity(rewards.rewards.len());
     let mut rewards_commission = Vec::with_capacity(rewards.rewards.len());
+    let mut rewards_commission_bps = Vec::with_capacity(rewards.rewards.len());
 
     for reward in &rewards.rewards {
         let pubkey = match reward.pubkey.parse::<Pubkey>() {
@@ -408,6 +413,9 @@ fn parse_block_rewards(
                 Ok(yellowstone_grpc_proto::prelude::RewardType::Voting) => {
                     Some("Voting".to_string())
                 }
+                Ok(yellowstone_grpc_proto::prelude::RewardType::DeactivatedStake) => {
+                    Some("DeactivatedStake".to_string())
+                }
                 Err(_) => {
                     warn!(
                         slot,
@@ -433,6 +441,21 @@ fn parse_block_rewards(
                 }
             }
         });
+        rewards_commission_bps.push(if reward.commission_bps.is_empty() {
+            None
+        } else {
+            match reward.commission_bps.parse::<u16>() {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    warn!(
+                        slot,
+                        commission_bps = reward.commission_bps.as_str(),
+                        "head cache: failed to parse reward commission bps from BlockMeta: {err}"
+                    );
+                    return None;
+                }
+            }
+        });
     }
 
     Some((
@@ -442,6 +465,7 @@ fn parse_block_rewards(
         rewards_post_balance,
         rewards_type,
         rewards_commission,
+        rewards_commission_bps,
         rewards
             .num_partitions
             .as_ref()
@@ -549,7 +573,7 @@ mod tests {
                         post_balance: 99,
                         reward_type: yellowstone_grpc_proto::prelude::RewardType::Fee as i32,
                         commission: "7".to_string(),
-                        commission_bps: String::new(),
+                        commission_bps: "725".to_string(),
                     }],
                     num_partitions: Some(yellowstone_grpc_proto::prelude::NumPartitions {
                         num_partitions: 4,
@@ -593,6 +617,7 @@ mod tests {
         assert_eq!(metadata.rewards_post_balance, vec![99]);
         assert_eq!(metadata.rewards_type, vec![Some("Fee".to_string())]);
         assert_eq!(metadata.rewards_commission, vec![Some(7)]);
+        assert_eq!(metadata.rewards_commission_bps, vec![Some(725)]);
         assert_eq!(metadata.rewards_num_partitions, Some(4));
     }
 }

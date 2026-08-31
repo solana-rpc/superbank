@@ -3,10 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
 use axum::{http::StatusCode, response::Response};
 use serde_json::{Value, json};
 use solana_commitment_config::CommitmentLevel;
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -196,11 +196,11 @@ pub(crate) async fn handle_get_signature_statuses(
         }
     };
 
-    // Disk tier: finalized statuses for signatures the head cache does not hold.
-    // Per getSignatureStatuses semantics, historical tiers are searched only
-    // when searchTransactionHistory is set.
+    // Disk tier: finalized recent statuses for signatures the head cache does not hold.
+    // This is part of the default status-cache lookup; searchTransactionHistory
+    // only controls the ClickHouse fallback below.
     #[cfg(feature = "disk-cache")]
-    let disk_statuses: HashMap<String, (u64, Option<Value>)> = if search_transaction_history {
+    let disk_statuses: HashMap<String, (u64, Option<Value>)> =
         if let Some(disk) = state.disk_cache.as_ref() {
             let pending: Vec<(String, Signature)> = unique_valid
                 .iter()
@@ -232,10 +232,7 @@ pub(crate) async fn handle_get_signature_statuses(
             }
         } else {
             HashMap::new()
-        }
-    } else {
-        HashMap::new()
-    };
+        };
 
     #[cfg(feature = "disk-cache")]
     let in_disk = |sig: &String| disk_statuses.contains_key(sig);

@@ -6,11 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
 use serde::Deserialize;
 use serde_big_array::Array;
+use solana_clock::DEFAULT_SLOTS_PER_EPOCH;
 use solana_epoch_rewards_hasher::EpochRewardsHasher;
 use solana_epoch_schedule::EpochSchedule;
-use solana_sdk::{hash::Hash, pubkey::Pubkey};
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
@@ -33,8 +34,8 @@ use super::rows::{
 #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 use super::rows::{TransactionRow, map_transaction_row};
 use super::types::{
-    BlockMetadataRecord, InflationRewardRecord, QueryTimings, StoredAccountsTransactionRecord,
-    StoredTransactionRecord,
+    BlockMetadataRecord, InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings,
+    StoredAccountsTransactionRecord, StoredTransactionRecord,
 };
 use super::util::{annotate_required_query, http_query_with_id};
 
@@ -77,6 +78,7 @@ struct InflationBoundaryRow {
 #[derive(Deserialize, clickhouse::Row)]
 struct InflationSlotRow {
     slot: u64,
+    block_height: Option<u64>,
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -86,6 +88,7 @@ struct InflationRewardRow {
     lamports: i64,
     post_balance: u64,
     commission: Option<u8>,
+    commission_bps: Option<u16>,
 }
 
 fn build_inflation_boundary_query(
@@ -118,20 +121,45 @@ fn build_inflation_partition_slots_query(
     table: &str,
     boundary_slot: u64,
     end_slot_exclusive: u64,
-    num_partitions: usize,
+    required_block_heights: &[u64],
     settings_clause: &str,
 ) -> String {
     let payout_epoch = boundary_slot / SLOT_SHARD_DIVISOR;
+    let block_height_literals = required_block_heights
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "SELECT slot
+        "SELECT slot, block_height
          FROM {table}
          PREWHERE
             intDiv(slot, {slot_shard_divisor}) = {payout_epoch}
             AND slot > {boundary_slot}
             AND slot < {end_slot_exclusive}
-         ORDER BY slot ASC
-         LIMIT 1 BY slot
-         LIMIT {num_partitions}
+         WHERE block_height IN ({block_height_literals})
+         ORDER BY block_height ASC, slot ASC
+         {settings_clause}",
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+    )
+}
+
+fn build_inflation_progress_query(
+    table: &str,
+    boundary_slot: u64,
+    end_slot_exclusive: u64,
+    settings_clause: &str,
+) -> String {
+    let payout_epoch = boundary_slot / SLOT_SHARD_DIVISOR;
+    format!(
+        "SELECT slot, block_height
+         FROM {table}
+         PREWHERE
+            intDiv(slot, {slot_shard_divisor}) = {payout_epoch}
+            AND slot >= {boundary_slot}
+            AND slot < {end_slot_exclusive}
+         ORDER BY slot DESC
+         LIMIT 1
          {settings_clause}",
         slot_shard_divisor = SLOT_SHARD_DIVISOR,
     )
@@ -168,11 +196,12 @@ fn build_inflation_rewards_query(
             tupleElement(latest, 1) AS effective_slot,
             tupleElement(latest, 2) AS lamports,
             tupleElement(latest, 3) AS post_balance,
-            tupleElement(latest, 4) AS commission
+            tupleElement(latest, 4) AS commission,
+            tupleElement(latest, 5) AS commission_bps
          FROM (
             SELECT
                 reward.1 AS pubkey,
-                argMax(tuple(slot, reward.2, reward.3, reward.5), slot) AS latest
+                argMax(tuple(slot, reward.2, reward.3, reward.5, reward.6), slot) AS latest
             FROM (
                 SELECT
                     slot,
@@ -180,7 +209,12 @@ fn build_inflation_rewards_query(
                     rewards_lamports,
                     rewards_post_balance,
                     rewards_type,
-                    rewards_commission
+                    rewards_commission,
+                    if(
+                        empty(rewards_commission_bps),
+                        arrayMap(_ -> CAST(NULL, 'Nullable(UInt16)'), rewards_pubkey),
+                        rewards_commission_bps
+                    ) AS rewards_commission_bps
                 FROM {table}
                 PREWHERE slot IN ({slot_literals})
                 WHERE rewards_present = 1 AND hasAny(rewards_pubkey, target_pubkeys)
@@ -190,7 +224,8 @@ fn build_inflation_rewards_query(
                 rewards_lamports,
                 rewards_post_balance,
                 rewards_type,
-                rewards_commission
+                rewards_commission,
+                rewards_commission_bps
             ) AS reward
             WHERE has(target_pubkeys, reward.1) AND {reward_type_predicate}
             GROUP BY pubkey
@@ -202,6 +237,44 @@ fn build_inflation_rewards_query(
 fn inflation_reward_partition(address: &[u8; 32], num_partitions: usize, seed: &[u8; 32]) -> usize {
     EpochRewardsHasher::new(num_partitions, &Hash::new_from_array(*seed))
         .hash_address_to_partition(&Pubkey::new_from_array(*address))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InflationRewardPartitionPlan {
+    block_height_by_pubkey: HashMap<[u8; 32], u64>,
+    required_block_heights: Vec<u64>,
+}
+
+fn plan_inflation_reward_partitions(
+    addresses: &[[u8; 32]],
+    num_partitions: usize,
+    seed: &[u8; 32],
+    boundary_block_height: u64,
+) -> Option<InflationRewardPartitionPlan> {
+    let mut block_height_by_pubkey = HashMap::with_capacity(addresses.len());
+    let mut required_block_height_set = HashSet::with_capacity(addresses.len());
+    for address in addresses {
+        let partition_index = inflation_reward_partition(address, num_partitions, seed);
+        let required_block_height = boundary_block_height
+            .checked_add(partition_index as u64)?
+            .checked_add(1)?;
+        block_height_by_pubkey.insert(*address, required_block_height);
+        required_block_height_set.insert(required_block_height);
+    }
+    let mut required_block_heights = required_block_height_set.into_iter().collect::<Vec<_>>();
+    required_block_heights.sort_unstable();
+
+    Some(InflationRewardPartitionPlan {
+        block_height_by_pubkey,
+        required_block_heights,
+    })
+}
+
+fn inflation_rewards_period_is_active(
+    current_block_height: u64,
+    rewards_complete_block_height: u64,
+) -> bool {
+    current_block_height < rewards_complete_block_height
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -685,7 +758,7 @@ impl ClickHouseClient {
             return Ok(latest_slot);
         }
 
-        self.with_timeout("get_latest_finalized_slot", async {
+        self.with_http_query_timeout("get_latest_finalized_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct MaxSlotRow {
                 max_slot: Option<u64>,
@@ -720,7 +793,7 @@ impl ClickHouseClient {
         context_slot: u64,
         min_block_height: u64,
     ) -> ProcessingResult<(bool, QueryTimings)> {
-        self.with_timeout("is_blockhash_valid", async {
+        self.with_http_query_timeout("is_blockhash_valid", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct PresentRow {
                 present: u8,
@@ -770,7 +843,7 @@ impl ClickHouseClient {
     }
 
     pub async fn get_first_available_block(&self) -> ProcessingResult<(Option<u64>, QueryTimings)> {
-        self.with_timeout("get_first_available_block", async {
+        self.with_http_query_timeout("get_first_available_block", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct MinSlotRow {
                 min_slot: Option<u64>,
@@ -814,7 +887,7 @@ impl ClickHouseClient {
     }
 
     pub async fn minimum_ledger_slot(&self) -> ProcessingResult<(Option<u64>, QueryTimings)> {
-        self.with_timeout("minimum_ledger_slot", async {
+        self.with_http_query_timeout("minimum_ledger_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct MinSlotRow {
                 min_slot: Option<u64>,
@@ -860,7 +933,7 @@ impl ClickHouseClient {
         operation: &'static str,
         query: String,
     ) -> ProcessingResult<(u64, QueryTimings)> {
-        self.with_timeout(operation, async move {
+        self.with_http_query_timeout(operation, async move {
             #[derive(Deserialize, clickhouse::Row)]
             struct TransactionCountRow {
                 transaction_count: u64,
@@ -929,7 +1002,7 @@ impl ClickHouseClient {
         start_slot: u64,
         end_slot: u64,
     ) -> ProcessingResult<(Vec<u64>, QueryTimings)> {
-        self.with_timeout("get_block_slots_by_range", async {
+        self.with_http_query_timeout("get_block_slots_by_range", async {
             let start_bucket = start_slot / SLOT_SHARD_DIVISOR;
             let end_bucket = end_slot / SLOT_SHARD_DIVISOR;
             let settings_clause = self.select_settings_clause(
@@ -988,11 +1061,14 @@ impl ClickHouseClient {
         addresses: &[[u8; 32]],
         epoch: u64,
         schedule: &EpochSchedule,
-    ) -> ProcessingResult<(Vec<InflationRewardRecord>, QueryTimings)> {
+    ) -> ProcessingResult<(InflationRewardLookupOutcome, QueryTimings)> {
         const OPERATION: &str = "get_inflation_rewards_for_epoch";
 
         if addresses.is_empty() {
-            return Ok((Vec::new(), QueryTimings::zero()));
+            return Ok((
+                InflationRewardLookupOutcome::Complete(Vec::new()),
+                QueryTimings::zero(),
+            ));
         }
 
         let (start_slot, end_slot_exclusive) = inflation_epoch_slot_bounds(epoch, schedule)
@@ -1033,10 +1109,24 @@ impl ClickHouseClient {
         };
         let query_timeout = self.inflation_reward_limits.query_timeout;
         let workflow_started = Instant::now();
+        let deadline = tokio::time::Instant::now() + query_timeout;
 
         // Keep one global HTTP permit for the complete multi-query workflow. This prevents each
         // step from releasing and reacquiring capacity while an admitted reward request is active.
-        let _http_permit = self.http_query_sem.acquire().await.ok();
+        // Admission and execution share one bounded deadline so saturation sheds work rather than
+        // waiting indefinitely before the operation timeout starts.
+        let _http_permit =
+            match tokio::time::timeout_at(deadline, self.acquire_http_query_permit()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    crate::metrics::clickhouse_timeout(OPERATION);
+                    crate::metrics::inflation_reward_lookup("unknown", "timeout");
+                    return Err(ProcessingError::timeout_msg(format!(
+                        "ClickHouse operation '{OPERATION}' timed out after {query_timeout:?}"
+                    )));
+                }
+            };
         let execute = async {
             let mut timings = QueryTimings::zero();
 
@@ -1078,9 +1168,10 @@ impl ClickHouseClient {
 
             let Some(boundary) = boundary else {
                 crate::metrics::inflation_reward_lookup("unknown", "boundary_missing");
-                return Err(ProcessingError::database_msg(format!(
-                    "no confirmed block is available in payout epoch for inflation epoch {epoch}"
-                )));
+                return Ok((
+                    InflationRewardLookupOutcome::BoundaryUnavailable { slot: start_slot },
+                    timings,
+                ));
             };
             if boundary.parent_slot >= start_slot {
                 crate::metrics::inflation_reward_lookup("unknown", "invalid_boundary");
@@ -1090,7 +1181,35 @@ impl ClickHouseClient {
                 )));
             }
 
-            let partitioned = boundary.rewards_num_partitions.is_some();
+            let boundary_block_height = boundary.block_height.ok_or_else(|| {
+                crate::metrics::inflation_reward_lookup("unknown", "invalid_boundary");
+                ProcessingError::database_msg(format!(
+                    "inflation reward boundary slot {} has no block height",
+                    boundary.slot
+                ))
+            })?;
+
+            let num_partitions = match boundary.rewards_num_partitions {
+                Some(num_partitions) => {
+                    let num_partitions = usize::try_from(num_partitions).map_err(|_| {
+                        ProcessingError::database_msg(format!(
+                            "inflation epoch {epoch} declares too many reward partitions"
+                        ))
+                    })?;
+                    if num_partitions == 0 || num_partitions > MAX_INFLATION_REWARD_PARTITIONS {
+                        crate::metrics::inflation_reward_lookup(
+                            "partitioned",
+                            "invalid_partitions",
+                        );
+                        return Err(ProcessingError::database_msg(format!(
+                            "inflation epoch {epoch} declares unsupported reward partition count {num_partitions}"
+                        )));
+                    }
+                    Some(num_partitions)
+                }
+                None => None,
+            };
+            let partitioned = num_partitions.is_some();
             let boundary_selection = if partitioned {
                 InflationRewardSelection::VoteOnly
             } else {
@@ -1133,16 +1252,34 @@ impl ClickHouseClient {
                 let Some(row) = next else {
                     break;
                 };
-                rewards_by_pubkey.insert(
-                    row.pubkey.0,
+                let pubkey = row.pubkey.0;
+                if !seen.contains(&pubkey) {
+                    return Err(ProcessingError::database_msg(
+                        "boundary reward query returned an unrequested address".to_string(),
+                    ));
+                }
+                if row.effective_slot != boundary.slot {
+                    return Err(ProcessingError::database_msg(format!(
+                        "boundary reward for requested address came from slot {}, expected {}",
+                        row.effective_slot, boundary.slot
+                    )));
+                }
+                let previous = rewards_by_pubkey.insert(
+                    pubkey,
                     InflationRewardRecord {
-                        pubkey: row.pubkey.0,
+                        pubkey,
                         effective_slot: row.effective_slot,
                         lamports: row.lamports,
                         post_balance: row.post_balance,
                         commission: row.commission,
+                        commission_bps: row.commission_bps,
                     },
                 );
+                if previous.is_some() {
+                    return Err(ProcessingError::database_msg(
+                        "boundary reward query returned a duplicate address".to_string(),
+                    ));
+                }
             }
             timings.add(QueryTimings {
                 elapsed_ms: boundary_rewards_started.elapsed().as_millis() as u64,
@@ -1168,23 +1305,24 @@ impl ClickHouseClient {
                     query_scope,
                     "Completed targeted getInflationReward lookup"
                 );
-                return Ok((rewards_by_pubkey.into_values().collect(), timings));
+                return Ok((
+                    InflationRewardLookupOutcome::Complete(
+                        rewards_by_pubkey.into_values().collect(),
+                    ),
+                    timings,
+                ));
             }
 
-            let num_partitions_u64 = boundary
-                .rewards_num_partitions
-                .expect("partitioned boundary has a partition count");
-            let num_partitions = usize::try_from(num_partitions_u64).map_err(|_| {
-                ProcessingError::database_msg(format!(
-                    "inflation epoch {epoch} declares too many reward partitions"
-                ))
-            })?;
-            if num_partitions == 0 || num_partitions > MAX_INFLATION_REWARD_PARTITIONS {
-                crate::metrics::inflation_reward_lookup("partitioned", "invalid_partitions");
-                return Err(ProcessingError::database_msg(format!(
-                    "inflation epoch {epoch} declares unsupported reward partition count {num_partitions}"
-                )));
-            }
+            let num_partitions =
+                num_partitions.expect("partitioned boundary has a partition count");
+            let rewards_complete_block_height = boundary_block_height
+                .checked_add(num_partitions as u64)
+                .and_then(|height| height.checked_add(1))
+                .ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "inflation epoch {epoch} rewards-complete block height overflowed"
+                    ))
+                })?;
 
             let unresolved_addresses = deduped_addresses
                 .iter()
@@ -1206,14 +1344,36 @@ impl ClickHouseClient {
                     query_scope,
                     "Completed targeted getInflationReward lookup"
                 );
-                return Ok((rewards_by_pubkey.into_values().collect(), timings));
+                return Ok((
+                    InflationRewardLookupOutcome::Complete(
+                        rewards_by_pubkey.into_values().collect(),
+                    ),
+                    timings,
+                ));
             }
+
+            let partition_plan = plan_inflation_reward_partitions(
+                &unresolved_addresses,
+                num_partitions,
+                &boundary.parent_blockhash.0,
+                boundary_block_height,
+            )
+            .ok_or_else(|| {
+                ProcessingError::database_msg(format!(
+                    "inflation epoch {epoch} partition block height overflowed"
+                ))
+            })?;
+            let required_block_height_set = partition_plan
+                .required_block_heights
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
 
             let partition_slots_query = build_inflation_partition_slots_query(
                 &blocks_metadata_table,
                 boundary.slot,
                 end_slot_exclusive,
-                num_partitions,
+                &partition_plan.required_block_heights,
                 &settings_clause,
             );
             let (partition_slots_query, partition_slots_query_id) = annotate_required_query(
@@ -1234,7 +1394,11 @@ impl ClickHouseClient {
             )
             .fetch::<InflationSlotRow>()
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-            let mut partition_slots = Vec::with_capacity(num_partitions);
+            let mut slot_by_block_height =
+                HashMap::with_capacity(partition_plan.required_block_heights.len());
+            let mut block_height_by_slot =
+                HashMap::with_capacity(partition_plan.required_block_heights.len());
+            let mut partition_slot_rows = 0u64;
             loop {
                 let next = match partition_slots_cursor.next().await {
                     Ok(next) => next,
@@ -1246,7 +1410,39 @@ impl ClickHouseClient {
                 let Some(row) = next else {
                     break;
                 };
-                partition_slots.push(row.slot);
+                partition_slot_rows = partition_slot_rows.saturating_add(1);
+                let block_height = row.block_height.ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "inflation reward partition slot {} has no block height",
+                        row.slot
+                    ))
+                })?;
+                if !required_block_height_set.contains(&block_height) {
+                    return Err(ProcessingError::database_msg(format!(
+                        "partition lookup returned unexpected block height {block_height}"
+                    )));
+                }
+                if row.slot <= boundary.slot || row.slot >= end_slot_exclusive {
+                    return Err(ProcessingError::database_msg(format!(
+                        "partition lookup returned unexpected slot {}",
+                        row.slot
+                    )));
+                }
+                if let Some(previous_slot) = slot_by_block_height.insert(block_height, row.slot)
+                    && previous_slot != row.slot
+                {
+                    return Err(ProcessingError::database_msg(format!(
+                        "partition block height {block_height} maps to multiple slots"
+                    )));
+                }
+                if let Some(previous_height) = block_height_by_slot.insert(row.slot, block_height)
+                    && previous_height != block_height
+                {
+                    return Err(ProcessingError::database_msg(format!(
+                        "partition slot {} maps to multiple block heights",
+                        row.slot
+                    )));
+                }
             }
             timings.add(QueryTimings {
                 elapsed_ms: partition_slots_started.elapsed().as_millis() as u64,
@@ -1254,14 +1450,91 @@ impl ClickHouseClient {
                 decoded_bytes: partition_slots_cursor.decoded_bytes(),
                 rows_read: Some(0),
                 rows_read_unknown: true,
-                rows_returned: partition_slots.len() as u64,
+                rows_returned: partition_slot_rows,
             });
             partition_slots_cleanup.disarm();
-            if partition_slots.len() < num_partitions {
-                crate::metrics::inflation_reward_lookup("partitioned", "incomplete");
+
+            let missing_block_heights = partition_plan
+                .required_block_heights
+                .iter()
+                .copied()
+                .filter(|block_height| !slot_by_block_height.contains_key(block_height))
+                .collect::<Vec<_>>();
+            if !missing_block_heights.is_empty() {
+                let progress_query = build_inflation_progress_query(
+                    &blocks_metadata_table,
+                    boundary.slot,
+                    end_slot_exclusive,
+                    &settings_clause,
+                );
+                let (progress_query, progress_query_id) =
+                    annotate_required_query(progress_query, "get_inflation_reward_payout_progress");
+                let mut progress_cleanup = self.http_query_cleanup_for_client(
+                    query_client.clone(),
+                    cleanup_cluster.clone(),
+                    OPERATION,
+                    progress_query_id.clone(),
+                );
+                let progress_started = Instant::now();
+                let mut progress_cursor =
+                    http_query_with_id(&query_client, &progress_query, Some(progress_query_id))
+                        .fetch::<InflationSlotRow>()
+                        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+                let progress = match progress_cursor.next().await {
+                    Ok(row) => row,
+                    Err(err) => {
+                        progress_cleanup.spawn_cleanup("error");
+                        return Err(ProcessingError::database(err.to_string(), err));
+                    }
+                };
+                timings.add(QueryTimings {
+                    elapsed_ms: progress_started.elapsed().as_millis() as u64,
+                    received_bytes: progress_cursor.received_bytes(),
+                    decoded_bytes: progress_cursor.decoded_bytes(),
+                    rows_read: Some(0),
+                    rows_read_unknown: true,
+                    rows_returned: u64::from(progress.is_some()),
+                });
+                progress_cleanup.disarm();
+
+                let progress = progress.ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "payout epoch progress disappeared after boundary slot {} was read",
+                        boundary.slot
+                    ))
+                })?;
+                let current_block_height = progress.block_height.ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "payout epoch progress slot {} has no block height",
+                        progress.slot
+                    ))
+                })?;
+                if progress.slot < boundary.slot
+                    || progress.slot >= end_slot_exclusive
+                    || current_block_height < boundary_block_height
+                {
+                    return Err(ProcessingError::database_msg(format!(
+                        "payout epoch progress returned unexpected slot {} at block height {}",
+                        progress.slot, current_block_height
+                    )));
+                }
+                if inflation_rewards_period_is_active(
+                    current_block_height,
+                    rewards_complete_block_height,
+                ) {
+                    crate::metrics::inflation_reward_lookup("partitioned", "active");
+                    return Ok((
+                        InflationRewardLookupOutcome::RewardsPeriodActive {
+                            slot: progress.slot,
+                            current_block_height,
+                            rewards_complete_block_height,
+                        },
+                        timings,
+                    ));
+                }
+
                 return Err(ProcessingError::database_msg(format!(
-                    "inflation rewards period for epoch {epoch} is incomplete: expected {num_partitions} partition blocks, found {}",
-                    partition_slots.len()
+                    "inflation rewards for epoch {epoch} reached completion block height {rewards_complete_block_height}, but required partition block heights {missing_block_heights:?} are missing"
                 )));
             }
 
@@ -1269,12 +1542,8 @@ impl ClickHouseClient {
             let mut selected_slots = Vec::with_capacity(unresolved_addresses.len());
             let mut selected_slot_set = HashSet::with_capacity(unresolved_addresses.len());
             for address in &unresolved_addresses {
-                let partition_index = inflation_reward_partition(
-                    address,
-                    num_partitions,
-                    &boundary.parent_blockhash.0,
-                );
-                let expected_slot = partition_slots[partition_index];
+                let required_block_height = partition_plan.block_height_by_pubkey[address];
+                let expected_slot = slot_by_block_height[&required_block_height];
                 expected_slot_by_pubkey.insert(*address, expected_slot);
                 if selected_slot_set.insert(expected_slot) {
                     selected_slots.push(expected_slot);
@@ -1331,7 +1600,7 @@ impl ClickHouseClient {
                         row.effective_slot, expected_slot
                     )));
                 }
-                rewards_by_pubkey.insert(
+                let previous = rewards_by_pubkey.insert(
                     pubkey,
                     InflationRewardRecord {
                         pubkey,
@@ -1339,8 +1608,14 @@ impl ClickHouseClient {
                         lamports: row.lamports,
                         post_balance: row.post_balance,
                         commission: row.commission,
+                        commission_bps: row.commission_bps,
                     },
                 );
+                if previous.is_some() {
+                    return Err(ProcessingError::database_msg(
+                        "partition reward query returned a duplicate address".to_string(),
+                    ));
+                }
                 partition_reward_count = partition_reward_count.saturating_add(1);
             }
             timings.add(QueryTimings {
@@ -1369,11 +1644,14 @@ impl ClickHouseClient {
                 "Completed targeted getInflationReward lookup"
             );
 
-            Ok((rewards_by_pubkey.into_values().collect(), timings))
+            Ok((
+                InflationRewardLookupOutcome::Complete(rewards_by_pubkey.into_values().collect()),
+                timings,
+            ))
         };
 
         let execute = Box::pin(execute);
-        match tokio::time::timeout(query_timeout, execute).await {
+        match tokio::time::timeout_at(deadline, execute).await {
             Ok(result) => {
                 if let Err(err) = &result {
                     let message = err.to_string();
@@ -1400,7 +1678,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Option<Option<i64>>, QueryTimings)> {
-        self.with_timeout("get_block_time_by_slot", async {
+        self.with_http_query_timeout("get_block_time_by_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
             struct BlockTimeRow {
                 block_time: Option<i64>,
@@ -1573,7 +1851,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Option<([u8; 32], Option<u64>)>, QueryTimings)> {
-        self.with_timeout("get_blockhash_height_by_slot", async {
+        self.with_http_query_timeout("get_blockhash_height_by_slot", async {
             let (mut row_opt, timings, used_local) = if self.scope_shard_direct()
                 && self.transport_http()
                 && let (Some(topology), Some(local_table)) =
@@ -1685,7 +1963,7 @@ impl ClickHouseClient {
         slot: u64,
         include_rewards: bool,
     ) -> ProcessingResult<(Option<BlockMetadataRecord>, QueryTimings)> {
-        self.with_timeout("get_block_metadata_by_slot", async {
+        self.with_http_query_timeout("get_block_metadata_by_slot", async {
             let (mut metadata_opt, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
                     (&self.shard_topology, &self.blocks_metadata_local_table)
@@ -1771,7 +2049,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Vec<String>, QueryTimings)> {
-        self.with_timeout("get_block_signatures_by_slot", async {
+        self.with_http_query_timeout("get_block_signatures_by_slot", async {
             let projection = BlockTransactionProjection::Signatures;
             let (mut signatures, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -1850,7 +2128,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Vec<StoredAccountsTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_block_accounts_by_slot", async {
+        self.with_http_query_timeout("get_block_accounts_by_slot", async {
             let projection = BlockTransactionProjection::Accounts;
             let (mut records, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -1928,7 +2206,7 @@ impl ClickHouseClient {
         &self,
         slot: u64,
     ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_block_full_transactions_by_slot", async {
+        self.with_http_query_timeout("get_block_full_transactions_by_slot", async {
             let projection = BlockTransactionProjection::Full;
             let (mut records, mut timings, used_local) = if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -2015,7 +2293,7 @@ impl ClickHouseClient {
         end_slot: u64,
         timeout: std::time::Duration,
     ) -> ProcessingResult<(Vec<BlockMetadataRecord>, QueryTimings)> {
-        self.with_timeout_duration("get_block_metadata_by_slot_range", timeout, async {
+        self.with_http_query_timeout_duration("get_block_metadata_by_slot_range", timeout, async {
             if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
                     (&self.shard_topology, &self.blocks_metadata_local_table)
@@ -2094,7 +2372,7 @@ impl ClickHouseClient {
         end_slot: u64,
         timeout: std::time::Duration,
     ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout_duration(
+        self.with_http_query_timeout_duration(
             "get_block_full_transactions_by_slot_range",
             timeout,
             async {
@@ -2170,16 +2448,18 @@ impl ClickHouseClient {
 
 #[cfg(test)]
 mod tests {
-    use solana_epoch_schedule::EpochSchedule;
+    use std::collections::HashMap;
 
-    use crate::clickhouse::blocks::inflation_epoch_slot_bounds;
+    use solana_epoch_schedule::EpochSchedule;
 
     use super::{
         BlockTransactionProjection, InflationRewardSelection, SLOT_SHARD_DIVISOR,
         build_block_metadata_query, build_block_transactions_query, build_blockhash_valid_query,
         build_inflation_boundary_query, build_inflation_partition_slots_query,
-        build_inflation_rewards_query, build_transaction_count_query, inflation_reward_partition,
-        normalize_slots, shard_indices_for_slot_range,
+        build_inflation_progress_query, build_inflation_rewards_query,
+        build_transaction_count_query, inflation_epoch_slot_bounds, inflation_reward_partition,
+        inflation_rewards_period_is_active, normalize_slots, plan_inflation_reward_partitions,
+        shard_indices_for_slot_range,
     };
     #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use super::{
@@ -2283,19 +2563,47 @@ mod tests {
     }
 
     #[test]
-    fn inflation_partition_slots_query_is_ordered_and_bounded() {
+    fn inflation_epoch_1018_payout_starts_at_foundation_error_slot() {
+        assert_eq!(
+            inflation_epoch_slot_bounds(1_018),
+            Some((440_208_000, 440_640_000))
+        );
+    }
+
+    #[test]
+    fn inflation_partition_slots_query_targets_exact_block_heights() {
         let query = build_inflation_partition_slots_query(
             "default.blocks_metadata",
             121_392_000,
             121_824_000,
-            293,
+            &[270_000_001, 270_000_017],
             "",
         );
 
+        assert!(query.contains("SELECT slot, block_height"));
         assert!(query.contains("slot > 121392000"));
         assert!(query.contains("slot < 121824000"));
-        assert!(query.contains("LIMIT 1 BY slot"));
-        assert!(query.contains("LIMIT 293"));
+        assert!(query.contains("WHERE block_height IN (270000001, 270000017)"));
+        assert!(query.contains("ORDER BY block_height ASC, slot ASC"));
+        assert!(!query.contains("LIMIT 1 BY slot"));
+        assert!(!query.contains("LIMIT 293"));
+    }
+
+    #[test]
+    fn inflation_progress_query_reads_latest_landed_payout_block() {
+        let query = build_inflation_progress_query(
+            "default.blocks_metadata",
+            121_392_000,
+            121_824_000,
+            "SETTINGS max_threads=2",
+        );
+
+        assert!(query.contains("SELECT slot, block_height"));
+        assert!(query.contains("slot >= 121392000"));
+        assert!(query.contains("slot < 121824000"));
+        assert!(query.contains("ORDER BY slot DESC"));
+        assert!(query.contains("LIMIT 1"));
+        assert!(query.contains("SETTINGS max_threads=2"));
     }
 
     #[test]
@@ -2312,6 +2620,9 @@ mod tests {
         assert!(query.contains("PREWHERE slot IN (121392000, 121392017)"));
         assert!(!query.contains("PREWHERE slot >="));
         assert!(query.contains("ARRAY JOIN arrayZip"));
+        assert!(query.contains("AS rewards_commission_bps"));
+        assert!(query.contains("CAST(NULL, 'Nullable(UInt16)')"));
+        assert!(query.contains("tupleElement(latest, 5) AS commission_bps"));
         assert!(query.contains("= 'staking'"));
         assert!(query.contains("max_threads=2"));
         assert!(query.contains("max_memory_usage=536870912"));
@@ -2328,6 +2639,73 @@ mod tests {
         assert!(first < 293);
         assert!(second < 293);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn inflation_partition_plan_deduplicates_shared_partitions_and_targets_distinct_ones() {
+        let seed = [9u8; 32];
+        let num_partitions = 4;
+        let boundary_block_height = 270_000_000;
+        let candidates = (0..=u8::MAX).map(|value| [value; 32]).collect::<Vec<_>>();
+        let mut addresses_by_partition = HashMap::<usize, Vec<[u8; 32]>>::new();
+        for address in candidates {
+            addresses_by_partition
+                .entry(inflation_reward_partition(&address, num_partitions, &seed))
+                .or_default()
+                .push(address);
+        }
+
+        let (shared_partition, shared_addresses) = addresses_by_partition
+            .iter()
+            .find(|(_, addresses)| addresses.len() >= 2)
+            .expect("test inputs should share a partition");
+        let shared_plan = plan_inflation_reward_partitions(
+            &shared_addresses[..2],
+            num_partitions,
+            &seed,
+            boundary_block_height,
+        )
+        .expect("partition heights should not overflow");
+        assert_eq!(
+            shared_plan.required_block_heights,
+            vec![boundary_block_height + *shared_partition as u64 + 1]
+        );
+
+        let mut distinct_partitions = addresses_by_partition.iter();
+        let (first_partition, first_addresses) = distinct_partitions
+            .next()
+            .expect("at least two partitions should be represented");
+        let (second_partition, second_addresses) = distinct_partitions
+            .find(|(partition, _)| partition != &first_partition)
+            .expect("at least two partitions should be represented");
+        let distinct_addresses = [first_addresses[0], second_addresses[0]];
+        let distinct_plan = plan_inflation_reward_partitions(
+            &distinct_addresses,
+            num_partitions,
+            &seed,
+            boundary_block_height,
+        )
+        .expect("partition heights should not overflow");
+        let mut expected_heights = vec![
+            boundary_block_height + *first_partition as u64 + 1,
+            boundary_block_height + *second_partition as u64 + 1,
+        ];
+        expected_heights.sort_unstable();
+        assert_eq!(distinct_plan.required_block_heights, expected_heights);
+    }
+
+    #[test]
+    fn inflation_partition_plan_rejects_block_height_overflow() {
+        assert!(
+            plan_inflation_reward_partitions(&[[1u8; 32]], 293, &[9u8; 32], u64::MAX).is_none()
+        );
+    }
+
+    #[test]
+    fn inflation_reward_period_stays_active_until_completion_height() {
+        assert!(inflation_rewards_period_is_active(1_292, 1_293));
+        assert!(!inflation_rewards_period_is_active(1_293, 1_293));
+        assert!(!inflation_rewards_period_is_active(1_294, 1_293));
     }
 
     #[test]
@@ -2420,6 +2798,7 @@ mod tests {
         assert!(query.contains("tx_account_keys"));
         assert!(query.contains("tx_instructions_program_id_index"));
         assert!(query.contains("meta_loaded_addresses_writable"));
+        assert!(!query.contains("tx_config_priority_fee"));
         assert!(!query.contains("meta_log_messages"));
         assert!(!query.contains("meta_return_data_data"));
         assert!(!query.contains("meta_compute_units_consumed"));
@@ -2436,6 +2815,10 @@ mod tests {
         );
 
         assert!(query.contains("tx_recent_blockhash"));
+        assert!(query.contains("tx_config_priority_fee"));
+        assert!(query.contains("tx_config_compute_unit_limit"));
+        assert!(query.contains("tx_config_loaded_accounts_data_size_limit"));
+        assert!(query.contains("tx_config_heap_size"));
         assert!(query.contains("meta_return_data_data"));
         assert!(!query.contains("\n                slot,"));
         assert!(!query.contains("\n                block_time,"));

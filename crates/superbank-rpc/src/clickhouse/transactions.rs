@@ -9,9 +9,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::solana_sdk::pubkey::Pubkey;
 use ch_cityhash102::cityhash64;
 use serde::Deserialize;
-use solana_sdk::pubkey::Pubkey;
 use tokio::task::JoinSet;
 
 use crate::processing::{ProcessingError, ProcessingResult};
@@ -27,8 +27,8 @@ use super::queries::{
 use super::rows::{TransactionRow, fetch_single_transaction_row, map_transaction_row};
 use super::sharding::ShardTopology;
 use super::types::{
-    QueryTimings, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
-    TransactionsForAddressQuery, TransactionsForAddressRecord,
+    PaginationToken, QueryTimings, SignatureSlot, SortOrder, StoredTransactionRecord,
+    TokenAccountsFilter, TransactionsForAddressQuery, TransactionsForAddressRecord,
 };
 use super::util::{
     append_max_execution_time_setting, format_gsfa_memo, parse_err_json,
@@ -80,26 +80,40 @@ fn compare_transactions_for_address_records(
     }
 }
 
-fn merge_hot_transactions_for_address_records(
+const TRANSACTIONS_FOR_ADDRESS_MIN_BATCH_SIZE: u64 = 64;
+const TRANSACTIONS_FOR_ADDRESS_MAX_BATCH_SIZE: u64 = 2_000;
+
+fn transactions_for_address_batch_size(remaining: u64) -> u64 {
+    remaining.saturating_mul(2).clamp(
+        TRANSACTIONS_FOR_ADDRESS_MIN_BATCH_SIZE,
+        TRANSACTIONS_FOR_ADDRESS_MAX_BATCH_SIZE,
+    )
+}
+
+fn order_transactions_for_address_records(
     mut records: Vec<TransactionsForAddressRecord>,
     sort_order: SortOrder,
     limit: u64,
 ) -> Vec<TransactionsForAddressRecord> {
     records.sort_unstable_by(|a, b| compare_transactions_for_address_records(sort_order, a, b));
+    records.truncate(limit as usize);
+    records
+}
 
-    let mut seen = HashSet::with_capacity(records.len());
-    let mut merged = Vec::with_capacity(records.len().min(limit as usize));
-    for record in records {
-        if !seen.insert(record.signature.clone()) {
-            continue;
-        }
-        merged.push(record);
-        if merged.len() >= limit as usize {
-            break;
+fn append_unique_transactions_for_address_records(
+    output: &mut Vec<TransactionsForAddressRecord>,
+    seen: &mut HashSet<String>,
+    batch: Vec<TransactionsForAddressRecord>,
+    limit: usize,
+) {
+    for record in batch {
+        if seen.insert(record.signature.clone()) {
+            output.push(record);
+            if output.len() >= limit {
+                break;
+            }
         }
     }
-
-    merged
 }
 
 fn decode_transaction_signature(signature: &str) -> ProcessingResult<([u8; 64], String)> {
@@ -173,7 +187,7 @@ impl ClickHouseClient {
         &self,
         query: &TransactionsForAddressQuery,
     ) -> ProcessingResult<(Vec<TransactionsForAddressRecord>, QueryTimings)> {
-        self.with_timeout("get_transactions_for_address_signatures", async {
+        self.with_http_query_timeout("get_transactions_for_address_signatures", async {
             let pubkey = Pubkey::from_str(&query.address)
                 .map_err(|e| ProcessingError::deserialization("Invalid address", e))?;
 
@@ -186,102 +200,179 @@ impl ClickHouseClient {
                 )));
             }
 
-            if self.should_use_gsfa_hot_fanout(&pubkey)
-                && query.token_accounts == TokenAccountsFilter::None
-            {
-                return self
-                    .get_hot_transactions_for_address_signatures(query, &pubkey)
-                    .await;
-            }
+            let requested_limit = query.limit;
+            let mut page_query = query.clone();
+            let mut seen = HashSet::with_capacity(requested_limit as usize);
+            let mut records = Vec::with_capacity(requested_limit as usize);
+            let mut timings = QueryTimings::zero();
 
-            if self.should_use_gsfa_shard_routing(&pubkey)
-                && let Some(router) = &self.gsfa_router
-            {
-                let token_owner_local_table = if query.token_accounts != TokenAccountsFilter::None {
-                    self.token_owner_activity_local_table.as_deref()
-                } else {
-                    Some(self.token_owner_activity_table.as_str())
+            while records.len() < requested_limit as usize {
+                let remaining = requested_limit.saturating_sub(records.len() as u64);
+                let batch_limit = transactions_for_address_batch_size(remaining);
+                page_query.limit = batch_limit;
+
+                let (mut batch, batch_timings) = self
+                    .get_transactions_for_address_signatures_batch(&page_query, &pubkey)
+                    .await?;
+                timings.add(batch_timings);
+
+                batch.sort_unstable_by(|a, b| {
+                    compare_transactions_for_address_records(query.sort_order, a, b)
+                });
+                let raw_count = batch.len() as u64;
+                let continuation = batch.last().map(|record| SignatureSlot {
+                    slot: record.slot,
+                    slot_idx: record.slot_idx,
+                });
+
+                append_unique_transactions_for_address_records(
+                    &mut records,
+                    &mut seen,
+                    batch,
+                    requested_limit as usize,
+                );
+
+                if records.len() >= requested_limit as usize || raw_count < batch_limit {
+                    break;
+                }
+
+                let Some(continuation) = continuation else {
+                    break;
                 };
-                let mut allow_local_http = self.transport_http();
-
-                if self.transport_tcp() {
-                    match self
-                        .try_get_transactions_for_address_signatures_tcp(
-                            router,
-                            token_owner_local_table,
-                            query,
-                            &pubkey,
-                        )
-                        .await?
-                    {
-                        Some(result) => return Ok(result),
-                        None => allow_local_http = true,
-                    }
+                if page_query.resolved_pagination == Some(continuation) {
+                    break;
                 }
-
-                if allow_local_http
-                    && let Some(result) = self
-                        .try_get_transactions_for_address_signatures_http(
-                            router,
-                            token_owner_local_table,
-                            query,
-                            &pubkey,
-                        )
-                        .await?
-                {
-                    return Ok(result);
-                }
+                page_query.pagination = Some(PaginationToken::SlotIndex {
+                    slot: continuation.slot,
+                    idx: continuation.slot_idx,
+                });
+                page_query.resolved_pagination = Some(continuation);
             }
 
-            let settings_clause = self.select_settings_clause_with_condition_cache(
-                "get_transactions_for_address_signatures",
-                QueryFreshnessClass::Historical,
-            );
-            let gsfa_table = self.gsfa_table_for_address(&pubkey);
-            let gsfa_bucket_modulus = self.gsfa_bucket_modulus_for_address(&pubkey);
-            let tables = TransactionsForAddressTables {
-                gsfa_table,
-                gsfa_bucket_modulus,
-                token_owner_table: &self.token_owner_activity_table,
-                token_owner_bucket_modulus: self.token_owner_bucket_modulus(),
-                signatures_table: &self.signature_statuses_table,
-                signature_bucket_modulus: self.signatures_bucket_modulus(),
-            };
-            let query = build_transactions_for_address_query(&tables, query, &settings_clause)?;
-
-            let start = Instant::now();
-            let mut cursor = self
-                .client
-                .query(&query)
-                .fetch::<TransactionsForAddressQueryRow>()
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-
-            let mut results = Vec::new();
-            while let Some(row) = cursor
-                .next()
-                .await
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?
-            {
-                results.push(row);
-            }
-
-            let records = results
-                .into_iter()
-                .map(map_transactions_for_address_row)
-                .collect::<Vec<_>>();
-
-            let timings = QueryTimings {
-                elapsed_ms: start.elapsed().as_millis() as u64,
-                received_bytes: cursor.received_bytes(),
-                decoded_bytes: cursor.decoded_bytes(),
-                rows_read: Some(0),
-                rows_read_unknown: true,
-                rows_returned: records.len() as u64,
-            };
-
+            timings.rows_returned = records.len() as u64;
             Ok((records, timings))
         })
         .await
+    }
+
+    async fn get_transactions_for_address_signatures_batch(
+        &self,
+        query: &TransactionsForAddressQuery,
+        pubkey: &Pubkey,
+    ) -> ProcessingResult<(Vec<TransactionsForAddressRecord>, QueryTimings)> {
+        if self.should_use_gsfa_hot_fanout(pubkey)
+            && query.token_accounts == TokenAccountsFilter::None
+        {
+            return self
+                .get_hot_transactions_for_address_signatures(query, pubkey)
+                .await;
+        }
+
+        if self.should_use_gsfa_shard_routing(pubkey) && self.shard_topology.is_some() {
+            let router = self.gsfa_router.as_ref().ok_or_else(|| {
+                ProcessingError::database_msg(
+                    "Shard topology is configured but GSFA owner-shard routing is unavailable",
+                )
+            })?;
+            let token_owner_local_table = if query.token_accounts != TokenAccountsFilter::None {
+                Some(
+                    self.token_owner_activity_local_table
+                        .as_deref()
+                        .ok_or_else(|| {
+                            ProcessingError::database_msg(
+                                "Shard topology is configured but token-owner shard routing is unavailable",
+                            )
+                        })?,
+                )
+            } else {
+                Some(self.token_owner_activity_table.as_str())
+            };
+
+            let mut allow_local_http = self.transport_http();
+
+            if self.transport_tcp() {
+                match self
+                    .try_get_transactions_for_address_signatures_tcp(
+                        router,
+                        token_owner_local_table,
+                        query,
+                        pubkey,
+                    )
+                    .await?
+                {
+                    Some(result) => return Ok(result),
+                    None => allow_local_http = true,
+                }
+            }
+
+            if allow_local_http {
+                return self
+                    .try_get_transactions_for_address_signatures_http(
+                        router,
+                        token_owner_local_table,
+                        query,
+                        pubkey,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        ProcessingError::database_msg(
+                            "Shard-local getTransactionsForAddress query was unavailable",
+                        )
+                    });
+            }
+
+            return Err(ProcessingError::database_msg(
+                "No shard-local transport is available for getTransactionsForAddress",
+            ));
+        }
+
+        let settings_clause = self.select_settings_clause_with_condition_cache(
+            "get_transactions_for_address_signatures",
+            QueryFreshnessClass::Historical,
+        );
+        let gsfa_table = self.gsfa_table_for_address(pubkey);
+        let gsfa_bucket_modulus = self.gsfa_bucket_modulus_for_address(pubkey);
+        let tables = TransactionsForAddressTables {
+            gsfa_table,
+            gsfa_bucket_modulus,
+            token_owner_table: &self.token_owner_activity_table,
+            token_owner_bucket_modulus: self.token_owner_bucket_modulus(),
+            signatures_table: &self.signature_statuses_table,
+            signature_bucket_modulus: self.signatures_bucket_modulus(),
+        };
+        let query = build_transactions_for_address_query(&tables, query, &settings_clause)?;
+
+        let start = Instant::now();
+        let mut cursor = self
+            .client
+            .query(&query)
+            .fetch::<TransactionsForAddressQueryRow>()
+            .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = cursor
+            .next()
+            .await
+            .map_err(|e| ProcessingError::database(e.to_string(), e))?
+        {
+            results.push(row);
+        }
+
+        let records = results
+            .into_iter()
+            .map(map_transactions_for_address_row)
+            .collect::<Vec<_>>();
+
+        let timings = QueryTimings {
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            received_bytes: cursor.received_bytes(),
+            decoded_bytes: cursor.decoded_bytes(),
+            rows_read: Some(0),
+            rows_read_unknown: true,
+            rows_returned: records.len() as u64,
+        };
+
+        Ok((records, timings))
     }
 
     async fn get_hot_transactions_for_address_signatures(
@@ -329,7 +420,7 @@ impl ClickHouseClient {
         signatures: &[(u64, String)],
         max_supported_transaction_version: Option<u8>,
     ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_transactions_by_slot_signatures", async {
+        self.with_http_query_timeout("get_transactions_by_slot_signatures", async {
             if signatures.is_empty() {
                 return Ok((
                     Vec::new(),
@@ -430,7 +521,7 @@ impl ClickHouseClient {
         &self,
         signature: &str,
     ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_transaction_by_signature", async {
+        self.with_operation_timeout("get_transaction_by_signature", async {
             let (signature_bytes, signature_literal) = decode_transaction_signature(signature)?;
             let (slot_opt, mut timings) = self
                 .get_signature_slot_by_signature_bytes(signature_bytes)
@@ -441,6 +532,7 @@ impl ClickHouseClient {
             };
             let slot = position.slot;
             let slot_idx = position.slot_idx;
+            let _http_permit = self.acquire_http_query_permit().await?;
 
             let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
                 build_get_transaction_by_signature_query(
@@ -536,7 +628,7 @@ impl ClickHouseClient {
         signature: &str,
         slot: u64,
     ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
-        self.with_timeout("get_transaction_by_signature_and_slot", async {
+        self.with_http_query_timeout("get_transaction_by_signature_and_slot", async {
             let (_signature_bytes, signature_literal) = decode_transaction_signature(signature)?;
             let build_query = |table: &str, settings_clause: &str| {
                 build_get_transaction_by_signature_query(
@@ -837,7 +929,7 @@ impl ClickHouseClient {
         }
 
         let records =
-            merge_hot_transactions_for_address_records(records, query.sort_order, query.limit);
+            order_transactions_for_address_records(records, query.sort_order, query.limit);
         timings.rows_returned = records.len() as u64;
         Ok((records, timings))
     }
@@ -886,19 +978,13 @@ impl ClickHouseClient {
         let mut cursor = match shard.http_client.query(&query_sql).fetch::<QueryResult>() {
             Ok(cursor) => cursor,
             Err(err) => {
-                crate::metrics::clickhouse_transport_fallback(
-                    "get_transactions_for_address_signatures_local_http",
-                    "http",
-                    "distributed",
-                    "query_init",
-                );
-                tracing::warn!(
-                    "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
-                    shard.host,
-                    shard.tcp_port,
-                    err
-                );
-                return Ok(None);
+                return Err(ProcessingError::database(
+                    format!(
+                        "Shard {}:{} HTTP getTransactionsForAddress query failed",
+                        shard.host, shard.tcp_port
+                    ),
+                    err,
+                ));
             }
         };
 
@@ -920,19 +1006,13 @@ impl ClickHouseClient {
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    crate::metrics::clickhouse_transport_fallback(
-                        "get_transactions_for_address_signatures_local_http",
-                        "http",
-                        "distributed",
-                        "stream_error",
-                    );
-                    tracing::warn!(
-                        "Shard {}:{} HTTP query stream failed; falling back to distributed table: {}",
-                        shard.host,
-                        shard.tcp_port,
-                        err
-                    );
-                    return Ok(None);
+                    return Err(ProcessingError::database(
+                        format!(
+                            "Shard {}:{} HTTP getTransactionsForAddress query stream failed",
+                            shard.host, shard.tcp_port
+                        ),
+                        err,
+                    ));
                 }
             }
         }
@@ -1050,7 +1130,7 @@ impl ClickHouseClient {
         }
 
         let records =
-            merge_hot_transactions_for_address_records(records, query.sort_order, query.limit);
+            order_transactions_for_address_records(records, query.sort_order, query.limit);
         timings.rows_returned = records.len() as u64;
         Ok((records, timings))
     }
@@ -1187,6 +1267,64 @@ mod tests {
 
     fn normalize_sql(sql: &str) -> String {
         sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn transactions_for_address_record(
+        signature: &str,
+        slot: u64,
+        slot_idx: u32,
+    ) -> TransactionsForAddressRecord {
+        TransactionsForAddressRecord {
+            signature: signature.to_string(),
+            slot,
+            slot_idx,
+            err: None,
+            memo: None,
+            block_time: None,
+        }
+    }
+
+    #[test]
+    fn transactions_for_address_batch_size_overfetches_with_bounds() {
+        assert_eq!(transactions_for_address_batch_size(1), 64);
+        assert_eq!(transactions_for_address_batch_size(100), 200);
+        assert_eq!(transactions_for_address_batch_size(1_000), 2_000);
+        assert_eq!(transactions_for_address_batch_size(u64::MAX), 2_000);
+    }
+
+    #[test]
+    fn transactions_for_address_deduplicates_across_internal_batches() {
+        let mut output = Vec::new();
+        let mut seen = HashSet::new();
+
+        append_unique_transactions_for_address_records(
+            &mut output,
+            &mut seen,
+            vec![
+                transactions_for_address_record("sig-c", 30, 3),
+                transactions_for_address_record("sig-c", 30, 3),
+                transactions_for_address_record("sig-b", 20, 2),
+            ],
+            3,
+        );
+        append_unique_transactions_for_address_records(
+            &mut output,
+            &mut seen,
+            vec![
+                transactions_for_address_record("sig-b", 20, 2),
+                transactions_for_address_record("sig-a", 10, 1),
+                transactions_for_address_record("sig-old", 5, 0),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            output
+                .iter()
+                .map(|record| record.signature.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sig-c", "sig-b", "sig-a"]
+        );
     }
 
     #[test]
