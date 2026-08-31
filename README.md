@@ -100,6 +100,10 @@ cat ddl/local/token_owner_activity.sql | docker exec -i clickhouse clickhouse-cl
 cat ddl/local/transfers.sql | docker exec -i clickhouse clickhouse-client --multiquery
 ```
 
+`transfers.sql` only indexes transaction rows inserted after the materialized view is created.
+Do not advertise `getTransfersByAddress` as historical until verified backfill coverage has been
+recorded; see [transfer endpoint operations](docs/get-transfers-by-address-operations.md).
+
 If you use `gsfa_hot.sql` and want hot addresses excluded from the main GSFA table, apply
 `ddl/local/gsfa_nohot.sql` instead of `ddl/local/gsfa.sql`, then apply `ddl/local/gsfa_hot.sql`.
 

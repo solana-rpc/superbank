@@ -25,6 +25,10 @@ running these repository files never occurs automatically against an existing de
 Apply `transactions.sql` before materialized-view files such as `gsfa*.sql`, `signatures.sql`, and
 `token_owner_activity.sql`/`transfers.sql`; those views select from the transactions
 table and will fail if it does not exist yet.
+`transfers.sql` starts indexing with subsequent transaction inserts; it does not backfill existing
+transactions. Treat `getTransfersByAddress` as historically complete only after verified coverage
+has been recorded using the operational design in
+[`docs/get-transfers-by-address-operations.md`](../docs/get-transfers-by-address-operations.md).
 `gsfa_nohot.sql` is an alternative to `gsfa.sql`; do not apply both for the same schema set.
 `entries.sql` is required for Superbank Fumarole/gRPC source defaults and for PoH entry ingestion
 from Old Faithful / Jetstreamer. RPC and Bigtable sources do not populate `entries`.

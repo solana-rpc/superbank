@@ -88,13 +88,19 @@ Notes:
   these aliases cannot be combined with same-side slot filters (`lt`/`lte` for `beforeSlot`,
   `gt`/`gte` for `untilSlot`).
   Token account filters require the token-owner activity table (see below).
-- `getTransfersByAddress` supports historical SOL/SPL transfers with
+- `getTransfersByAddress` returns successful indexed SOL/SPL transfers with
   top-level `with`, `direction=in|out`, `mint`, `solMode=merged|separate`, `sortOrder=asc|desc`,
   `limit`, `paginationToken` (`slot:transactionIdx:instructionIdx:innerInstructionIdx:type`),
   `commitment`, `minContextSlot`, and `filters.amount|slot|blockTime`. Amounts are raw integer
   strings (lamports for SOL, token base units for SPL), with `uiAmount` derived from decimals.
+  `filters.amount` accepts an unsigned JSON integer or a base-10 string; decimal and floating
+  values are rejected so values above JavaScript's safe-integer range remain exact. `feeAmount` is
+  a raw Token-2022 `TransferCheckedWithFee` fee when known, otherwise `null`.
   The index is derived from pre/post balance deltas, so the opposite user account is nullable when
   no counterparty can be inferred. This method requires the transfers table (see below).
+  Creating the materialized view only indexes future inserts. Do not describe the endpoint as
+  historically complete until an operator has completed and recorded verified backfill coverage;
+  see [`docs/get-transfers-by-address-operations.md`](../../docs/get-transfers-by-address-operations.md).
   Response `paginationToken` is non-null only when another matching page exists after all filters
   are applied; the token points to the last row returned by the current page.
 

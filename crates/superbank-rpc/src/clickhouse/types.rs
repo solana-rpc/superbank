@@ -3,6 +3,12 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use std::fmt;
+use std::str::FromStr;
+
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer};
+
 #[derive(Debug, Clone)]
 pub struct QueryTimings {
     pub elapsed_ms: u64,
@@ -80,7 +86,32 @@ impl QueryTimings {
 
 #[cfg(test)]
 mod tests {
-    use super::QueryTimings;
+    use super::{QueryTimings, RawAmount};
+    use serde_json::json;
+
+    #[test]
+    fn raw_amount_deserializes_exact_integers_without_float_conversion() {
+        let from_string: RawAmount = serde_json::from_value(json!("9007199254740993"))
+            .expect("large raw amount string should parse");
+        let from_number: RawAmount = serde_json::from_value(json!(9007199254740993_u64))
+            .expect("large raw amount number should parse");
+
+        assert_eq!(from_string.to_string(), "9007199254740993");
+        assert_eq!(from_number.to_string(), "9007199254740993");
+    }
+
+    #[test]
+    fn raw_amount_rejects_fractional_negative_and_invalid_strings() {
+        for value in [
+            json!(1.5),
+            json!(-1),
+            json!("1.5"),
+            json!("+1"),
+            json!("12x"),
+        ] {
+            assert!(serde_json::from_value::<RawAmount>(value).is_err());
+        }
+    }
 
     #[test]
     fn add_preserves_known_rows_read_when_other_is_unknown() {
@@ -163,6 +194,99 @@ pub struct NumericFilter<T> {
     pub lte: Option<T>,
     pub lt: Option<T>,
     pub eq: Option<T>,
+}
+
+/// A raw on-chain quantity accepted at the JSON-RPC boundary.
+///
+/// Amount filters use this type instead of floating point so comparisons retain every bit of a
+/// lamport or token base-unit value. JSON callers can send a JSON unsigned integer or a base-10
+/// string, which is necessary for JavaScript callers above `Number.MAX_SAFE_INTEGER`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RawAmount(u64);
+
+impl RawAmount {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for RawAmount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for RawAmount {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("amount must be an unsigned base-10 integer");
+        }
+
+        value
+            .parse::<u64>()
+            .map(Self)
+            .map_err(|_| "amount is outside the unsigned 64-bit range")
+    }
+}
+
+impl<'de> Deserialize<'de> for RawAmount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawAmountVisitor;
+
+        impl<'de> Visitor<'de> for RawAmountVisitor {
+            type Value = RawAmount;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an unsigned JSON integer or a base-10 integer string")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(RawAmount::new(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Err(E::custom(format!(
+                    "amount must be an unsigned integer, got {value}"
+                )))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Err(E::custom(format!(
+                    "amount must be an unsigned integer, got {value}"
+                )))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                RawAmount::from_str(value).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_any(RawAmountVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -308,7 +432,7 @@ pub struct TransfersByAddressQuery {
     pub sort_order: SortOrder,
     pub sol_mode: SolMode,
     pub pagination: Option<TransferPositionFilter>,
-    pub amount_filter: Option<NumericFilter<f64>>,
+    pub amount_filter: Option<NumericFilter<RawAmount>>,
     pub slot_filter: Option<NumericFilter<u64>>,
     pub block_time_filter: Option<NumericFilter<i64>>,
     pub direction: TransferDirectionFilter,
@@ -326,6 +450,7 @@ pub struct TransferRecord {
     pub block_time: Option<i64>,
     pub transfer_type: String,
     pub amount: String,
+    pub fee_amount: Option<String>,
     pub mint: Option<String>,
     pub decimals: Option<u8>,
     pub from_user_account: Option<String>,

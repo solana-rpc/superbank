@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use crate::clickhouse::RawAmount;
 use crate::solana_sdk::transaction::TransactionVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -152,7 +153,7 @@ pub(crate) struct GetTransactionsForAddressOptions {
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct GetTransfersByAddressFilters {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) amount: Option<ComparisonFilter<f64>>,
+    pub(crate) amount: Option<ComparisonFilter<RawAmount>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) slot: Option<ComparisonFilter<u64>>,
     #[serde(rename = "blockTime")]
@@ -260,6 +261,7 @@ pub(crate) struct TransfersByAddressInfo {
     pub(crate) to_token_account: Option<String>,
     pub(crate) mint: String,
     pub(crate) amount: String,
+    pub(crate) fee_amount: Option<String>,
     pub(crate) decimals: Option<u8>,
     pub(crate) ui_amount: String,
     pub(crate) confirmation_status: String,

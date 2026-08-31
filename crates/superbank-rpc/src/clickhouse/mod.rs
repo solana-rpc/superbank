@@ -21,7 +21,7 @@ pub use client::{ClickHouseClient, ClickHouseClientOptions, InflationRewardQuery
 #[allow(unused_imports)]
 pub use types::TransactionsForAddressRecord;
 pub use types::{
-    BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings, SignatureFilter,
+    BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings, RawAmount, SignatureFilter,
     SignatureRecord, SignatureStatusRecord, SolMode, SortOrder, StoredAccountsTransactionRecord,
     StoredBlockPayload, StoredBlockRecord, StoredTransactionRecord, TokenAccountsFilter,
     TokenTransferTypes, TransactionStatusFilter, TransactionsForAddressQuery,

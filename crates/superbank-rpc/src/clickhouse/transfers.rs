@@ -32,6 +32,7 @@ struct TransferQueryRow {
     block_time: Option<i64>,
     transfer_type: String,
     amount: String,
+    fee_amount: Option<String>,
     mint: Option<String>,
     decimals: Option<u8>,
     from_user_account: Option<String>,
@@ -50,6 +51,7 @@ fn map_transfer_row(row: TransferQueryRow) -> TransferRecord {
         block_time: row.block_time,
         transfer_type: row.transfer_type,
         amount: row.amount,
+        fee_amount: row.fee_amount,
         mint: row.mint,
         decimals: row.decimals,
         from_user_account: row.from_user_account,
@@ -126,6 +128,7 @@ fn transfer_select_list(table_alias: &str) -> String {
             {table_alias}.block_time,
             {table_alias}.transfer_type,
             {table_alias}.amount,
+            {table_alias}.fee_amount,
             if(isNull({table_alias}.mint), NULL, base58Encode(assumeNotNull({table_alias}.mint))) AS mint,
             {table_alias}.decimals,
             if(isNull({table_alias}.from_user_account), NULL, base58Encode(assumeNotNull({table_alias}.from_user_account))) AS from_user_account,
@@ -143,7 +146,7 @@ fn append_shared_filter_conditions(
     append_pagination_condition(query, conditions);
     if let Some(filter) = &query.amount_filter {
         append_numeric_filter_conditions(
-            &format!("toFloat64OrZero({table_alias}.amount)"),
+            &format!("toUInt64OrNull({table_alias}.amount)"),
             filter,
             conditions,
         );
@@ -264,7 +267,7 @@ impl ClickHouseClient {
         &self,
         query: &TransfersByAddressQuery,
     ) -> ProcessingResult<(Vec<TransferRecord>, QueryTimings)> {
-        self.with_timeout("get_transfers_by_address", async {
+        self.with_http_query_timeout("get_transfers_by_address", async {
             if !self.transfers_available {
                 return Err(ProcessingError::database_msg(format!(
                     "getTransfersByAddress requires transfers table '{}'",
@@ -440,5 +443,21 @@ mod tests {
             .expect("query should build");
 
         assert!(sql.contains("LIMIT 8"));
+    }
+
+    #[test]
+    fn amount_filter_uses_exact_unsigned_integer_conversion() {
+        let mut query = base_query(SolMode::Separate);
+        query.amount_filter = Some(NumericFilter {
+            eq: Some(super::super::RawAmount::new(9_007_199_254_740_993)),
+            ..NumericFilter::default()
+        });
+
+        let sql = build_transfers_by_address_query("default.transfers", &query, "")
+            .expect("query should build");
+
+        assert!(sql.contains("toUInt64OrNull(from_t.amount) = 9007199254740993"));
+        assert!(sql.contains("toUInt64OrNull(to_t.amount) = 9007199254740993"));
+        assert!(!sql.contains("toFloat64OrZero"));
     }
 }

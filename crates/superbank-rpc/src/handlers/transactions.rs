@@ -365,6 +365,7 @@ fn map_transfer_record_to_response(
         to_token_account,
         mint,
         amount: record.amount,
+        fee_amount: record.fee_amount,
         decimals,
         ui_amount,
         confirmation_status: confirmation_status.to_string(),
@@ -2559,6 +2560,7 @@ mod tests {
             block_time: Some(4),
             transfer_type: "mint".to_string(),
             amount: "100".to_string(),
+            fee_amount: None,
             mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
             decimals: Some(6),
             from_user_account: None,
@@ -2611,6 +2613,7 @@ mod tests {
             block_time: Some(4),
             transfer_type: "transfer".to_string(),
             amount: "2500000".to_string(),
+            fee_amount: None,
             mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
             decimals: Some(6),
             from_user_account: Some(owner.clone()),
@@ -2643,6 +2646,7 @@ mod tests {
             block_time: Some(4),
             transfer_type: "transfer".to_string(),
             amount: "1000".to_string(),
+            fee_amount: None,
             mint: Some(NATIVE_SOL_MINT.to_string()),
             decimals: Some(9),
             from_user_account: Some("9vR6ssB1BdzhAgVEoQoeZdbsqknBA2PkFYDsjvbAS5jP".to_string()),
@@ -2653,6 +2657,35 @@ mod tests {
         let mapped = map_transfer_record_to_response(record, SolMode::Merged, "finalized");
         assert_eq!(mapped.from_token_account, None);
         assert_eq!(mapped.to_token_account, None);
+    }
+
+    #[test]
+    fn map_transfer_record_to_response_exposes_withheld_fee() {
+        let record = TransferRecord {
+            signature: "sig".to_string(),
+            slot: 1,
+            slot_idx: 2,
+            transfer_idx: 3,
+            inner_instruction_idx: 0,
+            block_time: Some(4),
+            transfer_type: "transfer".to_string(),
+            amount: "9999999999999999".to_string(),
+            fee_amount: Some("1000000000000001".to_string()),
+            mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string()),
+            decimals: Some(6),
+            from_user_account: None,
+            to_user_account: None,
+            from_token_account: None,
+            to_token_account: None,
+        };
+
+        let mapped = map_transfer_record_to_response(record, SolMode::Separate, "finalized");
+
+        assert_eq!(mapped.fee_amount.as_deref(), Some("1000000000000001"));
+        assert_eq!(
+            serde_json::to_value(mapped).expect("transfer response should serialize")["feeAmount"],
+            "1000000000000001"
+        );
     }
 
     #[test]
@@ -2667,6 +2700,7 @@ mod tests {
                 block_time: None,
                 transfer_type: "transfer".to_string(),
                 amount: "1000".to_string(),
+                fee_amount: None,
                 mint: Some(NATIVE_SOL_MINT.to_string()),
                 decimals: Some(9),
                 from_user_account: None,

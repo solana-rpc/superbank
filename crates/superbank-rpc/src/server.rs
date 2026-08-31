@@ -209,7 +209,6 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         ));
     }
 
-    // Initialize ClickHouse client
     let routing_policy = build_routing_policy(&args)?;
     let ignored_shard_settings = ignored_distributed_shard_settings(&args);
     if !ignored_shard_settings.is_empty() {
@@ -220,6 +219,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     }
     let shard_routing = build_shard_routing_config(&args);
 
+    // Initialize ClickHouse client
     let mut clickhouse = ClickHouseClient::new(
         &args.clickhouse_url,
         &args.clickhouse_database,

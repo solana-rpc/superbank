@@ -961,6 +961,27 @@ impl ClickHouseClient {
         self.allow_query_settings
     }
 
+    pub(crate) async fn with_timeout<T>(
+        &self,
+        operation: &'static str,
+        fut: impl std::future::Future<Output = ProcessingResult<T>>,
+    ) -> ProcessingResult<T> {
+        self.with_http_query_timeout(operation, fut).await
+    }
+
+    /// [`Self::with_timeout`] with an explicit deadline, for operations whose
+    /// budget differs from the interactive query timeout (e.g. disk-cache
+    /// backfill range scans).
+    pub(crate) async fn with_timeout_duration<T>(
+        &self,
+        operation: &'static str,
+        timeout: std::time::Duration,
+        fut: impl std::future::Future<Output = ProcessingResult<T>>,
+    ) -> ProcessingResult<T> {
+        self.with_http_query_timeout_duration(operation, timeout, fut)
+            .await
+    }
+
     pub(crate) async fn with_http_query_timeout<T>(
         &self,
         operation: &'static str,
@@ -970,9 +991,6 @@ impl ClickHouseClient {
             .await
     }
 
-    /// [`Self::with_http_query_timeout`] with an explicit deadline, for operations whose
-    /// budget differs from the interactive query timeout (e.g. disk-cache
-    /// backfill range scans).
     pub(crate) async fn with_http_query_timeout_duration<T>(
         &self,
         operation: &'static str,
