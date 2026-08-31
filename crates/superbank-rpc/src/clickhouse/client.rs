@@ -2056,12 +2056,18 @@ impl ClickHouseClient {
     }
 
     async fn probe_replica(&self, replica: &ShardTarget) -> Result<(), String> {
-        probe_replica_tcp(replica, self.tcp_access_check_timeout).await
+        probe_replica(
+            replica,
+            self.routing_policy.transport,
+            self.tcp_access_check_timeout,
+        )
+        .await
     }
 
     fn spawn_replica_health_monitor(&self, topology: Arc<ShardTopology>) {
         let interval = self.replica_health_check_interval;
         let timeout = self.tcp_access_check_timeout;
+        let transport = self.routing_policy.transport;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await;
@@ -2069,7 +2075,7 @@ impl ClickHouseClient {
                 ticker.tick().await;
                 for (shard_index, replicas) in topology.replicas.iter().enumerate() {
                     for (replica_index, replica) in replicas.iter().enumerate() {
-                        let healthy = probe_replica_tcp(replica, timeout).await.is_ok();
+                        let healthy = probe_replica(replica, transport, timeout).await.is_ok();
                         let was_healthy = topology.replica_health[shard_index][replica_index]
                             .swap(healthy, Ordering::AcqRel);
                         if healthy != was_healthy {
@@ -2170,6 +2176,17 @@ impl ClickHouseClient {
     }
 }
 
+async fn probe_replica(
+    replica: &ShardTarget,
+    transport: RoutingTransport,
+    timeout: Duration,
+) -> Result<(), String> {
+    match transport {
+        RoutingTransport::Tcp => probe_replica_tcp(replica, timeout).await,
+        RoutingTransport::Http => probe_replica_http(replica, timeout).await,
+    }
+}
+
 async fn probe_replica_tcp(replica: &ShardTarget, timeout: Duration) -> Result<(), String> {
     let mut client = match tokio::time::timeout(timeout, replica.tcp_pool.get_handle()).await {
         Ok(Ok(handle)) => handle,
@@ -2181,6 +2198,14 @@ async fn probe_replica_tcp(replica: &ShardTarget, timeout: Duration) -> Result<(
         Ok(Ok(_)) => Ok(()),
         Ok(Err(err)) => Err(err.to_string()),
         Err(_) => Err("timeout executing SELECT 1".to_string()),
+    }
+}
+
+async fn probe_replica_http(replica: &ShardTarget, timeout: Duration) -> Result<(), String> {
+    match tokio::time::timeout(timeout, replica.http_client.query("SELECT 1").execute()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("timeout executing HTTP SELECT 1".to_string()),
     }
 }
 
@@ -2257,7 +2282,8 @@ mod tests {
 
     use super::{
         ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, kill_query_sql,
-        shard_tcp_query_timeout_for, split_table_reference, validate_gsfa_shard_layout_query,
+        probe_replica, shard_tcp_query_timeout_for, split_table_reference,
+        validate_gsfa_shard_layout_query,
     };
     use crate::clickhouse::{
         QueryCacheConfig, QueryFreshnessClass, RoutingPolicy, RoutingScope, RoutingTransport,
@@ -2712,6 +2738,73 @@ nodes:
             shard_tcp_query_timeout_for(std::time::Duration::from_millis(1)),
             std::time::Duration::from_millis(1)
         );
+    }
+
+    #[tokio::test]
+    async fn http_replica_probe_does_not_require_native_clickhouse() {
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP test listener");
+        let http_port = http_listener
+            .local_addr()
+            .expect("HTTP test listener address")
+            .port();
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unavailable TCP port");
+        let unavailable_tcp_port = tcp_listener
+            .local_addr()
+            .expect("unavailable TCP address")
+            .port();
+        drop(tcp_listener);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::OK });
+        let server = tokio::spawn(async move {
+            axum::serve(http_listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve HTTP probe")
+        });
+
+        let client = ClickHouseClient::new(
+            "http://127.0.0.1:8123",
+            "default",
+            "default",
+            "",
+            ClickHouseClientOptions::new(
+                RoutingPolicy {
+                    transport: RoutingTransport::Http,
+                    scope: RoutingScope::ShardDirect,
+                },
+                None,
+                Vec::new(),
+                "default.gsfa_hot".to_string(),
+                "default.gsfa_hot_local".to_string(),
+            ),
+        );
+        let base_url = reqwest::Url::parse("http://127.0.0.1:8123").expect("base URL");
+        let target = client
+            .build_shard_target(
+                &base_url,
+                http_port,
+                1,
+                "127.0.0.1".to_string(),
+                unavailable_tcp_port,
+                "HTTP-only test",
+            )
+            .expect("HTTP shard target");
+
+        assert!(
+            probe_replica(&target, RoutingTransport::Http, Duration::from_secs(1),)
+                .await
+                .is_ok()
+        );
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("HTTP probe server task");
     }
 
     #[test]
