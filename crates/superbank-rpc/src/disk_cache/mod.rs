@@ -128,6 +128,10 @@ fn partition_floor_after(slot: u64, partition_slots: u64) -> u64 {
         .saturating_mul(partition_slots)
 }
 
+fn exceeds_byte_budget(bytes: u64, max_bytes: u64) -> bool {
+    max_bytes > 0 && bytes > max_bytes
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlotStatus {
     Covered { tx_count: u32 },
@@ -1045,7 +1049,7 @@ impl DiskCache {
         if self.inner.cfg.max_bytes > 0 {
             let bytes = self.cache_bytes().await?;
             crate::metrics::disk_cache_size_bytes(bytes);
-            if bytes >= self.inner.cfg.max_bytes {
+            if exceeds_byte_budget(bytes, self.inner.cfg.max_bytes) {
                 byte_budget_bound = true;
                 new_floor = new_floor.max(byte_budget_eviction_floor(
                     head,
@@ -1066,13 +1070,13 @@ impl DiskCache {
         if byte_budget_bound {
             let bytes = self.cache_bytes().await?;
             crate::metrics::disk_cache_size_bytes(bytes);
-            if bytes >= self.inner.cfg.max_bytes {
+            if exceeds_byte_budget(bytes, self.inner.cfg.max_bytes) {
                 let purge_floor = partition_floor_after(head, self.inner.cfg.partition_slots);
                 evicted |= self.evict_below(purge_floor, "bytes").await?;
 
                 let bytes = self.cache_bytes().await?;
                 crate::metrics::disk_cache_size_bytes(bytes);
-                if bytes >= self.inner.cfg.max_bytes {
+                if exceeds_byte_budget(bytes, self.inner.cfg.max_bytes) {
                     self.set_ready(false);
                     return Err(DiskCacheError::ByteBudgetExceeded {
                         max_bytes: self.inner.cfg.max_bytes,
@@ -1292,6 +1296,8 @@ mod tests {
             byte_budget_eviction_floor(1_999, 0, 2_000, 1_000, 1_000),
             2_000
         );
+        assert!(!exceeds_byte_budget(1_000, 1_000));
+        assert!(exceeds_byte_budget(1_001, 1_000));
     }
 
     #[test]
