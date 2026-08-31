@@ -136,6 +136,10 @@ pub struct RpcConfig {
     #[arg(long, env = "METRICS_PORT", default_value = "9900")]
     pub(crate) metrics_port: u16,
 
+    /// Path to this RPC target cluster's genesis.bin, read at startup for epoch math.
+    #[arg(long, env = "GENESIS_PATH")]
+    pub(crate) genesis_path: Option<String>,
+
     // --- Optional Superbank gRPC streaming API ---
     #[cfg(feature = "grpc-streaming")]
     /// Enable the Superbank gRPC streaming API.
@@ -918,6 +922,27 @@ mod config_tests {
         assert!(!cfg.metrics_capture_x_rpc_node());
         assert!(!cfg.metrics_capture_x_subscription_id());
         assert!(!cfg.metrics_capture_x_account_id());
+    }
+}
+
+#[cfg(test)]
+mod genesis_path_config_tests {
+    use clap::Parser;
+
+    use super::RpcConfig;
+
+    #[test]
+    fn genesis_path_flag_parses() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--genesis-path",
+            "/etc/superbank/genesis.bin",
+        ]);
+
+        assert_eq!(
+            cfg.genesis_path.as_deref(),
+            Some("/etc/superbank/genesis.bin")
+        );
     }
 }
 

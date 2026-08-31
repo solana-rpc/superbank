@@ -9,8 +9,8 @@ use std::time::Instant;
 use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
 use serde::Deserialize;
 use serde_big_array::Array;
-use solana_clock::DEFAULT_SLOTS_PER_EPOCH;
 use solana_epoch_rewards_hasher::EpochRewardsHasher;
+use solana_epoch_schedule::EpochSchedule;
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
@@ -38,12 +38,12 @@ use super::types::{
 };
 use super::util::{annotate_required_query, http_query_with_id};
 
-fn inflation_epoch_slot_bounds(epoch: u64) -> Option<(u64, u64)> {
+fn inflation_epoch_slot_bounds(epoch: u64, schedule: &EpochSchedule) -> Option<(u64, u64)> {
     let next_epoch = epoch.checked_add(1)?;
     let following_epoch = next_epoch.checked_add(1)?;
-    let start_slot = next_epoch.checked_mul(DEFAULT_SLOTS_PER_EPOCH)?;
-    let end_slot_exclusive = following_epoch.checked_mul(DEFAULT_SLOTS_PER_EPOCH)?;
-    Some((start_slot, end_slot_exclusive))
+    let start_slot = schedule.get_first_slot_in_epoch(next_epoch);
+    let end_slot_exclusive = schedule.get_first_slot_in_epoch(following_epoch);
+    (start_slot < end_slot_exclusive).then_some((start_slot, end_slot_exclusive))
 }
 
 const MAX_INFLATION_REWARD_PARTITIONS: usize = 4_096;
@@ -1059,6 +1059,7 @@ impl ClickHouseClient {
         &self,
         addresses: &[[u8; 32]],
         epoch: u64,
+        schedule: &EpochSchedule,
     ) -> ProcessingResult<(InflationRewardLookupOutcome, QueryTimings)> {
         const OPERATION: &str = "get_inflation_rewards_for_epoch";
 
@@ -1069,8 +1070,8 @@ impl ClickHouseClient {
             ));
         }
 
-        let (start_slot, end_slot_exclusive) =
-            inflation_epoch_slot_bounds(epoch).ok_or_else(|| {
+        let (start_slot, end_slot_exclusive) = inflation_epoch_slot_bounds(epoch, schedule)
+            .ok_or_else(|| {
                 ProcessingError::deserialization_msg(format!("epoch {epoch} is out of range"))
             })?;
 
@@ -2448,6 +2449,8 @@ impl ClickHouseClient {
 mod tests {
     use std::collections::HashMap;
 
+    use solana_epoch_schedule::EpochSchedule;
+
     use super::{
         BlockTransactionProjection, InflationRewardSelection, SLOT_SHARD_DIVISOR,
         build_block_metadata_query, build_block_transactions_query, build_blockhash_valid_query,
@@ -2560,10 +2563,45 @@ mod tests {
 
     #[test]
     fn inflation_epoch_1018_payout_starts_at_foundation_error_slot() {
+        let schedule = EpochSchedule::without_warmup();
         assert_eq!(
-            inflation_epoch_slot_bounds(1_018),
+            inflation_epoch_slot_bounds(1_018, &schedule),
             Some((440_208_000, 440_640_000))
         );
+    }
+
+    #[test]
+    fn inflation_epoch_bounds_use_warmup_schedule_slots() {
+        let schedule = EpochSchedule::default();
+
+        assert_eq!(
+            inflation_epoch_slot_bounds(2, &schedule),
+            Some((
+                schedule.get_first_slot_in_epoch(3),
+                schedule.get_first_slot_in_epoch(4)
+            ))
+        );
+    }
+
+    #[test]
+    fn inflation_epoch_bounds_reject_epoch_overflow() {
+        assert_eq!(
+            inflation_epoch_slot_bounds(u64::MAX, &EpochSchedule::without_warmup()),
+            None
+        );
+    }
+
+    #[test]
+    fn inflation_epoch_bounds_reject_non_monotonic_schedule() {
+        let schedule = EpochSchedule {
+            slots_per_epoch: 0,
+            leader_schedule_slot_offset: 0,
+            warmup: false,
+            first_normal_epoch: 0,
+            first_normal_slot: 0,
+        };
+
+        assert_eq!(inflation_epoch_slot_bounds(2, &schedule), None);
     }
 
     #[test]
