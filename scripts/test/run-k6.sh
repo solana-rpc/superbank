@@ -36,6 +36,7 @@ Suite defaults (override as needed):
 Notes:
   - Validation tests are skipped unless REFERENCE_RPC_URL is set.
   - Head-cache WS scenario runs only if RPC supports `commitment=processed` and SOLANA_WS_URL is set.
+  - The getInflationReward stress scenario is skipped unless INFLATION_REWARD_EPOCH is set.
   - Stress/soak/spike scenarios are long-running; enable them explicitly via flags.
 EOF
 }
@@ -287,6 +288,11 @@ run_replay_suite() {
 run_long_suite() {
   if [[ "${include_stress}" == "true" ]]; then
     for script in tests/k6/scenarios/stress/*.js; do
+      if [[ "${script}" == "tests/k6/scenarios/stress/stress-test-get-inflation-reward.js" \
+        && -z "${INFLATION_REWARD_EPOCH:-}" ]]; then
+        skip "stress:$(basename "${script}")" "INFLATION_REWARD_EPOCH not set"
+        continue
+      fi
       run_k6 "stress:$(basename "${script}")" "${script}"
     done
   fi
