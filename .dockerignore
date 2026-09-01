@@ -14,7 +14,9 @@ Dockerfile
 *~
 artifacts/
 deploy/
-dist/
+dist/*
+!dist/superbank
+!dist/superbank-rpc
 docker-compose.yaml
 scripts/
 superbank.yaml
