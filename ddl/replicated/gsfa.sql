@@ -109,6 +109,7 @@ WITH
         CAST(base58Decode('SysvarS1otHashes111111111111111111111111111') AS FixedString(32))
     ] AS gsfa_ignored_addresses
 SELECT
+    cityHash64(address) % 32 AS addr_bucket,
     address,
     signature,
     slot,
