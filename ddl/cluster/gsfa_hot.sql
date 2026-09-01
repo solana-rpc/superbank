@@ -117,6 +117,7 @@ WITH
         CAST(base58Decode('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') AS FixedString(32))
     ] AS gsfa_hot_addresses
 SELECT
+    cityHash64(address) % 32 AS addr_bucket,
     address,
     signature,
     slot,

@@ -116,6 +116,7 @@ checksum:
 
 release:
   name_template: "Release {{ .Tag }}"
+  prerelease: auto
   header: |
     rust {{ .Env.RUST_VERSION }}
 

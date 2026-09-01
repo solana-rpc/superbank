@@ -211,19 +211,16 @@ CI enforces PR titles via the `Lint PR title` GitHub Actions check.
 Releases are tag-driven and published by GoReleaser:
 
 1. Update the shared package version under `[workspace.package]` in the root `Cargo.toml`.
-2. Create and push an annotated `vX.Y.Z` tag.
+2. Create and push a signed annotated `vX.Y.Z` or `vX.Y.Z-<prerelease>` tag.
 3. The release workflow verifies that the tag version matches the Cargo package versions.
-4. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL,
-   runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite before assets are
-   published.
-5. After E2E passes, GoReleaser builds both binaries for Linux amd64 and Linux arm64,
-   then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`.
+4. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL, runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite before assets are published.
+5. After E2E passes, GoReleaser builds `superbank`, `superbank-rpc`, `superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` for Linux amd64 and Linux arm64, then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`.
 
 Example:
 
 ```bash
-git tag -a v0.5.0 -m "Release v0.5.0"
-git push origin v0.5.0
+git tag -s v0.6.0-rc1 -m "Release v0.6.0-rc1"
+git push origin v0.6.0-rc1
 ```
 
 Repository settings required (GitHub UI):
