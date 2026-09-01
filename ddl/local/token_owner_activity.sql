@@ -113,6 +113,7 @@ WITH
         CAST(base58Decode('Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH') AS FixedString(32))
     ] AS memo_program_ids
 SELECT
+    cityHash64(owner) % 32 AS owner_bucket,
     assumeNotNull(entry.1) AS owner,
     entry.2 AS token_account,
     signature,
