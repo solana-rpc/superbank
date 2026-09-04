@@ -737,6 +737,7 @@ pub(crate) async fn handle_get_signatures_for_address(
                 .map(|meta| SignatureInfo {
                     signature: meta.signature_str.to_string(),
                     slot: meta.pos.slot,
+                    transaction_index: Some(meta.pos.idx),
                     err: meta.err.clone(),
                     memo: meta.memo.clone(),
                     block_time: meta.block_time,
@@ -897,6 +898,7 @@ pub(crate) async fn handle_get_signatures_for_address(
             .map(|sig| SignatureInfo {
                 signature: sig.signature,
                 slot: sig.slot,
+                transaction_index: Some(sig.slot_idx),
                 err: sig.err,
                 memo: sig.memo,
                 block_time: sig.block_time,
@@ -1067,6 +1069,7 @@ pub(crate) async fn handle_get_signatures_for_address(
         .map(|sig: SignatureRecord| SignatureInfo {
             signature: sig.signature,
             slot: sig.slot,
+            transaction_index: Some(sig.slot_idx),
             err: sig.err,
             memo: sig.memo,
             block_time: sig.block_time,

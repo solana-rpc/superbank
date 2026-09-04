@@ -75,6 +75,8 @@ Notes:
   - `slot`: optional `u64`; when supplied, ClickHouse is queried directly for that exact slot and
     the response is `null` if the signature is not present in that slot.
 - `getSignaturesForAddress` accepts standard Solana config fields plus optional Superbank extensions:
+  - Each returned entry includes `transactionIndex`, the transaction's zero-based position in the
+    block's flattened transaction list.
   - `beforeSlot`: optional `u64`; exclusive whole-slot upper bound (`slot < beforeSlot`).
   - `untilSlot`: optional `u64`; exclusive whole-slot lower bound (`slot > untilSlot`).
     These are whole-slot cursors, not signature-position cursors; `beforeSlot` cannot be combined

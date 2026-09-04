@@ -161,6 +161,12 @@ pub(crate) struct GetSignatureStatusesConfig {
 pub(crate) struct SignatureInfo {
     pub(crate) signature: String,
     pub(crate) slot: u64,
+    #[serde(
+        rename = "transactionIndex",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) transaction_index: Option<u32>,
     pub(crate) err: Option<Value>,
     pub(crate) memo: Option<String>,
     #[serde(rename = "blockTime")]
