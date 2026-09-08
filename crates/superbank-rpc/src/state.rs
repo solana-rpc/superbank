@@ -102,15 +102,72 @@ fn commitment_label(commitment: CommitmentLevel) -> &'static str {
 }
 
 enum CacheRefreshRole {
-    Leader(Arc<Notify>),
+    Leader(CacheRefreshLeader),
     Waiter(OwnedNotified),
+}
+
+// Owns one refresh notification, including while the backend or completion lock is pending.
+// Follow SignatureSlotCacheLeader's cancellation cleanup without retaining the whole cache.
+struct CacheRefreshLeader {
+    refresh_lock: Arc<Mutex<Option<Arc<Notify>>>>,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl CacheRefreshLeader {
+    async fn finish(mut self) {
+        Self::remove_in_flight(&self.refresh_lock, &self.notify).await;
+        self.armed = false;
+    }
+
+    async fn remove_in_flight(refresh_lock: &Mutex<Option<Arc<Notify>>>, notify: &Arc<Notify>) {
+        let mut guard = refresh_lock.lock().await;
+        Self::remove_matching_entry(&mut guard, notify);
+        drop(guard);
+        notify.notify_waiters();
+    }
+
+    fn remove_matching_entry(guard: &mut Option<Arc<Notify>>, notify: &Arc<Notify>) {
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, notify))
+        {
+            *guard = None;
+        }
+    }
+}
+
+impl Drop for CacheRefreshLeader {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let refresh_lock = self.refresh_lock.clone();
+        let notify = self.notify.clone();
+        if let Ok(mut guard) = refresh_lock.try_lock() {
+            Self::remove_matching_entry(&mut guard, &notify);
+            drop(guard);
+            notify.notify_waiters();
+            return;
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                Self::remove_in_flight(&refresh_lock, &notify).await;
+            });
+        } else {
+            // Match the signature cache's runtime-teardown fallback for retained waiters.
+            notify.notify_waiters();
+        }
+    }
 }
 
 pub(crate) struct LatestSlotCache {
     ttl: Duration,
     pub(crate) value: AtomicU64,
     pub(crate) last_updated_ms: AtomicU64,
-    refresh_lock: Mutex<Option<Arc<Notify>>>,
+    refresh_lock: Arc<Mutex<Option<Arc<Notify>>>>,
 }
 
 impl LatestSlotCache {
@@ -119,7 +176,7 @@ impl LatestSlotCache {
             ttl,
             value: AtomicU64::new(0),
             last_updated_ms: AtomicU64::new(0),
-            refresh_lock: Mutex::new(None),
+            refresh_lock: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -150,12 +207,16 @@ impl LatestSlotCache {
                 } else {
                     let inflight = Arc::new(Notify::new());
                     *guard = Some(inflight.clone());
-                    CacheRefreshRole::Leader(inflight)
+                    CacheRefreshRole::Leader(CacheRefreshLeader {
+                        refresh_lock: self.refresh_lock.clone(),
+                        notify: inflight,
+                        armed: true,
+                    })
                 }
             };
 
             match role {
-                CacheRefreshRole::Leader(notify) => {
+                CacheRefreshRole::Leader(leader) => {
                     let fetch_result = async {
                         let slot_opt = clickhouse.get_latest_finalized_slot().await?;
                         slot_opt.ok_or_else(|| {
@@ -171,15 +232,11 @@ impl LatestSlotCache {
                             self.value.store(latest, Ordering::Relaxed);
                             self.last_updated_ms
                                 .store(current_time_millis(), Ordering::Relaxed);
-                            let mut guard = self.refresh_lock.lock().await;
-                            *guard = None;
-                            notify.notify_waiters();
+                            leader.finish().await;
                             return Ok(latest);
                         }
                         Err(err) => {
-                            let mut guard = self.refresh_lock.lock().await;
-                            *guard = None;
-                            notify.notify_waiters();
+                            leader.finish().await;
                             return Err(err);
                         }
                     }
@@ -199,7 +256,7 @@ pub(crate) struct LatestBlockHeightCache {
     // u64::MAX means cache seeded without a slot (tests/back-compat).
     pub(crate) slot: AtomicU64,
     pub(crate) last_updated_ms: AtomicU64,
-    refresh_lock: Mutex<Option<Arc<Notify>>>,
+    refresh_lock: Arc<Mutex<Option<Arc<Notify>>>>,
 }
 
 impl LatestBlockHeightCache {
@@ -212,7 +269,7 @@ impl LatestBlockHeightCache {
             value: AtomicU64::new(Self::NONE_SENTINEL),
             slot: AtomicU64::new(Self::UNKNOWN_SLOT_SENTINEL),
             last_updated_ms: AtomicU64::new(0),
-            refresh_lock: Mutex::new(None),
+            refresh_lock: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -252,43 +309,111 @@ impl LatestBlockHeightCache {
                 } else {
                     let inflight = Arc::new(Notify::new());
                     *guard = Some(inflight.clone());
-                    CacheRefreshRole::Leader(inflight)
+                    CacheRefreshRole::Leader(CacheRefreshLeader {
+                        refresh_lock: self.refresh_lock.clone(),
+                        notify: inflight,
+                        armed: true,
+                    })
                 }
             };
 
             match role {
-                CacheRefreshRole::Leader(notify) => {
+                CacheRefreshRole::Leader(leader) => {
                     let result = clickhouse.get_blockhash_height_by_slot(slot).await.map(
                         |(row_opt, timings)| {
                             (row_opt.and_then(|(_blockhash, height)| height), timings)
                         },
                     );
-                    match result {
+                    let height = match result {
                         Ok((height_opt, _timings)) => {
                             let stored = height_opt.unwrap_or(Self::NONE_SENTINEL);
                             self.value.store(stored, Ordering::Relaxed);
                             self.slot.store(slot, Ordering::Relaxed);
                             self.last_updated_ms
                                 .store(current_time_millis(), Ordering::Release);
+                            height_opt
                         }
                         Err(err) => {
-                            let mut guard = self.refresh_lock.lock().await;
-                            *guard = None;
-                            notify.notify_waiters();
+                            leader.finish().await;
                             return Err(err);
                         }
-                    }
+                    };
 
-                    let mut guard = self.refresh_lock.lock().await;
-                    *guard = None;
-                    notify.notify_waiters();
-                    let cached = self.value.load(Ordering::Relaxed);
-                    return Ok((cached != Self::NONE_SENTINEL).then_some(cached));
+                    leader.finish().await;
+                    return Ok(height);
                 }
                 CacheRefreshRole::Waiter(notified) => {
                     notified.await;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leader() -> CacheRefreshLeader {
+        let notify = Arc::new(Notify::new());
+        CacheRefreshLeader {
+            refresh_lock: Arc::new(Mutex::new(Some(notify.clone()))),
+            notify,
+            armed: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_leader_drop_wakes_unpolled_waiter() {
+        let leader = leader();
+        let lock = leader.refresh_lock.clone();
+        let waiter = leader.notify.clone().notified_owned();
+        drop(leader);
+        assert!(lock.lock().await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("notification before first poll must not be lost");
+    }
+
+    #[tokio::test]
+    async fn refresh_leader_cancelled_during_finish_cleans_up_contended_lock() {
+        let leader = leader();
+        let lock = leader.refresh_lock.clone();
+        let waiter = leader.notify.clone().notified_owned();
+        let locked = lock.lock().await;
+        let mut finish = Box::pin(leader.finish());
+        assert!(futures_util::poll!(finish.as_mut()).is_pending());
+        drop(finish);
+        drop(locked);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("contended cancellation must wake waiters");
+        assert!(lock.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_leader_cleanup_preserves_replacement() {
+        for contended in [false, true] {
+            let leader = leader();
+            let lock = leader.refresh_lock.clone();
+            let waiter = leader.notify.clone().notified_owned();
+            let replacement = Arc::new(Notify::new());
+            let mut locked = lock.lock().await;
+            *locked = Some(replacement.clone());
+            if contended {
+                drop(leader);
+                drop(locked);
+            } else {
+                drop(locked);
+                drop(leader);
+            }
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("old waiters must still wake");
+            assert!(Arc::ptr_eq(
+                lock.lock().await.as_ref().unwrap(),
+                &replacement
+            ));
         }
     }
 }
