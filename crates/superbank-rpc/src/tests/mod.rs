@@ -5631,6 +5631,10 @@ async fn get_signatures_for_address_processed_served_from_head_cache() {
     );
     assert_eq!(arr[0].get("slot").and_then(|v| v.as_u64()), Some(11));
     assert_eq!(
+        arr[0].get("transactionIndex").and_then(|v| v.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
         arr[0].get("confirmationStatus").and_then(|v| v.as_str()),
         Some("processed")
     );
@@ -5640,6 +5644,10 @@ async fn get_signatures_for_address_processed_served_from_head_cache() {
         Some(sig1_str.as_str())
     );
     assert_eq!(arr[1].get("slot").and_then(|v| v.as_u64()), Some(10));
+    assert_eq!(
+        arr[1].get("transactionIndex").and_then(|v| v.as_u64()),
+        Some(7)
+    );
     assert_eq!(
         arr[1].get("confirmationStatus").and_then(|v| v.as_str()),
         Some("processed")
