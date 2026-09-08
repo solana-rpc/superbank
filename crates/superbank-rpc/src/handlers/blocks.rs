@@ -111,8 +111,23 @@ struct BlockResponseOptions {
     timings: Option<QueryTimings>,
 }
 
-fn block_payload_transaction_count(payload: &StoredBlockPayload) -> Option<usize> {
-    payload.observed_transaction_count()
+/// Metadata-only requests do not fetch transactions and cannot validate their count.
+fn block_payload_has_consistent_transaction_count(payload: &StoredBlockPayload) -> bool {
+    let Some(observed) = payload.observed_transaction_count() else {
+        return true;
+    };
+    let metadata = payload.metadata();
+    if metadata.executed_transaction_count == observed as u64 {
+        return true;
+    }
+    warn!(
+        slot = metadata.slot,
+        expected = metadata.executed_transaction_count,
+        observed,
+        entry_count = metadata.entry_count,
+        "Block transaction count mismatch"
+    );
+    false
 }
 
 fn unsupported_transaction_version_message(version: u8) -> String {
@@ -1353,16 +1368,14 @@ async fn respond_with_hydrated_block(
             "Block metadata slot mismatch"
         );
     }
-    if let Some(observed) = block_payload_transaction_count(&payload)
-        && payload.metadata().executed_transaction_count != observed as u64
-    {
-        warn!(
-            slot,
-            expected = payload.metadata().executed_transaction_count,
-            observed = observed,
-            entry_count = payload.metadata().entry_count,
-            "Block transaction count mismatch"
-        );
+    // Reject before hydration or cache insertion, including when caching is disabled.
+    if !block_payload_has_consistent_transaction_count(&payload) {
+        metrics::backend_error("get_block_transaction_count");
+        let mut resp = json_rpc_internal_error_response(id);
+        if let Some(timings) = timings.as_ref() {
+            add_downstream_header(&mut resp, timings);
+        }
+        return Ok(resp);
     }
 
     let attach_timings = |resp: &mut Response| {
@@ -1570,32 +1583,22 @@ pub(crate) async fn handle_get_block(
                 );
             }
 
-            if let Some(observed) = block_payload_transaction_count(&payload)
-                && payload.metadata().executed_transaction_count != observed as u64
-            {
-                warn!(
+            if block_payload_has_consistent_transaction_count(&payload) {
+                route.source_head_cache();
+                return respond_with_hydrated_block(
+                    state.as_ref(),
+                    id,
+                    &mut route,
                     slot,
-                    expected = payload.metadata().executed_transaction_count,
-                    observed = observed,
-                    entry_count = payload.metadata().entry_count,
-                    "Head-cache block transaction count mismatch"
-                );
+                    payload,
+                    fetch_plan,
+                    BlockResponseOptions {
+                        cache_key: response_cache_key.clone(),
+                        timings: None,
+                    },
+                )
+                .await;
             }
-
-            route.source_head_cache();
-            return respond_with_hydrated_block(
-                state.as_ref(),
-                id,
-                &mut route,
-                slot,
-                payload,
-                fetch_plan,
-                BlockResponseOptions {
-                    cache_key: response_cache_key.clone(),
-                    timings: None,
-                },
-            )
-            .await;
         }
     }
 
@@ -2673,6 +2676,222 @@ mod tests {
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
     use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
+
+    fn count_test_payload(
+        details: solana_transaction_status::TransactionDetails,
+        expected: u64,
+        observed: usize,
+    ) -> crate::clickhouse::StoredBlockPayload {
+        use crate::clickhouse::{StoredAccountsTransactionRecord, StoredBlockPayload};
+        use solana_transaction_status::TransactionDetails;
+
+        let mut block = crate::tests::projection_equivalence_block_record();
+        block.metadata.executed_transaction_count = expected;
+        block.transactions.truncate(observed);
+        assert_eq!(block.transactions.len(), observed);
+        match details {
+            TransactionDetails::None => StoredBlockPayload::Metadata(block.metadata),
+            TransactionDetails::Full => StoredBlockPayload::Full(block),
+            TransactionDetails::Accounts => StoredBlockPayload::Accounts {
+                metadata: block.metadata,
+                transactions: block
+                    .transactions
+                    .into_iter()
+                    .map(StoredAccountsTransactionRecord::from)
+                    .collect(),
+            },
+            TransactionDetails::Signatures => StoredBlockPayload::Signatures {
+                metadata: block.metadata,
+                signatures: block
+                    .transactions
+                    .into_iter()
+                    .map(|tx| bs58::encode(tx.signature).into_string())
+                    .collect(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn get_block_rejects_count_mismatch_before_caching_and_recovers_after_repair() {
+        use super::*;
+        use crate::block_response_cache::BlockResponseCache;
+
+        for details in [
+            TransactionDetails::Full,
+            TransactionDetails::Accounts,
+            TransactionDetails::Signatures,
+        ] {
+            for cache_bytes in [0, 1024 * 1024] {
+                let mut state = crate::tests::test_state();
+                Arc::get_mut(&mut state).unwrap().block_response_cache =
+                    BlockResponseCache::new(cache_bytes);
+                let plan = GetBlockFetchPlan::new(&RpcBlockConfig {
+                    transaction_details: Some(details),
+                    max_supported_transaction_version: Some(1),
+                    ..Default::default()
+                });
+                let key = plan.cache_key(10, CommitmentLevel::Finalized);
+                // Reject missing, empty, and excess transaction projections.
+                for (expected, observed) in [(2, 1), (2, 0), (1, 2), (0, 1)] {
+                    let response = respond_with_hydrated_block(
+                        &state,
+                        json!("partial"),
+                        &mut RouteMetric::for_state("getBlock", &state),
+                        10,
+                        count_test_payload(details, expected, observed),
+                        plan,
+                        BlockResponseOptions {
+                            cache_key: Some(key.clone()),
+                            timings: Some(QueryTimings {
+                                elapsed_ms: 1,
+                                received_bytes: 2,
+                                decoded_bytes: 3,
+                                rows_read: Some(4),
+                                rows_read_unknown: false,
+                                rows_returned: 2,
+                            }),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        crate::util::extract_downstream_timings(&response)
+                            .unwrap()
+                            .rows_returned,
+                        2
+                    );
+                    let body: Value = serde_json::from_slice(
+                        &axum::body::to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(body["id"], "partial");
+                    assert_eq!(
+                        body["error"]["code"], -32603,
+                        "{details:?}, cache={cache_bytes}"
+                    );
+                    assert!(body.get("result").is_none());
+                    assert!(state.block_response_cache.get(&key).await.is_none());
+                }
+                let response = respond_with_hydrated_block(
+                    &state,
+                    json!("repaired"),
+                    &mut RouteMetric::for_state("getBlock", &state),
+                    10,
+                    count_test_payload(details, 2, 2),
+                    plan,
+                    BlockResponseOptions {
+                        cache_key: Some(key.clone()),
+                        timings: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let body: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let field = if details == TransactionDetails::Signatures {
+                    "signatures"
+                } else {
+                    "transactions"
+                };
+                assert_eq!(body["id"], "repaired");
+                assert!(body.get("error").is_none(), "{body}");
+                assert_eq!(body["result"][field].as_array().unwrap().len(), 2);
+                assert_eq!(
+                    state.block_response_cache.get(&key).await.is_some(),
+                    cache_bytes > 0
+                );
+                if cache_bytes > 0 {
+                    // Exercise the handler's early cache hit, with no reachable storage needed.
+                    let cached = handle_get_block(
+                        state.clone(),
+                        json!("cached"),
+                        Some(vec![
+                            json!(10),
+                            json!({
+                                "transactionDetails": details, "maxSupportedTransactionVersion": 1
+                            }),
+                        ]),
+                    )
+                    .await
+                    .unwrap();
+                    let cached: Value = serde_json::from_slice(
+                        &axum::body::to_bytes(cached.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(cached["id"], "cached");
+                    assert_eq!(cached["result"], body["result"]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_block_count_validation_preserves_empty_and_metadata_only_responses() {
+        use super::*;
+        use crate::block_response_cache::BlockResponseCache;
+
+        for (details, expected) in [
+            (TransactionDetails::Full, 0),
+            (TransactionDetails::Accounts, 0),
+            (TransactionDetails::Signatures, 0),
+            (TransactionDetails::None, 0),
+            (TransactionDetails::None, 2),
+        ] {
+            for cache_bytes in [0, 1024 * 1024] {
+                let mut state = crate::tests::test_state();
+                Arc::get_mut(&mut state).unwrap().block_response_cache =
+                    BlockResponseCache::new(cache_bytes);
+                let plan = GetBlockFetchPlan::new(&RpcBlockConfig {
+                    transaction_details: Some(details),
+                    ..Default::default()
+                });
+                let key = plan.cache_key(10, CommitmentLevel::Finalized);
+                let response = respond_with_hydrated_block(
+                    &state,
+                    json!(1),
+                    &mut RouteMetric::for_state("getBlock", &state),
+                    10,
+                    count_test_payload(details, expected, 0),
+                    plan,
+                    BlockResponseOptions {
+                        cache_key: Some(key.clone()),
+                        timings: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let body: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(body.get("error").is_none(), "{body}");
+                match details {
+                    TransactionDetails::None => {
+                        assert!(body["result"].get("transactions").is_none());
+                        assert!(body["result"].get("signatures").is_none());
+                    }
+                    TransactionDetails::Signatures => {
+                        assert_eq!(body["result"]["signatures"], json!([]))
+                    }
+                    _ => assert_eq!(body["result"]["transactions"], json!([])),
+                }
+                assert_eq!(
+                    state.block_response_cache.get(&key).await.is_some(),
+                    cache_bytes > 0
+                );
+            }
+        }
+    }
 
     #[test]
     fn merge_sorted_block_slots_handles_empty_inputs() {
