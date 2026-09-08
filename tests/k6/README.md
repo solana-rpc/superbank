@@ -846,3 +846,63 @@ tests/k6/
 ### Threshold Failures
 
 If thresholds fail, k6 will exit with a non-zero code. Check the output for which thresholds failed and adjust your expectations or fix the underlying issue.
+
+### Disk-cache partition-routing regression gate
+
+`scenarios/performance/superbank-rpc-disk-cache-key-routing.js` runs 70 mixed key requests/s
+for 30 minutes. It rejects undersized datasets (fewer than 900 million signature rows,
+80 partitions, or 600 active signature parts) and requires a non-repeating request manifest.
+Use an isolated representative deployment with concurrent ingestion around 4,600 transactions/s.
+Do not run this load against production as part of routine repository validation.
+
+Supply `KEY_REQUEST_FILE` as a JSON array of at least 126,070 entries (including a one-second scheduling buffer):
+
+```json
+[{"method":"getTransaction","params":["<signature>",{"encoding":"json","maxSupportedTransactionVersion":1}],"ageBand":"oldest","expectedDiskHit":true,"expected":{}}]
+```
+
+Replace `expected` with the actual reference result. For `getSignatureStatuses`, store its
+`value`; for `getTransactionsForAddress`, store its `data`, excluding the tier-dependent cursor.
+Capture expected results from an independent reference over finalized data before measuring.
+For status-hit fixtures, capture the reference with `searchTransactionHistory=true`, then run
+the target with history disabled and non-null expected statuses. Status responses may still
+touch ClickHouse for their context slot. Disable the head cache in both benchmark targets.
+Include recent, middle, and oldest retained keys, all four key methods, misses, and out-of-window
+keys. Use 100-result address pages and include ascending/descending, token-owner, and cursor cases.
+A useful rate split is 40 getTransaction, 10 single-key getSignatureStatuses, 10
+getSignaturesForAddress, and 10 getTransactionsForAddress requests per second.
+
+```sh
+KEY_REQUEST_FILE=/absolute/path/requests.json RPC_URL=http://127.0.0.1:8899 \
+KEY_CLICKHOUSE_URL=http://127.0.0.1:8123 METRICS_URL=http://127.0.0.1:9900/metrics \
+k6 run tests/k6/scenarios/performance/superbank-rpc-disk-cache-key-routing.js
+```
+
+Acceptance requires exact data parity, no dropped iterations, index memory within 4 GiB,
+no growing ingestion backlog, signature-attempt p99 below 250 ms, and address-attempt p99 below
+500 ms. The script applies those latency thresholds to end-to-end disk hits, which is stricter
+than local-attempt latency. Inspect `superbank_disk_cache_key_seconds` for **all** attempts,
+including misses/timeouts, and compare backlog and ingestion rate before/after. Preserve the
+query-log selected-part counts and metrics alongside the k6 summary. A passing k6 process alone
+does not establish the ingestion and all-attempt gates.
+
+Repeat cold-start and invalidation tests separately: correctness and the two-second deadline
+must hold while the index is unavailable, but the steady-state latency targets apply after
+index building. `KEY_ROUTING_SMOKE=1` runs for ten seconds at one request/s and skips dataset-size checks; this is
+explicitly not a full-size performance pass. Existing disk-cache parity walks remain required.
+
+The Rust integration fixture uses a disposable loopback ClickHouse and the repository DDL:
+
+```sh
+DISK_CACHE_TEST_URL=http://127.0.0.1:18123 \
+cargo test -p superbank-rpc --all-features --locked key_routing_clickhouse_integration -- --ignored
+```
+
+It creates uniquely named `test_key_router_*` databases and removes them on success. Set
+`DISK_CACHE_TEST_KEEP=1` only when retaining the fixture for a local RPC/k6 smoke run.
+
+For the scoped Rust complexity gate, install `rust-code-analysis-cli` version `0.0.25` and run
+`python3 scripts/test/check-rust-complexity.py --base HEAD` before committing. New functions must
+have McCabe complexity at most 10; changed existing functions must not increase. After committing,
+pass the branch base revision instead of `HEAD`. Set `RUST_CODE_ANALYSIS` to an explicit tool path
+when it is not on `PATH`.

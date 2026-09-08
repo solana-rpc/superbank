@@ -333,6 +333,7 @@ impl ClickHouseClient {
         let gsfa_table = self.gsfa_table_for_address(pubkey);
         let gsfa_bucket_modulus = self.gsfa_bucket_modulus_for_address(pubkey);
         let tables = TransactionsForAddressTables {
+            cache_partition: self.cache_partition,
             gsfa_table,
             gsfa_bucket_modulus,
             token_owner_table: &self.token_owner_activity_table,
@@ -342,10 +343,10 @@ impl ClickHouseClient {
         };
         let query = build_transactions_for_address_query(&tables, query, &settings_clause)?;
 
+        let (query, query_id, mut cleanup) =
+            self.annotate_lookup_query(query, "cache_address_transactions");
         let start = Instant::now();
-        let mut cursor = self
-            .client
-            .query(&query)
+        let mut cursor = super::util::http_query_with_id(&self.client, &query, query_id)
             .fetch::<TransactionsForAddressQueryRow>()
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
@@ -358,6 +359,7 @@ impl ClickHouseClient {
             results.push(row);
         }
 
+        super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
         let records = results
             .into_iter()
             .map(map_transactions_for_address_row)
@@ -517,6 +519,21 @@ impl ClickHouseClient {
         .await
     }
 
+    async fn fetch_transaction_lookup(
+        &self,
+        query: &str,
+    ) -> ProcessingResult<(Option<TransactionRow>, QueryTimings)> {
+        let (query, query_id, mut cleanup) =
+            self.annotate_lookup_query(query.to_string(), "transaction_lookup");
+        let client = query_id.map_or_else(
+            || self.client.clone(),
+            |id| self.client.clone().with_setting("query_id", id),
+        );
+        let result = fetch_single_transaction_row(&client, &query).await?;
+        super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
+        Ok(result)
+    }
+
     pub async fn get_transaction_by_signature(
         &self,
         signature: &str,
@@ -574,7 +591,7 @@ impl ClickHouseClient {
                         );
                         let query =
                             build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                        let result = fetch_single_transaction_row(&self.client, &query).await?;
+                        let result = self.fetch_transaction_lookup(&query).await?;
                         (result.0, result.1, false)
                     }
                 }
@@ -584,7 +601,7 @@ impl ClickHouseClient {
                     QueryFreshnessClass::Historical,
                 );
                 let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                let result = fetch_single_transaction_row(&self.client, &query).await?;
+                let result = self.fetch_transaction_lookup(&query).await?;
                 (result.0, result.1, false)
             };
             timings.add(query_timings);
@@ -599,7 +616,7 @@ impl ClickHouseClient {
                 );
                 let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
                 let (fallback_opt, fallback_timings) =
-                    fetch_single_transaction_row(&self.client, &query).await?;
+                    self.fetch_transaction_lookup(&query).await?;
                 timings.add(fallback_timings);
                 row_opt = fallback_opt;
             }
@@ -612,7 +629,7 @@ impl ClickHouseClient {
                 );
                 let query = build_query(&self.transaction_table, None, &settings_clause);
                 let (fallback_opt, fallback_timings) =
-                    fetch_single_transaction_row(&self.client, &query).await?;
+                    self.fetch_transaction_lookup(&query).await?;
                 timings.add(fallback_timings);
                 row_opt = fallback_opt;
             }
@@ -672,7 +689,7 @@ impl ClickHouseClient {
                             QueryFreshnessClass::Historical,
                         );
                         let query = build_query(&self.transaction_table, &settings_clause);
-                        let result = fetch_single_transaction_row(&self.client, &query).await?;
+                        let result = self.fetch_transaction_lookup(&query).await?;
                         (result.0, result.1, false)
                     }
                 }
@@ -682,7 +699,7 @@ impl ClickHouseClient {
                     QueryFreshnessClass::Historical,
                 );
                 let query = build_query(&self.transaction_table, &settings_clause);
-                let result = fetch_single_transaction_row(&self.client, &query).await?;
+                let result = self.fetch_transaction_lookup(&query).await?;
                 (result.0, result.1, false)
             };
 
@@ -693,7 +710,7 @@ impl ClickHouseClient {
                 );
                 let query = build_query(&self.transaction_table, &settings_clause);
                 let (fallback_opt, fallback_timings) =
-                    fetch_single_transaction_row(&self.client, &query).await?;
+                    self.fetch_transaction_lookup(&query).await?;
                 timings.add(fallback_timings);
                 row_opt = fallback_opt;
             }
@@ -732,6 +749,7 @@ impl ClickHouseClient {
         let gsfa_table = self.gsfa_local_table(router);
         let gsfa_bucket_modulus = self.gsfa_bucket_modulus_for_address(pubkey);
         let tables = TransactionsForAddressTables {
+            cache_partition: self.cache_partition,
             gsfa_table,
             gsfa_bucket_modulus,
             token_owner_table,
@@ -964,6 +982,7 @@ impl ClickHouseClient {
         let gsfa_table = self.gsfa_local_table(router);
         let gsfa_bucket_modulus = self.gsfa_bucket_modulus_for_address(pubkey);
         let tables = TransactionsForAddressTables {
+            cache_partition: self.cache_partition,
             gsfa_table,
             gsfa_bucket_modulus,
             token_owner_table,

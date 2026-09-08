@@ -435,7 +435,7 @@ pub(crate) fn plan_ranges(
     chunked
 }
 
-async fn fill_range(
+pub(super) async fn fill_range(
     cache: &DiskCache,
     source: &ClickHouseClient,
     range: SlotRange,
@@ -462,6 +462,7 @@ async fn fill_range(
         .ok_or_else(|| DiskCacheError::Config("transactions schema missing".to_string()))?;
     // Forward the durable fact table first. The block table can use Memory,
     // which cannot deduplicate a retry after a later stage fails.
+    let _mutation = cache.begin_fill(range.start, range.end);
     native_forward(cache, source, transactions, range, cfg.query_timeout).await?;
     cache
         .validate_transaction_counts(range.start, range.end, &expected)

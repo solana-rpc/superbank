@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::clickhouse::ClickHouseClient;
 
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 4;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 5;
 pub(crate) const CACHE_MAGIC: &str = "superbank-clickhouse-forward-cache";
 pub(crate) const META_TABLE: &str = "_cache_meta";
 pub(crate) const COVERAGE_TABLE: &str = "_cache_coverage";
@@ -118,9 +118,18 @@ pub(crate) struct SourceTableSchema {
     storage: TableRow,
     view_select: Option<String>,
     indexes: Vec<String>,
+    settings: std::collections::BTreeMap<String, u64>,
 }
 
 impl SourceTableSchema {
+    fn with_storage_settings(mut self) -> Result<Self, SchemaError> {
+        self.settings = super::schema_settings::extract(&self.storage.create_table_query)?;
+        if let Some(key) = super::schema_settings::sorting_key(&self.storage.create_table_query) {
+            self.storage.sorting_key = key;
+        }
+        Ok(self)
+    }
+
     pub(crate) fn insert_columns(&self) -> Vec<String> {
         self.columns
             .iter()
@@ -291,7 +300,7 @@ async fn inspect_table(
     }
 
     let indexes = extract_index_definitions(&storage.create_table_query);
-    Ok(SourceTableSchema {
+    SourceTableSchema {
         kind,
         logical_name,
         storage_name,
@@ -299,7 +308,9 @@ async fn inspect_table(
         storage,
         view_select,
         indexes,
-    })
+        settings: Default::default(),
+    }
+    .with_storage_settings()
 }
 
 pub(crate) async fn inspect_source_schema(
@@ -408,6 +419,7 @@ fn schema_fingerprint(tables: &[SourceTableSchema], config: &CacheSchemaConfig) 
                 column.compression_codec
             );
         }
+        let _ = writeln!(input, "settings={:?}", table.settings);
         for index in &table.indexes {
             let _ = writeln!(input, "index={index}");
         }
@@ -474,15 +486,15 @@ fn create_cache_table_sql(
     } else {
         table.storage.primary_key.trim()
     };
-    let reverse_setting = if sorting_key.to_ascii_uppercase().contains(" DESC") {
-        " SETTINGS allow_experimental_reverse_key = 1"
-    } else {
-        ""
-    };
+    let mut settings = table.settings.clone();
+    if sorting_key.to_ascii_uppercase().contains(" DESC") {
+        settings.insert("allow_experimental_reverse_key".into(), 1);
+    }
+    let settings = super::schema_settings::clause(&settings);
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS {target} (\n    {columns}\n) \
          ENGINE = ReplacingMergeTree(slot) \
-         PARTITION BY intDiv(slot, {}) PRIMARY KEY ({primary_key}) ORDER BY ({sorting_key}){reverse_setting}",
+         PARTITION BY intDiv(slot, {}) PRIMARY KEY ({primary_key}) ORDER BY ({sorting_key}){settings}",
         config.partition_slots
     ))
 }
@@ -522,8 +534,16 @@ fn create_cache_view_sql(
     let view_name = format!("{}__mv", table.kind.local_name());
     let view = quote_table(&config.database, &view_name);
     let target = quote_table(&config.database, table.kind.local_name());
+    // Source views may explicitly emit materialized bucket columns. The target
+    // recomputes them, so insert only ordinary columns into the forwarding view.
+    let columns = table
+        .insert_columns()
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ");
     Ok(format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS {view} TO {target} AS {rewritten}"
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {view} TO {target} AS SELECT {columns} FROM ({rewritten})"
     ))
 }
 
@@ -787,7 +807,7 @@ fn extract_index_definitions(create: &str) -> Vec<String> {
         .collect()
 }
 
-fn split_top_level(input: &str) -> Vec<&str> {
+pub(super) fn split_top_level(input: &str) -> Vec<&str> {
     let mut entries = Vec::new();
     let mut start = 0usize;
     let mut depth = 0usize;
@@ -877,6 +897,7 @@ mod tests {
             },
             view_select: None,
             indexes: Vec::new(),
+            settings: Default::default(),
         };
         let config = |partition_slots| CacheSchemaConfig {
             database: "cache".into(),

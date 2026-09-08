@@ -304,6 +304,41 @@ The configured cache database is exclusively owned by this feature. A nonempty d
 
 By default, local initialization failures do not block RPC startup. Reads continue against the source cluster while a background supervisor retries local initialization. `DISK_CACHE_REQUIRED=true` makes initialization a startup requirement and makes `/health` return HTTP 503 when the local cache is not ready or cannot answer a health query.
 
+Signature and address reads use an in-process Bloom membership index to exclude unrelated slot
+partitions before querying ClickHouse. This preserves whole-partition eviction without making
+key lookups search every retained partition. Signature status batches, pagination-bound signature
+lookups, regular/hot address history, and token-owner history use the same routing mechanism.
+Candidate partitions are queried in result order, one at a time, until the answer is complete or
+the shared `DISK_CACHE_QUERY_TIMEOUT_MS` deadline expires. Admission waiting and transaction
+hydration count against that deadline. Incomplete address pages use source fallback.
+
+The routing index rebuilds asynchronously from actual materialized-table keys, newest complete
+historical partitions first. The actively filled partition, unbuilt filters, and invalidated
+filters remain query candidates. Fill/repair, poisoning, eviction, and schema rebuild invalidate
+filters before changing data. A stale build cannot publish, and a read whose exclusions became
+invalid falls back. This assumes the owned cache has no independent external writers.
+
+The memory budget reserves 64 MiB for buffers/metadata and allocates the remaining space across
+the retention window. Filters target roughly 1% false positives; limited memory reduces
+selectivity rather than correctness. A single builder uses one ClickHouse execution thread and a
+separate 64 MiB server query-memory limit. Initialization and index failures preserve source
+fallback; a cold index can have higher latency than a fully built index.
+
+Cache format **5** preserves the source's portable MergeTree index/mark settings and reverse
+sort directions from canonical DDL. Forwarding views project only insertable columns so the
+cache recomputes materialized bucket columns. Upgrading uses
+the existing ownership-checked cache rebuild and temporarily refills through source fallback.
+The separately owned full-history block index is preserved. Before deployment, run the full-size
+key-routing workload described in `tests/k6/README.md`; small-fixture tests do not establish its
+latency targets.
+
+The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors, and timeouts.
+`superbank_disk_cache_key_seconds` records complete attempts, admission waits, and index builds;
+`superbank_disk_cache_key_index_bytes` reports reserved index memory, and
+`superbank_disk_cache_key_index_partitions` / `superbank_disk_cache_key_index_unknown_partitions`
+show index coverage. Partition probe/skip counters use `operation="key_partition"` with bounded
+labels; no keys or partition IDs are metric labels.
+
 Query-facing tables use `ReplacingMergeTree` by default. `blocks_metadata` can opt into the ClickHouse `Memory` engine with `DISK_CACHE_MEMORY_TABLES=blocks_metadata`. This mode requires explicit row and byte caps. Memory-engine coverage is reset after a local ClickHouse restart because those rows are not durable. No other query-facing table is accepted in the Memory allowlist in this release.
 
 Run example:
@@ -330,6 +365,9 @@ Configuration:
 | `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Enforced active-part byte budget for the primary cache database; `0` means unlimited. May purge the newest partition and mark the cache unready when one partition cannot fit. |
 | `--disk-cache-partition-slots` | `DISK_CACHE_PARTITION_SLOTS` | automatic | Width of local slot partitions. The automatic value targets at most 128 active partitions. |
 | `--disk-cache-query-timeout-ms` | `DISK_CACHE_QUERY_TIMEOUT_MS` | `2000` | Timeout for one local cache read. |
+| `--disk-cache-key-index-max-memory-bytes` | `DISK_CACHE_KEY_INDEX_MAX_MEMORY_BYTES` | `4294967296` | In-process partition membership budget, including builder buffers and metadata; minimum 64 MiB. Separate from ClickHouse and the historical block index. |
+| `--disk-cache-query-concurrency` | `DISK_CACHE_QUERY_CONCURRENCY` | `8` | Concurrent local interactive queries, range 1–64. |
+| `--disk-cache-query-max-threads` | `DISK_CACHE_QUERY_MAX_THREADS` | `2` | ClickHouse execution threads per local interactive query, range 1–16. |
 | `--disk-cache-schema-check-interval-secs` | `DISK_CACHE_SCHEMA_CHECK_INTERVAL_SECS` | `300` | Source schema fingerprint check interval. |
 | `--disk-cache-memory-tables` | `DISK_CACHE_MEMORY_TABLES` | empty | Comma-separated Memory-engine allowlist. Only `blocks_metadata` is accepted. |
 | `--disk-cache-memory-retain-slots` | `DISK_CACHE_MEMORY_RETAIN_SLOTS` | — | Required row cap when `blocks_metadata` uses Memory; must not exceed the main retention window. |

@@ -568,6 +568,14 @@ pub struct Metrics {
     superbank_grpc_stream_errors_total: Family<SuperbankGrpcErrorLabels, Counter>,
 
     #[cfg(feature = "disk-cache")]
+    disk_cache_key_seconds: Family<DiskCacheReadLabels, Histogram>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_key_index_bytes: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_key_index_partitions: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_key_index_unknown_partitions: Gauge,
+    #[cfg(feature = "disk-cache")]
     disk_cache_active: Gauge,
     #[cfg(feature = "disk-cache")]
     disk_cache_reads_total: Family<DiskCacheReadLabels, Counter>,
@@ -686,6 +694,15 @@ impl Metrics {
         #[cfg(feature = "grpc-streaming")]
         let superbank_grpc_stream_errors_total = Family::default();
 
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_key_seconds =
+            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_key_index_bytes = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_key_index_partitions = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_key_index_unknown_partitions = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_active = Gauge::default();
         #[cfg(feature = "disk-cache")]
@@ -995,6 +1012,26 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         {
             registry.register(
+                "disk_cache_key_seconds",
+                "Partition routing index instrumentation",
+                disk_cache_key_seconds.clone(),
+            );
+            registry.register(
+                "disk_cache_key_index_bytes",
+                "Partition routing index instrumentation",
+                disk_cache_key_index_bytes.clone(),
+            );
+            registry.register(
+                "disk_cache_key_index_partitions",
+                "Partition routing index instrumentation",
+                disk_cache_key_index_partitions.clone(),
+            );
+            registry.register(
+                "disk_cache_key_index_unknown_partitions",
+                "Partition routing index instrumentation",
+                disk_cache_key_index_unknown_partitions.clone(),
+            );
+            registry.register(
                 "disk_cache_active",
                 "Whether the disk cache is open and serving (1) or disabled (0)",
                 disk_cache_active.clone(),
@@ -1143,6 +1180,14 @@ impl Metrics {
             superbank_grpc_stream_messages_total,
             #[cfg(feature = "grpc-streaming")]
             superbank_grpc_stream_errors_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_key_seconds,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_key_index_bytes,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_key_index_partitions,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_key_index_unknown_partitions,
             #[cfg(feature = "disk-cache")]
             disk_cache_active,
             #[cfg(feature = "disk-cache")]
@@ -2153,5 +2198,31 @@ pub async fn metrics_handler() -> impl IntoResponse {
             warn!("Failed to scrape metrics: {err}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_key_seconds(operation: &'static str, outcome: &'static str, seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_key_seconds
+            .get_or_create(&DiskCacheReadLabels {
+                operation: operation.into(),
+                outcome: outcome.into(),
+            })
+            .observe(seconds);
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_key_index(bytes: u64, indexed: u64, unknown: u64) {
+    if let Some(metrics) = metrics() {
+        metrics.disk_cache_key_index_bytes.set(clamp_i64(bytes));
+        metrics
+            .disk_cache_key_index_partitions
+            .set(clamp_i64(indexed));
+        metrics
+            .disk_cache_key_index_unknown_partitions
+            .set(clamp_i64(unknown));
     }
 }

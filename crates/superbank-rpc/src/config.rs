@@ -526,6 +526,21 @@ pub struct RpcConfig {
     pub(crate) disk_cache_query_timeout_ms: u64,
 
     #[cfg(feature = "disk-cache")]
+    /// Total partition routing index budget, including build buffers.
+    #[arg(long, env = "DISK_CACHE_KEY_INDEX_MAX_MEMORY_BYTES", default_value_t = 4_294_967_296, value_parser = clap::value_parser!(u64).range(67_108_864..))]
+    pub(crate) disk_cache_key_index_max_memory_bytes: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Concurrent local interactive queries.
+    #[arg(long, env = "DISK_CACHE_QUERY_CONCURRENCY", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub(crate) disk_cache_query_concurrency: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Execution threads per local interactive query.
+    #[arg(long, env = "DISK_CACHE_QUERY_MAX_THREADS", default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=16))]
+    pub(crate) disk_cache_query_max_threads: u64,
+
+    #[cfg(feature = "disk-cache")]
     /// Interval for checking the source schema fingerprint.
     #[arg(long, env = "DISK_CACHE_SCHEMA_CHECK_INTERVAL_SECS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) disk_cache_schema_check_interval_secs: u64,

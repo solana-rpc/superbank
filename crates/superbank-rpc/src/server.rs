@@ -691,6 +691,9 @@ async fn start_disk_cache(
         required: args.disk_cache_required,
         retain_slots,
         max_bytes: args.disk_cache_max_bytes,
+        key_index_max_memory_bytes: args.disk_cache_key_index_max_memory_bytes,
+        query_concurrency: args.disk_cache_query_concurrency as usize,
+        query_max_threads: args.disk_cache_query_max_threads,
         partition_slots: args
             .disk_cache_partition_slots
             .unwrap_or_else(|| automatic_partition_slots(retain_slots)),
@@ -802,6 +805,7 @@ async fn run_disk_cache_supervisor(
     }
 
     let cache = cache.expect("cache initialized");
+    let key_index_task = tokio::spawn(cache.clone().run_key_index(shutdown.resubscribe()));
     let block_index_task = cache
         .block_index()
         .map(|index| tokio::spawn(index.clone().run(source.clone(), shutdown.resubscribe())));
@@ -811,6 +815,8 @@ async fn run_disk_cache_supervisor(
         let _ = shutdown.recv().await;
         cache.set_ready(false);
     }
+    key_index_task.abort();
+    let _ = key_index_task.await;
     if let Some(task) = block_index_task {
         let _ = task.await;
     }
