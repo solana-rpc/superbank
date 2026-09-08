@@ -276,7 +276,9 @@ impl ClickHouseClient {
         records: Vec<SignatureRecord>,
         timings: QueryTimings,
     ) -> ProcessingResult<(Vec<SignatureRecord>, QueryTimings)> {
-        let mode = gsfa_fallback_mode();
+        let mode = self
+            .cache_partition
+            .map_or_else(gsfa_fallback_mode, |_| GsfaFallbackMode::Disabled);
         let should_fallback = match mode {
             GsfaFallbackMode::Disabled => false,
             GsfaFallbackMode::EmptyOnly => records.is_empty(),
@@ -711,6 +713,7 @@ impl ClickHouseClient {
             let addr_bucket =
                 cityhash64(pubkey.as_ref()) % self.gsfa_bucket_modulus_for_address(&pubkey);
             let (with_clause, where_clause) = build_pagination_clauses(before_pos, until_pos);
+            let where_clause = format!("({where_clause}){}", self.cache_slot_predicate());
 
             let settings_clause = self.select_settings_clause(
                 "get_signatures_for_address_with_positions",
@@ -725,7 +728,7 @@ impl ClickHouseClient {
                 limit,
                 &settings_clause,
             );
-            let (query, query_id) = annotate_query(query, "gsfa_signatures");
+            let (query, query_id, mut cleanup) = self.annotate_lookup_query(query, "gsfa_signatures");
 
             let start = Instant::now();
 
@@ -747,6 +750,7 @@ impl ClickHouseClient {
                 .map(map_gsfa_signature_row)
                 .collect::<Vec<_>>();
 
+            super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
             let timings = QueryTimings {
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 received_bytes: cursor.received_bytes(),

@@ -157,6 +157,12 @@ impl HttpQueryCleanup {
         }
     }
 
+    pub(crate) fn disarm_optional(cleanup: &mut Option<Self>) {
+        if let Some(cleanup) = cleanup {
+            cleanup.disarm();
+        }
+    }
+
     pub(crate) fn disarm(&mut self) {
         self.query_id = None;
     }
@@ -409,6 +415,7 @@ pub struct ClickHouseClient {
     pub(crate) username: String,
     pub(crate) password: String,
     pub(crate) signature_slot_cache: Arc<SignatureSlotCache>,
+    pub(crate) cache_partition: Option<(u64, u64)>,
     pub(crate) transaction_table: String,
     pub(crate) blocks_metadata_table: String,
     pub(crate) gsfa_table: String,
@@ -765,6 +772,7 @@ impl ClickHouseClient {
             username: username.to_string(),
             password: password.to_string(),
             signature_slot_cache: Arc::new(SignatureSlotCache::from_env()),
+            cache_partition: None,
             transaction_table,
             blocks_metadata_table,
             gsfa_table,
@@ -920,6 +928,50 @@ impl ClickHouseClient {
         })
     }
 
+    pub(crate) fn annotate_lookup_query(
+        &self,
+        query: String,
+        operation: &'static str,
+    ) -> (String, Option<String>, Option<HttpQueryCleanup>) {
+        if self.cache_partition.is_some() {
+            let (query, id) = super::util::annotate_required_query(query, operation);
+            let cleanup = self.http_query_cleanup(operation, id.clone());
+            (query, Some(id), Some(cleanup))
+        } else {
+            let (query, id) = super::util::annotate_query(query, operation);
+            (query, id, None)
+        }
+    }
+
+    fn cache_settings_or(&self, settings: String, timeout: Duration) -> String {
+        if self.cache_partition.is_some() {
+            format!(
+                "SETTINGS max_execution_time={}, timeout_overflow_mode='throw', use_query_cache=0",
+                timeout.as_secs_f64().max(0.001)
+            )
+        } else {
+            settings
+        }
+    }
+
+    #[cfg(feature = "disk-cache")]
+    fn record_cache_admission(&self, started: std::time::Instant) {
+        if self.cache_partition.is_some() {
+            crate::metrics::disk_cache_key_seconds(
+                "admission",
+                "acquired",
+                started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+
+    pub(crate) fn cache_slot_predicate(&self) -> String {
+        self.cache_partition
+            .map_or_else(String::new, |(width, partition)| {
+                format!(" AND intDiv(slot, {width}) = {partition}")
+            })
+    }
+
     pub(crate) fn select_settings_clause(
         &self,
         operation: &'static str,
@@ -936,7 +988,7 @@ impl ClickHouseClient {
     ) -> String {
         // Bound the server-side query lifetime so a query ClickHouse keeps running after
         // `with_http_query_timeout` drops the HTTP future does not linger and hold a connection.
-        append_max_execution_time_setting(
+        let settings = append_max_execution_time_setting(
             &build_select_settings_clause(
                 self.allow_query_settings,
                 freshness,
@@ -945,7 +997,8 @@ impl ClickHouseClient {
                 operation,
             ),
             timeout,
-        )
+        );
+        self.cache_settings_or(settings, timeout)
     }
 
     pub(crate) fn select_settings_clause_with_condition_cache(
@@ -970,7 +1023,7 @@ impl ClickHouseClient {
         operation: &'static str,
         freshness: QueryFreshnessClass,
     ) -> String {
-        append_max_execution_time_setting(
+        let settings = append_max_execution_time_setting(
             &build_select_settings_clause_with_overrides(
                 self.allow_query_settings,
                 freshness,
@@ -980,7 +1033,8 @@ impl ClickHouseClient {
                 operation,
             ),
             self.query_timeout,
-        )
+        );
+        self.cache_settings_or(settings, self.query_timeout)
     }
 
     pub(crate) fn inflation_reward_settings_clause(&self, operation: &'static str) -> String {
@@ -1070,10 +1124,15 @@ impl ClickHouseClient {
     pub(crate) async fn acquire_http_query_permit(
         &self,
     ) -> ProcessingResult<tokio::sync::SemaphorePermit<'_>> {
-        self.http_query_sem
-            .acquire()
-            .await
-            .map_err(|_| ProcessingError::database_msg("ClickHouse HTTP query semaphore closed"))
+        #[cfg(feature = "disk-cache")]
+        let started = std::time::Instant::now();
+        let permit =
+            self.http_query_sem.acquire().await.map_err(|_| {
+                ProcessingError::database_msg("ClickHouse HTTP query semaphore closed")
+            });
+        #[cfg(feature = "disk-cache")]
+        self.record_cache_admission(started);
+        permit
     }
 
     async fn describe_table_http(&self, table: &str) -> ProcessingResult<Vec<DescribeTableRow>> {

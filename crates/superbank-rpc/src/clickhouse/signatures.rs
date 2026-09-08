@@ -18,7 +18,7 @@ use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
 use super::sharding::ShardTopology;
 use super::types::{QueryTimings, SignatureSlot, SignatureStatusRecord};
 use super::util::{
-    annotate_query, append_max_execution_time_setting, http_query_with_id, parse_err_json,
+    append_max_execution_time_setting, http_query_with_id, parse_err_json,
     transient_shard_local_error_reason,
 };
 
@@ -87,6 +87,32 @@ impl ClickHouseClient {
         let signature_hex = hex::encode(signature_bytes.as_ref()).to_uppercase();
         let signature_literal = format!("toFixedString(unhex('{signature_hex}'), 64)");
 
+        if self.cache_partition.is_some() {
+            return self
+                .get_signature_slot_by_signature_uncached(
+                    signature_hash,
+                    sig_bucket,
+                    &signature_literal,
+                )
+                .await;
+        }
+
+        self.get_signature_slot_cached(
+            signature_bytes,
+            signature_hash,
+            sig_bucket,
+            &signature_literal,
+        )
+        .await
+    }
+
+    async fn get_signature_slot_cached(
+        &self,
+        signature_bytes: SignatureBytes,
+        signature_hash: u64,
+        sig_bucket: u64,
+        signature_literal: &str,
+    ) -> ProcessingResult<(Option<SignatureSlot>, QueryTimings)> {
         let call_start = Instant::now();
         let mut waited = false;
 
@@ -120,7 +146,7 @@ impl ClickHouseClient {
                         .get_signature_slot_by_signature_uncached(
                             signature_hash,
                             sig_bucket,
-                            &signature_literal,
+                            signature_literal,
                         )
                         .await;
 
@@ -197,16 +223,18 @@ impl ClickHouseClient {
                     slot,
                     slot_idx
                  FROM {signature_statuses_table}
-                 PREWHERE sig_bucket = {sig_bucket} AND signature = {signature_literal}
+                 PREWHERE sig_bucket = {sig_bucket} AND signature = {signature_literal}{cache_scope}
                  ORDER BY slot DESC, slot_idx DESC, signature
                  LIMIT 1
                  {settings_clause}",
+                cache_scope = self.cache_slot_predicate(),
                 signature_statuses_table = signature_statuses_table,
                 sig_bucket = sig_bucket,
                 signature_literal = signature_literal,
                 settings_clause = settings_clause
             );
-            let (query, query_id) = annotate_query(query, "signature_slot");
+            let (query, query_id, mut cleanup) =
+                self.annotate_lookup_query(query, "signature_slot");
 
             let start = Instant::now();
             let mut cursor = http_query_with_id(&self.client, &query, query_id)
@@ -218,6 +246,7 @@ impl ClickHouseClient {
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
+            super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
             let timings = QueryTimings {
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 received_bytes: cursor.received_bytes(),
@@ -320,15 +349,17 @@ impl ClickHouseClient {
                         signature,
                         argMax(tuple(slot, err), tuple(slot, slot_idx)) AS latest
                     FROM {signature_statuses_table}
-                    PREWHERE {signature_filter}
+                    PREWHERE ({signature_filter}){cache_scope}
                     GROUP BY signature
                  )
                  {settings_clause}",
+                cache_scope = self.cache_slot_predicate(),
                 signature_statuses_table = signature_statuses_table,
                 signature_filter = signature_filter,
                 settings_clause = settings_clause
             );
-            let (query, query_id) = annotate_query(query, "signature_statuses");
+            let (query, query_id, mut cleanup) =
+                self.annotate_lookup_query(query, "signature_statuses");
 
             #[derive(Deserialize, clickhouse::Row)]
             struct StatusRow {
@@ -359,6 +390,7 @@ impl ClickHouseClient {
                 });
             }
 
+            super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
             let timings = QueryTimings {
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 received_bytes: cursor.received_bytes(),
