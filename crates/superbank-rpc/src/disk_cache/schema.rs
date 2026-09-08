@@ -681,6 +681,33 @@ async fn reset_coverage_after_memory_restart(
     Ok(true)
 }
 
+/// Called only after validating the ownership marker. Keep the marker and its
+/// old fingerprint until all replacement DDL succeeds, so interruption retries
+/// the rebuild instead of leaving an unowned, partially dropped database.
+async fn rebuild_owned_tables(
+    local: &ClickHouseClient,
+    config: &CacheSchemaConfig,
+    existing: &[String],
+) -> Result<(), SchemaError> {
+    // Remove forwarding views before their source/target tables.
+    let mut tables: Vec<_> = existing.iter().filter(|name| *name != META_TABLE).collect();
+    tables.sort_by_key(|name| !name.ends_with("__mv"));
+    for name in tables {
+        local
+            .client
+            .clone()
+            .with_setting("max_table_size_to_drop", "0")
+            .query(&format!(
+                "DROP TABLE IF EXISTS {} SYNC",
+                quote_table(&config.database, name)
+            ))
+            .execute()
+            .await
+            .map_err(|err| SchemaError::Query(err.to_string()))?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn initialize_cache_schema(
     local: &ClickHouseClient,
     snapshot: &SourceSchemaSnapshot,
@@ -712,11 +739,7 @@ pub(crate) async fn initialize_cache_schema(
         if value("format_version") != Some(expected_version.as_str())
             || value("fingerprint") != Some(snapshot.fingerprint.as_str())
         {
-            execute(
-                local,
-                &format!("DROP DATABASE {} SYNC", quote_identifier(&config.database)),
-            )
-            .await?;
+            rebuild_owned_tables(local, config, &existing).await?;
             rebuilt = true;
         }
     }

@@ -327,10 +327,19 @@ fallback; a cold index can have higher latency than a fully built index.
 Cache format **5** preserves the source's portable MergeTree index/mark settings and reverse
 sort directions from canonical DDL. Forwarding views project only insertable columns so the
 cache recomputes materialized bucket columns. Upgrading uses
-the existing ownership-checked cache rebuild and temporarily refills through source fallback.
-The separately owned full-history block index is preserved. Before deployment, run the full-size
+an ownership-checked table rebuild and temporarily refills through source fallback.
+The rebuild preserves `_cache_meta` until replacement DDL succeeds, so interrupted rebuilds
+can retry. Drops of verified owned tables set `max_table_size_to_drop=0` for that query only;
+server-wide drop protection remains unchanged. The separately owned full-history block index is preserved. Before deployment, run the full-size
 key-routing workload described in `tests/k6/README.md`; small-fixture tests do not establish its
 latency targets.
+
+If an older build partially dropped the cache database and removed `_cache_meta`, startup
+continues to reject the remaining tables. After confirming the target is the disposable cache
+ClickHouse instance and pausing its RPC task, an operator can remove the remaining cache with
+`DROP DATABASE IF EXISTS superbank_disk_cache SYNC SETTINGS max_table_size_to_drop=0`
+(substitute the configured cache database). This deletes the remaining cache data; restart RPC
+to recreate and refill it. Do not recreate an ownership marker over unidentified tables.
 
 The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors, and timeouts.
 `superbank_disk_cache_key_seconds` records complete attempts, admission waits, and index builds;

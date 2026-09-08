@@ -204,11 +204,12 @@ async fn assert_migration(
     execute(
         client,
         &format!(
-            "INSERT INTO {}._cache_meta VALUES ('format_version','4',now64(3)+INTERVAL 1 SECOND)",
+            "ALTER TABLE {}._cache_meta UPDATE value='4' WHERE key='format_version' SETTINGS mutations_sync=2",
             cfg.database
         ),
     )
     .await;
+    assert_resumable_rebuild(&cache, &cfg).await;
     let reopened = DiskCache::open(cfg.clone(), source).await.unwrap();
     let count = reopened
         .inner
@@ -230,9 +231,85 @@ async fn assert_migration(
     .unwrap();
     assert!(reopened.covers_slot(15));
     assert_eq!(reopened.get_tx(signature(15)).await.unwrap().slot, 15);
+    let restarted = DiskCache::open(cfg.clone(), source).await.unwrap();
+    assert_eq!(restarted.get_tx(signature(15)).await.unwrap().slot, 15);
+    execute(
+        client,
+        &format!("DROP TABLE {}._cache_meta SYNC", cfg.database),
+    )
+    .await;
+    let error = DiskCache::open(cfg.clone(), source)
+        .await
+        .err()
+        .expect("missing marker must fail closed");
+    assert!(error.to_string().contains("ownership check failed"));
+    assert_eq!(restarted.get_tx(signature(15)).await.unwrap().slot, 15);
     drop(cache);
     execute(client, &format!("DROP DATABASE {} SYNC", cfg.database)).await;
 }
+async fn assert_resumable_rebuild(cache: &DiskCache, cfg: &DiskCacheConfig) {
+    let mut admin = cache.inner.admin.clone();
+    admin.client = admin.client.with_setting("max_table_size_to_drop", "1");
+    let table = format!("{}.gsfa", cfg.database);
+    let error = admin
+        .client
+        .query(&format!("DROP TABLE {table} SYNC"))
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("TABLE_SIZE_EXCEEDS_MAX_DROP_SIZE_LIMIT")
+    );
+    let marker_query = format!(
+        "SELECT toString(uuid) FROM system.tables WHERE database='{}' AND name='_cache_meta'",
+        cfg.database
+    );
+    let marker = admin
+        .client
+        .query(&marker_query)
+        .fetch_one::<String>()
+        .await
+        .unwrap();
+    // Fail replacement DDL after deletion, then retry with the real schema.
+    let mut broken = (*cache.source_schema()).clone();
+    broken.tables.clear();
+    assert!(
+        schema::initialize_cache_schema(&admin, &broken, &cfg.schema_config())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        admin
+            .client
+            .query(&marker_query)
+            .fetch_one::<String>()
+            .await
+            .unwrap(),
+        marker
+    );
+    assert!(
+        schema::initialize_cache_schema(&admin, &cache.source_schema(), &cfg.schema_config())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !schema::initialize_cache_schema(&admin, &cache.source_schema(), &cfg.schema_config())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        admin
+            .client
+            .query(&marker_query)
+            .fetch_one::<String>()
+            .await
+            .unwrap(),
+        marker
+    );
+}
+
 async fn assert_pruning(client: &clickhouse::Client, database: &str) {
     let query = format!(
         "EXPLAIN indexes=1 SELECT slot FROM {database}.signatures PREWHERE signature=toFixedString('sig-15',64) AND intDiv(slot,10)=1"
