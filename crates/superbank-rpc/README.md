@@ -124,7 +124,7 @@ CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_DATABASE=default \
 cargo run -p superbank-rpc --
 ```
 
-### Cluster genesis for inflation-reward epoch math
+### Cluster genesis for epoch schedules and inflation rewards
 
 `getInflationReward` needs the epoch schedule for the same Solana cluster represented by the
 ClickHouse data. Operators of a cluster with warmup epochs must mount that cluster's exact
@@ -142,8 +142,9 @@ docker run --rm \
   superbank:0.5.0
 ```
 
-This setting currently affects internal `getInflationReward` epoch math only; RPC schedule and
-epoch-info behavior remain separate follow-up work.
+This setting controls both `getEpochSchedule` responses and internal `getInflationReward`
+epoch math. For testnet, supply its exact current genesis file: testnet uses warmup epochs,
+so the no-warmup fallback is incorrect even for recent payout boundaries.
 
 ## Exact method and parameter filters
 

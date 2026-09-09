@@ -7,7 +7,7 @@ use crate::solana_sdk::hash::Hash;
 use crate::solana_sdk::pubkey::Pubkey;
 use axum::{body::Bytes, http::StatusCode, response::Response};
 use serde_json::{Value, json};
-use solana_clock::{DEFAULT_SLOTS_PER_EPOCH, MAX_PROCESSING_AGE};
+use solana_clock::MAX_PROCESSING_AGE;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE;
 use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE;
@@ -2571,11 +2571,11 @@ pub(crate) async fn handle_get_epoch_schedule(
     }
 
     let epoch_schedule = EpochSchedule {
-        slots_per_epoch: DEFAULT_SLOTS_PER_EPOCH,
-        leader_schedule_slot_offset: DEFAULT_SLOTS_PER_EPOCH,
-        warmup: false,
-        first_normal_epoch: 0,
-        first_normal_slot: 0,
+        slots_per_epoch: state.epoch_schedule.slots_per_epoch,
+        leader_schedule_slot_offset: state.epoch_schedule.leader_schedule_slot_offset,
+        warmup: state.epoch_schedule.warmup,
+        first_normal_epoch: state.epoch_schedule.first_normal_epoch,
+        first_normal_slot: state.epoch_schedule.first_normal_slot,
     };
 
     route.success();

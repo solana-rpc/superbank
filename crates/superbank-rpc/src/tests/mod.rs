@@ -3462,6 +3462,33 @@ async fn get_epoch_schedule_returns_default_schedule() {
 }
 
 #[tokio::test]
+async fn get_epoch_schedule_returns_loaded_schedule() {
+    let mut state = test_state();
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .epoch_schedule = EpochSchedule::custom(8192, 4096, true);
+
+    let response = handle_get_epoch_schedule(state, json!(1), None)
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let parsed: JsonRpcResponse = serde_json::from_slice(&body).expect("json parse");
+    assert_eq!(
+        parsed.result,
+        Some(json!({
+            "slotsPerEpoch": 8192,
+            "leaderScheduleSlotOffset": 4096,
+            "warmup": true,
+            "firstNormalEpoch": 8,
+            "firstNormalSlot": 8160
+        }))
+    );
+}
+
+#[tokio::test]
 async fn get_epoch_schedule_rejects_params() {
     let state = test_state();
 
