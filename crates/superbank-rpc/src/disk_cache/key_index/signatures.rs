@@ -242,7 +242,7 @@ impl KeyIndex {
         }
         Ok(())
     }
-    fn finish_signature_build(&self, partition: u64, token: u64) {
+    fn finish_signature_build(&self, partition: u64, token: u64) -> bool {
         let mut state = self.state.lock().expect("key index lock");
         if let Some(entry) = state
             .signatures
@@ -250,7 +250,17 @@ impl KeyIndex {
             .filter(|entry| entry.token == token)
         {
             entry.complete = true;
+            return true;
         }
+        false
+    }
+    fn signature_generation_matches(&self, partition: u64, token: u64) -> bool {
+        self.state
+            .lock()
+            .expect("key index lock")
+            .signatures
+            .get(&partition)
+            .is_some_and(|entry| entry.token == token)
     }
     fn signature_complete(&self, partition: u64) -> bool {
         self.state
@@ -337,7 +347,23 @@ impl DiskCache {
             .await
     }
 
-    pub(super) async fn build_signature_indexes(&self) {
+    pub(in crate::disk_cache) fn signature_indexes_ready(&self) -> bool {
+        let width = self.inner.cfg.partition_slots;
+        self.ready()
+            && self.key_span().is_some_and(|(floor, tip)| {
+                self.inner
+                    .key_index
+                    .signature_completeness(floor / width, tip / width)
+                    .1
+                    == 0
+            })
+    }
+
+    pub(in crate::disk_cache) async fn build_signature_indexes(&self) {
+        self.publish_index_metrics();
+        if !self.ready() {
+            return;
+        }
         let Some((floor, tip)) = self.key_span() else {
             return;
         };
@@ -346,27 +372,68 @@ impl DiskCache {
             if self.inner.key_index.signature_complete(partition) {
                 continue;
             }
-            let Some(token) = self.signature_partition(partition).await else {
-                continue;
-            };
-            let sql = format!(
-                "SELECT slot, signature AS key FROM `{}`.signatures WHERE intDiv(slot, {width}) = {partition}",
-                self.inner.cfg.database
-            );
-            let tokens = BTreeMap::from([(partition, token)]);
-            let built = tokio::time::timeout(
-                Duration::from_secs(300),
-                self.stream_signature_hashes(&sql, &tokens, Duration::from_secs(300)),
-            )
-            .await;
-            if matches!(built, Ok(Ok(()))) {
-                self.inner
-                    .key_index
-                    .finish_signature_build(partition, token);
-            }
-            self.publish_signature_index_metrics();
+            self.build_signature_partition(partition).await;
+            self.publish_index_metrics();
         }
-        self.publish_signature_index_metrics();
+    }
+
+    async fn build_signature_partition(&self, partition: u64) {
+        let Some(token) = self.signature_partition(partition).await else {
+            crate::metrics::disk_cache_read("signature_index_build", "deferred");
+            tracing::debug!(partition, "disk cache: signature index allocation deferred");
+            return;
+        };
+        self.publish_index_metrics();
+        let width = self.inner.cfg.partition_slots;
+        let sql = format!(
+            "SELECT slot, signature AS key FROM `{}`.signatures WHERE intDiv(slot, {width}) = {partition}",
+            self.inner.cfg.database
+        );
+        let tokens = BTreeMap::from([(partition, token)]);
+        let started = std::time::Instant::now();
+        let built = tokio::time::timeout(
+            Duration::from_secs(300),
+            self.stream_signature_hashes(&sql, &tokens, Duration::from_secs(300)),
+        )
+        .await;
+        let outcome = match &built {
+            Ok(Ok(()))
+                if self
+                    .inner
+                    .key_index
+                    .finish_signature_build(partition, token) =>
+            {
+                "success"
+            }
+            _ if !self
+                .inner
+                .key_index
+                .signature_generation_matches(partition, token) =>
+            {
+                "superseded"
+            }
+            Err(_) => "timeout",
+            _ => "error",
+        };
+        crate::metrics::disk_cache_key_seconds(
+            "signature_index_build",
+            outcome,
+            started.elapsed().as_secs_f64(),
+        );
+        if matches!(outcome, "error" | "timeout") {
+            tracing::warn!(
+                partition,
+                outcome,
+                ?built,
+                "disk cache: signature index build failed"
+            );
+        } else {
+            tracing::debug!(
+                partition,
+                outcome,
+                "disk cache: signature index build finished"
+            );
+        }
     }
 
     pub(in crate::disk_cache) fn publish_signature_index_metrics(&self) {

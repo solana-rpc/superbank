@@ -37,6 +37,29 @@ async fn assert_absent_without_admission(cache: &DiskCache) {
     .await
     .expect("complete negative must not wait for admission");
 }
+async fn assert_address_priority_recovery(cache: &DiskCache) {
+    let mut repair = cache.begin_fill(25, 25);
+    assert!(!cache.signature_indexes_ready());
+    cache.build_key_indexes().await;
+    assert!(
+        cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    cache.update_signature_membership(&mut repair, 25, 25).await;
+    drop(repair);
+    assert!(cache.signature_indexes_ready());
+    cache.build_key_indexes().await;
+    assert!(
+        !cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    assert_absent_without_admission(cache).await;
+}
+
 fn address(value: &str) -> Pubkey {
     let mut key = [0; 32];
     key[..value.len()].copy_from_slice(value.as_bytes());
@@ -429,6 +452,23 @@ async fn key_routing_clickhouse_integration() {
         .await
         .unwrap();
     cache.build_key_indexes().await;
+    assert!(
+        cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    assert!(!cache.signature_indexes_ready());
+    cache.build_signature_indexes().await;
+    assert!(cache.signature_indexes_ready());
+    cache.build_key_indexes().await;
+    assert!(
+        !cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    assert_address_priority_recovery(&cache).await;
     assert_absent_without_admission(&cache).await;
     assert!(!signature_candidate(&cache, 1, signature(35)));
     assert!(signature_candidate(&cache, 1, signature(15)));

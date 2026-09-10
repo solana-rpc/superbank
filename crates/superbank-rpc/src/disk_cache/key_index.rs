@@ -240,62 +240,74 @@ struct KeyRow<const N: usize> {
 impl DiskCache {
     pub(crate) async fn run_key_index(
         self: Arc<Self>,
-        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+        shutdown: tokio::sync::broadcast::Receiver<()>,
     ) {
-        loop {
-            tokio::select! {
-                _ = shutdown.recv() => return,
-                _ = self.build_key_indexes() => {}
-            }
-            tokio::select! {
-                _ = shutdown.recv() => return,
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-            }
-        }
+        run_workers(
+            || self.build_signature_indexes(),
+            || self.build_key_indexes(),
+            shutdown,
+        )
+        .await;
     }
     pub(super) async fn build_key_indexes(&self) {
-        self.build_signature_indexes().await;
+        self.publish_index_metrics();
         let Some((floor, tip)) = self.tip_span() else {
             return;
         };
         let width = self.inner.cfg.partition_slots;
-        self.publish_key_index_metrics(floor, tip);
         for partition in (floor.div_ceil(width)..tip / width).rev() {
+            // Check live state before each build. An already-running address scan
+            // may finish, but cannot delay the independent signature worker.
+            if !self.signature_indexes_ready() {
+                break;
+            }
             let Some(token) = self.inner.key_index.begin(partition) else {
                 continue;
             };
-            let started = std::time::Instant::now();
-            let built = tokio::time::timeout(
-                Duration::from_secs(300),
-                self.build_partition_filters(partition),
-            )
-            .await;
-            let outcome = if matches!(&built, Ok(Ok(_))) {
-                "success"
-            } else {
-                "error"
-            };
-            let filters = match built {
-                Ok(Ok(filters)) => Some(filters),
-                _ => {
-                    crate::metrics::disk_cache_read("key_index_build", "error");
-                    None
-                }
-            };
-            self.inner.key_index.finish(partition, token, filters);
-            crate::metrics::disk_cache_key_seconds(
-                "index_build",
-                outcome,
-                started.elapsed().as_secs_f64(),
-            );
-            tracing::debug!(
-                partition,
-                elapsed_ms = started.elapsed().as_millis(),
-                "disk cache: key index build finished"
-            );
+            self.publish_index_metrics();
+            self.build_address_partition(partition, token).await;
+            self.publish_index_metrics();
         }
     }
-    fn publish_key_index_metrics(&self, floor: u64, tip: u64) {
+    async fn build_address_partition(&self, partition: u64, token: u64) {
+        let started = std::time::Instant::now();
+        let built = tokio::time::timeout(
+            Duration::from_secs(300),
+            self.build_partition_filters(partition),
+        )
+        .await;
+        let outcome = if matches!(&built, Ok(Ok(_))) {
+            "success"
+        } else {
+            "error"
+        };
+        let filters = match built {
+            Ok(Ok(filters)) => Some(filters),
+            _ => {
+                crate::metrics::disk_cache_read("key_index_build", "error");
+                None
+            }
+        };
+        self.inner.key_index.finish(partition, token, filters);
+        crate::metrics::disk_cache_key_seconds(
+            "index_build",
+            outcome,
+            started.elapsed().as_secs_f64(),
+        );
+        tracing::debug!(
+            partition,
+            elapsed_ms = started.elapsed().as_millis(),
+            "disk cache: key index build finished"
+        );
+    }
+    fn publish_index_metrics(&self) {
+        self.publish_signature_index_metrics();
+        self.publish_key_index_metrics();
+    }
+    fn publish_key_index_metrics(&self) {
+        let total = self.key_span().map_or(0, |(floor, tip)| {
+            tip / self.inner.cfg.partition_slots - floor / self.inner.cfg.partition_slots + 1
+        });
         let state = self.inner.key_index.state.lock().expect("key index lock");
         let indexed = state
             .entries
@@ -309,27 +321,24 @@ impl DiskCache {
             .flat_map(|filters| filters.iter().flatten())
             .map(|bloom| bloom.bits.capacity() as u64)
             .sum::<u64>();
-        let total =
-            tip / self.inner.cfg.partition_slots - floor / self.inner.cfg.partition_slots + 1;
+
         let building = state
             .entries
             .values()
             .filter(|entry| entry.filters.is_none())
             .count() as u64;
         // Include the reserved builder/metadata allowance to report the upper bound.
-        crate::metrics::disk_cache_key_index(
-            allocated
-                + building * self.inner.key_index.address_quota() as u64
-                + state
-                    .signatures
-                    .values()
-                    .map(|entry| entry.bloom.bits.capacity() as u64)
-                    .sum::<u64>()
-                + RESERVE
-                + (state.entries.len() + state.signatures.len()) as u64 * (ENTRY_OVERHEAD / 2),
-            indexed,
-            total.saturating_sub(indexed),
-        );
+        let bytes = allocated
+            + building * self.inner.key_index.address_quota() as u64
+            + state
+                .signatures
+                .values()
+                .map(|entry| entry.bloom.bits.capacity() as u64)
+                .sum::<u64>()
+            + RESERVE
+            + (state.entries.len() + state.signatures.len()) as u64 * (ENTRY_OVERHEAD / 2);
+        drop(state);
+        crate::metrics::disk_cache_key_index(bytes, indexed, total.saturating_sub(indexed));
     }
     async fn build_partition_filters(
         &self,
@@ -389,6 +398,31 @@ impl DiskCache {
             filters[family as usize] = Some(bloom);
         }
         Ok(filters)
+    }
+}
+
+// Both loops are owned by the supervisor's existing task. Dropping this future
+// also drops active query cleanup guards; no maintenance task can outlive it.
+async fn run_workers<S, A, SF, AF>(
+    signatures: S,
+    addresses: A,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) where
+    S: Fn() -> SF,
+    A: Fn() -> AF,
+    SF: std::future::Future<Output = ()>,
+    AF: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        _ = shutdown.recv() => {},
+        _ = async { tokio::join!(repeat(signatures), repeat(addresses)); } => {},
+    }
+}
+
+async fn repeat<F: std::future::Future<Output = ()>>(work: impl Fn() -> F) {
+    loop {
+        work().await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 

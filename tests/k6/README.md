@@ -886,6 +886,14 @@ including misses/timeouts, and compare backlog and ingestion rate before/after. 
 query-log selected-part counts and metrics alongside the k6 summary. A passing k6 process alone
 does not establish the ingestion and all-attempt gates.
 
+For signature-priority scheduling, compare the deployed baseline and candidate at the same rates
+and request mix. Invalidate a signature partition while an address build is running: signature
+recovery must progress independently, no new address build may start until signatures recover,
+and address warming must resume afterward. Also exercise a failed signature scan followed by a
+successful retry. The idle signature worker discovers work within five seconds; scan duration and
+other signature work add to recovery time. Preserve the cold-start and repair timelines separately
+from the 30-minute steady-state results. A small fixture is not a production performance pass.
+
 Repeat cold-start and invalidation tests separately: correctness and the two-second deadline
 must hold while the index is unavailable, but the steady-state latency targets apply after
 index building. `KEY_ROUTING_SMOKE=1` runs for ten seconds at one request/s and skips dataset-size checks; this is

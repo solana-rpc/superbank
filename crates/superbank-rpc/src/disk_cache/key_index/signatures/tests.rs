@@ -224,3 +224,97 @@ async fn edges_holes_and_budget_exhaustion_remain_conservative() {
     assert!(index.ensure_signature_partition(1, || true).await.is_none());
     drop(guards);
 }
+
+#[tokio::test]
+async fn signature_retries_progress_while_address_build_is_stalled() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::{Notify, broadcast};
+
+    let index = index();
+    insert(&index, b"old").await;
+    let entered = Arc::new(Notify::new());
+    let released = Arc::new(Notify::new());
+    let recovered = Arc::new(Notify::new());
+    let invalidated = Arc::new(AtomicBool::new(false));
+    let (shutdown, receiver) = broadcast::channel(1);
+    let worker = {
+        let (index, entered, released, recovered, invalidated) = (
+            index.clone(),
+            entered.clone(),
+            released.clone(),
+            recovered.clone(),
+            invalidated.clone(),
+        );
+        tokio::spawn(async move {
+            super::super::run_workers(
+                || async {
+                    if invalidated.load(Ordering::Relaxed) {
+                        let token = insert(&index, b"new").await;
+                        assert!(index.finish_signature_build(1, token));
+                        recovered.notify_one();
+                    }
+                },
+                || async {
+                    entered.notify_one();
+                    released.notified().await;
+                },
+                receiver,
+            )
+            .await;
+        })
+    };
+    entered.notified().await;
+    drop(index.mutation(15, 15).signature_fill(false));
+    assert_eq!(candidates(&index, b"absent").outcome(), "unknown");
+    invalidated.store(true, Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(8), recovered.notified())
+        .await
+        .expect("signature retry must not wait for the stalled address scan");
+    assert_eq!(candidates(&index, b"absent").outcome(), "absent");
+    assert_eq!(candidates(&index, b"new").outcome(), "possible");
+    // Leave the address future stalled: shutdown must cancel it, too.
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failed_build_retries_without_publishing_partial_keys() {
+    let index = index();
+    let old = index.ensure_signature_partition(1, || false).await.unwrap();
+    index
+        .insert_signature_hashes(
+            &BTreeMap::from([(1, old)]),
+            &[(15, SignatureHash::new(b"first"))],
+        )
+        .unwrap();
+    assert_eq!(candidates(&index, b"missing").outcome(), "unknown");
+    // A failed scan leaves its partial bits conservative and reusable.
+    let retry = index.ensure_signature_partition(1, || false).await.unwrap();
+    index
+        .insert_signature_hashes(
+            &BTreeMap::from([(1, retry)]),
+            &[(16, SignatureHash::new(b"second"))],
+        )
+        .unwrap();
+    assert!(index.finish_signature_build(1, retry));
+    assert_eq!(candidates(&index, b"first").outcome(), "possible");
+    assert_eq!(candidates(&index, b"second").outcome(), "possible");
+    drop(index.mutation(15, 15).signature_fill(false));
+    assert!(!index.finish_signature_build(1, old));
+    assert!(!index.signature_generation_matches(1, old));
+}
+
+#[test]
+fn concurrent_builds_fit_the_existing_spare_partition_budget() {
+    let cfg = crate::disk_cache::key_tests::config(String::new(), String::new());
+    let index = KeyIndex::new(&cfg);
+    // Address builds are reserved by entries; one signature allocation can be
+    // outside the map. Both shares together fit the existing spare allowance.
+    let partitions = index.max_entries as u64;
+    let bitmaps = (partitions + 1) * (index.address_quota() + index.signature_quota()) as u64;
+    let metadata = (partitions + 1) * super::super::ENTRY_OVERHEAD;
+    assert!(bitmaps + metadata + super::super::RESERVE <= cfg.key_index_max_memory_bytes);
+}

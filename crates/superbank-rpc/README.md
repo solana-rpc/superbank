@@ -323,6 +323,14 @@ coverage. The bounded local transaction projection uses the source signatures vi
 Ordinary appends and partial eviction preserve existing bits. Repairs remain unknown until their
 update completes; failed or cancelled updates invalidate completeness. Missing and incomplete
 filters rebuild asynchronously from actual materialized-table keys, newest partitions first.
+Signature and address maintenance run in independent bounded loops. Signature sweeps retry
+incomplete partitions after a five-second delay between sweeps; scan duration and other signature
+builds add to recovery time. Before each address-partition build, maintenance checks live signature
+completeness and cache readiness. New address builds pause while any signature partition is unknown;
+an already-running address scan can finish alongside one signature rebuild. Persistent signature
+failures therefore pause address warming, while queries retain their existing safe fallbacks.
+Both workers stop with the existing cache task. This scheduling change preserves cache format 5,
+its schema fingerprint, and existing disk data; only the in-memory indexes rebuild on restart.
 Stale builds cannot publish across invalidation or schema reset. Address filters continue to
 rebuild on complete historical partitions and invalidate on mutation. This assumes the owned
 cache has no independent external writers.
@@ -358,7 +366,12 @@ The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors
 `superbank_disk_cache_key_seconds` records complete attempts, admission waits, and index builds;
 `superbank_disk_cache_key_index_bytes` reports reserved index memory, and
 `superbank_disk_cache_key_index_partitions` / `superbank_disk_cache_key_index_unknown_partitions`
-show address index coverage. `superbank_disk_cache_signature_index_partitions` and
+show address index coverage and refresh during builds and paused maintenance.
+`superbank_disk_cache_key_seconds{operation="signature_index_build"}` distinguishes `success`,
+`error`, `timeout`, and `superseded` attempts. Allocation or conflicting-writer deferrals use
+`superbank_disk_cache_reads_total{operation="signature_index_build",outcome="deferred"}`.
+Partition IDs appear only in diagnostic logs, not metric labels.
+`superbank_disk_cache_signature_index_partitions` and
 `superbank_disk_cache_signature_index_unknown_partitions` separately show signature completeness.
 `superbank_disk_cache_signature_membership_seconds` has microsecond buckets and `absent`,
 `possible`, and `unknown` outcomes. Partition probe/skip counters use
