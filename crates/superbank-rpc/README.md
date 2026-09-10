@@ -312,6 +312,14 @@ Candidate partitions are queried in result order, one at a time, until the answe
 the shared `DISK_CACHE_QUERY_TIMEOUT_MS` deadline expires. Admission waiting and transaction
 hydration count against that deadline. Incomplete address pages use source fallback.
 
+Partition-scoped interactive reads enable ClickHouse's uncompressed-block cache
+(`use_uncompressed_cache=1`) while keeping the query-result cache disabled. The cache reuses
+decompressed MergeTree blocks; its capacity remains controlled by the local ClickHouse server's
+`uncompressed_cache_size`. Background index scans and source-cluster reads retain their existing
+settings. Transaction payload reads use the resolved slot and transaction index, with a same-slot
+fallback if the signature index points to a missing transaction position. Both reads share the
+existing admission permit and cache-attempt deadline.
+
 The routing index rebuilds asynchronously from actual materialized-table keys, newest complete
 historical partitions first. The actively filled partition, unbuilt filters, and invalidated
 filters remain query candidates. Fill/repair, poisoning, eviction, and schema rebuild invalidate

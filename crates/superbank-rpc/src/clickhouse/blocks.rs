@@ -848,8 +848,8 @@ impl ClickHouseClient {
 
         self.with_http_query_timeout("get_latest_finalized_slot", async {
             #[derive(Deserialize, clickhouse::Row)]
-            struct MaxSlotRow {
-                max_slot: Option<u64>,
+            struct LatestSlotRow {
+                slot: u64,
             }
 
             let blocks_metadata_table = &self.blocks_metadata_table;
@@ -858,7 +858,7 @@ impl ClickHouseClient {
                 QueryFreshnessClass::TipSensitive,
             );
             let query = format!(
-                "SELECT maxOrNull(slot) AS max_slot FROM {blocks_metadata_table} {settings_clause}",
+                "SELECT slot FROM {blocks_metadata_table} ORDER BY slot DESC LIMIT 1 {settings_clause}",
                 blocks_metadata_table = blocks_metadata_table,
                 settings_clause = settings_clause
             );
@@ -866,11 +866,11 @@ impl ClickHouseClient {
             let row = self
                 .client
                 .query(&query)
-                .fetch_one::<MaxSlotRow>()
+                .fetch_optional::<LatestSlotRow>()
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
-            Ok(row.max_slot)
+            Ok(row.map(|row| row.slot))
         })
         .await
     }

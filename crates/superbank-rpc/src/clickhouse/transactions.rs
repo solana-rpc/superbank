@@ -643,6 +643,43 @@ impl ClickHouseClient {
         .await
     }
 
+    /// Reads a resolved position from the local cache, retaining the same-slot fallback for
+    /// historical rows whose transaction index differs from the signature index.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn get_cached_transaction_by_position(
+        &self,
+        signature: &str,
+        position: SignatureSlot,
+    ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
+        self.with_http_query_timeout("get_cached_transaction_by_position", async {
+            let (_, signature_literal) = decode_transaction_signature(signature)?;
+            let settings = self.select_get_transaction_settings_clause(
+                "get_cached_transaction_by_position",
+                QueryFreshnessClass::Historical,
+            );
+            let query = |slot_idx| {
+                build_get_transaction_by_signature_query(
+                    &self.transaction_table,
+                    &signature_literal,
+                    position.slot,
+                    slot_idx,
+                    &settings,
+                )
+            };
+            let (mut row, mut timings) = self
+                .fetch_transaction_lookup(&query(Some(position.slot_idx)))
+                .await?;
+            if row.is_none() {
+                let (fallback, fallback_timings) =
+                    self.fetch_transaction_lookup(&query(None)).await?;
+                row = fallback;
+                timings.add(fallback_timings);
+            }
+            Ok((row.map(map_transaction_row), timings))
+        })
+        .await
+    }
+
     pub async fn get_transaction_by_signature_and_slot(
         &self,
         signature: &str,

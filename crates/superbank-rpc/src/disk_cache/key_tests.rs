@@ -141,6 +141,33 @@ async fn assert_pagination(cache: &DiskCache) {
         assert_eq!(slots, expected);
     }
 }
+
+async fn assert_transaction_position_fallback(cache: &DiskCache) {
+    let mut client = cache.query_client();
+    client.cache_partition = Some((10, 1));
+    // The fallback must reuse the first query's permit instead of deadlocking at capacity one.
+    client.http_query_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let position = crate::clickhouse::SignatureSlot {
+        slot: 15,
+        slot_idx: 99,
+    };
+    let (record, _) = client
+        .get_cached_transaction_by_position(&signature(15).to_string(), position)
+        .await
+        .unwrap();
+    let record = record.unwrap();
+    assert_eq!((record.slot, record.slot_idx), (15, 0));
+    let (missing, _) = client
+        .get_cached_transaction_by_position(&signature(500).to_string(), position)
+        .await
+        .unwrap();
+    assert!(missing.is_none());
+    let (wrong_slot, _) = client
+        .get_cached_transaction_by_position(&signature(25).to_string(), position)
+        .await
+        .unwrap();
+    assert!(wrong_slot.is_none());
+}
 async fn assert_cross_partition_duplicates(client: &clickhouse::Client, cache: &DiskCache) {
     let _mutation = cache.begin_fill(39, 39);
     execute(client, &format!("INSERT INTO {}.transactions (signature,slot,slot_idx,tx_account_keys,meta_status_ok) SELECT signature,39,0,tx_account_keys,1 FROM {}.transactions WHERE slot=49 LIMIT 1", cache.inner.cfg.database,cache.inner.cfg.database)).await;
@@ -445,6 +472,7 @@ async fn key_routing_clickhouse_integration() {
             .slot,
         15
     );
+    assert_transaction_position_fallback(&cache).await;
     assert_pagination(&cache).await;
     assert_pruning(&client, &cache_database).await;
     assert_migration(&client, &source, &cfg).await;

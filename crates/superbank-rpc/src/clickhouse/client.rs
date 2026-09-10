@@ -946,7 +946,7 @@ impl ClickHouseClient {
     fn cache_settings_or(&self, settings: String, timeout: Duration) -> String {
         if self.cache_partition.is_some() {
             format!(
-                "SETTINGS max_execution_time={}, timeout_overflow_mode='throw', use_query_cache=0",
+                "SETTINGS max_execution_time={}, timeout_overflow_mode='throw', use_query_cache=0, use_uncompressed_cache=1",
                 timeout.as_secs_f64().max(0.001)
             )
         } else {
@@ -2512,6 +2512,31 @@ mod tests {
                 QueryCacheConfig::new(true, 10, false, true).with_get_transaction_overrides(300, 2),
             ),
         )
+    }
+
+    #[test]
+    fn uncompressed_cache_is_scoped_to_local_partition_reads() {
+        let mut client = test_client_with_query_cache();
+        let source = client
+            .select_get_transaction_settings_clause("test_source", QueryFreshnessClass::Historical);
+        assert!(source.contains("use_query_cache=1"));
+        assert!(!source.contains("use_uncompressed_cache"));
+
+        client.cache_partition = Some((10, 1));
+        client.query_timeout = Duration::from_millis(50);
+        let transaction = client.select_get_transaction_settings_clause(
+            "test_cache_transaction",
+            QueryFreshnessClass::Historical,
+        );
+        let signature =
+            client.select_settings_clause("test_cache_signature", QueryFreshnessClass::Historical);
+        for settings in [transaction, signature] {
+            assert!(settings.contains("use_uncompressed_cache=1"));
+            assert!(settings.contains("use_query_cache=0"));
+            assert!(!settings.contains("query_cache_ttl"));
+            assert!(settings.contains("max_execution_time=0.05"));
+            assert!(settings.contains("timeout_overflow_mode='throw'"));
+        }
     }
 
     fn test_client_with_http_limit(query_timeout: Duration) -> ClickHouseClient {
