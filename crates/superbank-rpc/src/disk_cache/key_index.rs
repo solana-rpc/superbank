@@ -8,12 +8,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod signatures;
+pub(super) use signatures::{SignatureCandidates, SignatureHash};
+
 const RESERVE: u64 = 64 * 1024 * 1024;
 const ENTRY_OVERHEAD: u64 = 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Family {
-    Signature,
     Address,
     HotAddress,
     Owner,
@@ -21,19 +23,13 @@ pub(super) enum Family {
 impl Family {
     fn table(self) -> (CacheTableKind, &'static str) {
         match self {
-            Self::Signature => (CacheTableKind::Signatures, "signature"),
             Self::Address => (CacheTableKind::Gsfa, "address"),
             Self::HotAddress => (CacheTableKind::GsfaHot, "address"),
             Self::Owner => (CacheTableKind::TokenOwnerActivity, "owner"),
         }
     }
 }
-const FAMILIES: [Family; 4] = [
-    Family::Signature,
-    Family::Address,
-    Family::HotAddress,
-    Family::Owner,
-];
+const FAMILIES: [Family; 3] = [Family::Address, Family::HotAddress, Family::Owner];
 
 struct Bloom {
     bits: Vec<u8>,
@@ -41,25 +37,27 @@ struct Bloom {
 }
 impl Bloom {
     fn new(bytes: usize, cardinality: u64) -> Option<Self> {
+        let hashes = ((bytes as f64 * 8.0 / cardinality.max(1) as f64) * std::f64::consts::LN_2)
+            .round()
+            .clamp(1.0, 16.0) as u32;
+        Self::with_hashes(bytes, hashes)
+    }
+    fn with_hashes(bytes: usize, hashes: u32) -> Option<Self> {
         if bytes == 0 {
             return None;
         }
         let mut bits = Vec::new();
         bits.try_reserve_exact(bytes).ok()?;
         bits.resize(bytes, 0);
-        let hashes = ((bytes as f64 * 8.0 / cardinality.max(1) as f64) * std::f64::consts::LN_2)
-            .round()
-            .clamp(1.0, 16.0) as u32;
         Some(Self { bits, hashes })
     }
     fn positions(&self, key: &[u8]) -> impl Iterator<Item = usize> + use<> {
-        let digest = blake3::hash(key);
-        let mut a = [0; 8];
-        let mut b = [0; 8];
-        a.copy_from_slice(&digest.as_bytes()[..8]);
-        b.copy_from_slice(&digest.as_bytes()[8..16]);
-        let a = u64::from_le_bytes(a);
-        let b = u64::from_le_bytes(b) | 1;
+        self.hash_positions(SignatureHash::new(key))
+    }
+    fn hash_positions(
+        &self,
+        SignatureHash(a, b): SignatureHash,
+    ) -> impl Iterator<Item = usize> + use<> {
         let bits = self.bits.len() as u64 * 8;
         (0..self.hashes)
             .map(move |i| (a.wrapping_add(u64::from(i).wrapping_mul(b)) % bits) as usize)
@@ -76,12 +74,13 @@ impl Bloom {
 }
 struct Entry {
     token: u64,
-    filters: Option<[Option<Bloom>; 4]>,
+    filters: Option<[Option<Bloom>; 3]>,
 }
 #[derive(Default)]
 struct State {
     entries: BTreeMap<u64, Entry>,
-    writers: BTreeMap<u64, (u64, u64)>,
+    writers: BTreeMap<u64, signatures::Writer>,
+    signatures: BTreeMap<u64, signatures::SignatureEntry>,
     serial: u64,
     epoch: u64,
     untracked_writers: usize,
@@ -89,6 +88,7 @@ struct State {
 
 pub(super) struct KeyIndex {
     state: Mutex<State>,
+    allocation: tokio::sync::Mutex<()>,
     width: u64,
     quota: usize,
     max_entries: usize,
@@ -102,7 +102,9 @@ impl Drop for Mutation {
         let mut state = self.index.state.lock().expect("key index lock");
         match self.id {
             Some(id) => {
-                state.writers.remove(&id);
+                if let Some(writer) = state.writers.remove(&id) {
+                    signatures::abandon_update(&mut state, &writer);
+                }
             }
             None => state.untracked_writers -= 1,
         }
@@ -119,6 +121,7 @@ impl KeyIndex {
         let quota = cfg.key_index_max_memory_bytes.saturating_sub(RESERVE) / slots;
         Self {
             state: Mutex::default(),
+            allocation: tokio::sync::Mutex::default(),
             width: cfg.partition_slots,
             quota: usize::try_from(quota.saturating_sub(ENTRY_OVERHEAD)).unwrap_or(0),
             max_entries: usize::try_from(slots.saturating_sub(1)).unwrap_or(0),
@@ -129,6 +132,7 @@ impl KeyIndex {
         // Bound mutation metadata even if many callers concurrently poison slots.
         if state.writers.len() >= 128 {
             state.entries.clear();
+            state.signatures.clear();
             state.epoch += 1;
             state.untracked_writers += 1;
             return Mutation {
@@ -144,7 +148,7 @@ impl KeyIndex {
         if count != state.entries.len() {
             state.epoch += 1;
         }
-        state.writers.insert(id, range);
+        state.writers.insert(id, signatures::Writer::new(range));
         Mutation {
             index: self.clone(),
             id: Some(id),
@@ -183,7 +187,7 @@ impl KeyIndex {
         if state
             .writers
             .values()
-            .any(|(a, b)| (*a..=*b).contains(&partition))
+            .any(|writer| (writer.range.0..=writer.range.1).contains(&partition))
         {
             return None;
         }
@@ -198,7 +202,7 @@ impl KeyIndex {
         );
         Some(token)
     }
-    fn finish(&self, partition: u64, token: u64, filters: Option<[Option<Bloom>; 4]>) {
+    fn finish(&self, partition: u64, token: u64, filters: Option<[Option<Bloom>; 3]>) {
         let mut state = self.state.lock().expect("key index lock");
         if state
             .entries
@@ -250,6 +254,7 @@ impl DiskCache {
         }
     }
     pub(super) async fn build_key_indexes(&self) {
+        self.build_signature_indexes().await;
         let Some((floor, tip)) = self.tip_span() else {
             return;
         };
@@ -314,9 +319,14 @@ impl DiskCache {
         // Include the reserved builder/metadata allowance to report the upper bound.
         crate::metrics::disk_cache_key_index(
             allocated
-                + building * self.inner.key_index.quota as u64
+                + building * self.inner.key_index.address_quota() as u64
+                + state
+                    .signatures
+                    .values()
+                    .map(|entry| entry.bloom.bits.capacity() as u64)
+                    .sum::<u64>()
                 + RESERVE
-                + state.entries.len() as u64 * ENTRY_OVERHEAD,
+                + (state.entries.len() + state.signatures.len()) as u64 * (ENTRY_OVERHEAD / 2),
             indexed,
             total.saturating_sub(indexed),
         );
@@ -324,7 +334,7 @@ impl DiskCache {
     async fn build_partition_filters(
         &self,
         partition: u64,
-    ) -> Result<[Option<Bloom>; 4], DiskCacheError> {
+    ) -> Result<[Option<Bloom>; 3], DiskCacheError> {
         // A separate lane: never consume the interactive query semaphore.
         let client = self
             .inner
@@ -341,7 +351,7 @@ impl DiskCache {
         builder.cache_partition = Some((self.inner.cfg.partition_slots, partition));
         builder.query_timeout = Duration::from_secs(300);
         let snapshot = self.source_schema();
-        let mut cardinalities = [0u64; 4];
+        let mut cardinalities = [0u64; 3];
         for family in FAMILIES {
             let (kind, key) = family.table();
             if !snapshot.has_table(kind) {
@@ -356,14 +366,14 @@ impl DiskCache {
             cardinalities[family as usize] = cardinality(&builder, &sql).await?.max(1);
         }
         let total: u128 = cardinalities.iter().map(|n| u128::from(*n)).sum();
-        let mut filters: [Option<Bloom>; 4] = std::array::from_fn(|_| None);
+        let mut filters: [Option<Bloom>; 3] = std::array::from_fn(|_| None);
         for family in FAMILIES {
             let n = cardinalities[family as usize];
             if n == 0 {
                 continue;
             }
-            let share =
-                (self.inner.key_index.quota as u128 * u128::from(n) / total.max(1)) as usize;
+            let share = (self.inner.key_index.address_quota() as u128 * u128::from(n)
+                / total.max(1)) as usize;
             let target = (n as f64 * 1.2).ceil() as usize;
             let Some(mut bloom) = Bloom::new(share.min(target), n) else {
                 continue;
@@ -375,10 +385,7 @@ impl DiskCache {
                 kind.local_name(),
                 self.inner.cfg.partition_slots
             );
-            match family {
-                Family::Signature => read_keys::<64>(&builder, &sql, &mut bloom).await?,
-                _ => read_keys::<32>(&builder, &sql, &mut bloom).await?,
-            }
+            read_keys::<32>(&builder, &sql, &mut bloom).await?;
             filters[family as usize] = Some(bloom);
         }
         Ok(filters)
@@ -444,6 +451,7 @@ mod tests {
     fn mutation_metadata_is_bounded_under_overload() {
         let index = Arc::new(KeyIndex {
             state: Mutex::default(),
+            allocation: tokio::sync::Mutex::default(),
             width: 10,
             quota: 1024,
             max_entries: 2,
@@ -472,6 +480,7 @@ mod tests {
     fn family_isolation_and_failed_builds_remain_conservative() {
         let index = KeyIndex {
             state: Mutex::default(),
+            allocation: tokio::sync::Mutex::default(),
             width: 10,
             quota: 1024,
             max_entries: 1,
@@ -488,12 +497,13 @@ mod tests {
         index.finish(1, token, Some(filters));
         assert!(!index.may_contain(1, &[Family::Address], b"owner"));
         assert!(index.may_contain(1, &[Family::Address, Family::Owner], b"owner"));
-        assert!(index.may_contain(2, &[Family::Signature], b"unknown"));
+        assert!(index.may_contain(2, &[Family::Address], b"unknown"));
     }
     #[test]
     fn old_build_cannot_replace_new_generation() {
         let index = Arc::new(KeyIndex {
             state: Mutex::default(),
+            allocation: tokio::sync::Mutex::default(),
             width: 10,
             quota: 1024,
             max_entries: 2,
@@ -502,9 +512,9 @@ mod tests {
         drop(index.mutation(10, 19));
         let new = index.begin(1).unwrap();
         index.finish(1, old, Some(std::array::from_fn(|_| Bloom::new(32, 10))));
-        assert!(index.may_contain(1, &[Family::Signature], b"missing"));
+        assert!(index.may_contain(1, &[Family::Address], b"missing"));
         index.finish(1, new, Some(std::array::from_fn(|_| Bloom::new(32, 10))));
-        assert!(!index.may_contain(1, &[Family::Signature], b"missing"));
+        assert!(!index.may_contain(1, &[Family::Address], b"missing"));
     }
 
     #[test]
@@ -522,6 +532,7 @@ mod tests {
     fn invalidation_rejects_in_flight_build_and_admits_unknown_keys() {
         let index = Arc::new(KeyIndex {
             state: Mutex::default(),
+            allocation: tokio::sync::Mutex::default(),
             width: 10,
             quota: 1024,
             max_entries: 4,
@@ -529,7 +540,7 @@ mod tests {
         let token = index.begin(1).unwrap();
         let mutation = index.mutation(10, 19);
         index.finish(1, token, Some(std::array::from_fn(|_| Bloom::new(32, 10))));
-        assert!(index.may_contain(1, &[Family::Signature], b"missing"));
+        assert!(index.may_contain(1, &[Family::Address], b"missing"));
         assert!(index.begin(1).is_none());
         drop(mutation);
         assert!(index.begin(1).is_some());

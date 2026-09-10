@@ -5,10 +5,37 @@ use crate::clickhouse::{NumericFilter, SortOrder, TransactionStatusFilter};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
 
 fn signature(slot: u64) -> Signature {
+    named_signature("sig", slot)
+}
+fn named_signature(prefix: &str, slot: u64) -> Signature {
     let mut key = [0; 64];
-    let value = format!("sig-{slot}");
+    let value = format!("{prefix}-{slot}");
     key[..value.len()].copy_from_slice(value.as_bytes());
     Signature::from(key)
+}
+fn signature_candidate(cache: &DiskCache, partition: u64, signature: Signature) -> bool {
+    !cache
+        .inner
+        .key_index
+        .signature_candidates(
+            partition,
+            partition,
+            key_index::SignatureHash::new(signature.as_ref()),
+        )
+        .partitions
+        .is_empty()
+}
+
+async fn assert_absent_without_admission(cache: &DiskCache) {
+    let client = cache.query_client();
+    let _permits = client.http_query_sem.acquire_many(2).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(50), async {
+        assert!(cache.get_tx(signature(500)).await.is_none());
+        assert!(cache.signature_position(signature(500)).await.is_none());
+        assert!(cache.get_sig_statuses(vec![signature(500)]).await[0].is_none());
+    })
+    .await
+    .expect("complete negative must not wait for admission");
 }
 fn address(value: &str) -> Pubkey {
     let mut key = [0; 32];
@@ -97,7 +124,7 @@ async fn fixture(client: &clickhouse::Client, database: &str) {
     execute(client, &format!("INSERT INTO {database}.blocks_metadata (slot,parent_slot,blockhash,parent_blockhash,block_time,block_height,executed_transaction_count) SELECT number,number-1,toFixedString('hash',32),toFixedString('hash',32),1700000000+number,number,1 FROM numbers(10,40)")).await;
 }
 async fn insert_transactions(client: &clickhouse::Client, database: &str) {
-    execute(client, &format!("INSERT INTO {database}.transactions (signature, slot, slot_idx, tx_signatures, tx_account_keys, tx_num_required_signatures, meta_status_ok, meta_post_token_balances_present, meta_post_token_account_index, meta_post_token_mint, meta_post_token_owner, meta_post_token_program_id, meta_post_token_amount, meta_post_token_decimals, meta_post_token_ui_amount, meta_post_token_ui_amount_string) SELECT toFixedString(concat('sig-', toString(number)),64), number, 0, [toFixedString(concat('sig-', toString(number)),64)], [toFixedString('address',32)], 1, 1, 1, [0], [toFixedString('mint',32)], [toFixedString('owner',32)], [toFixedString('program',32)], ['1'], [0], [1.0], ['1'] FROM numbers(10,40)")).await;
+    execute(client, &format!("INSERT INTO {database}.transactions (signature, slot, slot_idx, tx_signatures, tx_account_keys, tx_num_required_signatures, meta_status_ok, meta_post_token_balances_present, meta_post_token_account_index, meta_post_token_mint, meta_post_token_owner, meta_post_token_program_id, meta_post_token_amount, meta_post_token_decimals, meta_post_token_ui_amount, meta_post_token_ui_amount_string) SELECT toFixedString(concat('sig-', toString(number)),64), number, 0, [toFixedString(concat('sig-', toString(number)),64),toFixedString(concat('secondary-', toString(number)),64)], [toFixedString('address',32),toFixedString('signer',32)], 2, 1, 1, [0], [toFixedString('mint',32)], [toFixedString('owner',32)], [toFixedString('program',32)], ['1'], [0], [1.0], ['1'] FROM numbers(10,40)")).await;
 }
 fn tfa(order: SortOrder, tokens: TokenAccountsFilter) -> index::DiskTfaQuery {
     index::DiskTfaQuery {
@@ -192,6 +219,44 @@ async fn assert_cancellation(client: &clickhouse::Client, cache: &DiskCache) {
     wait_for_query(client, &id, false).await;
 }
 
+async fn assert_signature_fill_updates(cache: &DiskCache, source: &ClickHouseClient) {
+    // First fill, append within the same partition, then repair covered slots.
+    for (start, end) in [(10, 14), (15, 19), (15, 19)] {
+        filler::fill_range(
+            cache,
+            source,
+            filler::SlotRange { start, end },
+            &filler::FillerConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(signature_candidate(cache, 1, signature(10)));
+        assert!(signature_candidate(
+            cache,
+            1,
+            named_signature("secondary", end)
+        ));
+        assert_eq!(
+            cache
+                .signature_position(named_signature("secondary", end))
+                .await
+                .unwrap()
+                .slot,
+            end
+        );
+        assert_eq!(
+            cache
+                .get_sig_statuses(vec![named_signature("secondary", end)])
+                .await[0]
+                .as_ref()
+                .unwrap()
+                .slot,
+            end
+        );
+        assert_absent_without_admission(cache).await;
+    }
+}
+
 async fn assert_migration(
     client: &clickhouse::Client,
     source: &ClickHouseClient,
@@ -221,14 +286,7 @@ async fn assert_migration(
         .unwrap();
     assert_eq!(count, 0);
     assert!(reopened.tip_span().is_none());
-    filler::fill_range(
-        &reopened,
-        source,
-        filler::SlotRange { start: 10, end: 19 },
-        &filler::FillerConfig::default(),
-    )
-    .await
-    .unwrap();
+    assert_signature_fill_updates(&reopened, source).await;
     assert!(reopened.covers_slot(15));
     assert_eq!(reopened.get_tx(signature(15)).await.unwrap().slot, 15);
     let restarted = DiskCache::open(cfg.clone(), source).await.unwrap();
@@ -371,16 +429,9 @@ async fn key_routing_clickhouse_integration() {
         .await
         .unwrap();
     cache.build_key_indexes().await;
-    assert!(!cache.inner.key_index.may_contain(
-        1,
-        &[key_index::Family::Signature],
-        signature(35).as_ref()
-    ));
-    assert!(cache.inner.key_index.may_contain(
-        1,
-        &[key_index::Family::Signature],
-        signature(15).as_ref()
-    ));
+    assert_absent_without_admission(&cache).await;
+    assert!(!signature_candidate(&cache, 1, signature(35)));
+    assert!(signature_candidate(&cache, 1, signature(15)));
     assert_eq!(
         cache.signature_position(signature(15)).await.unwrap().slot,
         15
@@ -447,16 +498,21 @@ async fn key_routing_clickhouse_integration() {
     );
     assert_pagination(&cache).await;
     assert_pruning(&client, &cache_database).await;
-    assert_migration(&client, &source, &cfg).await;
+    // Poll migration separately so nested debug lookup futures do not consume
+    // the fixture task's stack as well as their own.
+    let migration_client = client.clone();
+    let migration_source = source.clone();
+    let migration_cfg = cfg.clone();
+    tokio::spawn(async move {
+        assert_migration(&migration_client, &migration_source, &migration_cfg).await;
+    })
+    .await
+    .unwrap();
     assert_cancellation(&client, &cache).await;
     assert_cross_partition_duplicates(&client, &cache).await;
     cache.poison_slot(15).await;
     assert!(cache.get_tx(signature(15)).await.is_none());
-    assert!(cache.inner.key_index.may_contain(
-        1,
-        &[key_index::Family::Signature],
-        signature(500).as_ref()
-    ));
+    assert!(!signature_candidate(&cache, 1, signature(500)));
     let mut reopened_cfg = cfg;
     reopened_cfg.query_timeout = Duration::from_millis(50);
     let reopened = DiskCache::open(reopened_cfg, &source).await.unwrap();

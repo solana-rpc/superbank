@@ -570,6 +570,12 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_key_seconds: Family<DiskCacheReadLabels, Histogram>,
     #[cfg(feature = "disk-cache")]
+    disk_cache_signature_membership_seconds: Family<DiskCacheReadLabels, Histogram>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_signature_index_partitions: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_signature_index_unknown_partitions: Gauge,
+    #[cfg(feature = "disk-cache")]
     disk_cache_key_index_bytes: Gauge,
     #[cfg(feature = "disk-cache")]
     disk_cache_key_index_partitions: Gauge,
@@ -697,6 +703,13 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         let disk_cache_key_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_signature_membership_seconds =
+            Family::new_with_constructor(signature_membership_histogram as fn() -> Histogram);
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_signature_index_partitions = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_signature_index_unknown_partitions = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_key_index_bytes = Gauge::default();
         #[cfg(feature = "disk-cache")]
@@ -1012,6 +1025,21 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         {
             registry.register(
+                "disk_cache_signature_membership_seconds",
+                "In-memory signature membership latency and outcomes",
+                disk_cache_signature_membership_seconds.clone(),
+            );
+            registry.register(
+                "disk_cache_signature_index_partitions",
+                "Complete signature membership partitions",
+                disk_cache_signature_index_partitions.clone(),
+            );
+            registry.register(
+                "disk_cache_signature_index_unknown_partitions",
+                "Unknown signature membership partitions",
+                disk_cache_signature_index_unknown_partitions.clone(),
+            );
+            registry.register(
                 "disk_cache_key_seconds",
                 "Partition routing index instrumentation",
                 disk_cache_key_seconds.clone(),
@@ -1182,6 +1210,12 @@ impl Metrics {
             superbank_grpc_stream_errors_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_key_seconds,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_signature_membership_seconds,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_signature_index_partitions,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_signature_index_unknown_partitions,
             #[cfg(feature = "disk-cache")]
             disk_cache_key_index_bytes,
             #[cfg(feature = "disk-cache")]
@@ -2001,6 +2035,11 @@ pub(crate) fn disk_cache_set_active(active: bool) {
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_read(operation: &'static str, outcome: &'static str) {
+    disk_cache_read_count(operation, outcome, 1);
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_read_count(operation: &'static str, outcome: &'static str, count: u64) {
     if let Some(metrics) = metrics() {
         metrics
             .disk_cache_reads_total
@@ -2008,7 +2047,7 @@ pub(crate) fn disk_cache_read(operation: &'static str, outcome: &'static str) {
                 operation: operation.to_string(),
                 outcome: outcome.to_string(),
             })
-            .inc();
+            .inc_by(count);
     }
 }
 
@@ -2223,6 +2262,38 @@ pub(crate) fn disk_cache_key_index(bytes: u64, indexed: u64, unknown: u64) {
             .set(clamp_i64(indexed));
         metrics
             .disk_cache_key_index_unknown_partitions
+            .set(clamp_i64(unknown));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+fn signature_membership_histogram() -> Histogram {
+    Histogram::new([
+        0.000001, 0.000005, 0.000010, 0.000025, 0.000050, 0.000100, 0.000250, 0.001, 0.01,
+    ])
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_signature_membership(outcome: &'static str, seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_signature_membership_seconds
+            .get_or_create(&DiskCacheReadLabels {
+                operation: "signature_membership".into(),
+                outcome: outcome.into(),
+            })
+            .observe(seconds);
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_signature_index(ready: u64, unknown: u64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_signature_index_partitions
+            .set(clamp_i64(ready));
+        metrics
+            .disk_cache_signature_index_unknown_partitions
             .set(clamp_i64(unknown));
     }
 }

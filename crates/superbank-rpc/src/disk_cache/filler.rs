@@ -462,7 +462,7 @@ pub(super) async fn fill_range(
         .ok_or_else(|| DiskCacheError::Config("transactions schema missing".to_string()))?;
     // Forward the durable fact table first. The block table can use Memory,
     // which cannot deduplicate a retry after a later stage fails.
-    let _mutation = cache.begin_fill(range.start, range.end);
+    let mut mutation = cache.begin_fill(range.start, range.end);
     native_forward(cache, source, transactions, range, cfg.query_timeout).await?;
     cache
         .validate_transaction_counts(range.start, range.end, &expected)
@@ -471,6 +471,9 @@ pub(super) async fn fill_range(
 
     let coverage = coverage_from_metadata(range, &metadata, successor.as_ref());
     let published: HashSet<u64> = coverage.iter().map(|(slot, _)| *slot).collect();
+    cache
+        .update_signature_membership(&mut mutation, range.start, range.end)
+        .await;
     cache.publish_range_coverage(coverage).await?;
     let transactions_written = expected.values().copied().sum();
     crate::metrics::disk_cache_write(

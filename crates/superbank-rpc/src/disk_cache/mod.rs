@@ -455,6 +455,7 @@ impl DiskCache {
         self.set_ready(false);
         self.inner.key_index.invalidate_reads();
         let _mutation = self.inner.key_index.mutation(0, u64::MAX);
+        self.inner.key_index.clear_signatures();
         let result = async {
             schema::initialize_cache_schema(&self.inner.admin, &snapshot, &schema_config).await?;
             let mut query_client = self.inner.local.clone();
@@ -796,16 +797,19 @@ impl DiskCache {
     }
 
     fn begin_fill(&self, start: u64, end: u64) -> key_index::Mutation {
-        if self
+        let repair = self
             .inner
             .coverage
             .read()
             .expect("coverage lock")
-            .intersects(start, end)
-        {
+            .intersects(start, end);
+        if repair {
             self.inner.key_index.invalidate_reads();
         }
-        self.inner.key_index.mutation(start, end)
+        self.inner
+            .key_index
+            .mutation(start, end)
+            .signature_fill(repair)
     }
 
     pub(crate) async fn publish_range_coverage(
@@ -854,6 +858,7 @@ impl DiskCache {
             drop(coverage);
             self.inner.min_retained.store(floor, Ordering::Relaxed);
             self.publish_coverage_metrics();
+            self.publish_signature_index_metrics();
         }
         Ok(())
     }
@@ -966,6 +971,7 @@ impl DiskCache {
         self.inner.key_index.invalidate_reads();
         let _mutation = self.inner.key_index.mutation(0, new_floor - 1);
         self.drop_partitions_below(new_floor).await?;
+        self.inner.key_index.evict_signatures(new_floor);
         self.inner.min_retained.store(new_floor, Ordering::Relaxed);
         self.inner
             .coverage

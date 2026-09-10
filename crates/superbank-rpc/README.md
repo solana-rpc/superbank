@@ -312,17 +312,30 @@ Candidate partitions are queried in result order, one at a time, until the answe
 the shared `DISK_CACHE_QUERY_TIMEOUT_MS` deadline expires. Admission waiting and transaction
 hydration count against that deadline. Incomplete address pages use source fallback.
 
-The routing index rebuilds asynchronously from actual materialized-table keys, newest complete
-historical partitions first. The actively filled partition, unbuilt filters, and invalidated
-filters remain query candidates. Fill/repair, poisoning, eviction, and schema rebuild invalidate
-filters before changing data. A stale build cannot publish, and a read whose exclusions became
-invalid falls back. This assumes the owned cache has no independent external writers.
+Signature membership covers every retained partition, including the active and partially
+retained edges and gaps between covered ranges. Each signature is hashed once and checked under
+one index lock. A complete negative returns before ClickHouse admission, client cloning, or
+signature encoding. Positive candidates still require a database lookup: Bloom filters can
+produce false positives.
+
+Fills add all signature keys, including secondary transaction signatures, before publishing
+coverage. The bounded local transaction projection uses the source signatures view's expressions.
+Ordinary appends and partial eviction preserve existing bits. Repairs remain unknown until their
+update completes; failed or cancelled updates invalidate completeness. Missing and incomplete
+filters rebuild asynchronously from actual materialized-table keys, newest partitions first.
+Stale builds cannot publish across invalidation or schema reset. Address filters continue to
+rebuild on complete historical partitions and invalidate on mutation. This assumes the owned
+cache has no independent external writers.
 
 The memory budget reserves 64 MiB for buffers/metadata and allocates the remaining space across
-the retention window. Filters target roughly 1% false positives; limited memory reduces
-selectivity rather than correctness. A single builder uses one ClickHouse execution thread and a
-separate 64 MiB server query-memory limit. Initialization and index failures preserve source
-fallback; a cold index can have higher latency than a fully built index.
+the retention window. Two-thirds of each partition's bitmap allowance is reserved for signatures
+with seven probes; the remainder serves address filters. Signature selectivity depends on the
+number of keys per partition and partition count: validate the **aggregate** false-positive rate,
+targeting at most 1%, rather than a per-partition rate. Limited memory reduces selectivity rather
+than correctness. The default budget remains 4 GiB. Background scans and fill updates each use
+one ClickHouse execution thread and a separate 64 MiB server query-memory limit. Initialization
+and index failures preserve source fallback; a cold index can have higher latency than a fully
+built index.
 
 Cache format **5** preserves the source's portable MergeTree index/mark settings and reverse
 sort directions from canonical DDL. Forwarding views project only insertable columns so the
@@ -345,8 +358,11 @@ The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors
 `superbank_disk_cache_key_seconds` records complete attempts, admission waits, and index builds;
 `superbank_disk_cache_key_index_bytes` reports reserved index memory, and
 `superbank_disk_cache_key_index_partitions` / `superbank_disk_cache_key_index_unknown_partitions`
-show index coverage. Partition probe/skip counters use `operation="key_partition"` with bounded
-labels; no keys or partition IDs are metric labels.
+show address index coverage. `superbank_disk_cache_signature_index_partitions` and
+`superbank_disk_cache_signature_index_unknown_partitions` separately show signature completeness.
+`superbank_disk_cache_signature_membership_seconds` has microsecond buckets and `absent`,
+`possible`, and `unknown` outcomes. Partition probe/skip counters use
+`operation="key_partition"` with bounded labels; no keys or partition IDs are metric labels.
 
 Query-facing tables use `ReplacingMergeTree` by default. `blocks_metadata` can opt into the ClickHouse `Memory` engine with `DISK_CACHE_MEMORY_TABLES=blocks_metadata`. This mode requires explicit row and byte caps. Memory-engine coverage is reset after a local ClickHouse restart because those rows are not durable. No other query-facing table is accepted in the Memory allowlist in this release.
 

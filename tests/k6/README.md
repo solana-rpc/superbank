@@ -898,6 +898,23 @@ DISK_CACHE_TEST_URL=http://127.0.0.1:18123 \
 cargo test -p superbank-rpc --all-features --locked key_routing_clickhouse_integration -- --ignored
 ```
 
+Signature membership also has a reproducible CPU/selectivity check over 80 partitions and
+four million keys at 24 bits/key. It checks sampled inserted keys, aggregate false positives
+at most 1%, and membership p99 below 100 microseconds both idle and during continuous bounded
+updates. Run an optimized build on an otherwise idle machine:
+
+```sh
+cargo test -p superbank-rpc --all-features --locked --release \
+  signature_membership_latency_and_false_positives -- --ignored --nocapture
+```
+
+This scaled check does not establish full-retention memory behavior or RPC latency. For the
+deployment gate above, also require zero unknown signature partitions after warming, membership
+p99 below 100 microseconds, aggregate false positives at most 1%, and immediate negative cache
+lookups while admission is saturated. The local integration fixture holds all cache permits
+while checking absent signatures, and exercises secondary signatures through native fills.
+Measure cold rebuilds, repairs, ingestion backlog, and address latency with the new memory split.
+
 It creates uniquely named `test_key_router_*` databases and removes them on success. Set
 `DISK_CACHE_TEST_KEEP=1` only when retaining the fixture for a local RPC/k6 smoke run.
 
