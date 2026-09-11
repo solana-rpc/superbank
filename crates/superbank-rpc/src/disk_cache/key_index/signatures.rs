@@ -103,7 +103,10 @@ impl Mutation {
         let Some(writer) = state.writers.get_mut(&self.id.unwrap_or(0)) else {
             return;
         };
-        writer.updated = true;
+        writer.updated = success;
+        // Failed fills may still publish coverage. Keep the partition unknown
+        // until guard drop, which also invalidates entries allocated meanwhile.
+        writer.repair |= !success;
         let range = writer.range;
         if !success {
             invalidate(&mut state, range);

@@ -116,6 +116,115 @@ k6 run tests/k6/scenarios/fuzz/fuzz-options-rpc-methods.js -e RPC_URL=http://loc
 
 ## Test Scenarios
 
+### Signature-status miss replay and cancellation evidence
+
+`scenarios/performance/superbank-rpc-signature-statuses-misses.js` sends one
+`getSignatureStatuses` request per iteration with `searchTransactionHistory: true`.
+Defaults are **256 distinct signatures, 2 requests/second, a 1-second HTTP request
+timeout, and 30 minutes**. Arrival rate is independent of response speed. Dropped
+iterations fail the test; timeouts are recorded separately from valid all-null
+responses and unexpected HTTP/JSON-RPC responses. Expected timeouts do not fail
+the replay by themselves, so a successful k6 exit is not an availability or
+backend-cancellation acceptance result.
+
+Use an isolated fixture and a reproducible corpus known to be absent from it.
+This creates 1,000,000 syntactically valid 64-byte signatures without sending traffic.
+The replay never recycles signatures: exhaustion aborts the run, preventing repeated negative
+condition-cache hits from masking fresh-miss cost. The default run needs 921,600 signatures
+plus a small scheduling buffer:
+
+```bash
+python3 - <<'PY' > /tmp/status-misses.txt
+import hashlib
+alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+for index in range(1_000_000):
+    raw = hashlib.sha512(f'superbank-status-miss-v1:{index}'.encode()).digest()
+    value, encoded = int.from_bytes(raw, 'big'), ''
+    while value:
+        value, digit = divmod(value, 58)
+        encoded = alphabet[digit] + encoded
+    print('1' * (len(raw) - len(raw.lstrip(b'\0'))) + encoded)
+PY
+
+k6 run tests/k6/scenarios/performance/superbank-rpc-signature-statuses-misses.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e MISS_SIGNATURE_FILE=/tmp/status-misses.txt \
+  -e MISS_RUN_LABEL=tuple-in-warm \
+  --summary-export=/tmp/status-misses-summary.json
+```
+
+The scenario cycles through the corpus in batches, preserving the same ordering
+across runs. With the default corpus size, keys repeat every 128 seconds. A corpus
+must contain at least one batch of distinct signatures; completed responses must
+contain exactly that many null statuses. The scenario checks base58 characters and
+length; fixture preparation must ensure signatures decode to 64 bytes and are absent.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `MISS_SIGNATURE_FILE` | required | Whitespace-separated, distinct, known-absent signatures |
+| `MISS_BATCH_SIZE` | `256` | Signatures per request, from 1 through 256 |
+| `MISS_RPS` | `2` | Positive integer requests per second |
+| `MISS_DURATION` | `30m` | Replay duration; use `5s` for a local harness smoke test |
+| `MISS_TIMEOUT_MS` | `1000` | Actual k6 HTTP request timeout, in milliseconds |
+| `MISS_VUS` | rate × timeout, rounded up, plus 2 | Preallocated VUs; increase if iterations drop |
+| `MISS_RUN_LABEL` | `unspecified` | Metric label and JSON-RPC request-ID prefix |
+
+Compare baseline OR and candidate tuple-IN builds against the **same populated
+ClickHouse snapshot, corpus, settings, request rate, and client timeout**. Run each
+for 30 minutes in both cold and warm states. Record table parts, retention, index
+coverage, cache state, and replica topology separately: neither this scenario nor
+an empty local ClickHouse establishes full-retention performance. Cache preparation
+is an explicit fixture operation, not an action performed by this scenario.
+
+Start each isolated RPC process with a distinct `CLICKHOUSE_QUERY_ID_PREFIX`, for
+example `miss-or` and `miss-tuple-in`. `MISS_RUN_LABEL` only labels k6 requests; it
+does **not** establish a mapping to ClickHouse query IDs. Export all start and
+terminal query-log rows for the chosen prefix and exact run window from every
+coordinator and replica. Include these columns, using `system.query_log` locally
+or `clusterAllReplicas('test_cluster', system.query_log)` for a test cluster:
+
+```sql
+SELECT hostName() AS node, query_id, initial_query_id, is_initial_query,
+       toString(type) AS type, query_duration_ms,
+       toUnixTimestamp64Milli(query_start_time_microseconds) AS started_at_ms,
+       ProfileEvents
+FROM system.query_log
+WHERE event_date = '2026-09-11'
+  AND event_time >= '2026-09-11 12:00:00'
+  AND event_time < '2026-09-11 12:31:00'
+  AND startsWith(initial_query_id, 'miss-tuple-in:signature_statuses:')
+FORMAT JSONEachRow
+```
+
+Adjust dates and collection end to the run. Allow asynchronous query-log delivery
+to complete, and retain a `system.processes` snapshot after the cancellation
+deadline as independent evidence of remaining work. Missing logs do not prove
+cancellation. Collect **actual externally observed client-abandonment timestamps
+correlated to exact initial ClickHouse query IDs**, as JSONEachRow records:
+
+```json
+{"initial_query_id":"miss-tuple-in:signature_statuses:1","cancelled_at_ms":1789128001000}
+```
+
+Do not synthesize these timestamps as query start plus the k6 timeout. With complete
+exports and externally established correlation, run the offline report:
+
+```bash
+python3 scripts/test/report-signature-status-query-log.py /tmp/query-log.jsonl \
+  --require-leaves --max-query-ms=5000 \
+  --cancellations=/tmp/cancellations.jsonl \
+  --observed-until-ms=1789129860000 --cancellation-grace-ms=5000
+```
+
+The report keeps coordinator and leaf CPU/duration distributions separate, checks
+observed query lifetimes, and checks whether each correlated execution ended within
+five seconds of the supplied abandonment time. It fails for missing start/terminal
+evidence, missing distributed leaves, incomplete collection intervals, or exceeded
+deadlines. Without cancellation correlation it still prints latency/CPU summaries
+but exits unsuccessfully with cancellation unverified. Collection must include all
+participating replicas; the report cannot detect an omitted server or fabricated
+correlation. No script issues database commands or production requests implicitly.
+
 ### Basic Load Test (`superbank-rpc-get-signatures.js`)
 
 Simple constant-load test with configurable VUs and duration.

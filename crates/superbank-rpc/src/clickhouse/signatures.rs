@@ -4,7 +4,7 @@
  */
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ch_cityhash102::cityhash64;
 use serde::Deserialize;
@@ -18,8 +18,8 @@ use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
 use super::sharding::ShardTopology;
 use super::types::{QueryTimings, SignatureSlot, SignatureStatusRecord};
 use super::util::{
-    append_max_execution_time_setting, http_query_with_id, parse_err_json,
-    transient_shard_local_error_reason,
+    append_max_execution_time_setting, build_select_settings_clause, http_query_with_id,
+    parse_err_json, transient_shard_local_error_reason,
 };
 
 fn build_signature_filter(
@@ -52,6 +52,48 @@ fn build_signature_filter(
         }
     }
     bucket_clauses.join(" OR ")
+}
+
+fn build_primary_signature_filter(bucketed: BTreeMap<u64, Vec<String>>) -> String {
+    if bucketed.values().map(Vec::len).sum::<usize>() == 1 {
+        return build_signature_filter(bucketed, 1);
+    }
+    let keys = bucketed
+        .into_iter()
+        .flat_map(|(bucket, signatures)| {
+            signatures
+                .into_iter()
+                .map(move |signature| format!("({bucket}, {signature})"))
+        })
+        .collect::<Vec<_>>();
+    format!("(sig_bucket, signature) IN ({})", keys.join(","))
+}
+
+fn primary_signature_status_settings(
+    base: &str,
+    max_threads: usize,
+    remaining: Duration,
+) -> ProcessingResult<String> {
+    // ClickHouse truncates execution limits to microseconds; zero disables the limit.
+    // Leave at least one millisecond rather than submitting an effectively expired query.
+    if remaining < Duration::from_millis(1) {
+        return Err(ProcessingError::timeout_msg(
+            "Signature status query deadline exhausted",
+        ));
+    }
+    let prefix = if base.trim().is_empty() {
+        "SETTINGS".to_string()
+    } else {
+        format!("{base},")
+    };
+    let seconds = remaining.as_secs_f64();
+    Ok(format!(
+        "{prefix} max_threads={max_threads}, max_threads_for_indexes={max_threads}, \
+        use_hedged_requests=0, max_parallel_replicas=1, \
+        max_execution_time={seconds}, max_execution_time_leaf={seconds}, \
+        timeout_overflow_mode='throw', timeout_overflow_mode_leaf='throw', \
+        timeout_before_checking_execution_speed=0"
+    ))
 }
 
 impl ClickHouseClient {
@@ -271,7 +313,8 @@ impl ClickHouseClient {
         &self,
         signatures: &[String],
     ) -> ProcessingResult<(Vec<SignatureStatusRecord>, QueryTimings)> {
-        self.with_http_query_timeout("get_signature_statuses", async {
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        self.with_operation_timeout("get_signature_statuses", async {
             if signatures.is_empty() {
                 return Ok((
                     Vec::new(),
@@ -285,6 +328,13 @@ impl ClickHouseClient {
                     },
                 ));
             }
+
+            let admission = self
+                .cache_partition
+                .is_none()
+                .then(crate::metrics::SignatureStatusAdmission::start);
+            let (source_permit, _http_permit) = self.acquire_signature_status_permits().await?;
+            drop(admission);
 
             if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -311,34 +361,9 @@ impl ClickHouseClient {
                 }
             }
 
-            let signature_bucket_modulus = self.signatures_bucket_modulus();
-            let mut bucketed_signatures: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-            for sig in signatures {
-                let signature_bytes = bs58::decode(sig)
-                    .into_vec()
-                    .map_err(|e| ProcessingError::deserialization("Invalid signature", e))?;
-                if signature_bytes.len() != 64 {
-                    return Err(ProcessingError::deserialization_msg(format!(
-                        "Invalid signature length {} (expected 64 bytes)",
-                        signature_bytes.len()
-                    )));
-                }
-
-                let bucket = cityhash64(signature_bytes.as_slice()) % signature_bucket_modulus;
-                let signature_hex = hex::encode(signature_bytes).to_uppercase();
-                let signature_literal = format!("toFixedString(unhex('{signature_hex}'), 64)");
-                bucketed_signatures
-                    .entry(bucket)
-                    .or_default()
-                    .push(signature_literal);
-            }
-
-            let signature_filter =
-                build_signature_filter(bucketed_signatures, self.in_clause_chunk);
-
+            let signature_filter = self.signature_status_filter(signatures)?;
             let signature_statuses_table = &self.signature_statuses_table;
-            let settings_clause = self
-                .select_settings_clause("get_signature_statuses", QueryFreshnessClass::Historical);
+            let settings_clause = self.signature_status_settings(deadline)?;
             let query = format!(
                 "SELECT
                     signature,
@@ -359,7 +384,7 @@ impl ClickHouseClient {
                 settings_clause = settings_clause
             );
             let (query, query_id, mut cleanup) =
-                self.annotate_lookup_query(query, "signature_statuses");
+                self.annotate_signature_status_query(query, source_permit);
 
             #[derive(Deserialize, clickhouse::Row)]
             struct StatusRow {
@@ -403,6 +428,61 @@ impl ClickHouseClient {
             Ok((results, timings))
         })
         .await
+    }
+
+    fn signature_status_filter(&self, signatures: &[String]) -> ProcessingResult<String> {
+        let mut bucketed_signatures: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for sig in signatures {
+            let signature_bytes = bs58::decode(sig)
+                .into_vec()
+                .map_err(|e| ProcessingError::deserialization("Invalid signature", e))?;
+            if signature_bytes.len() != 64 {
+                return Err(ProcessingError::deserialization_msg(format!(
+                    "Invalid signature length {} (expected 64 bytes)",
+                    signature_bytes.len()
+                )));
+            }
+            let bucket = cityhash64(&signature_bytes) % self.signatures_bucket_modulus();
+            let signature_hex = hex::encode(signature_bytes).to_uppercase();
+            bucketed_signatures
+                .entry(bucket)
+                .or_default()
+                .push(format!("toFixedString(unhex('{signature_hex}'), 64)"));
+        }
+        if self.cache_partition.is_some() {
+            Ok(build_signature_filter(
+                bucketed_signatures,
+                self.in_clause_chunk,
+            ))
+        } else {
+            Ok(build_primary_signature_filter(bucketed_signatures))
+        }
+    }
+
+    fn signature_status_settings(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessingResult<String> {
+        if self.cache_partition.is_some() {
+            return Ok(self.select_settings_clause(
+                "get_signature_statuses",
+                QueryFreshnessClass::Historical,
+            ));
+        }
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                ProcessingError::timeout_msg("Signature status admission exhausted query deadline")
+            })?;
+        let base = build_select_settings_clause(
+            self.allow_query_settings,
+            QueryFreshnessClass::Historical,
+            &self.query_cache,
+            false,
+            "get_signature_statuses",
+        );
+        primary_signature_status_settings(&base, self.signature_status_max_threads, remaining)
     }
 
     async fn try_signature_slot_by_signature_tcp(
@@ -961,3 +1041,6 @@ impl ClickHouseClient {
         Ok(Some((results, timings)))
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -42,6 +42,43 @@ fn batch_size_histogram() -> Histogram {
     Histogram::new(BATCH_SIZE_BUCKETS)
 }
 
+fn signature_status_batch_histogram() -> Histogram {
+    Histogram::new([0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0])
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SignatureStatusStageLabels {
+    stage: &'static str,
+}
+
+/// Includes cancelled admission waits; no request identifiers become metric labels.
+pub(crate) struct SignatureStatusAdmission(Instant);
+
+impl SignatureStatusAdmission {
+    pub(crate) fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Drop for SignatureStatusAdmission {
+    fn drop(&mut self) {
+        if let Some(metrics) = metrics() {
+            metrics
+                .signature_status_admission_seconds
+                .observe(self.0.elapsed().as_secs_f64());
+        }
+    }
+}
+
+pub(crate) fn signature_status_batch_size(stage: &'static str, size: usize) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .signature_status_batch_size
+            .get_or_create(&SignatureStatusStageLabels { stage })
+            .observe(size as f64);
+    }
+}
+
 const BLOCK_SLOT_COUNT_BUCKETS: [f64; 20] = [
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
     16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 500000.0,
@@ -510,6 +547,8 @@ pub struct Metrics {
     rpc_batch_requests: Family<BatchLabels, Counter>,
     rpc_batch_items: Family<BatchLabels, Counter>,
     rpc_batch_size: Family<BatchLabels, Histogram>,
+    signature_status_batch_size: Family<SignatureStatusStageLabels, Histogram>,
+    signature_status_admission_seconds: Histogram,
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
@@ -639,6 +678,9 @@ impl Metrics {
         let rpc_batch_items = Family::default();
         let rpc_batch_size =
             Family::new_with_constructor(batch_size_histogram as fn() -> Histogram);
+        let signature_status_batch_size =
+            Family::new_with_constructor(signature_status_batch_histogram as fn() -> Histogram);
+        let signature_status_admission_seconds = latency_histogram();
         let rpc_batch_rejected = Family::default();
         let rpc_response_overhead_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
@@ -798,6 +840,16 @@ impl Metrics {
             "rpc_batch_size",
             "Batch size distribution for JSON-RPC envelopes",
             rpc_batch_size.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_batch_size",
+            "getSignatureStatuses input and unresolved primary-fallback signature counts",
+            signature_status_batch_size.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_admission_seconds",
+            "Primary signature-status source and HTTP admission wait, including cancelled waits",
+            signature_status_admission_seconds.clone(),
         );
         registry.register(
             "rpc_batch_rejected_total",
@@ -1157,6 +1209,8 @@ impl Metrics {
             rpc_batch_requests,
             rpc_batch_items,
             rpc_batch_size,
+            signature_status_batch_size,
+            signature_status_admission_seconds,
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
             rpc_blocks_slots_returned,

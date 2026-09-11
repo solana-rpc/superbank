@@ -168,9 +168,91 @@ async fn cancelled_or_failed_fills_reject_stale_builds_even_for_empty_results() 
     fill.finish_signatures(false);
     index.finish_signature_build(1, token);
     assert_eq!(candidates(&index, b"new").outcome(), "unknown");
+    drop(fill);
     let token = insert(&index, b"new").await;
     index.finish_signature_build(1, token);
     assert_eq!(candidates(&index, b"old").outcome(), "possible");
+}
+
+#[tokio::test]
+async fn failed_fill_keeps_concurrently_allocated_filter_unknown_through_publication() {
+    let index = index();
+    let mut coverage = crate::disk_cache::coverage::CoverageMap::new();
+    let mut failed = index.mutation(10, 14).signature_fill(false);
+
+    // Deterministically interleave an unrelated mutation with the allocation.
+    // Fill A's transactions exist, but its membership update has no entry.
+    assert!(
+        index
+            .ensure_signature_partition(1, || {
+                drop(index.mutation(20, 29));
+                !coverage.intersects(10, 19)
+            })
+            .await
+            .is_none()
+    );
+    failed.finish_signatures(false);
+
+    // Fill B allocates before A's awaited coverage publication completes.
+    let mut successful = index.mutation(15, 19).signature_fill(false);
+    let token = index
+        .ensure_signature_partition(1, || !coverage.intersects(10, 19))
+        .await
+        .unwrap();
+    index
+        .insert_signature_hashes(
+            &BTreeMap::from([(1, token)]),
+            &[(15, SignatureHash::new(b"fill-b"))],
+        )
+        .unwrap();
+    successful.finish_signatures(true);
+    coverage.insert_range(10, 19);
+    drop(successful);
+
+    assert!(coverage.contains(10));
+    assert_eq!(candidates(&index, b"fill-a").outcome(), "unknown");
+    assert_eq!(index.signature_completeness(1, 1), (0, 1));
+    // A rebuild finishing before the failed writer drops must not expose it.
+    assert!(index.finish_signature_build(1, token));
+    assert_eq!(candidates(&index, b"fill-a").outcome(), "unknown");
+    drop(failed);
+    assert_eq!(candidates(&index, b"fill-a").outcome(), "unknown");
+    assert!(!index.finish_signature_build(1, token));
+
+    // Only a scan including the now-covered A keys restores completeness.
+    let rebuilt = index
+        .ensure_signature_partition(1, || !coverage.intersects(10, 19))
+        .await
+        .unwrap();
+    index
+        .insert_signature_hashes(
+            &BTreeMap::from([(1, rebuilt)]),
+            &[(10, SignatureHash::new(b"fill-a"))],
+        )
+        .unwrap();
+    assert!(index.finish_signature_build(1, rebuilt));
+    assert_eq!(candidates(&index, b"fill-a").outcome(), "possible");
+    assert_eq!(candidates(&index, b"fill-b").outcome(), "possible");
+    assert_eq!(candidates(&index, b"absent").outcome(), "absent");
+    assert_eq!(index.signature_completeness(1, 1), (1, 0));
+}
+
+#[tokio::test]
+async fn successful_overlapping_fills_preserve_complete_membership() {
+    let index = index();
+    let mut first = index.mutation(15, 15).signature_fill(false);
+    let mut second = index.mutation(15, 15).signature_fill(false);
+    insert(&index, b"fill-a").await;
+    first.finish_signatures(true);
+    insert(&index, b"fill-b").await;
+    second.finish_signatures(true);
+    drop(first);
+    drop(second);
+
+    assert_eq!(candidates(&index, b"fill-a").outcome(), "possible");
+    assert_eq!(candidates(&index, b"fill-b").outcome(), "possible");
+    assert_eq!(candidates(&index, b"absent").outcome(), "absent");
+    assert_eq!(index.signature_completeness(1, 1), (1, 0));
 }
 
 #[tokio::test]

@@ -78,7 +78,10 @@ fi
 : "${CLICKHOUSE_USER:=default}"
 : "${CLICKHOUSE_PASSWORD:=}"
 : "${CLICKHOUSE_QUERY_TIMEOUT_MS:=8000}"
-: "${CLICKHOUSE_CLUSTER:={cluster}}"
+# Preserve an explicitly empty cluster for standalone cancellation.
+if [[ -z "${CLICKHOUSE_CLUSTER+x}" ]]; then
+  CLICKHOUSE_CLUSTER='{cluster}'
+fi
 : "${CLICKHOUSE_TOPOLOGY_CONFIG:=}"
 : "${CLICKHOUSE_TRANSPORT:=http}"
 : "${CLICKHOUSE_SCOPE:=distributed}"
