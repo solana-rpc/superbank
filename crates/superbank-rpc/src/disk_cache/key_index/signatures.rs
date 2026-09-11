@@ -161,7 +161,8 @@ impl KeyIndex {
         let bloom = Bloom::with_hashes(self.signature_quota(), SIGNATURE_HASHES)?;
         let complete = empty();
         let mut state = self.state.lock().expect("key index lock");
-        if state.serial != serial {
+        // Publication requires the original generation and no untracked writers.
+        if (state.serial, state.untracked_writers) != (serial, 0) {
             return None;
         }
         state.serial += 1;

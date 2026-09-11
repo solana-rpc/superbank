@@ -22,6 +22,12 @@ use crate::processing::{ProcessingError, ProcessingResult};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const UNCONFIRMED_AFTER: Duration = Duration::from_secs(5);
+const INITIALIZATION_BACKOFF: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+mod initialization_tests;
+#[cfg(test)]
+mod integration_tests;
 
 #[derive(Clone)]
 pub(crate) struct DisconnectVerifier(Arc<Inner>);
@@ -30,6 +36,7 @@ struct Inner {
     client: HttpClient,
     cluster: Option<String>,
     topology: OnceCell<Topology>,
+    retry_after: Mutex<Option<Instant>>,
     pending: Mutex<BTreeMap<String, Pending>>,
     notify: Arc<Notify>,
     worker_running: AtomicBool,
@@ -66,6 +73,7 @@ impl DisconnectVerifier {
             client,
             cluster,
             topology: OnceCell::new(),
+            retry_after: Mutex::new(None),
             pending: Mutex::new(BTreeMap::new()),
             notify: Arc::new(Notify::new()),
             worker_running: AtomicBool::new(false),
@@ -81,7 +89,7 @@ impl DisconnectVerifier {
     ) -> ProcessingResult<DisconnectGuard> {
         self.0
             .topology
-            .get_or_try_init(|| discover(&self.0))
+            .get_or_try_init(|| self.initialize())
             .await?;
         start_worker(&self.0);
         Ok(DisconnectGuard {
@@ -89,6 +97,48 @@ impl DisconnectVerifier {
             query_id,
             permit: Some(permit),
         })
+    }
+
+    async fn initialize(&self) -> ProcessingResult<Topology> {
+        let mut attempt = InitializationAttempt::begin(&self.0.retry_after)?;
+        let topology = discover(&self.0).await?;
+        attempt.succeeded = true;
+        Ok(topology)
+    }
+}
+
+// OnceCell serializes attempts. This guard also applies backoff when the caller
+// drops initialization while it is awaiting ClickHouse; no lock crosses an await.
+struct InitializationAttempt<'a> {
+    retry_after: &'a Mutex<Option<Instant>>,
+    succeeded: bool,
+}
+
+impl<'a> InitializationAttempt<'a> {
+    fn begin(retry_after: &'a Mutex<Option<Instant>>) -> ProcessingResult<Self> {
+        if retry_after
+            .lock()
+            .expect("disconnect initialization state poisoned")
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return Err(ProcessingError::database_msg(
+                "primary disconnect verification initialization is backing off",
+            ));
+        }
+        Ok(Self {
+            retry_after,
+            succeeded: false,
+        })
+    }
+}
+
+impl Drop for InitializationAttempt<'_> {
+    fn drop(&mut self) {
+        *self
+            .retry_after
+            .lock()
+            .expect("disconnect initialization state poisoned") =
+            (!self.succeeded).then(|| Instant::now() + INITIALIZATION_BACKOFF);
     }
 }
 
@@ -237,7 +287,7 @@ fn discovery_sql(cluster: Option<&str>) -> String {
     };
     format!(
         "SELECT hostName() AS node, toUInt64(0) AS expected, toUInt8(0) AS coordinator FROM {} \
-         UNION ALL SELECT hostName() AS node, (SELECT count() FROM system.clusters WHERE cluster = {}) AS expected, \
+         UNION ALL SELECT hostName() AS node, ifNull((SELECT count() FROM system.clusters WHERE cluster = {}), toUInt64(0)) AS expected, \
          toUInt8(1) AS coordinator FROM system.one",
         table(Some(cluster), "one"),
         quoted(cluster),
@@ -283,7 +333,7 @@ async fn resolve_cluster(owner: &Inner) -> ProcessingResult<Option<String>> {
     if !cluster.contains('{') {
         return Ok(Some(cluster.into()));
     }
-    let rows = fetch::<MacroRow>(&owner.client, &macro_sql(cluster)?).await?;
+    let rows = fetch::<MacroRow>(&owner.client, &macro_sql(cluster)?, "macro_resolution").await?;
     let mut rows = rows.into_iter();
     let resolved = rows
         .next()
@@ -300,8 +350,22 @@ async fn resolve_cluster(owner: &Inner) -> ProcessingResult<Option<String>> {
 }
 
 async fn discover(owner: &Inner) -> ProcessingResult<Topology> {
+    let topology = discover_topology(owner).await?;
+    // Exercise the same table, decoder, coverage checks and settings needed to
+    // release admission. A unique nonempty ID prevents an empty-set shortcut.
+    let id = next_required_query_id("status_disconnect_preflight");
+    probe_topology(&owner.client, &topology, &[id], "capability_probe").await?;
+    Ok(topology)
+}
+
+async fn discover_topology(owner: &Inner) -> ProcessingResult<Topology> {
     let cluster = resolve_cluster(owner).await?;
-    let rows = fetch::<DiscoveryRow>(&owner.client, &discovery_sql(cluster.as_deref())).await?;
+    let rows = fetch::<DiscoveryRow>(
+        &owner.client,
+        &discovery_sql(cluster.as_deref()),
+        "discovery",
+    )
+    .await?;
     Ok(Topology {
         nodes: validate_topology(rows, cluster.is_some())?,
         cluster,
@@ -365,8 +429,17 @@ async fn probe(owner: &Inner, ids: &[String]) -> ProcessingResult<HashSet<String
         .topology
         .get()
         .expect("topology precedes source submission");
+    probe_topology(&owner.client, topology, ids, "termination_probe").await
+}
+
+async fn probe_topology(
+    client: &HttpClient,
+    topology: &Topology,
+    ids: &[String],
+    phase: &'static str,
+) -> ProcessingResult<HashSet<String>> {
     let rows =
-        fetch::<ProbeRow>(&owner.client, &probe_sql(topology.cluster.as_deref(), ids)).await?;
+        fetch::<ProbeRow>(client, &probe_sql(topology.cluster.as_deref(), ids), phase).await?;
     validate_observation(rows, &topology.nodes)
 }
 
@@ -399,6 +472,7 @@ fn validate_observation(
 async fn fetch<T: clickhouse::RowOwned + clickhouse::RowRead>(
     client: &HttpClient,
     sql: &str,
+    phase: &'static str,
 ) -> ProcessingResult<Vec<T>> {
     let query = client
         .query(sql)
@@ -421,8 +495,16 @@ async fn fetch<T: clickhouse::RowOwned + clickhouse::RowRead>(
         .with_setting("use_query_cache", "0");
     tokio::time::timeout(PROBE_TIMEOUT, query.fetch_all::<T>())
         .await
-        .map_err(|error| ProcessingError::timeout("primary disconnect verification", error))?
-        .map_err(|error| ProcessingError::database("primary disconnect verification", error))
+        .map_err(|error| {
+            tracing::warn!(phase, %error, "Primary disconnect verification timed out");
+            ProcessingError::timeout("primary disconnect verification", error)
+        })?
+        .map_err(|error| {
+            // Log the SDK cause before wrapping it in the stable RPC-facing context.
+            // Do not log the client, credentials or SQL/request payload.
+            tracing::warn!(phase, ?error, "Primary disconnect verification failed");
+            ProcessingError::database("primary disconnect verification", error)
+        })
 }
 
 #[cfg(test)]
@@ -731,6 +813,10 @@ mod tests {
         bytes.extend_from_slice(value.as_bytes());
     }
 
+    fn is_termination_probe(sql: &str) -> bool {
+        sql.contains("system.processes") && !sql.contains("status_disconnect_preflight")
+    }
+
     #[tokio::test]
     async fn worker_batches_ids_uses_http_settings_and_stops_with_owner() {
         use axum::extract::OriginalUri;
@@ -805,7 +891,7 @@ mod tests {
             assert_eq!(params["max_execution_time_leaf"], "1");
             assert!(params.contains_key("query_id"));
             assert!(!sql.contains("KILL"));
-            if sql.contains("system.processes") {
+            if is_termination_probe(&sql) {
                 assert!(sql.contains("q1") && sql.contains("q2"));
                 probes += 1;
             }

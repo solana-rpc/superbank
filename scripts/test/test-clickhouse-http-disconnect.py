@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Exercise HTTP disconnect cancellation on an isolated three-node ClickHouse cluster.
 
-Requires Docker. Never connects to an existing ClickHouse endpoint. Example:
+Requires Docker and the Rust build prerequisites. Never connects to an existing ClickHouse endpoint. Example:
   python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/ch-disconnect
 
 The proxy is deliberately small and transparent; this proves server/proxy mechanics,
@@ -14,10 +14,13 @@ on exit. JSON evidence and generated configuration remain in --output.
 import argparse
 import contextlib
 import http.client
+import http.server
+import os
 import json
 import pathlib
 import select
 import socket
+import socketserver
 import subprocess
 import threading
 import time
@@ -59,6 +62,7 @@ class Cluster:
 <background_pool_size>4</background_pool_size><background_schedule_pool_size>4</background_schedule_pool_size>
 <background_merges_mutations_concurrency_ratio>8</background_merges_mutations_concurrency_ratio>
 <remote_servers><fixture>{shards}</fixture></remote_servers>
+<macros><cluster>fixture</cluster></macros>
 <zookeeper><node><host>{self.nodes[0]}</host><port>9181</port></node></zookeeper>
 <distributed_ddl><path>/fixture/ddl</path><pool_size>1</pool_size></distributed_ddl>
 <query_log><flush_interval_milliseconds>100</flush_interval_milliseconds></query_log>
@@ -81,8 +85,8 @@ class Cluster:
                     f"{common}:/etc/clickhouse-server/config.d/fixture.xml:ro"]
             if i == 0:
                 args += ["-v", f"{keeper}:/etc/clickhouse-server/config.d/keeper.xml:ro"]
-            docker(*args, self.image)
             self.created.append(name)
+            docker(*args, self.image)
             self.ports.append(int(docker("port", name, "8123/tcp").rsplit(":", 1)[1]))
         for i in range(3):
             wait_for(lambda i=i: self.ready(i), 90)
@@ -92,6 +96,16 @@ class Cluster:
         for i in range(3):
             self.sql("CREATE VIEW slow AS "
                      "SELECT number, sleepEachRow(0.05) AS delay FROM numbers(600)", i)
+        for i in range(3):
+            self.sql("CREATE TABLE fixture_signatures_local (signature FixedString(64), "
+                     "sig_bucket UInt64 MATERIALIZED cityHash64(signature)%32,slot UInt64, "
+                     "slot_idx UInt32,err Nullable(String)) ENGINE=MergeTree "
+                     "ORDER BY (sig_bucket,signature,slot,slot_idx)", i)
+        self.sql("CREATE TABLE fixture_signatures AS fixture_signatures_local "
+                 "ENGINE=Distributed(fixture,default,fixture_signatures_local)")
+        self.sql("INSERT INTO fixture_signatures_local (signature,slot,slot_idx,err) VALUES "
+                 f"(unhex('{('11' * 64)}'),17,1,NULL),"
+                 f"(unhex('{('33' * 64)}'),19,2,'\"BlockhashNotFound\"')")
         self.sql("CREATE TABLE slow_all (number UInt64, delay UInt8) "
                  "ENGINE=Distributed(fixture,default,slow)")
 
@@ -129,6 +143,9 @@ class Cluster:
 
     def close(self):
         for name in reversed(self.created):
+            with contextlib.suppress(subprocess.CalledProcessError):
+                docker("cp", f"{name}:/var/log/clickhouse-server/clickhouse-server.err.log",
+                       str(self.output / f"{name}.err.log"))
             with contextlib.suppress(subprocess.CalledProcessError):
                 logs = docker("logs", name)
                 (self.output / f"{name}.log").write_text(logs)
@@ -189,6 +206,105 @@ class Proxy:
         self.thread.join(timeout=2)
         assert not self.thread.is_alive(), "Proxy did not stop"
         assert self.error is None, self.error
+
+
+class GatewayHandler(socketserver.BaseRequestHandler):
+    """Transparent persistent connections, including production binary compression."""
+    def handle(self):
+        try:
+            with socket.create_connection(("127.0.0.1", self.server.upstream_port)) as upstream:
+                sockets = [self.request, upstream]
+                while not self.server.stopping.is_set():
+                    ready, _, _ = select.select(sockets, [], [], 0.1)
+                    for source in ready:
+                        data = source.recv(65536)
+                        if not data:
+                            return
+                        target = upstream if source is self.request else self.request
+                        target.sendall(data)
+        except OSError:
+            return
+
+
+class ControlHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        cluster = self.server.cluster
+        actions = {
+            "/pause-replica": lambda: docker("pause", cluster.nodes[2]),
+            "/resume-replica": lambda: docker("unpause", cluster.nodes[2]),
+            "/block-ddl": lambda: block_ddl(cluster),
+            "/assert-ddl-blocked": lambda: assert_ddl_blocked(cluster),
+        }
+        try:
+            actions[self.path]()
+            self.send_response(200)
+        except (KeyError, AssertionError, RuntimeError, subprocess.CalledProcessError):
+            self.send_response(500)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def rust_test_binary(output, explicit):
+    if explicit:
+        return explicit.resolve()
+    root = pathlib.Path(__file__).resolve().parents[2]
+    command = ["cargo", "test", "-p", "superbank-rpc", "--lib", "--all-features", "--locked",
+               "--no-run", "--message-format=json"]
+    with (output / "rust-build.log").open("w") as log:
+        result = subprocess.run(command, cwd=root, stdout=subprocess.PIPE, stderr=log, text=True)
+    artifacts = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    with (output / "rust-build.log").open("a") as log:
+        for row in artifacts:
+            if row.get("reason") == "compiler-message":
+                log.write(row.get("message", {}).get("rendered") or "")
+    result.check_returncode()
+    executables = {row["executable"] for row in artifacts if row.get("reason") == "compiler-artifact"
+                   and row.get("executable") and row.get("profile", {}).get("test")
+                   and row.get("target", {}).get("name") == "superbank_rpc"
+                   and row.get("target", {}).get("kind") == ["lib"]}
+    assert len(executables) == 1, f"Expected one RPC test executable: {executables}"
+    return pathlib.Path(executables.pop())
+
+
+def validate_rust_test_binary(executable):
+    test_filter = "clickhouse::disconnect::integration_tests::"
+    listed = subprocess.check_output([str(executable), test_filter, "--ignored", "--list"], text=True)
+    assert listed.count(": test") == 3, "All three real protocol tests must be present in the library test binary"
+
+
+def run_rust_integration(cluster, executable):
+    gateway = socketserver.ThreadingTCPServer(("127.0.0.1", 0), GatewayHandler)
+    gateway.daemon_threads = True
+    gateway.upstream_port = cluster.ports[0]
+    gateway.stopping = threading.Event()
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ControlHandler)
+    control.cluster = cluster
+    workers = [threading.Thread(target=server.serve_forever, daemon=True) for server in (gateway, control)]
+    for worker in workers:
+        worker.start()
+    env = os.environ.copy()
+    env["SUPERBANK_DISCONNECT_TEST_URL"] = f"http://127.0.0.1:{gateway.server_address[1]}"
+    env["SUPERBANK_DISCONNECT_TEST_CONTROL_URL"] = f"http://127.0.0.1:{control.server_address[1]}"
+    test_filter = "clickhouse::disconnect::integration_tests::"
+    command = [str(executable), test_filter, "--ignored", "--nocapture", "--test-threads=1"]
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=150)
+        (cluster.output / "rust-integration.log").write_text(result.stdout + result.stderr)
+        result.check_returncode()
+        assert "3 passed; 0 failed" in result.stdout, "No silently skipped protocol tests"
+        return {"passed": True, "tests": 3, "production_validation_and_compression": True}
+    finally:
+        with contextlib.suppress(subprocess.CalledProcessError):
+            docker("unpause", cluster.nodes[2])
+        gateway.stopping.set()
+        for server in (gateway, control):
+            server.shutdown()
+            server.server_close()
+        for worker in workers:
+            worker.join(timeout=2)
 
 
 def request_bytes(query_id, streaming):
@@ -288,6 +404,13 @@ def delayed_forwarding_control(cluster):
         wait_for(lambda: not any(cluster.active(query_id)), 5)
 
 
+def assert_ddl_blocked(cluster):
+    count = int(cluster.sql("SELECT count() FROM system.distributed_ddl_queue "
+                            "WHERE query LIKE '%ddl_queued%' AND status='Inactive'").strip())
+    assert count == 3, "DDL blocker finished before cancellation verification"
+    return count
+
+
 def block_ddl(cluster):
     cluster.sql("CREATE TABLE ddl_blocker ON CLUSTER fixture ENGINE=Memory AS SELECT "
                 "number,sleepEachRow(0.05) delay FROM numbers(800) "
@@ -305,9 +428,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--image", default=IMAGE)
+    parser.add_argument("--rust-test-binary", type=pathlib.Path, help="Use a prebuilt RPC test executable")
     args = parser.parse_args()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
+    executable = rust_test_binary(args.output, args.rust_test_binary)
+    validate_rust_test_binary(executable)
     cluster = Cluster(args.output, args.image)
     report = {"image": args.image, "cases": [], "passed": False}
     try:
@@ -331,6 +457,15 @@ def main():
             "SELECT count() FROM system.distributed_ddl_queue WHERE query LIKE '%ddl_queued%' "
             "AND status='Inactive'").strip())
         assert report["queued_ddl_still_inactive"] == 3, "DDL blocker finished before gate completed"
+        report["kill_queries"] = [int(cluster.sql(
+            "SELECT count() FROM system.query_log WHERE startsWith(query, 'KILL QUERY')", i).strip())
+            for i in range(3)]
+        assert report["kill_queries"] == [0, 0, 0]
+        wait_for(lambda: int(cluster.sql("SELECT count() FROM system.distributed_ddl_queue "
+                                        "WHERE status IN ('Active','Inactive')").strip()) == 0, 50)
+        cluster.sql("DROP TABLE ddl_blocker ON CLUSTER fixture SETTINGS distributed_ddl_task_timeout=10")
+        cluster.sql("DROP TABLE ddl_queued ON CLUSTER fixture SETTINGS distributed_ddl_task_timeout=10")
+        report["rust_integration"] = run_rust_integration(cluster, executable)
         report["kill_queries"] = [int(cluster.sql(
             "SELECT count() FROM system.query_log WHERE startsWith(query, 'KILL QUERY')", i).strip())
             for i in range(3)]

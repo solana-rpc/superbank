@@ -278,6 +278,57 @@ async fn reset_rejects_allocations_and_builds_from_the_old_generation() {
 }
 
 #[tokio::test]
+async fn writer_overflow_rejects_inflight_signature_allocation_until_recovery() {
+    let index = index();
+    let writers: Vec<_> = (100..228).map(|slot| index.mutation(slot, slot)).collect();
+    let mut untracked = None;
+    let allocation = index
+        .ensure_signature_partition(1, || {
+            // The 129th writer resets the index while a bitmap is outside the map.
+            untracked = Some(index.mutation(10, 19).signature_fill(false));
+            true
+        })
+        .await;
+    assert!(allocation.is_none());
+
+    // A failed untracked fill may still publish coverage, but never a negative filter.
+    untracked.as_mut().unwrap().finish_signatures(false);
+    assert_eq!(candidates(&index, b"fill").outcome(), "unknown");
+    assert!(index.ensure_signature_partition(1, || true).await.is_none());
+    drop(untracked);
+    drop(writers);
+
+    let token = index.ensure_signature_partition(1, || false).await.unwrap();
+    assert_eq!(candidates(&index, b"fill").outcome(), "unknown");
+    index
+        .insert_signature_hashes(
+            &BTreeMap::from([(1, token)]),
+            &[(10, SignatureHash::new(b"fill"))],
+        )
+        .unwrap();
+    assert!(index.finish_signature_build(1, token));
+    assert_eq!(candidates(&index, b"fill").outcome(), "possible");
+    assert_eq!(candidates(&index, b"absent").outcome(), "absent");
+}
+
+#[tokio::test]
+async fn writer_overflow_rejects_allocation_even_after_untracked_writer_finishes() {
+    let index = index();
+    let _writers: Vec<_> = (100..228).map(|slot| index.mutation(slot, slot)).collect();
+    assert!(
+        index
+            .ensure_signature_partition(1, || {
+                // The writer can finish before the allocator reacquires the state lock.
+                drop(index.mutation(10, 19).signature_fill(false));
+                true
+            })
+            .await
+            .is_none()
+    );
+    assert_eq!(candidates(&index, b"fill").outcome(), "unknown");
+}
+
+#[tokio::test]
 async fn edges_holes_and_budget_exhaustion_remain_conservative() {
     let index = index();
     for partition in 1..=4 {

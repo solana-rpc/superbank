@@ -112,9 +112,15 @@ Existing `{cluster}` macro support is preserved. For standalone development, set
 `CLICKHOUSE_CLUSTER=''`; verification then covers the single server behind that URL.
 Before submitting the first protected read, discovery validates unique `hostName()` identities
 against `system.clusters` and requires the coordinator to belong to the discovered cluster.
-The application account must be able to read `system.clusters`, `system.one`, and
+Initialization also executes the actual process-inspection probe with a unique query ID
+and requires complete replica coverage before caching success. The application account
+must be able to read `system.clusters`, `system.one`, and
 `system.processes` across all replicas and use the required query settings. Unavailable,
 ambiguous, or unsupported discovery fails before submitting the source lookup.
+Failed or cancelled initialization attempts share a one-second retry backoff across client
+clones. Requests during backoff fail promptly without submitting discovery or source work;
+their admission permits are released. Internal verification logs include the failing phase
+and underlying ClickHouse error; external RPC errors remain unchanged.
 
 One verifier is shared by client clones. On abandonment it retains the source permit until
 two consecutive, fully covered observations show neither the query ID nor its
@@ -630,7 +636,7 @@ Table selection (environment variables, read at startup):
 | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE` | `default.token_owner_activity` | — |
 
 Shard routing:
-When `CLICKHOUSE_SCOPE=distributed`, superbank-rpc sends every ClickHouse query through `CLICKHOUSE_URL`. It does not read `CLICKHOUSE_TOPOLOGY_CONFIG`, discover `system.clusters`, connect to shard endpoints, query local tables, or validate local schemas. Explicit shard-local settings are ignored with a startup warning.
+When `CLICKHOUSE_SCOPE=distributed`, superbank-rpc sends every ClickHouse query through `CLICKHOUSE_URL`. Primary signature-status protection inspects `system.clusters` and replica processes through that gateway. It does not read `CLICKHOUSE_TOPOLOGY_CONFIG`, connect directly to shard endpoints, query shard-local application tables, or validate local schemas. Explicit shard-local settings are ignored with a startup warning.
 
 When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and validates local table schemas. Local tables default to `{table}_local` when not provided explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`). When a shard has multiple replicas, startup selects the first reachable replica, warns about unavailable replicas, and fails only if no replica is reachable for a shard. Background health checks move traffic away from failed replicas and restore recovered replicas to the failover pool.
 

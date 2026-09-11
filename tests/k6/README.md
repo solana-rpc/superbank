@@ -1078,3 +1078,41 @@ For the scoped Rust complexity gate, install `rust-code-analysis-cli` version `0
 have McCabe complexity at most 10; changed existing functions must not increase. After committing,
 pass the branch base revision instead of `HEAD`. Set `RUST_CODE_ANALYSIS` to an explicit tool path
 when it is not on `PATH`.
+
+### ClickHouse HTTP cancellation protocol gate
+
+The mandatory **ClickHouse protocol integration** CI job runs the production Rust
+HTTP client against three disposable ClickHouse **26.2.3.2** nodes through a transparent
+local gateway. It exercises schema validation and compression, cluster macro/discovery
+and process-probe decoding, and the real `get_signature_statuses` path with successful,
+missing, and failed transaction fixtures. Slow distributed queries test cancellation
+before response headers and after a decoded streaming row, including while distributed
+DDL is blocked. The before-headers fixture sets `wait_end_of_query=1` to hold its
+response; the streaming fixture uses deterministic hash text so compression produces
+enough wire bytes to decode an early row. These are test controls, not production
+setting changes. A paused replica must retain admission until observation recovers.
+Cancellation checks require prompt termination on all three nodes and a cancellation
+exception on the coordinator. A streaming leaf may instead report a socket reset or
+broken pipe while writing after its coordinator closes the native connection; other
+network errors and natural query completion fail the gate.
+
+Run the same gate locally with Docker and the normal Rust build prerequisites:
+
+```sh
+python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/clickhouse-protocol
+```
+
+The output directory must not exist. The script builds the all-feature RPC test executable
+before starting the cluster; `--rust-test-binary /absolute/path/to/test-executable` reuses
+an existing build. The three Rust integration tests are ignored in ordinary unit-test runs
+because they require this disposable fixture; the dedicated CI job explicitly runs all
+three and fails if any are absent, skipped, or fail. Production validation and compression
+remain enabled. The fixture removes its own containers and network on exit and retains
+`report.json`, `rust-integration.log`, generated configuration, and container logs.
+
+Two gateway controls intentionally demonstrate incompatible behavior: retaining an upstream
+request after downstream disconnect, and forwarding queued work after two quiet process
+observations. These controls must fail the cancellation gate for the overall fixture to pass.
+The production gateway must promptly close the upstream connection and discard queued work
+when the caller disconnects. This local protocol gate does not replace the staged customer
+replay or prove the deployed gateway follows that contract.

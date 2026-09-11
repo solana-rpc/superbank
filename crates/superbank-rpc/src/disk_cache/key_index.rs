@@ -131,6 +131,8 @@ impl KeyIndex {
         let mut state = self.state.lock().expect("key index lock");
         // Bound mutation metadata even if many callers concurrently poison slots.
         if state.writers.len() >= 128 {
+            // Reject allocations already in flight even if the untracked writer finishes first.
+            state.serial += 1;
             state.entries.clear();
             state.signatures.clear();
             state.epoch += 1;

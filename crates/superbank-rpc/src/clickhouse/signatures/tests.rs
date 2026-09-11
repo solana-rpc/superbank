@@ -50,7 +50,10 @@ fn record_query(
     sql: &str,
     params: &HashMap<String, String>,
 ) {
-    if !sql.contains("AS coordinator") {
+    if !["AS coordinator", "status_disconnect_preflight"]
+        .iter()
+        .any(|marker| sql.contains(marker))
+    {
         send.send((
             sql.into(),
             params.get("query_id").cloned().unwrap_or_default(),
