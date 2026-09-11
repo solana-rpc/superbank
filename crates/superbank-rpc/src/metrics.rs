@@ -51,6 +51,32 @@ struct SignatureStatusStageLabels {
     stage: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DisconnectOutcomeLabels {
+    outcome: &'static str,
+}
+
+pub(crate) fn signature_status_disconnect_pending_inc() {
+    if let Some(metrics) = metrics() {
+        metrics.signature_status_disconnect_pending.inc();
+    }
+}
+
+pub(crate) fn signature_status_disconnect_pending_dec() {
+    if let Some(metrics) = metrics() {
+        metrics.signature_status_disconnect_pending.dec();
+    }
+}
+
+pub(crate) fn signature_status_disconnect_verification(outcome: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .signature_status_disconnect_verification
+            .get_or_create(&DisconnectOutcomeLabels { outcome })
+            .inc();
+    }
+}
+
 /// Includes cancelled admission waits; no request identifiers become metric labels.
 pub(crate) struct SignatureStatusAdmission(Instant);
 
@@ -549,6 +575,8 @@ pub struct Metrics {
     rpc_batch_size: Family<BatchLabels, Histogram>,
     signature_status_batch_size: Family<SignatureStatusStageLabels, Histogram>,
     signature_status_admission_seconds: Histogram,
+    signature_status_disconnect_pending: Gauge,
+    signature_status_disconnect_verification: Family<DisconnectOutcomeLabels, Counter>,
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
@@ -681,6 +709,8 @@ impl Metrics {
         let signature_status_batch_size =
             Family::new_with_constructor(signature_status_batch_histogram as fn() -> Histogram);
         let signature_status_admission_seconds = latency_histogram();
+        let signature_status_disconnect_pending = Gauge::default();
+        let signature_status_disconnect_verification = Family::default();
         let rpc_batch_rejected = Family::default();
         let rpc_response_overhead_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
@@ -840,6 +870,16 @@ impl Metrics {
             "rpc_batch_size",
             "Batch size distribution for JSON-RPC envelopes",
             rpc_batch_size.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_disconnect_pending",
+            "Abandoned source reads retaining admission until replica absence is confirmed",
+            signature_status_disconnect_pending.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_disconnect_verification",
+            "Abandoned source verification outcomes; unconfirmed is recorded once after five seconds",
+            signature_status_disconnect_verification.clone(),
         );
         registry.register(
             "rpc_signature_status_batch_size",
@@ -1211,6 +1251,8 @@ impl Metrics {
             rpc_batch_size,
             signature_status_batch_size,
             signature_status_admission_seconds,
+            signature_status_disconnect_pending,
+            signature_status_disconnect_verification,
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
             rpc_blocks_slots_returned,

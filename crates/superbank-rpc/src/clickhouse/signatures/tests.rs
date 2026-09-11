@@ -23,6 +23,42 @@ impl Drop for MockClickHouse {
     }
 }
 
+fn discovery_response(sql: &str) -> Option<Body> {
+    if !sql.contains("AS coordinator") {
+        return None;
+    }
+    let mut rows = vec![5];
+    rows.extend_from_slice(b"node1");
+    rows.extend_from_slice(&0_u64.to_le_bytes());
+    rows.push(0);
+    rows.push(5);
+    rows.extend_from_slice(b"node1");
+    rows.extend_from_slice(&1_u64.to_le_bytes());
+    rows.push(1);
+    Some(Body::from(rows))
+}
+
+fn verification_response(sql: &str) -> Option<Body> {
+    discovery_response(sql).or_else(|| {
+        sql.contains("system.processes")
+            .then(|| Body::from(vec![5, b'n', b'o', b'd', b'e', b'1', 0]))
+    })
+}
+
+fn record_query(
+    send: &mpsc::UnboundedSender<(String, String)>,
+    sql: &str,
+    params: &HashMap<String, String>,
+) {
+    if !sql.contains("AS coordinator") {
+        send.send((
+            sql.into(),
+            params.get("query_id").cloned().unwrap_or_default(),
+        ))
+        .unwrap();
+    }
+}
+
 impl MockClickHouse {
     async fn new(response: Vec<u8>, pending_headers: bool, pending_body: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -39,11 +75,17 @@ impl MockClickHouse {
                     let body_notify = body_notify.clone();
                     async move {
                         let sql = params.get("query").cloned().unwrap_or(body);
-                        let is_kill = sql.starts_with("KILL QUERY");
-                        send.send((sql, params.get("query_id").cloned().unwrap_or_default()))
-                            .unwrap();
-                        if is_kill {
-                            return Body::empty();
+                        assert_eq!(params.get("readonly").map(String::as_str), Some("2"));
+                        assert_eq!(
+                            params
+                                .get("cancel_http_readonly_queries_on_client_close")
+                                .map(String::as_str),
+                            Some("1")
+                        );
+                        assert!(!sql.contains("KILL QUERY"));
+                        record_query(&send, &sql, &params);
+                        if let Some(body) = verification_response(&sql) {
+                            return body;
                         }
                         if pending_headers {
                             std::future::pending::<()>().await;
@@ -82,10 +124,13 @@ impl MockClickHouse {
             .with_query_cleanup_cluster("rbx2".into())
             .with_signature_status_limits(1, 2),
         );
-        client.client = client
-            .client
-            .with_validation(false)
-            .with_compression(clickhouse::Compression::None);
+        client.set_http_client_for_tests(
+            client
+                .client
+                .clone()
+                .with_validation(false)
+                .with_compression(clickhouse::Compression::None),
+        );
         client.allow_query_settings = false;
         Self {
             client,
@@ -163,6 +208,16 @@ async fn primary_consumes_successful_rows_and_disarms_cleanup() {
     );
 }
 
+async fn assert_two_absent_probes(mock: &mut MockClickHouse, id: &str) {
+    for _ in 0..2 {
+        let (probe, _) = mock.next_query().await;
+        assert!(probe.contains("system.processes"));
+        assert!(probe.contains(&format!("query_id IN ('{id}')")));
+        assert!(probe.contains(&format!("initial_query_id IN ('{id}')")));
+        assert!(!probe.contains("KILL"));
+    }
+}
+
 async fn assert_cancelled_query_cleanup(pending_headers: bool, pending_body: bool) {
     let mut mock = MockClickHouse::new(status_row(), pending_headers, pending_body).await;
     let client = mock.client.clone();
@@ -176,10 +231,7 @@ async fn assert_cancelled_query_cleanup(pending_headers: bool, pending_body: boo
     }
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
-    let (kill, _) = mock.next_query().await;
-    assert!(kill.starts_with("KILL QUERY ON CLUSTER 'rbx2'"));
-    assert!(kill.contains(&format!("query_id = '{id}'")));
-    assert!(kill.contains(&format!("initial_query_id = '{id}'")));
+    assert_two_absent_probes(&mut mock, &id).await;
     let _permits = tokio::time::timeout(
         Duration::from_secs(2),
         mock.client.acquire_signature_status_permits(),
@@ -262,8 +314,9 @@ async fn primary_timeout_during_headers_dispatches_cleanup() {
             .is_err()
     );
     let (_, id) = mock.next_query().await;
-    let (kill, _) = mock.next_query().await;
-    assert!(kill.contains(&format!("initial_query_id = '{id}'")));
+    let (probe, _) = mock.next_query().await;
+    assert!(probe.contains(&format!("initial_query_id IN ('{id}')")));
+    assert!(!probe.contains("KILL"));
 }
 
 #[tokio::test]

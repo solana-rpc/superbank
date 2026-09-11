@@ -99,28 +99,51 @@ is true. Primary admission is shared across client clones, precedes HTTP admissi
 
 Distributed primary status queries always carry a query ID and explicit thread/index-thread,
 replica, and remaining execution-time limits, including when optional query tuning is disabled.
-On cancellation or error, a bounded cleanup task retains the source permit and dispatches
-`KILL QUERY ON CLUSTER` for the query ID and matching `initial_query_id`. Configure
-`CLICKHOUSE_CLUSTER=rbx2` for RBX2. For standalone development without a ClickHouse cluster, set
-`CLICKHOUSE_CLUSTER=''` to issue a local kill; `scripts/dev/run-local-rpc.sh` preserves
-this explicit empty value. Existing `{cluster}` macro support is preserved.
-Local disk-cache clients never inherit the primary cleanup cluster.
+Primary **distributed HTTP** status reads send `readonly=2` and
+`cancel_http_readonly_queries_on_client_close=1` as HTTP parameters. Dropping an abandoned
+response closes its connection so ClickHouse can cancel it without the distributed DDL queue.
+These settings are scoped to this read and its verification requests; the shared client,
+other RPC methods, shard-direct cleanup, and disk-cache reads/writes keep their existing behavior.
+Do not enable `readonly` on the shared application profile to configure this feature.
 
-Cleanup has at most two seconds to dispatch, with capacity reserved by the source permit.
-A `kill_dispatched` metric means dispatch succeeded, not that every replica stopped: cluster
-kills use the distributed DDL queue. The application cap therefore is not a hard count of live
-ClickHouse queries after cleanup timeout/failure. Deployment requires verifying the application's
-`KILL QUERY`/`CLUSTER` privileges, distributed DDL availability, and actual coordinator/leaf
-termination. Shard-direct reads retain their existing transport cleanup; the new distributed
-query protections are also applied when a shard-direct request falls back to the coordinator.
+Configure `CLICKHOUSE_CLUSTER=rbx2` for RBX2. The verifier uses the configured gateway and
+`clusterAllReplicas` to inspect every replica, never direct application-to-node connections.
+Existing `{cluster}` macro support is preserved. For standalone development, set
+`CLICKHOUSE_CLUSTER=''`; verification then covers the single server behind that URL.
+Before submitting the first protected read, discovery validates unique `hostName()` identities
+against `system.clusters` and requires the coordinator to belong to the discovered cluster.
+The application account must be able to read `system.clusters`, `system.one`, and
+`system.processes` across all replicas and use the required query settings. Unavailable,
+ambiguous, or unsupported discovery fails before submitting the source lookup.
+
+One verifier is shared by client clones. On abandonment it retains the source permit until
+two consecutive, fully covered observations show neither the query ID nor its
+`initial_query_id` on any expected node. It batches pending IDs into one in-flight probe,
+checks every 250 ms, and uses one-thread, one-second HTTP/server budgets with unavailable
+shards treated as errors. After five seconds without confirmation it records `unconfirmed`,
+keeps the permit, and retries once per second. Successful later verification restores capacity.
+Probe errors, partial coverage, or changed topology never establish absence. Cached topology
+is fixed for the client lifetime; a topology change requires rediscovery through a process restart.
+If verification is unavailable, all configured source slots can remain reserved and subsequent
+status history reads can time out in admission. Other lookup methods keep their existing limits.
+
+Absence observations are operational evidence of termination, not proof of what caused it.
+This mechanism requires a gateway that closes the upstream request when the downstream closes
+and never forwards buffered requests after abandonment. A gateway that delays forwarding can
+make an absent query appear after the checks. Verify that contract on the deployed route before
+promotion; the local proxy fixture is not proof about production. There is no DDL-kill fallback
+for this path. Shard-direct/TCP paths retain their existing best-effort cleanup.
 
 Metrics `superbank_rpc_signature_status_batch_size{stage="input"|"primary_fallback"}` count
 accepted-size input arrays (including duplicates) and unresolved history candidates before
 primary admission. Fallback observations are recorded when history candidates are evaluated,
 including zero when caches resolve them. They are not JSON-RPC envelope batch sizes or counts
 of submitted ClickHouse queries. `superbank_rpc_signature_status_admission_seconds` includes
-both successful and cancelled primary admission waits. Cleanup outcomes remain under
-`superbank_rpc_clickhouse_shard_query_cleanup_total_total{operation="signature_statuses"}`.
+both successful and cancelled primary admission waits.
+`superbank_rpc_signature_status_disconnect_pending` counts abandoned reads still retaining
+source capacity. `superbank_rpc_signature_status_disconnect_verification_total{outcome="confirmed_absent"|"unconfirmed"}`
+counts absence confirmations and five-second failures (once per abandoned query). Legacy cleanup
+outcomes remain under `superbank_rpc_clickhouse_shard_query_cleanup_total_total{operation="signature_statuses"}`.
 
 See the [miss replay and cancellation gate](../../tests/k6/README.md) for the matched-rate
 256-signature workload. Preserve PR #88's fast-negative behavior during warm and cold cache

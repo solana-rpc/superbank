@@ -363,7 +363,6 @@ impl ClickHouseClient {
 
             let signature_filter = self.signature_status_filter(signatures)?;
             let signature_statuses_table = &self.signature_statuses_table;
-            let settings_clause = self.signature_status_settings(deadline)?;
             let query = format!(
                 "SELECT
                     signature,
@@ -377,14 +376,14 @@ impl ClickHouseClient {
                     PREWHERE ({signature_filter}){cache_scope}
                     GROUP BY signature
                  )
-                 {settings_clause}",
+                 ",
                 cache_scope = self.cache_slot_predicate(),
                 signature_statuses_table = signature_statuses_table,
-                signature_filter = signature_filter,
-                settings_clause = settings_clause
+                signature_filter = signature_filter
             );
-            let (query, query_id, mut cleanup) =
-                self.annotate_signature_status_query(query, source_permit);
+            let (query, query_id, mut cleanup) = self
+                .prepare_signature_status_query(query, source_permit, deadline)
+                .await?;
 
             #[derive(Deserialize, clickhouse::Row)]
             struct StatusRow {
@@ -394,9 +393,12 @@ impl ClickHouseClient {
             }
 
             let start = Instant::now();
-            let mut cursor = http_query_with_id(&self.client, &query, query_id)
-                .fetch::<StatusRow>()
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let mut cursor = super::client::SignatureStatusCleanup::before_submission(
+                self.signature_status_http_query(&query, query_id)
+                    .fetch::<StatusRow>()
+                    .map_err(|error| ProcessingError::database(error.to_string(), error)),
+                &mut cleanup,
+            )?;
 
             let mut results = Vec::new();
             while let Some(row) = cursor
@@ -415,7 +417,7 @@ impl ClickHouseClient {
                 });
             }
 
-            super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
+            super::client::SignatureStatusCleanup::disarm_optional(&mut cleanup);
             let timings = QueryTimings {
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 received_bytes: cursor.received_bytes(),
@@ -428,6 +430,28 @@ impl ClickHouseClient {
             Ok((results, timings))
         })
         .await
+    }
+
+    async fn prepare_signature_status_query(
+        &self,
+        query: String,
+        source_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
+    ) -> ProcessingResult<(
+        String,
+        Option<String>,
+        Option<super::client::SignatureStatusCleanup>,
+    )> {
+        let (mut query, query_id, mut cleanup) = self
+            .annotate_signature_status_query(query, source_permit)
+            .await?;
+        // Discovery consumes the same operation deadline as admission and execution.
+        let settings = super::client::SignatureStatusCleanup::before_submission(
+            self.signature_status_settings(deadline),
+            &mut cleanup,
+        )?;
+        query.push_str(&settings);
+        Ok((query, query_id, cleanup))
     }
 
     fn signature_status_filter(&self, signatures: &[String]) -> ProcessingResult<String> {
@@ -1044,3 +1068,7 @@ impl ClickHouseClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "signatures/settings_tests.rs"]
+mod settings_tests;

@@ -26,6 +26,7 @@ use crate::processing::{ProcessingError, ProcessingResult};
 
 use super::cache::SignatureSlotCache;
 use super::constants::DEFAULT_BUCKET_MODULUS;
+use super::disconnect::{DisconnectGuard, DisconnectVerifier};
 use super::gsfa::GsfaShardRouter;
 use super::queries::{
     GSFA_REQUIRED_COLUMNS, SIGNATURES_REQUIRED_COLUMNS, TOKEN_OWNER_REQUIRED_COLUMNS,
@@ -68,6 +69,32 @@ pub(crate) fn shard_tcp_query_timeout_for(query_timeout: Duration) -> Duration {
 
     let tcp_timeout_ms = timeout_ms.saturating_sub(reserve_ms);
     Duration::from_millis(tcp_timeout_ms.min(u128::from(u64::MAX)) as u64)
+}
+
+pub(crate) enum SignatureStatusCleanup {
+    Http(Box<HttpQueryCleanup>),
+    Disconnect(DisconnectGuard),
+}
+
+impl SignatureStatusCleanup {
+    /// Construction failures precede HTTP submission and need no absence probes.
+    pub(crate) fn before_submission<T>(
+        result: ProcessingResult<T>,
+        cleanup: &mut Option<Self>,
+    ) -> ProcessingResult<T> {
+        if result.is_err() {
+            Self::disarm_optional(cleanup);
+        }
+        result
+    }
+
+    pub(crate) fn disarm_optional(cleanup: &mut Option<Self>) {
+        match cleanup {
+            Some(Self::Http(guard)) => guard.disarm(),
+            Some(Self::Disconnect(guard)) => guard.disarm(),
+            None => {}
+        }
+    }
 }
 
 struct ShardTcpQueryCleanup {
@@ -463,6 +490,7 @@ pub struct ClickHouseClient {
     pub(crate) signature_status_max_threads: usize,
     signature_status_sem: Arc<Semaphore>,
     query_cleanup_cluster: Option<String>,
+    signature_status_disconnect: DisconnectVerifier,
     pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) replica_health_check_interval: Duration,
@@ -574,7 +602,7 @@ const HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 ///
 /// NB: this mirrors the crate default's plain-HTTP connector. superbank builds `clickhouse`
 /// without a TLS feature, so ClickHouse connections are HTTP-only, the same as before.
-fn build_clickhouse_http_client(
+pub(super) fn build_clickhouse_http_client(
     url: &str,
     database: &str,
     username: &str,
@@ -815,6 +843,8 @@ impl ClickHouseClient {
             config
         });
 
+        let signature_status_disconnect =
+            DisconnectVerifier::new(client.clone(), query_cleanup_cluster.clone());
         Self {
             client,
             url: url.to_string(),
@@ -852,6 +882,7 @@ impl ClickHouseClient {
             signature_status_max_threads: signature_status_max_threads.max(1),
             signature_status_sem: Arc::new(Semaphore::new(signature_status_max_concurrency.max(1))),
             query_cleanup_cluster,
+            signature_status_disconnect,
             inflation_reward_limits,
             tcp_access_check_timeout,
             replica_health_check_interval,
@@ -1021,15 +1052,37 @@ impl ClickHouseClient {
 
     /// Arm only immediately before submitting the HTTP request. Required IDs are independent
     /// of optional query-ID logging. A cancelled source retains admission through cleanup.
-    pub(crate) fn annotate_signature_status_query(
+    pub(crate) async fn annotate_signature_status_query(
         &self,
         query: String,
         source_permit: Option<OwnedSemaphorePermit>,
-    ) -> (String, Option<String>, Option<HttpQueryCleanup>) {
+    ) -> ProcessingResult<(String, Option<String>, Option<SignatureStatusCleanup>)> {
         let Some(source_permit) = source_permit else {
-            return self.annotate_lookup_query(query, "signature_statuses");
+            let (query, id, cleanup) = self.annotate_lookup_query(query, "signature_statuses");
+            return Ok((
+                query,
+                id,
+                cleanup.map(Box::new).map(SignatureStatusCleanup::Http),
+            ));
         };
         let (query, query_id) = super::util::annotate_required_query(query, "signature_statuses");
+        self.primary_signature_status_cleanup(query_id.clone(), source_permit)
+            .await
+            .map(|cleanup| (query, Some(query_id), Some(cleanup)))
+    }
+
+    async fn primary_signature_status_cleanup(
+        &self,
+        query_id: String,
+        source_permit: OwnedSemaphorePermit,
+    ) -> ProcessingResult<SignatureStatusCleanup> {
+        if self.signature_status_native_disconnect() {
+            return self
+                .signature_status_disconnect
+                .arm(query_id, source_permit)
+                .await
+                .map(SignatureStatusCleanup::Disconnect);
+        }
         let cluster = self.query_cleanup_cluster.clone().or_else(|| {
             self.shard_routing
                 .as_ref()
@@ -1040,10 +1093,38 @@ impl ClickHouseClient {
             cluster,
             "signature_statuses",
             self.query_timeout,
-            query_id.clone(),
+            query_id,
         );
         cleanup.source_permit = Some(source_permit);
-        (query, Some(query_id), Some(cleanup))
+        Ok(SignatureStatusCleanup::Http(Box::new(cleanup)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_http_client_for_tests(&mut self, client: HttpClient) {
+        self.signature_status_disconnect =
+            DisconnectVerifier::new(client.clone(), self.query_cleanup_cluster.clone());
+        self.client = client;
+    }
+
+    fn signature_status_native_disconnect(&self) -> bool {
+        self.cache_partition.is_none()
+            && self.routing_policy.scope == RoutingScope::Distributed
+            && self.transport_http()
+    }
+
+    pub(crate) fn signature_status_http_query(
+        &self,
+        sql: &str,
+        query_id: Option<String>,
+    ) -> clickhouse::query::Query {
+        let query = super::util::http_query_with_id(&self.client, sql, query_id);
+        if self.signature_status_native_disconnect() {
+            query
+                .with_setting("readonly", "2")
+                .with_setting("cancel_http_readonly_queries_on_client_close", "1")
+        } else {
+            query
+        }
     }
 
     fn cache_settings_or(&self, settings: String, timeout: Duration) -> String {
@@ -2547,18 +2628,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_status_cleanup_retains_admission_and_targets_cluster() {
+    async fn shard_direct_status_cleanup_retains_admission_and_targets_cluster() {
         let mut server = CleanupServer::new().await;
-        let client = server.client();
+        let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
         let (source, http) = client
             .acquire_signature_status_permits()
             .await
             .expect("admission");
-        let (_, id, cleanup) = client.annotate_signature_status_query("SELECT 1".into(), source);
+        let (_, id, cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
         let id = id.expect("required ID");
         assert!(client.shard_routing.is_none());
         assert_eq!(
-            cleanup.as_ref().expect("guard").cluster.as_deref(),
+            match cleanup.as_ref().expect("guard") {
+                super::SignatureStatusCleanup::Http(guard) => guard.cluster.as_deref(),
+                _ => panic!("expected legacy cleanup"),
+            },
             Some("rbx2")
         );
         drop(http);
@@ -2580,15 +2668,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_status_cleanup_timeout_releases_admission() {
+    async fn shard_direct_status_cleanup_timeout_releases_admission() {
         let mut server = CleanupServer::new().await;
         let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
         client.query_timeout = Duration::from_millis(50);
         let (source, http) = client
             .acquire_signature_status_permits()
             .await
             .expect("admission");
-        let (_, _, cleanup) = client.annotate_signature_status_query("SELECT 1".into(), source);
+        let (_, _, cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
         drop(http);
         drop(cleanup);
         server.next_request().await;
@@ -2604,16 +2696,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_status_cleanup_connection_failure_releases_admission() {
+    async fn shard_direct_status_cleanup_connection_failure_releases_admission() {
         let server = CleanupServer::new().await;
-        let client = server.client();
+        let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
         server.task.abort();
         tokio::task::yield_now().await;
         let (source, http) = client
             .acquire_signature_status_permits()
             .await
             .expect("admission");
-        let (_, _, cleanup) = client.annotate_signature_status_query("SELECT 1".into(), source);
+        let (_, _, cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
         drop(http);
         drop(cleanup);
         let permits = tokio::time::timeout(
@@ -2628,17 +2724,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_status_success_disarms_cleanup_and_releases_admission() {
+    async fn shard_direct_status_success_disarms_cleanup_and_releases_admission() {
         let mut server = CleanupServer::new().await;
-        let client = server.client();
+        let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
         let (source, http) = client
             .acquire_signature_status_permits()
             .await
             .expect("admission");
-        let (_, id, mut cleanup) =
-            client.annotate_signature_status_query("SELECT 1".into(), source);
+        let (_, id, mut cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
         assert!(id.is_some());
-        super::HttpQueryCleanup::disarm_optional(&mut cleanup);
+        super::SignatureStatusCleanup::disarm_optional(&mut cleanup);
         assert_eq!(client.signature_status_sem.available_permits(), 1);
         drop(http);
         drop(cleanup);

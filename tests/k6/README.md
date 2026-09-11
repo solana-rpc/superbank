@@ -153,9 +153,8 @@ k6 run tests/k6/scenarios/performance/superbank-rpc-signature-statuses-misses.js
   --summary-export=/tmp/status-misses-summary.json
 ```
 
-The scenario cycles through the corpus in batches, preserving the same ordering
-across runs. With the default corpus size, keys repeat every 128 seconds. A corpus
-must contain at least one batch of distinct signatures; completed responses must
+The scenario consumes the corpus without reuse, preserving the same ordering
+across runs. A corpus must contain enough distinct signatures for the whole run; completed responses must
 contain exactly that many null statuses. The scenario checks base58 characters and
 length; fixture preparation must ensure signatures decode to 64 bytes and are absent.
 
@@ -168,6 +167,7 @@ length; fixture preparation must ensure signatures decode to 64 bytes and are ab
 | `MISS_TIMEOUT_MS` | `1000` | Actual k6 HTTP request timeout, in milliseconds |
 | `MISS_VUS` | rate × timeout, rounded up, plus 2 | Preallocated VUs; increase if iterations drop |
 | `MISS_RUN_LABEL` | `unspecified` | Metric label and JSON-RPC request-ID prefix |
+| `MISS_LOG_REQUESTS` | `false` | Emit safe per-request start/end JSON with IDs, timestamps, HTTP status and timeout result; no signatures |
 
 Compare baseline OR and candidate tuple-IN builds against the **same populated
 ClickHouse snapshot, corpus, settings, request rate, and client timeout**. Run each
@@ -187,7 +187,8 @@ or `clusterAllReplicas('test_cluster', system.query_log)` for a test cluster:
 SELECT hostName() AS node, query_id, initial_query_id, is_initial_query,
        toString(type) AS type, query_duration_ms,
        toUnixTimestamp64Milli(query_start_time_microseconds) AS started_at_ms,
-       ProfileEvents
+       toUnixTimestamp64Milli(event_time_microseconds) AS event_at_ms,
+       exception_code, ProfileEvents
 FROM system.query_log
 WHERE event_date = '2026-09-11'
   AND event_time >= '2026-09-11 12:00:00'
@@ -213,17 +214,54 @@ exports and externally established correlation, run the offline report:
 python3 scripts/test/report-signature-status-query-log.py /tmp/query-log.jsonl \
   --require-leaves --max-query-ms=5000 \
   --cancellations=/tmp/cancellations.jsonl \
-  --observed-until-ms=1789129860000 --cancellation-grace-ms=5000
+  --observed-until-ms=1789129860000 --cancellation-grace-ms=5000 \
+  --expected-nodes node1 node2 node3 \
+  --clock-bounds=/tmp/clock-bounds.json --count-manifest=/tmp/query-log-counts.json
 ```
 
-The report keeps coordinator and leaf CPU/duration distributions separate, checks
-observed query lifetimes, and checks whether each correlated execution ended within
-five seconds of the supplied abandonment time. It fails for missing start/terminal
-evidence, missing distributed leaves, incomplete collection intervals, or exceeded
-deadlines. Without cancellation correlation it still prints latency/CPU summaries
-but exits unsuccessfully with cancellation unverified. Collection must include all
-participating replicas; the report cannot detect an omitted server or fabricated
-correlation. No script issues database commands or production requests implicitly.
+The report keeps coordinator and leaf CPU/duration distributions separate. Valid
+`ExceptionBeforeStart` events need no `QueryStart`; started executions require a terminal event.
+Timing uses actual `event_at_ms` with independently measured clock bounds, not start plus duration.
+Supply clock offsets as node clock minus client clock, in milliseconds:
+
+```json
+{"node1":{"min_offset_ms":-20,"max_offset_ms":20}}
+```
+
+Include every expected node, even idle nodes, in both the clock file and count manifest.
+Independently count the same query-ID scope and time window after flushing query logs;
+include all four event types, including zero counts. `observed_until_ms` uses client time:
+
+```json
+{"node1":{"observed_until_ms":1789129860000,"counts":{"QueryStart":1,"QueryFinish":0,"ExceptionBeforeStart":0,"ExceptionWhileProcessing":1}}}
+```
+
+Incomplete coverage, mismatched counts, insufficient observation intervals, missing correlation,
+or uncertain clock bounds leave cancellation unverified and fail the gate. Successful natural
+`QueryFinish` establishes termination only. Disconnect cancellation requires a cancelled
+coordinator (394/735) and a 735 event in the correlated family, under a controlled test with no
+competing cancellation source. A replica's 735 can reflect closure of an internal native stream;
+it alone does not identify which external client caused it. Safe k6 start/end records help
+correlation but do not by themselves map requests to ClickHouse query IDs. Missing logs never
+prove cancellation. The reporter makes no network requests.
+
+Run the isolated disconnect fixture (Docker required):
+
+```bash
+python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/ch-disconnect
+python3 -m unittest discover -s scripts/test -p 'test_report_signature_status_query_log.py'
+```
+
+It creates three local ClickHouse 26.2.3.2 nodes with Keeper and a proxy, checks cancellation
+before headers and during streaming, and repeats with distributed DDL blocked. Negative proxy
+controls must demonstrate that incompatible gateway behavior fails the acceptance contract.
+It removes its containers/network on exit and leaves evidence in the output directory.
+
+Promotion still requires the actual staging gateway, a populated full-retention snapshot,
+30 minutes at 256 fresh signatures / 2 RPS / 1-second client deadlines after cache warmup,
+complete coordinator/replica evidence, and bounded CPU and active-query counts. Verify read-only
+settings reach ClickHouse, upstream disconnects propagate, and no buffered request is forwarded
+after downstream abandonment. Local fixture success is not a production-performance result.
 
 ### Basic Load Test (`superbank-rpc-get-signatures.js`)
 

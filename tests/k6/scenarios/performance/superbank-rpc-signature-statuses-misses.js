@@ -19,6 +19,7 @@ const rate = positiveInteger('MISS_RPS', 2);
 const timeoutMs = positiveInteger('MISS_TIMEOUT_MS', 1000);
 const duration = __ENV.MISS_DURATION || '30m';
 const runLabel = __ENV.MISS_RUN_LABEL || 'unspecified';
+const logRequests = __ENV.MISS_LOG_REQUESTS === 'true';
 const rpcUrl = __ENV.RPC_URL || 'http://localhost:8899';
 if (batchSize > 256) throw new Error('MISS_BATCH_SIZE must be at most 256');
 if (!__ENV.MISS_SIGNATURE_FILE) throw new Error('MISS_SIGNATURE_FILE is required');
@@ -81,6 +82,10 @@ export default function () {
   const batch = Array.from({ length: batchSize }, (_, index) => signatures[offset + index]);
   const requestId = `${runLabel}:${iteration}`;
   const started = Date.now();
+  if (logRequests) console.log(JSON.stringify({
+    event: 'status_miss_request_started', requestId, started_at_ms: started,
+    batchSize, corpusOffset: offset, timeoutMs,
+  }));
   const response = http.post(rpcUrl, JSON.stringify({
     jsonrpc: '2.0', id: requestId, method: 'getSignatureStatuses',
     params: [batch, { searchTransactionHistory: true }],
@@ -90,10 +95,15 @@ export default function () {
     headers: { 'Content-Type': 'application/json' },
     tags: { name: 'getSignatureStatuses known misses' },
   });
+  const ended = Date.now();
   const timedOut = response.error_code === 1050;
   const complete = isCompleteMiss(response, requestId);
+  if (logRequests) console.log(JSON.stringify({
+    event: 'status_miss_request_ended', requestId, started_at_ms: started, ended_at_ms: ended,
+    status: response.status, error_code: response.error_code || 0, timedOut, complete,
+  }));
   requests.add(1);
-  clientElapsed.add(Date.now() - started);
+  clientElapsed.add(ended - started);
   completedMisses.add(complete);
   clientTimeouts.add(timedOut ? 1 : 0);
   unexpectedResponses.add(!complete && !timedOut ? 1 : 0);
