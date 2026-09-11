@@ -25,6 +25,11 @@ writer that matches the same schemas).
 - `getTransactionsForAddress` (custom)
 
 Notes:
+- `getBlock` requires the returned transaction count to match block metadata for `full`,
+  `accounts`, and `signatures` responses. Incomplete cache data falls back to storage;
+  inconsistent source data returns internal error (`-32603`) without populating the serialized
+  response cache. A subsequent request can succeed once storage is repaired. Metadata-only
+  (`transactionDetails: "none"`) requests and valid empty blocks remain supported.
 - JSON-RPC batch envelopes are supported. Batch execution is bounded by
   `RPC_MAX_BATCH_SIZE` and `RPC_BATCH_CONCURRENCY_LIMIT`.
 - Requests without an `id` are normalized to `id: null` and still return
@@ -789,3 +794,20 @@ Head cache activation metric:
   - `x_rpc_node="none"`: head cache is disabled.
   - `x_rpc_node="unknown"`: head cache is enabled, but upstream metadata did not include `x-rpc-node`.
   - `x_rpc_node="<value>"`: concrete upstream node identifier reported by DragonsMouth metadata.
+
+
+## getBlock completeness regression
+
+The regular Rust tests cover incomplete payload rejection and response-cache recovery.
+To also exercise real ClickHouse reads, use a local ClickHouse instance with the default
+user and permission to create databases:
+
+```bash
+BLO576_CLICKHOUSE_TEST_URL=http://127.0.0.1:8123 \
+cargo test -p superbank-rpc --all-features --locked \
+  get_block_clickhouse_partial_payload_repair -- --ignored
+```
+
+This test creates uniquely named `blo576_*` databases and drops them on success. A failed
+run can leave those test databases for inspection. With optional cache features compiled,
+it also exercises incomplete head-cache and disk-cache fallback, including disk slot poisoning.

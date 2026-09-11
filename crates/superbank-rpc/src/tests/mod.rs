@@ -179,7 +179,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
     })
 }
 
-fn test_state() -> Arc<AppState> {
+pub(crate) fn test_state() -> Arc<AppState> {
     test_state_with_token_owner_activity_available(true)
 }
 
@@ -710,7 +710,7 @@ fn head_cache_metadata(
     metadata
 }
 
-fn projection_equivalence_block_record() -> StoredBlockRecord {
+pub(crate) fn projection_equivalence_block_record() -> StoredBlockRecord {
     let mut block = base_block_record(10);
     block.metadata.block_time = Some(1_700_000_000);
     block.metadata.block_height = Some(123);
@@ -7090,4 +7090,196 @@ async fn handle_json_rpc_batch_response_aggregates_clickhouse_metrics_header() {
     let value: Value = serde_json::from_slice(&body_bytes).expect("valid JSON body");
     let items = value.as_array().expect("batch response array");
     assert_eq!(items.len(), 2);
+}
+
+/// Uses a dedicated database on an explicitly supplied local ClickHouse instance.
+#[tokio::test]
+#[ignore = "requires BLO576_CLICKHOUSE_TEST_URL pointing to local ClickHouse"]
+async fn get_block_clickhouse_partial_payload_repair() {
+    let url = std::env::var("BLO576_CLICKHOUSE_TEST_URL").expect("set BLO576_CLICKHOUSE_TEST_URL");
+    let http = reqwest::Client::new();
+    let database = format!("blo576_{}_{}", std::process::id(), current_time_millis());
+    async fn execute(http: &reqwest::Client, url: &str, sql: String) {
+        let response = http
+            .post(url)
+            .body(sql)
+            .send()
+            .await
+            .expect("ClickHouse request");
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "ClickHouse {status}: {body}");
+    }
+    execute(&http, &url, format!("CREATE DATABASE {database}")).await;
+    for ddl in [
+        include_str!("../../../../ddl/local/transactions.sql"),
+        include_str!("../../../../ddl/local/blocks_metadata.sql"),
+        include_str!("../../../../ddl/local/signatures.sql"),
+        // Use the initial view definition: the migration's projection of the materialized
+        // addr_bucket column cannot be cloned by the disk cache on ClickHouse 26.8.
+        include_str!("../../../../ddl/local/gsfa.sql")
+            .split_once("-- Update the query")
+            .expect("GSFA migration marker")
+            .0,
+    ] {
+        for statement in ddl
+            .replace("default.", &format!("{database}."))
+            .split(";\n")
+        {
+            if !statement.trim().is_empty() {
+                execute(&http, &url, statement.to_string()).await;
+            }
+        }
+    }
+    let mut slot = 600;
+    for details in ["full", "accounts", "signatures"] {
+        for cache_bytes in [0, 1024 * 1024] {
+            slot += 1;
+            execute(&http, &url, format!(
+                "INSERT INTO {database}.blocks_metadata (slot, parent_slot, blockhash, parent_blockhash, executed_transaction_count) VALUES ({slot}, {}, repeat('b', 32), repeat('p', 32), 2)", slot - 1
+            )).await;
+            let insert_transaction = |index| {
+                format!(
+                    "INSERT INTO {database}.transactions (signature, slot, slot_idx, tx_signatures, tx_num_required_signatures, tx_account_keys, tx_recent_blockhash, meta_status_ok, meta_pre_balances, meta_post_balances) VALUES (repeat('{}', 64), {slot}, {index}, [repeat('{}', 64)], 1, [repeat('k', 32)], repeat('h', 32), 1, [10], [10])",
+                    if index == 0 { 'a' } else { 'z' },
+                    if index == 0 { 'a' } else { 'z' }
+                )
+            };
+            execute(&http, &url, insert_transaction(0)).await;
+            let mut state = test_state_with_clickhouse_url(&url);
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.clickhouse.transaction_table = format!("{database}.transactions");
+            mutable.clickhouse.blocks_metadata_table = format!("{database}.blocks_metadata");
+            mutable.block_response_cache = BlockResponseCache::new(cache_bytes);
+            mutable.emit_http_errors = cache_bytes > 0;
+            #[cfg(feature = "grpc-head-cache")]
+            {
+                let head = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+                let mut metadata = base_block_record(slot).metadata;
+                metadata.executed_transaction_count = 2;
+                head.note_block_metadata(metadata);
+                let signature = Signature::new_unique();
+                let address = Pubkey::new_unique();
+                let mut record = base_transaction_record();
+                record.slot = slot;
+                record.signature = *signature.as_array();
+                head.insert_for_tests(signature, record, 0, &[address], CommitmentLevel::Finalized);
+                head.note_slot_commitment(slot, CommitmentLevel::Finalized);
+                mutable.head_cache = Some(head);
+            }
+            #[cfg(feature = "disk-cache")]
+            let disk = {
+                use crate::disk_cache::{DiskCache, DiskCacheConfig, SlotStatus};
+                mutable.clickhouse.use_table_names(
+                    crate::clickhouse::ClickHouseTableNames::in_database(&database),
+                );
+                mutable
+                    .clickhouse
+                    .set_token_owner_activity_available_for_tests(false);
+                let cache_database = format!("{database}_cache_{slot}");
+                let disk = Arc::new(
+                    DiskCache::open(
+                        DiskCacheConfig {
+                            url: url.clone(),
+                            database: cache_database.clone(),
+                            username: "default".to_string(),
+                            password: String::new(),
+                            required: false,
+                            retain_slots: 1000,
+                            max_bytes: 0,
+                            partition_slots: 100,
+                            query_timeout: Duration::from_secs(10),
+                            schema_check_interval: Duration::from_secs(60),
+                            memory_blocks_metadata: false,
+                            memory_retain_slots: None,
+                            memory_max_bytes: None,
+                            block_index: None,
+                        },
+                        &mutable.clickhouse,
+                    )
+                    .await
+                    .unwrap(),
+                );
+                for table in ["transactions", "blocks_metadata"] {
+                    execute(&http, &url, format!("INSERT INTO {cache_database}.{table} SELECT * FROM {database}.{table} WHERE slot = {slot}")).await;
+                }
+                // Simulate a previously covered cache slot whose transaction data is incomplete.
+                disk.publish_range_coverage(vec![(slot, SlotStatus::Covered { tx_count: 2 })])
+                    .await
+                    .unwrap();
+                mutable.disk_cache = Some(Arc::new(tokio::sync::OnceCell::new_with(Some(
+                    disk.clone(),
+                ))));
+                disk
+            };
+
+            let params = vec![
+                json!(slot),
+                json!({ "transactionDetails": details, "maxSupportedTransactionVersion": 1 }),
+            ];
+            let partial = handle_json_rpc_value(
+                state.clone(),
+                &json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "getBlock", "params": params.clone()
+                }),
+            )
+            .await;
+            assert_eq!(
+                partial.status(),
+                if cache_bytes > 0 {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                }
+            );
+            assert!(partial.headers().contains_key("X-Superbank-Metrics"));
+            let partial = parse_json_rpc_response(partial).await;
+            assert_eq!(partial.error.expect("partial must fail").code, -32603);
+            assert!(partial.result.is_none());
+            assert_eq!(state.block_response_cache.entry_count(), 0);
+            #[cfg(feature = "disk-cache")]
+            assert!(
+                !disk.covers_slot(slot),
+                "incomplete cache slot must be poisoned"
+            );
+            execute(&http, &url, insert_transaction(1)).await;
+            #[cfg(feature = "disk-cache")]
+            disk.publish_range_coverage(vec![(
+                slot,
+                crate::disk_cache::SlotStatus::Covered { tx_count: 2 },
+            )])
+            .await
+            .unwrap();
+
+            for id in [2, 3] {
+                let repaired = handle_get_block(state.clone(), json!(id), Some(params.clone()))
+                    .await
+                    .unwrap();
+                let repaired = parse_json_rpc_response(repaired).await;
+                assert!(repaired.error.is_none(), "{:?}", repaired.error);
+                assert_eq!(repaired.id, json!(id));
+                let field = if details == "signatures" {
+                    "signatures"
+                } else {
+                    "transactions"
+                };
+                assert_eq!(repaired.result.unwrap()[field].as_array().unwrap().len(), 2);
+            }
+            assert_eq!(
+                state.block_response_cache.entry_count(),
+                u64::from(cache_bytes > 0)
+            );
+            #[cfg(feature = "disk-cache")]
+            {
+                assert!(!disk.covers_slot(slot));
+                execute(
+                    &http,
+                    &url,
+                    format!("DROP DATABASE {database}_cache_{slot}"),
+                )
+                .await;
+            }
+        }
+    }
+    execute(&http, &url, format!("DROP DATABASE {database}")).await;
 }
