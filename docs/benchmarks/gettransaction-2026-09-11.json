@@ -1,0 +1,871 @@
+{
+  "image": "clickhouse/clickhouse-server:26.2.3.2",
+  "node_memory": "8g",
+  "rows_per_payload_table": 3000000,
+  "host": "macOS-15.7.4-arm64-arm-64bit",
+  "script_sha256": "6ae34af242d963cb0235642ab3f22753343213d27dcf9154f25a08d14db1822b",
+  "settings": "max_threads=2,max_execution_time=10,max_execution_time_leaf=10,optimize_skip_unused_shards=1,use_query_cache=0,log_queries=1,log_profile_events=1,use_hedged_requests=0,max_parallel_replicas=1",
+  "seed": 88,
+  "runs": 5,
+  "samples_per_run": 50,
+  "filesystem_cache": "uncontrolled; cache-cleared means ClickHouse mark/uncompressed caches only",
+  "gateway_integration": "rejected: combined query returns indistinguishable empty responses for an absent signature and a stale position whose payload exists; it cannot preserve fallback without resolving the signature again",
+  "edge_cases": {
+    "absent": {
+      "bytes": 0,
+      "http_ms": 17.742333002388477
+    },
+    "stale_combined": {
+      "bytes": 0,
+      "http_ms": 15.730334002000745
+    },
+    "stale_position": {
+      "bytes": 0,
+      "http_ms": 10.19224999618018
+    },
+    "stale_fallback": {
+      "bytes": 804,
+      "http_ms": 18.558416995801963
+    }
+  },
+  "summary": {
+    "position-cold=False": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 16.352167000150075,
+        "p95": 20.216625001921784,
+        "p99": 21.83195899851853
+      },
+      "means": {
+        "server_ms": 14.716,
+        "read_rows": 8683.52,
+        "read_bytes": 5717459.9,
+        "cpu_us": 8036.98
+      }
+    },
+    "position-cold=True": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 18.167083500884473,
+        "p95": 25.322749999759253,
+        "p99": 31.38995800691191
+      },
+      "means": {
+        "server_ms": 17.148,
+        "read_rows": 8683.52,
+        "read_bytes": 5717459.9,
+        "cpu_us": 9078.316
+      }
+    },
+    "slot_only-cold=False": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 17.477312998380512,
+        "p95": 22.573250003915746,
+        "p99": 28.157250002550427
+      },
+      "means": {
+        "server_ms": 16.032,
+        "read_rows": 16416.768,
+        "read_bytes": 5649912.556,
+        "cpu_us": 8986.976
+      }
+    },
+    "slot_only-cold=True": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 18.937437500426313,
+        "p95": 26.58066699950723,
+        "p99": 51.63008299859939
+      },
+      "means": {
+        "server_ms": 18.06,
+        "read_rows": 16384,
+        "read_bytes": 5649640.14,
+        "cpu_us": 9568.32
+      }
+    },
+    "granularity1024-cold=False": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 13.60708350330242,
+        "p95": 17.171958003018517,
+        "p99": 20.203832995321136
+      },
+      "means": {
+        "server_ms": 11.748,
+        "read_rows": 1597.44,
+        "read_bytes": 691882.62,
+        "cpu_us": 7198.824
+      }
+    },
+    "granularity1024-cold=True": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 15.821333501662593,
+        "p95": 19.909583999833558,
+        "p99": 25.571874997694977
+      },
+      "means": {
+        "server_ms": 14.312,
+        "read_rows": 1597.44,
+        "read_bytes": 691882.62,
+        "cpu_us": 8108.812
+      }
+    },
+    "two_step-cold=False": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 22.5458120003168,
+        "p95": 30.725582997547463,
+        "p99": 32.56637499725912
+      },
+      "means": {
+        "server_ms": 19.436,
+        "read_rows": 9209.368,
+        "read_bytes": 5757901.112,
+        "cpu_us": 11987.552
+      }
+    },
+    "two_step-cold=True": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 22.732354500476504,
+        "p95": 27.36124999501044,
+        "p99": 29.227624996565282
+      },
+      "means": {
+        "server_ms": 19.708,
+        "read_rows": 9207.32,
+        "read_bytes": 5757767.96,
+        "cpu_us": 11977.696
+      }
+    },
+    "combined-cold=False": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 20.783625503099756,
+        "p95": 25.460999997449107,
+        "p99": 31.980874999135267
+      },
+      "means": {
+        "server_ms": 19.408,
+        "read_rows": 9207.32,
+        "read_bytes": 5757767.96,
+        "cpu_us": 12047.8
+      }
+    },
+    "combined-cold=True": {
+      "errors": 0,
+      "http_ms": {
+        "p50": 22.481187497760402,
+        "p95": 26.85958400252275,
+        "p99": 30.312957998830825
+      },
+      "means": {
+        "server_ms": 21.092,
+        "read_rows": 9207.32,
+        "read_bytes": 5757767.96,
+        "cpu_us": 12768.676
+      }
+    }
+  },
+  "ingestion": [
+    {
+      "table": "transactions",
+      "rows": 3000000,
+      "seconds": 19.40292879199842,
+      "sampled_peak_all_table_parts_bytes": 2922025586,
+      "parts": [
+        {
+          "host": "ch-disconnect-1dc2c006af-0",
+          "table": "signatures_local",
+          "rows": 1002143,
+          "disk_bytes": 73594585,
+          "resident_parts_bytes": 430504848,
+          "compressed_bytes": 72029933,
+          "marks_bytes": 46657,
+          "primary_key_memory": 147905,
+          "parts": 224
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-0",
+          "table": "transactions_local",
+          "rows": 1000000,
+          "disk_bytes": 337166003,
+          "resident_parts_bytes": 539542706,
+          "compressed_bytes": 335758419,
+          "marks_bytes": 124655,
+          "primary_key_memory": 5616,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-1",
+          "table": "signatures_local",
+          "rows": 999090,
+          "disk_bytes": 73357307,
+          "resident_parts_bytes": 501649076,
+          "compressed_bytes": 71911505,
+          "marks_bytes": 34609,
+          "primary_key_memory": 129474,
+          "parts": 36
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-1",
+          "table": "transactions_local",
+          "rows": 1000000,
+          "disk_bytes": 337165735,
+          "resident_parts_bytes": 539542133,
+          "compressed_bytes": 335758150,
+          "marks_bytes": 124656,
+          "primary_key_memory": 5616,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-2",
+          "table": "signatures_local",
+          "rows": 998767,
+          "disk_bytes": 73335187,
+          "resident_parts_bytes": 502024145,
+          "compressed_bytes": 71890879,
+          "marks_bytes": 34450,
+          "primary_key_memory": 129410,
+          "parts": 34
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-2",
+          "table": "transactions_local",
+          "rows": 1000000,
+          "disk_bytes": 337165757,
+          "resident_parts_bytes": 539542571,
+          "compressed_bytes": 335758173,
+          "marks_bytes": 124656,
+          "primary_key_memory": 5616,
+          "parts": 10
+        }
+      ]
+    },
+    {
+      "table": "transactions1024",
+      "rows": 3000000,
+      "seconds": 22.79159441599768,
+      "sampled_peak_all_table_parts_bytes": 6185116124,
+      "parts": [
+        {
+          "host": "ch-disconnect-1dc2c006af-0",
+          "table": "signatures_local",
+          "rows": 1002143,
+          "disk_bytes": 73579319,
+          "resident_parts_bytes": 504084167,
+          "compressed_bytes": 72131721,
+          "marks_bytes": 34419,
+          "primary_key_memory": 129411,
+          "parts": 32
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-0",
+          "table": "transactions_local",
+          "rows": 1000000,
+          "disk_bytes": 337166003,
+          "resident_parts_bytes": 539542706,
+          "compressed_bytes": 335758419,
+          "marks_bytes": 124655,
+          "primary_key_memory": 5616,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-0",
+          "table": "transactions1024_local",
+          "rows": 1000000,
+          "disk_bytes": 337439669,
+          "resident_parts_bytes": 539998952,
+          "compressed_bytes": 335864455,
+          "marks_bytes": 234580,
+          "primary_key_memory": 7920,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-0",
+          "table": "signatures1024_local",
+          "rows": 1002143,
+          "disk_bytes": 73592983,
+          "resident_parts_bytes": 437336047,
+          "compressed_bytes": 72039351,
+          "marks_bytes": 45489,
+          "primary_key_memory": 146159,
+          "parts": 206
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-1",
+          "table": "signatures_local",
+          "rows": 999090,
+          "disk_bytes": 73357307,
+          "resident_parts_bytes": 501649076,
+          "compressed_bytes": 71911505,
+          "marks_bytes": 34609,
+          "primary_key_memory": 129474,
+          "parts": 36
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-1",
+          "table": "transactions_local",
+          "rows": 1000000,
+          "disk_bytes": 337165735,
+          "resident_parts_bytes": 539542133,
+          "compressed_bytes": 335758150,
+          "marks_bytes": 124656,
+          "primary_key_memory": 5616,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-1",
+          "table": "transactions1024_local",
+          "rows": 1000000,
+          "disk_bytes": 337439469,
+          "resident_parts_bytes": 539998407,
+          "compressed_bytes": 335864253,
+          "marks_bytes": 234584,
+          "primary_key_memory": 7920,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-1",
+          "table": "signatures1024_local",
+          "rows": 999090,
+          "disk_bytes": 73357307,
+          "resident_parts_bytes": 501649076,
+          "compressed_bytes": 71911505,
+          "marks_bytes": 34609,
+          "primary_key_memory": 129474,
+          "parts": 36
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-2",
+          "table": "signatures_local",
+          "rows": 998767,
+          "disk_bytes": 73335187,
+          "resident_parts_bytes": 502024145,
+          "compressed_bytes": 71890879,
+          "marks_bytes": 34450,
+          "primary_key_memory": 129410,
+          "parts": 34
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-2",
+          "table": "transactions_local",
+          "rows": 1000000,
+          "disk_bytes": 337165757,
+          "resident_parts_bytes": 539542571,
+          "compressed_bytes": 335758173,
+          "marks_bytes": 124656,
+          "primary_key_memory": 5616,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-2",
+          "table": "transactions1024_local",
+          "rows": 1000000,
+          "disk_bytes": 337439081,
+          "resident_parts_bytes": 539997870,
+          "compressed_bytes": 335863849,
+          "marks_bytes": 234582,
+          "primary_key_memory": 7920,
+          "parts": 10
+        },
+        {
+          "host": "ch-disconnect-1dc2c006af-2",
+          "table": "signatures1024_local",
+          "rows": 998767,
+          "disk_bytes": 73335187,
+          "resident_parts_bytes": 502024145,
+          "compressed_bytes": 71890879,
+          "marks_bytes": 34450,
+          "primary_key_memory": 129410,
+          "parts": 34
+        }
+      ]
+    }
+  ],
+  "before_merge": [
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "signatures_local",
+      "rows": 1002143,
+      "disk_bytes": 73579319,
+      "resident_parts_bytes": 504084167,
+      "compressed_bytes": 72131721,
+      "marks_bytes": 34419,
+      "primary_key_memory": 129411,
+      "parts": 32
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337166003,
+      "resident_parts_bytes": 539542706,
+      "compressed_bytes": 335758419,
+      "marks_bytes": 124655,
+      "primary_key_memory": 5616,
+      "parts": 10
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337439669,
+      "resident_parts_bytes": 539998952,
+      "compressed_bytes": 335864455,
+      "marks_bytes": 234580,
+      "primary_key_memory": 7920,
+      "parts": 10
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "signatures1024_local",
+      "rows": 1002143,
+      "disk_bytes": 73579319,
+      "resident_parts_bytes": 504084167,
+      "compressed_bytes": 72131721,
+      "marks_bytes": 34419,
+      "primary_key_memory": 129411,
+      "parts": 32
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "signatures_local",
+      "rows": 999090,
+      "disk_bytes": 73357307,
+      "resident_parts_bytes": 501649076,
+      "compressed_bytes": 71911505,
+      "marks_bytes": 34609,
+      "primary_key_memory": 129474,
+      "parts": 36
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337165735,
+      "resident_parts_bytes": 539542133,
+      "compressed_bytes": 335758150,
+      "marks_bytes": 124656,
+      "primary_key_memory": 5616,
+      "parts": 10
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337439469,
+      "resident_parts_bytes": 539998407,
+      "compressed_bytes": 335864253,
+      "marks_bytes": 234584,
+      "primary_key_memory": 7920,
+      "parts": 10
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "signatures1024_local",
+      "rows": 999090,
+      "disk_bytes": 73357307,
+      "resident_parts_bytes": 501649076,
+      "compressed_bytes": 71911505,
+      "marks_bytes": 34609,
+      "primary_key_memory": 129474,
+      "parts": 36
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "signatures_local",
+      "rows": 998767,
+      "disk_bytes": 73335187,
+      "resident_parts_bytes": 502024145,
+      "compressed_bytes": 71890879,
+      "marks_bytes": 34450,
+      "primary_key_memory": 129410,
+      "parts": 34
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337165757,
+      "resident_parts_bytes": 539542571,
+      "compressed_bytes": 335758173,
+      "marks_bytes": 124656,
+      "primary_key_memory": 5616,
+      "parts": 10
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337439081,
+      "resident_parts_bytes": 539997870,
+      "compressed_bytes": 335863849,
+      "marks_bytes": 234582,
+      "primary_key_memory": 7920,
+      "parts": 10
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "signatures1024_local",
+      "rows": 998767,
+      "disk_bytes": 73335187,
+      "resident_parts_bytes": 502024145,
+      "compressed_bytes": 71890879,
+      "marks_bytes": 34450,
+      "primary_key_memory": 129410,
+      "parts": 34
+    }
+  ],
+  "after_merge": [
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "signatures_local",
+      "rows": 1002143,
+      "disk_bytes": 73579319,
+      "resident_parts_bytes": 504084167,
+      "compressed_bytes": 72131721,
+      "marks_bytes": 34419,
+      "primary_key_memory": 129411,
+      "parts": 32
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337050135,
+      "resident_parts_bytes": 876592841,
+      "compressed_bytes": 335735973,
+      "marks_bytes": 46121,
+      "primary_key_memory": 1136,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337301508,
+      "resident_parts_bytes": 877300460,
+      "compressed_bytes": 335842041,
+      "marks_bytes": 135188,
+      "primary_key_memory": 7856,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "signatures1024_local",
+      "rows": 1002143,
+      "disk_bytes": 73579319,
+      "resident_parts_bytes": 504084167,
+      "compressed_bytes": 72131721,
+      "marks_bytes": 34419,
+      "primary_key_memory": 129411,
+      "parts": 32
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "signatures_local",
+      "rows": 999090,
+      "disk_bytes": 73357307,
+      "resident_parts_bytes": 501649076,
+      "compressed_bytes": 71911505,
+      "marks_bytes": 34609,
+      "primary_key_memory": 129474,
+      "parts": 36
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337049867,
+      "resident_parts_bytes": 876592000,
+      "compressed_bytes": 335735704,
+      "marks_bytes": 46122,
+      "primary_key_memory": 1136,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337301293,
+      "resident_parts_bytes": 877299700,
+      "compressed_bytes": 335841839,
+      "marks_bytes": 135174,
+      "primary_key_memory": 7856,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "signatures1024_local",
+      "rows": 999090,
+      "disk_bytes": 73357307,
+      "resident_parts_bytes": 501649076,
+      "compressed_bytes": 71911505,
+      "marks_bytes": 34609,
+      "primary_key_memory": 129474,
+      "parts": 36
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "signatures_local",
+      "rows": 998767,
+      "disk_bytes": 73335187,
+      "resident_parts_bytes": 502024145,
+      "compressed_bytes": 71890879,
+      "marks_bytes": 34450,
+      "primary_key_memory": 129410,
+      "parts": 34
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337049890,
+      "resident_parts_bytes": 876592461,
+      "compressed_bytes": 335735727,
+      "marks_bytes": 46122,
+      "primary_key_memory": 1136,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337300936,
+      "resident_parts_bytes": 877298806,
+      "compressed_bytes": 335841435,
+      "marks_bytes": 135218,
+      "primary_key_memory": 7856,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "signatures1024_local",
+      "rows": 998767,
+      "disk_bytes": 73335187,
+      "resident_parts_bytes": 502024145,
+      "compressed_bytes": 71890879,
+      "marks_bytes": 34450,
+      "primary_key_memory": 129410,
+      "parts": 34
+    }
+  ],
+  "final_parts": [
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "signatures_local",
+      "rows": 1002143,
+      "disk_bytes": 73579319,
+      "resident_parts_bytes": 504084167,
+      "compressed_bytes": 72131721,
+      "marks_bytes": 34419,
+      "primary_key_memory": 129411,
+      "parts": 32
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337050135,
+      "resident_parts_bytes": 876592841,
+      "compressed_bytes": 335735973,
+      "marks_bytes": 46121,
+      "primary_key_memory": 1136,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337301508,
+      "resident_parts_bytes": 877300460,
+      "compressed_bytes": 335842041,
+      "marks_bytes": 135188,
+      "primary_key_memory": 7856,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "signatures1024_local",
+      "rows": 1002143,
+      "disk_bytes": 73579319,
+      "resident_parts_bytes": 504084167,
+      "compressed_bytes": 72131721,
+      "marks_bytes": 34419,
+      "primary_key_memory": 129411,
+      "parts": 32
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "signatures_local",
+      "rows": 999091,
+      "disk_bytes": 73358127,
+      "resident_parts_bytes": 501649896,
+      "compressed_bytes": 71911715,
+      "marks_bytes": 34683,
+      "primary_key_memory": 129636,
+      "parts": 37
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337049867,
+      "resident_parts_bytes": 876592000,
+      "compressed_bytes": 335735704,
+      "marks_bytes": 46122,
+      "primary_key_memory": 1136,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337301293,
+      "resident_parts_bytes": 877299700,
+      "compressed_bytes": 335841839,
+      "marks_bytes": 135174,
+      "primary_key_memory": 7856,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "signatures1024_local",
+      "rows": 999090,
+      "disk_bytes": 73357307,
+      "resident_parts_bytes": 501649076,
+      "compressed_bytes": 71911505,
+      "marks_bytes": 34609,
+      "primary_key_memory": 129474,
+      "parts": 36
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "signatures_local",
+      "rows": 998767,
+      "disk_bytes": 73335187,
+      "resident_parts_bytes": 502024145,
+      "compressed_bytes": 71890879,
+      "marks_bytes": 34450,
+      "primary_key_memory": 129410,
+      "parts": 34
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions_local",
+      "rows": 1000000,
+      "disk_bytes": 337049890,
+      "resident_parts_bytes": 876592461,
+      "compressed_bytes": 335735727,
+      "marks_bytes": 46122,
+      "primary_key_memory": 1136,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions1024_local",
+      "rows": 1000000,
+      "disk_bytes": 337300936,
+      "resident_parts_bytes": 877298806,
+      "compressed_bytes": 335841435,
+      "marks_bytes": 135218,
+      "primary_key_memory": 7856,
+      "parts": 2
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "signatures1024_local",
+      "rows": 998767,
+      "disk_bytes": 73335187,
+      "resident_parts_bytes": 502024145,
+      "compressed_bytes": 71890879,
+      "marks_bytes": 34450,
+      "primary_key_memory": 129410,
+      "parts": 34
+    }
+  ],
+  "merge_wall_seconds": 12.02977379100048,
+  "merges": [
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions_local",
+      "merges": 4,
+      "duration_ms": 2511,
+      "read_rows": 1600000,
+      "read_bytes": 1672706528,
+      "peak_memory": 93129028
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-0",
+      "table": "transactions1024_local",
+      "merges": 4,
+      "duration_ms": 3764,
+      "read_rows": 1600000,
+      "read_bytes": 1673105696,
+      "peak_memory": 29804556
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions_local",
+      "merges": 4,
+      "duration_ms": 5416,
+      "read_rows": 1600000,
+      "read_bytes": 1672706528,
+      "peak_memory": 93129092
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-1",
+      "table": "transactions1024_local",
+      "merges": 4,
+      "duration_ms": 3686,
+      "read_rows": 1600000,
+      "read_bytes": 1673105696,
+      "peak_memory": 29804460
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions_local",
+      "merges": 4,
+      "duration_ms": 4223,
+      "read_rows": 1600000,
+      "read_bytes": 1672706528,
+      "peak_memory": 93129028
+    },
+    {
+      "host": "ch-disconnect-1dc2c006af-2",
+      "table": "transactions1024_local",
+      "merges": 4,
+      "duration_ms": 3621,
+      "read_rows": 1600000,
+      "read_bytes": 1673105696,
+      "peak_memory": 29804556
+    }
+  ],
+  "plans": {
+    "combined": "node 0:\nReadFromRemote (Read from remote replica)\n",
+    "position": "node 0:\nReadFromRemote (Read from remote replica)\n",
+    "granularity1024": "node 0:\nReadFromRemote (Read from remote replica)\n",
+    "slot_only": "node 0:\nReadFromRemote (Read from remote replica)\n",
+    "local_position": "node 0:\nExpression ((Project names + (Projection + Change column names to column identifiers)))\n  Limit (preliminary LIMIT)\n    ReadFromMergeTree (default.transactions_local)\n    Indexes:\n      MinMax\n        Keys:\n          slot\n        Condition: (slot in [432001, 432001])\n        Parts: 0/2\n        Granules: 0/140\n      Partition\n        Keys:\n          intDiv(slot, 432000)\n        Condition: (intDiv(slot, 432000) in [1, 1])\n        Parts: 0/0\n        Granules: 0/0\n      PrimaryKey\n        Keys:\n          slot\n          slot_idx\n          signature\n        Condition: and((signature in [\\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\', \\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\']), and((slot_idx in [234, 234]), (slot in [432001, 432001])))\n        Parts: 0/0\n        Granules: 0/0\n      Skip\n        Name: bf_signature\n        Description: bloom_filter GRANULARITY 64\n        Parts: 0/0\n        Granules: 0/0\n      Ranges: 0\n\nnode 1:\nExpression ((Project names + (Projection + Change column names to column identifiers)))\n  Limit (preliminary LIMIT)\n    ReadFromMergeTree (default.transactions_local)\n    Indexes:\n      MinMax\n        Keys:\n          slot\n        Condition: (slot in [432001, 432001])\n        Parts: 1/2\n        Granules: 70/140\n      Partition\n        Keys:\n          intDiv(slot, 432000)\n        Condition: (intDiv(slot, 432000) in [1, 1])\n        Parts: 1/1\n        Granules: 70/70\n      PrimaryKey\n        Keys:\n          slot\n          slot_idx\n          signature\n        Condition: and((signature in [\\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\', \\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\']), and((slot_idx in [234, 234]), (slot in [432001, 432001])))\n        Parts: 1/1\n        Granules: 1/70\n        Search Algorithm: binary search\n      Skip\n        Name: bf_signature\n        Description: bloom_filter GRANULARITY 64\n        Parts: 1/1\n        Granules: 1/1\n      Ranges: 1\n\nnode 2:\nExpression ((Project names + (Projection + Change column names to column identifiers)))\n  Limit (preliminary LIMIT)\n    ReadFromMergeTree (default.transactions_local)\n    Indexes:\n      MinMax\n        Keys:\n          slot\n        Condition: (slot in [432001, 432001])\n        Parts: 0/2\n        Granules: 0/140\n      Partition\n        Keys:\n          intDiv(slot, 432000)\n        Condition: (intDiv(slot, 432000) in [1, 1])\n        Parts: 0/0\n        Granules: 0/0\n      PrimaryKey\n        Keys:\n          slot\n          slot_idx\n          signature\n        Condition: and((signature in [\\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\', \\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\']), and((slot_idx in [234, 234]), (slot in [432001, 432001])))\n        Parts: 0/0\n        Granules: 0/0\n      Skip\n        Name: bf_signature\n        Description: bloom_filter GRANULARITY 64\n        Parts: 0/0\n        Granules: 0/0\n      Ranges: 0\n",
+    "local_granularity1024": "node 0:\nExpression ((Project names + (Projection + Change column names to column identifiers)))\n  Limit (preliminary LIMIT)\n    ReadFromMergeTree (default.transactions1024_local)\n    Indexes:\n      MinMax\n        Keys:\n          slot\n        Condition: (slot in [432001, 432001])\n        Parts: 0/2\n        Granules: 0/980\n      Partition\n        Keys:\n          intDiv(slot, 432000)\n        Condition: (intDiv(slot, 432000) in [1, 1])\n        Parts: 0/0\n        Granules: 0/0\n      PrimaryKey\n        Keys:\n          slot\n          slot_idx\n          signature\n        Condition: and((signature in [\\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\', \\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\']), and((slot_idx in [234, 234]), (slot in [432001, 432001])))\n        Parts: 0/0\n        Granules: 0/0\n      Skip\n        Name: bf_signature\n        Description: bloom_filter GRANULARITY 64\n        Parts: 0/0\n        Granules: 0/0\n      Ranges: 0\n\nnode 1:\nExpression ((Project names + (Projection + Change column names to column identifiers)))\n  Limit (preliminary LIMIT)\n    ReadFromMergeTree (default.transactions1024_local)\n    Indexes:\n      MinMax\n        Keys:\n          slot\n        Condition: (slot in [432001, 432001])\n        Parts: 1/2\n        Granules: 490/980\n      Partition\n        Keys:\n          intDiv(slot, 432000)\n        Condition: (intDiv(slot, 432000) in [1, 1])\n        Parts: 1/1\n        Granules: 490/490\n      PrimaryKey\n        Keys:\n          slot\n          slot_idx\n          signature\n        Condition: and((signature in [\\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\', \\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\']), and((slot_idx in [234, 234]), (slot in [432001, 432001])))\n        Parts: 1/1\n        Granules: 2/490\n        Search Algorithm: binary search\n      Skip\n        Name: bf_signature\n        Description: bloom_filter GRANULARITY 64\n        Parts: 1/1\n        Granules: 2/2\n      Ranges: 1\n\nnode 2:\nExpression ((Project names + (Projection + Change column names to column identifiers)))\n  Limit (preliminary LIMIT)\n    ReadFromMergeTree (default.transactions1024_local)\n    Indexes:\n      MinMax\n        Keys:\n          slot\n        Condition: (slot in [432001, 432001])\n        Parts: 0/2\n        Granules: 0/980\n      Partition\n        Keys:\n          intDiv(slot, 432000)\n        Condition: (intDiv(slot, 432000) in [1, 1])\n        Parts: 0/0\n        Granules: 0/0\n      PrimaryKey\n        Keys:\n          slot\n          slot_idx\n          signature\n        Condition: and((signature in [\\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\', \\'\ufffd\u0004U\ufffd`.\ufffdo\ufffd\u0002\ufffdv\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd603^\ufffd\u001f\\\\tz\ufffd\u000e\ufffd\ufffdv\ufffd\ufffd(Q/.\\\\0\u000b\ufffd\u0004\ufffd\ufffd\u0013>\ufffd\u001cn\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd\ufffd`\ufffdK\ufffd\u031e\ufffd\ufffd\\']), and((slot_idx in [234, 234]), (slot in [432001, 432001])))\n        Parts: 0/0\n        Granules: 0/0\n      Skip\n        Name: bf_signature\n        Description: bloom_filter GRANULARITY 64\n        Parts: 0/0\n        Granules: 0/0\n      Ranges: 0\n"
+  },
+  "raw_report_sha256": "15aeaf5d3f78057c615b3f1474d278081e87da1d28b31ed126533a7601cd52c5",
+  "raw_report_path": "/tmp/gettx-bench-matched/report.json",
+  "validation": {
+    "workspace_tests_passed": 666,
+    "rpc_all_features_tests_passed": 551,
+    "disk_integration_passed": true,
+    "http_parity_comparisons": 1041,
+    "http_parity_checks_passed": 1122,
+    "http_parity_requests": 2122,
+    "basic_k6_requests": 1244,
+    "complexity_functions_checked": 25,
+    "protocol_passed": true
+  },
+  "complete_measurements": 2500,
+  "measurements_with_terminal_telemetry": 2500
+}

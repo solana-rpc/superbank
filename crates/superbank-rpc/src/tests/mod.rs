@@ -179,7 +179,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
     })
 }
 
-fn test_state() -> Arc<AppState> {
+pub(crate) fn test_state() -> Arc<AppState> {
     test_state_with_token_owner_activity_available(true)
 }
 

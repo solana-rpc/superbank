@@ -146,6 +146,15 @@ pub(crate) enum SlotStatus {
     NotCovered,
 }
 
+/// Only `Absent` authorizes an RPC null response. Unavailable includes ordinary
+/// unpinned cache misses, since the primary may hold older transactions.
+#[derive(Debug)]
+pub(crate) enum DiskTransactionResult {
+    Found(Arc<StoredTransactionRecord>),
+    Absent,
+    Unavailable,
+}
+
 #[derive(Debug)]
 pub(crate) enum DiskBlockResult {
     Found(Box<StoredBlockPayload>),
