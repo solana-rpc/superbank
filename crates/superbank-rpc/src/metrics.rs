@@ -42,6 +42,69 @@ fn batch_size_histogram() -> Histogram {
     Histogram::new(BATCH_SIZE_BUCKETS)
 }
 
+fn signature_status_batch_histogram() -> Histogram {
+    Histogram::new([0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0])
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SignatureStatusStageLabels {
+    stage: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DisconnectOutcomeLabels {
+    outcome: &'static str,
+}
+
+pub(crate) fn signature_status_disconnect_pending_inc() {
+    if let Some(metrics) = metrics() {
+        metrics.signature_status_disconnect_pending.inc();
+    }
+}
+
+pub(crate) fn signature_status_disconnect_pending_dec() {
+    if let Some(metrics) = metrics() {
+        metrics.signature_status_disconnect_pending.dec();
+    }
+}
+
+pub(crate) fn signature_status_disconnect_verification(outcome: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .signature_status_disconnect_verification
+            .get_or_create(&DisconnectOutcomeLabels { outcome })
+            .inc();
+    }
+}
+
+/// Includes cancelled admission waits; no request identifiers become metric labels.
+pub(crate) struct SignatureStatusAdmission(Instant);
+
+impl SignatureStatusAdmission {
+    pub(crate) fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Drop for SignatureStatusAdmission {
+    fn drop(&mut self) {
+        if let Some(metrics) = metrics() {
+            metrics
+                .signature_status_admission_seconds
+                .observe(self.0.elapsed().as_secs_f64());
+        }
+    }
+}
+
+pub(crate) fn signature_status_batch_size(stage: &'static str, size: usize) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .signature_status_batch_size
+            .get_or_create(&SignatureStatusStageLabels { stage })
+            .observe(size as f64);
+    }
+}
+
 const BLOCK_SLOT_COUNT_BUCKETS: [f64; 20] = [
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
     16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 500000.0,
@@ -510,6 +573,10 @@ pub struct Metrics {
     rpc_batch_requests: Family<BatchLabels, Counter>,
     rpc_batch_items: Family<BatchLabels, Counter>,
     rpc_batch_size: Family<BatchLabels, Histogram>,
+    signature_status_batch_size: Family<SignatureStatusStageLabels, Histogram>,
+    signature_status_admission_seconds: Histogram,
+    signature_status_disconnect_pending: Gauge,
+    signature_status_disconnect_verification: Family<DisconnectOutcomeLabels, Counter>,
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
@@ -569,6 +636,12 @@ pub struct Metrics {
 
     #[cfg(feature = "disk-cache")]
     disk_cache_key_seconds: Family<DiskCacheReadLabels, Histogram>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_signature_membership_seconds: Family<DiskCacheReadLabels, Histogram>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_signature_index_partitions: Gauge,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_signature_index_unknown_partitions: Gauge,
     #[cfg(feature = "disk-cache")]
     disk_cache_key_index_bytes: Gauge,
     #[cfg(feature = "disk-cache")]
@@ -633,6 +706,11 @@ impl Metrics {
         let rpc_batch_items = Family::default();
         let rpc_batch_size =
             Family::new_with_constructor(batch_size_histogram as fn() -> Histogram);
+        let signature_status_batch_size =
+            Family::new_with_constructor(signature_status_batch_histogram as fn() -> Histogram);
+        let signature_status_admission_seconds = latency_histogram();
+        let signature_status_disconnect_pending = Gauge::default();
+        let signature_status_disconnect_verification = Family::default();
         let rpc_batch_rejected = Family::default();
         let rpc_response_overhead_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
@@ -697,6 +775,13 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         let disk_cache_key_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_signature_membership_seconds =
+            Family::new_with_constructor(signature_membership_histogram as fn() -> Histogram);
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_signature_index_partitions = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_signature_index_unknown_partitions = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_key_index_bytes = Gauge::default();
         #[cfg(feature = "disk-cache")]
@@ -785,6 +870,26 @@ impl Metrics {
             "rpc_batch_size",
             "Batch size distribution for JSON-RPC envelopes",
             rpc_batch_size.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_disconnect_pending",
+            "Abandoned source reads retaining admission until replica absence is confirmed",
+            signature_status_disconnect_pending.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_disconnect_verification",
+            "Abandoned source verification outcomes; unconfirmed is recorded once after five seconds",
+            signature_status_disconnect_verification.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_batch_size",
+            "getSignatureStatuses input and unresolved primary-fallback signature counts",
+            signature_status_batch_size.clone(),
+        );
+        registry.register(
+            "rpc_signature_status_admission_seconds",
+            "Primary signature-status source and HTTP admission wait, including cancelled waits",
+            signature_status_admission_seconds.clone(),
         );
         registry.register(
             "rpc_batch_rejected_total",
@@ -1012,6 +1117,21 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         {
             registry.register(
+                "disk_cache_signature_membership_seconds",
+                "In-memory signature membership latency and outcomes",
+                disk_cache_signature_membership_seconds.clone(),
+            );
+            registry.register(
+                "disk_cache_signature_index_partitions",
+                "Complete signature membership partitions",
+                disk_cache_signature_index_partitions.clone(),
+            );
+            registry.register(
+                "disk_cache_signature_index_unknown_partitions",
+                "Unknown signature membership partitions",
+                disk_cache_signature_index_unknown_partitions.clone(),
+            );
+            registry.register(
                 "disk_cache_key_seconds",
                 "Partition routing index instrumentation",
                 disk_cache_key_seconds.clone(),
@@ -1129,6 +1249,10 @@ impl Metrics {
             rpc_batch_requests,
             rpc_batch_items,
             rpc_batch_size,
+            signature_status_batch_size,
+            signature_status_admission_seconds,
+            signature_status_disconnect_pending,
+            signature_status_disconnect_verification,
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
             rpc_blocks_slots_returned,
@@ -1182,6 +1306,12 @@ impl Metrics {
             superbank_grpc_stream_errors_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_key_seconds,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_signature_membership_seconds,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_signature_index_partitions,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_signature_index_unknown_partitions,
             #[cfg(feature = "disk-cache")]
             disk_cache_key_index_bytes,
             #[cfg(feature = "disk-cache")]
@@ -2001,6 +2131,11 @@ pub(crate) fn disk_cache_set_active(active: bool) {
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_read(operation: &'static str, outcome: &'static str) {
+    disk_cache_read_count(operation, outcome, 1);
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_read_count(operation: &'static str, outcome: &'static str, count: u64) {
     if let Some(metrics) = metrics() {
         metrics
             .disk_cache_reads_total
@@ -2008,7 +2143,7 @@ pub(crate) fn disk_cache_read(operation: &'static str, outcome: &'static str) {
                 operation: operation.to_string(),
                 outcome: outcome.to_string(),
             })
-            .inc();
+            .inc_by(count);
     }
 }
 
@@ -2223,6 +2358,38 @@ pub(crate) fn disk_cache_key_index(bytes: u64, indexed: u64, unknown: u64) {
             .set(clamp_i64(indexed));
         metrics
             .disk_cache_key_index_unknown_partitions
+            .set(clamp_i64(unknown));
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+fn signature_membership_histogram() -> Histogram {
+    Histogram::new([
+        0.000001, 0.000005, 0.000010, 0.000025, 0.000050, 0.000100, 0.000250, 0.001, 0.01,
+    ])
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_signature_membership(outcome: &'static str, seconds: f64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_signature_membership_seconds
+            .get_or_create(&DiskCacheReadLabels {
+                operation: "signature_membership".into(),
+                outcome: outcome.into(),
+            })
+            .observe(seconds);
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_signature_index(ready: u64, unknown: u64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .disk_cache_signature_index_partitions
+            .set(clamp_i64(ready));
+        metrics
+            .disk_cache_signature_index_unknown_partitions
             .set(clamp_i64(unknown));
     }
 }

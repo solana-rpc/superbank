@@ -116,6 +116,153 @@ k6 run tests/k6/scenarios/fuzz/fuzz-options-rpc-methods.js -e RPC_URL=http://loc
 
 ## Test Scenarios
 
+### Signature-status miss replay and cancellation evidence
+
+`scenarios/performance/superbank-rpc-signature-statuses-misses.js` sends one
+`getSignatureStatuses` request per iteration with `searchTransactionHistory: true`.
+Defaults are **256 distinct signatures, 2 requests/second, a 1-second HTTP request
+timeout, and 30 minutes**. Arrival rate is independent of response speed. Dropped
+iterations fail the test; timeouts are recorded separately from valid all-null
+responses and unexpected HTTP/JSON-RPC responses. Expected timeouts do not fail
+the replay by themselves, so a successful k6 exit is not an availability or
+backend-cancellation acceptance result.
+
+Use an isolated fixture and a reproducible corpus known to be absent from it.
+This creates 1,000,000 syntactically valid 64-byte signatures without sending traffic.
+The replay never recycles signatures: exhaustion aborts the run, preventing repeated negative
+condition-cache hits from masking fresh-miss cost. The default run needs 921,600 signatures
+plus a small scheduling buffer:
+
+```bash
+python3 - <<'PY' > /tmp/status-misses.txt
+import hashlib
+alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+for index in range(1_000_000):
+    raw = hashlib.sha512(f'superbank-status-miss-v1:{index}'.encode()).digest()
+    value, encoded = int.from_bytes(raw, 'big'), ''
+    while value:
+        value, digit = divmod(value, 58)
+        encoded = alphabet[digit] + encoded
+    print('1' * (len(raw) - len(raw.lstrip(b'\0'))) + encoded)
+PY
+
+k6 run tests/k6/scenarios/performance/superbank-rpc-signature-statuses-misses.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e MISS_SIGNATURE_FILE=/tmp/status-misses.txt \
+  -e MISS_RUN_LABEL=tuple-in-warm \
+  --summary-export=/tmp/status-misses-summary.json
+```
+
+The scenario consumes the corpus without reuse, preserving the same ordering
+across runs. A corpus must contain enough distinct signatures for the whole run; completed responses must
+contain exactly that many null statuses. The scenario checks base58 characters and
+length; fixture preparation must ensure signatures decode to 64 bytes and are absent.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `MISS_SIGNATURE_FILE` | required | Whitespace-separated, distinct, known-absent signatures |
+| `MISS_BATCH_SIZE` | `256` | Signatures per request, from 1 through 256 |
+| `MISS_RPS` | `2` | Positive integer requests per second |
+| `MISS_DURATION` | `30m` | Replay duration; use `5s` for a local harness smoke test |
+| `MISS_TIMEOUT_MS` | `1000` | Actual k6 HTTP request timeout, in milliseconds |
+| `MISS_VUS` | rate × timeout, rounded up, plus 2 | Preallocated VUs; increase if iterations drop |
+| `MISS_RUN_LABEL` | `unspecified` | Metric label and JSON-RPC request-ID prefix |
+| `MISS_LOG_REQUESTS` | `false` | Emit safe per-request start/end JSON with IDs, timestamps, HTTP status and timeout result; no signatures |
+
+Compare baseline OR and candidate tuple-IN builds against the **same populated
+ClickHouse snapshot, corpus, settings, request rate, and client timeout**. Run each
+for 30 minutes in both cold and warm states. Record table parts, retention, index
+coverage, cache state, and replica topology separately: neither this scenario nor
+an empty local ClickHouse establishes full-retention performance. Cache preparation
+is an explicit fixture operation, not an action performed by this scenario.
+
+Start each isolated RPC process with a distinct `CLICKHOUSE_QUERY_ID_PREFIX`, for
+example `miss-or` and `miss-tuple-in`. `MISS_RUN_LABEL` only labels k6 requests; it
+does **not** establish a mapping to ClickHouse query IDs. Export all start and
+terminal query-log rows for the chosen prefix and exact run window from every
+coordinator and replica. Include these columns, using `system.query_log` locally
+or `clusterAllReplicas('test_cluster', system.query_log)` for a test cluster:
+
+```sql
+SELECT hostName() AS node, query_id, initial_query_id, is_initial_query,
+       toString(type) AS type, query_duration_ms,
+       toUnixTimestamp64Milli(query_start_time_microseconds) AS started_at_ms,
+       toUnixTimestamp64Milli(event_time_microseconds) AS event_at_ms,
+       exception_code, ProfileEvents
+FROM system.query_log
+WHERE event_date = '2026-09-11'
+  AND event_time >= '2026-09-11 12:00:00'
+  AND event_time < '2026-09-11 12:31:00'
+  AND startsWith(initial_query_id, 'miss-tuple-in:signature_statuses:')
+FORMAT JSONEachRow
+```
+
+Adjust dates and collection end to the run. Allow asynchronous query-log delivery
+to complete, and retain a `system.processes` snapshot after the cancellation
+deadline as independent evidence of remaining work. Missing logs do not prove
+cancellation. Collect **actual externally observed client-abandonment timestamps
+correlated to exact initial ClickHouse query IDs**, as JSONEachRow records:
+
+```json
+{"initial_query_id":"miss-tuple-in:signature_statuses:1","cancelled_at_ms":1789128001000}
+```
+
+Do not synthesize these timestamps as query start plus the k6 timeout. With complete
+exports and externally established correlation, run the offline report:
+
+```bash
+python3 scripts/test/report-signature-status-query-log.py /tmp/query-log.jsonl \
+  --require-leaves --max-query-ms=5000 \
+  --cancellations=/tmp/cancellations.jsonl \
+  --observed-until-ms=1789129860000 --cancellation-grace-ms=5000 \
+  --expected-nodes node1 node2 node3 \
+  --clock-bounds=/tmp/clock-bounds.json --count-manifest=/tmp/query-log-counts.json
+```
+
+The report keeps coordinator and leaf CPU/duration distributions separate. Valid
+`ExceptionBeforeStart` events need no `QueryStart`; started executions require a terminal event.
+Timing uses actual `event_at_ms` with independently measured clock bounds, not start plus duration.
+Supply clock offsets as node clock minus client clock, in milliseconds:
+
+```json
+{"node1":{"min_offset_ms":-20,"max_offset_ms":20}}
+```
+
+Include every expected node, even idle nodes, in both the clock file and count manifest.
+Independently count the same query-ID scope and time window after flushing query logs;
+include all four event types, including zero counts. `observed_until_ms` uses client time:
+
+```json
+{"node1":{"observed_until_ms":1789129860000,"counts":{"QueryStart":1,"QueryFinish":0,"ExceptionBeforeStart":0,"ExceptionWhileProcessing":1}}}
+```
+
+Incomplete coverage, mismatched counts, insufficient observation intervals, missing correlation,
+or uncertain clock bounds leave cancellation unverified and fail the gate. Successful natural
+`QueryFinish` establishes termination only. Disconnect cancellation requires a cancelled
+coordinator (394/735) and a 735 event in the correlated family, under a controlled test with no
+competing cancellation source. A replica's 735 can reflect closure of an internal native stream;
+it alone does not identify which external client caused it. Safe k6 start/end records help
+correlation but do not by themselves map requests to ClickHouse query IDs. Missing logs never
+prove cancellation. The reporter makes no network requests.
+
+Run the isolated disconnect fixture (Docker required):
+
+```bash
+python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/ch-disconnect
+python3 -m unittest discover -s scripts/test -p 'test_report_signature_status_query_log.py'
+```
+
+It creates three local ClickHouse 26.2.3.2 nodes with Keeper and a proxy, checks cancellation
+before headers and during streaming, and repeats with distributed DDL blocked. Negative proxy
+controls must demonstrate that incompatible gateway behavior fails the acceptance contract.
+It removes its containers/network on exit and leaves evidence in the output directory.
+
+Promotion still requires the actual staging gateway, a populated full-retention snapshot,
+30 minutes at 256 fresh signatures / 2 RPS / 1-second client deadlines after cache warmup,
+complete coordinator/replica evidence, and bounded CPU and active-query counts. Verify read-only
+settings reach ClickHouse, upstream disconnects propagate, and no buffered request is forwarded
+after downstream abandonment. Local fixture success is not a production-performance result.
+
 ### Basic Load Test (`superbank-rpc-get-signatures.js`)
 
 Simple constant-load test with configurable VUs and duration.
@@ -886,6 +1033,14 @@ including misses/timeouts, and compare backlog and ingestion rate before/after. 
 query-log selected-part counts and metrics alongside the k6 summary. A passing k6 process alone
 does not establish the ingestion and all-attempt gates.
 
+For signature-priority scheduling, compare the deployed baseline and candidate at the same rates
+and request mix. Invalidate a signature partition while an address build is running: signature
+recovery must progress independently, no new address build may start until signatures recover,
+and address warming must resume afterward. Also exercise a failed signature scan followed by a
+successful retry. The idle signature worker discovers work within five seconds; scan duration and
+other signature work add to recovery time. Preserve the cold-start and repair timelines separately
+from the 30-minute steady-state results. A small fixture is not a production performance pass.
+
 Repeat cold-start and invalidation tests separately: correctness and the two-second deadline
 must hold while the index is unavailable, but the steady-state latency targets apply after
 index building. `KEY_ROUTING_SMOKE=1` runs for ten seconds at one request/s and skips dataset-size checks; this is
@@ -898,6 +1053,23 @@ DISK_CACHE_TEST_URL=http://127.0.0.1:18123 \
 cargo test -p superbank-rpc --all-features --locked key_routing_clickhouse_integration -- --ignored
 ```
 
+Signature membership also has a reproducible CPU/selectivity check over 80 partitions and
+four million keys at 24 bits/key. It checks sampled inserted keys, aggregate false positives
+at most 1%, and membership p99 below 100 microseconds both idle and during continuous bounded
+updates. Run an optimized build on an otherwise idle machine:
+
+```sh
+cargo test -p superbank-rpc --all-features --locked --release \
+  signature_membership_latency_and_false_positives -- --ignored --nocapture
+```
+
+This scaled check does not establish full-retention memory behavior or RPC latency. For the
+deployment gate above, also require zero unknown signature partitions after warming, membership
+p99 below 100 microseconds, aggregate false positives at most 1%, and immediate negative cache
+lookups while admission is saturated. The local integration fixture holds all cache permits
+while checking absent signatures, and exercises secondary signatures through native fills.
+Measure cold rebuilds, repairs, ingestion backlog, and address latency with the new memory split.
+
 It creates uniquely named `test_key_router_*` databases and removes them on success. Set
 `DISK_CACHE_TEST_KEEP=1` only when retaining the fixture for a local RPC/k6 smoke run.
 
@@ -906,3 +1078,41 @@ For the scoped Rust complexity gate, install `rust-code-analysis-cli` version `0
 have McCabe complexity at most 10; changed existing functions must not increase. After committing,
 pass the branch base revision instead of `HEAD`. Set `RUST_CODE_ANALYSIS` to an explicit tool path
 when it is not on `PATH`.
+
+### ClickHouse HTTP cancellation protocol gate
+
+The mandatory **ClickHouse protocol integration** CI job runs the production Rust
+HTTP client against three disposable ClickHouse **26.2.3.2** nodes through a transparent
+local gateway. It exercises schema validation and compression, cluster macro/discovery
+and process-probe decoding, and the real `get_signature_statuses` path with successful,
+missing, and failed transaction fixtures. Slow distributed queries test cancellation
+before response headers and after a decoded streaming row, including while distributed
+DDL is blocked. The before-headers fixture sets `wait_end_of_query=1` to hold its
+response; the streaming fixture uses deterministic hash text so compression produces
+enough wire bytes to decode an early row. These are test controls, not production
+setting changes. A paused replica must retain admission until observation recovers.
+Cancellation checks require prompt termination on all three nodes and a cancellation
+exception on the coordinator. A streaming leaf may instead report a socket reset or
+broken pipe while writing after its coordinator closes the native connection; other
+network errors and natural query completion fail the gate.
+
+Run the same gate locally with Docker and the normal Rust build prerequisites:
+
+```sh
+python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/clickhouse-protocol
+```
+
+The output directory must not exist. The script builds the all-feature RPC test executable
+before starting the cluster; `--rust-test-binary /absolute/path/to/test-executable` reuses
+an existing build. The three Rust integration tests are ignored in ordinary unit-test runs
+because they require this disposable fixture; the dedicated CI job explicitly runs all
+three and fails if any are absent, skipped, or fail. Production validation and compression
+remain enabled. The fixture removes its own containers and network on exit and retains
+`report.json`, `rust-integration.log`, generated configuration, and container logs.
+
+Two gateway controls intentionally demonstrate incompatible behavior: retaining an upstream
+request after downstream disconnect, and forwarding queued work after two quiet process
+observations. These controls must fail the cancellation gate for the overall fixture to pass.
+The production gateway must promptly close the upstream connection and discard queued work
+when the caller disconnects. This local protocol gate does not replace the staged customer
+replay or prove the deployed gateway follows that contract.

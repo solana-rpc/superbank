@@ -90,6 +90,71 @@ Notes:
   `gt`/`gte` for `untilSlot`).
   Token account filters require the token-owner activity table (see below).
 
+### Primary signature-status overload protection
+
+History requests may contain up to 256 signatures. Cache-negative membership skips only local
+cache work: unresolved signatures still need a primary lookup when `searchTransactionHistory`
+is true. Primary admission is shared across client clones, precedes HTTP admission, and consumes
+`CLICKHOUSE_QUERY_TIMEOUT_MS`; keep that timeout below `RPC_REQUEST_TIMEOUT_MS`.
+
+Distributed primary status queries always carry a query ID and explicit thread/index-thread,
+replica, and remaining execution-time limits, including when optional query tuning is disabled.
+Primary **distributed HTTP** status reads send `readonly=2` and
+`cancel_http_readonly_queries_on_client_close=1` as HTTP parameters. Dropping an abandoned
+response closes its connection so ClickHouse can cancel it without the distributed DDL queue.
+These settings are scoped to this read and its verification requests; the shared client,
+other RPC methods, shard-direct cleanup, and disk-cache reads/writes keep their existing behavior.
+Do not enable `readonly` on the shared application profile to configure this feature.
+
+Configure `CLICKHOUSE_CLUSTER=rbx2` for RBX2. The verifier uses the configured gateway and
+`clusterAllReplicas` to inspect every replica, never direct application-to-node connections.
+Existing `{cluster}` macro support is preserved. For standalone development, set
+`CLICKHOUSE_CLUSTER=''`; verification then covers the single server behind that URL.
+Before submitting the first protected read, discovery validates unique `hostName()` identities
+against `system.clusters` and requires the coordinator to belong to the discovered cluster.
+Initialization also executes the actual process-inspection probe with a unique query ID
+and requires complete replica coverage before caching success. The application account
+must be able to read `system.clusters`, `system.one`, and
+`system.processes` across all replicas and use the required query settings. Unavailable,
+ambiguous, or unsupported discovery fails before submitting the source lookup.
+Failed or cancelled initialization attempts share a one-second retry backoff across client
+clones. Requests during backoff fail promptly without submitting discovery or source work;
+their admission permits are released. Internal verification logs include the failing phase
+and underlying ClickHouse error; external RPC errors remain unchanged.
+
+One verifier is shared by client clones. On abandonment it retains the source permit until
+two consecutive, fully covered observations show neither the query ID nor its
+`initial_query_id` on any expected node. It batches pending IDs into one in-flight probe,
+checks every 250 ms, and uses one-thread, one-second HTTP/server budgets with unavailable
+shards treated as errors. After five seconds without confirmation it records `unconfirmed`,
+keeps the permit, and retries once per second. Successful later verification restores capacity.
+Probe errors, partial coverage, or changed topology never establish absence. Cached topology
+is fixed for the client lifetime; a topology change requires rediscovery through a process restart.
+If verification is unavailable, all configured source slots can remain reserved and subsequent
+status history reads can time out in admission. Other lookup methods keep their existing limits.
+
+Absence observations are operational evidence of termination, not proof of what caused it.
+This mechanism requires a gateway that closes the upstream request when the downstream closes
+and never forwards buffered requests after abandonment. A gateway that delays forwarding can
+make an absent query appear after the checks. Verify that contract on the deployed route before
+promotion; the local proxy fixture is not proof about production. There is no DDL-kill fallback
+for this path. Shard-direct/TCP paths retain their existing best-effort cleanup.
+
+Metrics `superbank_rpc_signature_status_batch_size{stage="input"|"primary_fallback"}` count
+accepted-size input arrays (including duplicates) and unresolved history candidates before
+primary admission. Fallback observations are recorded when history candidates are evaluated,
+including zero when caches resolve them. They are not JSON-RPC envelope batch sizes or counts
+of submitted ClickHouse queries. `superbank_rpc_signature_status_admission_seconds` includes
+both successful and cancelled primary admission waits.
+`superbank_rpc_signature_status_disconnect_pending` counts abandoned reads still retaining
+source capacity. `superbank_rpc_signature_status_disconnect_verification_total{outcome="confirmed_absent"|"unconfirmed"}`
+counts absence confirmations and five-second failures (once per abandoned query). Legacy cleanup
+outcomes remain under `superbank_rpc_clickhouse_shard_query_cleanup_total_total{operation="signature_statuses"}`.
+
+See the [miss replay and cancellation gate](../../tests/k6/README.md) for the matched-rate
+256-signature workload. Preserve PR #88's fast-negative behavior during warm and cold cache
+validation; do not use cache warming delays as backend protection.
+
 ## ClickHouse schemas
 
 Choose one schema set under `ddl/`:
@@ -320,17 +385,38 @@ settings. Transaction payload reads use the resolved slot and transaction index,
 fallback if the signature index points to a missing transaction position. Both reads share the
 existing admission permit and cache-attempt deadline.
 
-The routing index rebuilds asynchronously from actual materialized-table keys, newest complete
-historical partitions first. The actively filled partition, unbuilt filters, and invalidated
-filters remain query candidates. Fill/repair, poisoning, eviction, and schema rebuild invalidate
-filters before changing data. A stale build cannot publish, and a read whose exclusions became
-invalid falls back. This assumes the owned cache has no independent external writers.
+Signature membership covers every retained partition, including the active and partially
+retained edges and gaps between covered ranges. Each signature is hashed once and checked under
+one index lock. A complete negative returns before ClickHouse admission, client cloning, or
+signature encoding. Positive candidates still require a database lookup: Bloom filters can
+produce false positives.
+
+Fills add all signature keys, including secondary transaction signatures, before publishing
+coverage. The bounded local transaction projection uses the source signatures view's expressions.
+Ordinary appends and partial eviction preserve existing bits. Repairs remain unknown until their
+update completes; failed or cancelled updates invalidate completeness. Missing and incomplete
+filters rebuild asynchronously from actual materialized-table keys, newest partitions first.
+Signature and address maintenance run in independent bounded loops. Signature sweeps retry
+incomplete partitions after a five-second delay between sweeps; scan duration and other signature
+builds add to recovery time. Before each address-partition build, maintenance checks live signature
+completeness and cache readiness. New address builds pause while any signature partition is unknown;
+an already-running address scan can finish alongside one signature rebuild. Persistent signature
+failures therefore pause address warming, while queries retain their existing safe fallbacks.
+Both workers stop with the existing cache task. This scheduling change preserves cache format 5,
+its schema fingerprint, and existing disk data; only the in-memory indexes rebuild on restart.
+Stale builds cannot publish across invalidation or schema reset. Address filters continue to
+rebuild on complete historical partitions and invalidate on mutation. This assumes the owned
+cache has no independent external writers.
 
 The memory budget reserves 64 MiB for buffers/metadata and allocates the remaining space across
-the retention window. Filters target roughly 1% false positives; limited memory reduces
-selectivity rather than correctness. A single builder uses one ClickHouse execution thread and a
-separate 64 MiB server query-memory limit. Initialization and index failures preserve source
-fallback; a cold index can have higher latency than a fully built index.
+the retention window. Two-thirds of each partition's bitmap allowance is reserved for signatures
+with seven probes; the remainder serves address filters. Signature selectivity depends on the
+number of keys per partition and partition count: validate the **aggregate** false-positive rate,
+targeting at most 1%, rather than a per-partition rate. Limited memory reduces selectivity rather
+than correctness. The default budget remains 4 GiB. Background scans and fill updates each use
+one ClickHouse execution thread and a separate 64 MiB server query-memory limit. Initialization
+and index failures preserve source fallback; a cold index can have higher latency than a fully
+built index.
 
 Cache format **5** preserves the source's portable MergeTree index/mark settings and reverse
 sort directions from canonical DDL. Forwarding views project only insertable columns so the
@@ -353,8 +439,16 @@ The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors
 `superbank_disk_cache_key_seconds` records complete attempts, admission waits, and index builds;
 `superbank_disk_cache_key_index_bytes` reports reserved index memory, and
 `superbank_disk_cache_key_index_partitions` / `superbank_disk_cache_key_index_unknown_partitions`
-show index coverage. Partition probe/skip counters use `operation="key_partition"` with bounded
-labels; no keys or partition IDs are metric labels.
+show address index coverage and refresh during builds and paused maintenance.
+`superbank_disk_cache_key_seconds{operation="signature_index_build"}` distinguishes `success`,
+`error`, `timeout`, and `superseded` attempts. Allocation or conflicting-writer deferrals use
+`superbank_disk_cache_reads_total{operation="signature_index_build",outcome="deferred"}`.
+Partition IDs appear only in diagnostic logs, not metric labels.
+`superbank_disk_cache_signature_index_partitions` and
+`superbank_disk_cache_signature_index_unknown_partitions` separately show signature completeness.
+`superbank_disk_cache_signature_membership_seconds` has microsecond buckets and `absent`,
+`possible`, and `unknown` outcomes. Partition probe/skip counters use
+`operation="key_partition"` with bounded labels; no keys or partition IDs are metric labels.
 
 Query-facing tables use `ReplacingMergeTree` by default. `blocks_metadata` can opt into the ClickHouse `Memory` engine with `DISK_CACHE_MEMORY_TABLES=blocks_metadata`. This mode requires explicit row and byte caps. Memory-engine coverage is reset after a local ClickHouse restart because those rows are not durable. No other query-facing table is accepted in the Memory allowlist in this release.
 
@@ -486,6 +580,8 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--get-inflation-reward-max-concurrency` | `GET_INFLATION_REWARD_MAX_CONCURRENCY` | `20` | Maximum active `getInflationReward` ClickHouse workflows per RPC instance. Excess calls fail fast with node-unhealthy (`-32005`); `0` disables this method-level admission check. |
 | `--get-inflation-reward-query-timeout-ms` | `GET_INFLATION_REWARD_QUERY_TIMEOUT_MS` | `5000` | End-to-end ClickHouse budget for HTTP-permit admission plus the targeted boundary and partition lookup. Must be below `RPC_REQUEST_TIMEOUT_MS`. |
 | `--get-inflation-reward-max-threads` | `GET_INFLATION_REWARD_MAX_THREADS` | `2` | ClickHouse `max_threads` applied to every reward lookup query. |
+| `--get-signature-statuses-max-concurrency` | `GET_SIGNATURE_STATUSES_MAX_CONCURRENCY` | `4` | Maximum primary signature-status workflows per RPC process, including pending cleanup. Must be positive. Admission waits consume the ClickHouse operation timeout; local disk-cache reads use their existing limits. |
+| `--get-signature-statuses-max-threads` | `GET_SIGNATURE_STATUSES_MAX_THREADS` | `2` | Required `max_threads` and `max_threads_for_indexes` for distributed primary signature-status queries. Must be positive. These queries also disable hedging and parallel replicas. |
 | `--get-inflation-reward-max-memory-bytes` | `GET_INFLATION_REWARD_MAX_MEMORY_BYTES` | `536870912` | ClickHouse `max_memory_usage` applied to every reward lookup query. |
 | `--get-inflation-reward-max-bytes-to-read` | `GET_INFLATION_REWARD_MAX_BYTES_TO_READ` | `536870912` | ClickHouse `max_bytes_to_read` applied to every reward lookup query. |
 | `--emit-http-errors` | `SUPERBANK_RPC_EMIT_HTTP_ERRORS` | `false` | Return HTTP `503 Service Unavailable` for selected server-side JSON-RPC failures; response bodies are unchanged. |
@@ -523,7 +619,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-replica-health-check-interval-ms` | `CLICKHOUSE_REPLICA_HEALTH_CHECK_INTERVAL_MS` | `10000` | Background health-check interval for shard-direct replicas. Unavailable replicas are restored to the failover pool after recovery. |
 | `--clickhouse-tcp-pool-min` | `CLICKHOUSE_TCP_POOL_MIN` | `10` | Shard-direct only. Minimum connections retained per shard in each ClickHouse native (TCP) connection pool. |
 | `--clickhouse-tcp-pool-max` | `CLICKHOUSE_TCP_POOL_MAX` | `20` | Shard-direct only. Maximum connections per shard in each ClickHouse native (TCP) connection pool. Total native connections per instance are bounded by this value times the number of shards, so size it against the ClickHouse connection budget. |
-| `--clickhouse-cluster` | `CLICKHOUSE_CLUSTER` | `{cluster}` | Shard-direct only. Cluster used for topology discovery. |
+| `--clickhouse-cluster` | `CLICKHOUSE_CLUSTER` | `{cluster}` | Cluster identity in both scopes: topology discovery in shard-direct mode and primary signature-status cancellation across coordinator/replicas in distributed mode. Supports ClickHouse macros. Set explicitly to `rbx2` for RBX2, or an empty string for standalone ClickHouse with no cluster. |
 | `--clickhouse-topology-config` | `CLICKHOUSE_TOPOLOGY_CONFIG` | — | Shard-direct only. Optional authoritative YAML shard topology. When set, superbank-rpc skips `system.clusters` discovery, uses the YAML shard/IP/port mapping for shard-local connections, and routes `getTransactionsForAddress` to the address-owner shard. |
 | `--clickhouse-gsfa-local-table` | `CLICKHOUSE_GSFA_LOCAL_TABLE` | — | Shard-direct only. Local GSFA table used by shard-direct reads and owner-shard `getTransactionsForAddress` routing. |
 | `--clickhouse-hot-address` | `CLICKHOUSE_GSFA_HOT_ADDRESSES` | empty | Repeatable; env accepts comma-separated values. |
@@ -548,7 +644,7 @@ Table selection (environment variables, read at startup):
 | `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE` | `default.token_owner_activity` | — |
 
 Shard routing:
-When `CLICKHOUSE_SCOPE=distributed`, superbank-rpc sends every ClickHouse query through `CLICKHOUSE_URL`. It does not read `CLICKHOUSE_TOPOLOGY_CONFIG`, discover `system.clusters`, connect to shard endpoints, query local tables, or validate local schemas. Explicit shard-local settings are ignored with a startup warning.
+When `CLICKHOUSE_SCOPE=distributed`, superbank-rpc sends every ClickHouse query through `CLICKHOUSE_URL`. Primary signature-status protection inspects `system.clusters` and replica processes through that gateway. It does not read `CLICKHOUSE_TOPOLOGY_CONFIG`, connect directly to shard endpoints, query shard-local application tables, or validate local schemas. Explicit shard-local settings are ignored with a startup warning.
 
 When `CLICKHOUSE_SCOPE=shard-direct`, superbank-rpc discovers shards from `system.clusters` and validates local table schemas. Local tables default to `{table}_local` when not provided explicitly. `CLICKHOUSE_TRANSPORT` selects the shard-direct transport (`tcp` or `http`). When a shard has multiple replicas, startup selects the first reachable replica, warns about unavailable replicas, and fails only if no replica is reachable for a shard. Background health checks move traffic away from failed replicas and restore recovered replicas to the failover pool.
 
@@ -583,7 +679,7 @@ Additional env flags:
 | `CLICKHOUSE_QUERY_ID_PREFIX` | `superbank` | `auto` or `off`/`0`/`false` disables. |
 | `CLICKHOUSE_GSFA_STRICT_PAGINATION` | `true` | — |
 | `CLICKHOUSE_GSFA_FALLBACK_TRANSACTIONS` | disabled | `empty`/`true` for empty-only fallback; `force`/`always` for incomplete fallback. |
-| `CLICKHOUSE_DISABLE_QUERY_SETTINGS` | `false` | Disables per-query ClickHouse `SETTINGS` overrides (including `getInflationReward` thread, memory, read-byte, and execution-time caps) when truthy. The targeted query shape and RPC admission limits remain active. |
+| `CLICKHOUSE_DISABLE_QUERY_SETTINGS` | `false` | Disables optional per-query ClickHouse `SETTINGS` overrides (including `getInflationReward` thread, memory, read-byte, and execution-time caps) when truthy. Required local-cache and distributed primary `getSignatureStatuses` safety settings still apply; unsupported safety settings fail the operation without an uncapped retry. RPC admission limits remain active. |
 
 ### ClickHouse query cache (read queries)
 

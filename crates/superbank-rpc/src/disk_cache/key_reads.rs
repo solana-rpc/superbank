@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Ordered, partition-scoped reads under one cache-attempt deadline.
 use super::{
-    DiskCache, DiskGsfaPage, DiskSigStatus, clamp_until_to_floor, index::DiskTfaQuery,
-    key_index::Family, lower_bound_reaches_floor, upper_bound_reaches_tip,
+    DiskCache, DiskGsfaPage, DiskSigStatus, clamp_until_to_floor,
+    index::DiskTfaQuery,
+    key_index::{Family, SignatureCandidates, SignatureHash},
+    lower_bound_reaches_floor, upper_bound_reaches_tip,
 };
 use crate::clickhouse::{
     ClickHouseClient, NumericFilter, PaginationToken, SignatureRecord, SignatureSlot, SlotBoundary,
@@ -129,7 +131,7 @@ impl DiskCache {
         client.query_timeout = read.deadline.saturating_duration_since(Instant::now());
         client
     }
-    fn key_span(&self) -> Option<(u64, u64)> {
+    pub(super) fn key_span(&self) -> Option<(u64, u64)> {
         self.inner
             .coverage
             .read()
@@ -156,6 +158,28 @@ impl DiskCache {
             if candidate { "probed" } else { "skipped" },
         );
         candidate
+    }
+    fn signature_candidates(
+        &self,
+        floor: u64,
+        tip: u64,
+        signature: &Signature,
+    ) -> SignatureCandidates {
+        let started = std::time::Instant::now();
+        let width = self.inner.cfg.partition_slots;
+        let candidates = self.inner.key_index.signature_candidates(
+            floor / width,
+            tip / width,
+            SignatureHash::new(signature.as_ref()),
+        );
+        let elapsed = started.elapsed().as_secs_f64();
+        crate::metrics::disk_cache_signature_membership(candidates.outcome(), elapsed);
+        crate::metrics::disk_cache_read_count(
+            "key_partition",
+            "skipped",
+            candidates.total - candidates.partitions.len() as u64,
+        );
+        candidates
     }
     async fn attempt<T>(
         &self,
@@ -189,14 +213,17 @@ impl DiskCache {
         let Some((floor, tip)) = self.key_span() else {
             return Ok(None);
         };
+        let candidates = self.signature_candidates(floor, tip, &signature);
+        if candidates.partitions.is_empty() {
+            return Ok(None);
+        }
         let base = self.query_client();
-        for partition in self.partitions(floor, tip, SortOrder::Desc) {
+        let signature = signature.to_string();
+        for partition in candidates.partitions {
             read.check()?;
-            if !self.candidate(partition, &[Family::Signature], signature.as_ref()) {
-                continue;
-            }
+            crate::metrics::disk_cache_read("key_partition", "probed");
             let client = self.scoped_client(&base, partition, read);
-            if let (Some(position), _) = client.get_signature_slot(&signature.to_string()).await? {
+            if let (Some(position), _) = client.get_signature_slot(&signature).await? {
                 return Ok(self.covers_slot(position.slot).then_some(position));
             }
         }
@@ -237,9 +264,11 @@ impl DiskCache {
             return vec![None; signatures.len()];
         };
         let mut found = HashMap::new();
+        let mut encoded = HashMap::new();
         let result = self
             .attempt("signature_statuses", &read, async {
-                self.find_statuses(&signatures, &read, &mut found).await?;
+                self.find_statuses(&signatures, &read, &mut found, &mut encoded)
+                    .await?;
                 Ok(found.values().any(Option::is_some).then_some(()))
             })
             .await;
@@ -249,31 +278,62 @@ impl DiskCache {
         }
         signatures
             .iter()
-            .map(|signature| found.get(&signature.to_string()).cloned().flatten())
+            .map(|signature| {
+                encoded
+                    .get(signature)
+                    .and_then(|key| found.get(key))
+                    .cloned()
+                    .flatten()
+            })
             .collect()
     }
+    fn status_candidates(
+        &self,
+        floor: u64,
+        tip: u64,
+        signatures: &[Signature],
+        encoded: &mut HashMap<Signature, String>,
+    ) -> std::collections::BTreeMap<u64, Vec<String>> {
+        let mut by_partition = std::collections::BTreeMap::<u64, Vec<String>>::new();
+        for signature in signatures {
+            let candidates = self.signature_candidates(floor, tip, signature);
+            if candidates.partitions.is_empty() {
+                continue;
+            }
+            let key = encoded
+                .entry(*signature)
+                .or_insert_with(|| signature.to_string());
+            for partition in candidates.partitions {
+                by_partition.entry(partition).or_default().push(key.clone());
+            }
+        }
+        by_partition
+    }
+
     async fn find_statuses(
         &self,
         signatures: &[Signature],
         read: &Read,
         found: &mut HashMap<String, Option<DiskSigStatus>>,
+        encoded: &mut HashMap<Signature, String>,
     ) -> ProcessingResult<()> {
         let Some((floor, tip)) = self.key_span() else {
             return Ok(());
         };
-        let base = self.query_client();
-        for partition in self.partitions(floor, tip, SortOrder::Desc) {
+        let by_partition = self.status_candidates(floor, tip, signatures, encoded);
+        let mut base = None;
+        for (partition, mut pending) in by_partition.into_iter().rev() {
             read.check()?;
-            let pending: Vec<_> = signatures
-                .iter()
-                .filter(|s| !found.contains_key(&s.to_string()))
-                .filter(|s| self.candidate(partition, &[Family::Signature], s.as_ref()))
-                .map(ToString::to_string)
-                .collect();
+            pending.retain(|signature| !found.contains_key(signature));
             if pending.is_empty() {
                 continue;
             }
-            let client = self.scoped_client(&base, partition, read);
+            crate::metrics::disk_cache_read_count("key_partition", "probed", pending.len() as u64);
+            let client = self.scoped_client(
+                base.get_or_insert_with(|| self.query_client()),
+                partition,
+                read,
+            );
             let (records, _) = client.get_signature_statuses(&pending).await?;
             for record in records {
                 found.insert(

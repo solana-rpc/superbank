@@ -90,3 +90,48 @@ jobs:
 
       - name: Test optional features (superbank-rpc)
         run: cargo test -p superbank-rpc --all-features --locked
+
+  clickhouse-protocol:
+    name: ClickHouse protocol integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev pkg-config libudev-dev libusb-1.0-0-dev
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          version: "25.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: ci-clickhouse-protocol
+
+      - name: Test production Rust protocol against ClickHouse 26.2.3.2
+        run: python3 scripts/test/test-clickhouse-http-disconnect.py --output "${RUNNER_TEMP}/clickhouse-protocol"
+
+      - name: Show integration results
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "clickhouse-protocol"
+          for name in ("rust-build.log", "report.json", "rust-integration.log"):
+              path = root / name
+              if path.exists():
+                  print(path.read_text())
+          PY
