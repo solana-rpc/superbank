@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in integration against a disposable, loopback ClickHouse server.
+//! Raw queries below are fixture setup and independent observation probes;
+//! cancellation assertions exercise the guarded application read path.
 use super::*;
 use crate::clickhouse::{NumericFilter, SortOrder, TransactionStatusFilter};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -256,13 +258,12 @@ async fn wait_for_query(client: &clickhouse::Client, id: &str, running: bool) {
 async fn assert_cancellation(client: &clickhouse::Client, cache: &DiskCache) {
     let mut lookup = cache.query_client();
     lookup.cache_partition = Some((10, 1));
-    let (sql,id,cleanup)=lookup.annotate_lookup_query("SELECT sum(cityHash64(number)) FROM numbers(1000000000000) SETTINGS max_execution_time=2,max_threads=1".into(),"test_cache_cancel");
-    let id = id.unwrap();
-    let query_client = lookup.client.clone().with_setting("query_id", id.clone());
-    let task = tokio::spawn(async move {
-        let _cleanup = cleanup;
-        query_client.query(&sql).execute().await
-    });
+    let query = lookup.read_query(
+        "SELECT sum(cityHash64(number)) FROM numbers(1000000000000) SETTINGS max_execution_time=2,max_threads=1",
+        "test_cache_cancel",
+    ).await.unwrap();
+    let id = query.query_id().to_owned();
+    let task = tokio::spawn(query.fetch_one::<u64>());
     wait_for_query(client, &id, true).await;
     task.abort();
     let _ = task.await;

@@ -272,7 +272,7 @@ def rust_test_binary(output, explicit):
 def validate_rust_test_binary(executable):
     test_filter = "clickhouse::disconnect::integration_tests::"
     listed = subprocess.check_output([str(executable), test_filter, "--ignored", "--list"], text=True)
-    assert listed.count(": test") == 3, "All three real protocol tests must be present in the library test binary"
+    assert listed.count(": test") == 6, "All six real protocol tests must be present in the library test binary"
 
 
 def run_rust_integration(cluster, executable):
@@ -291,11 +291,11 @@ def run_rust_integration(cluster, executable):
     test_filter = "clickhouse::disconnect::integration_tests::"
     command = [str(executable), test_filter, "--ignored", "--nocapture", "--test-threads=1"]
     try:
-        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=150)
+        result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=300)
         (cluster.output / "rust-integration.log").write_text(result.stdout + result.stderr)
         result.check_returncode()
-        assert "3 passed; 0 failed" in result.stdout, "No silently skipped protocol tests"
-        return {"passed": True, "tests": 3, "production_validation_and_compression": True}
+        assert "6 passed; 0 failed" in result.stdout, "No silently skipped protocol tests"
+        return {"passed": True, "tests": 6, "production_validation_and_compression": True}
     finally:
         with contextlib.suppress(subprocess.CalledProcessError):
             docker("unpause", cluster.nodes[2])

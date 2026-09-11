@@ -24,6 +24,7 @@ use super::queries::{
     BLOCK_METADATA_REWARD_COLUMNS, BLOCK_SIGNATURE_COLUMNS, BLOCK_TRANSACTION_REWARD_COLUMNS,
     format_select_columns,
 };
+use super::read_query::ReadEndpoint;
 #[cfg(feature = "disk-cache")]
 use super::rows::BlockTimeRangeRow;
 use super::rows::{
@@ -38,7 +39,6 @@ use super::types::{
     BlockMetadataRecord, InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings,
     StoredAccountsTransactionRecord, StoredTransactionRecord,
 };
-use super::util::{annotate_required_query, http_query_with_id};
 
 fn inflation_epoch_slot_bounds(epoch: u64, schedule: &EpochSchedule) -> Option<(u64, u64)> {
     let next_epoch = epoch.checked_add(1)?;
@@ -365,16 +365,17 @@ fn normalize_slots(mut slots: Vec<u64>) -> Vec<u64> {
 
 async fn fetch_slot_rows(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Vec<u64>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<SlotArrayRow>()
+    let mut cursor = read_endpoint
+        .fetch::<SlotArrayRow>(client, query, "fetch_slot_rows")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
     let row_opt = cursor
-        .next()
+        .next_optional()
         .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
     let row_present = row_opt.is_some();
@@ -611,17 +612,18 @@ fn build_transaction_count_query(
 
 async fn fetch_block_metadata_projection(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
     include_rewards: bool,
 ) -> ProcessingResult<(Option<BlockMetadataRecord>, QueryTimings)> {
     if include_rewards {
         let start = Instant::now();
-        let mut cursor = client
-            .query(query)
-            .fetch::<BlockMetadataRow>()
+        let mut cursor = read_endpoint
+            .fetch::<BlockMetadataRow>(client, query, "fetch_block_metadata_projection")
+            .await
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
         let row_opt = cursor
-            .next()
+            .next_optional()
             .await
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
         let timings = QueryTimings {
@@ -635,12 +637,12 @@ async fn fetch_block_metadata_projection(
         Ok((row_opt.map(map_block_metadata_row), timings))
     } else {
         let start = Instant::now();
-        let mut cursor = client
-            .query(query)
-            .fetch::<BlockMetadataBaseRow>()
+        let mut cursor = read_endpoint
+            .fetch::<BlockMetadataBaseRow>(client, query, "fetch_block_metadata_projection")
+            .await
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
         let row_opt = cursor
-            .next()
+            .next_optional()
             .await
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
         let timings = QueryTimings {
@@ -658,12 +660,13 @@ async fn fetch_block_metadata_projection(
 #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
 async fn fetch_block_metadata_range(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Vec<BlockMetadataRecord>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<BlockMetadataRow>()
+    let mut cursor = read_endpoint
+        .fetch::<BlockMetadataRow>(client, query, "fetch_block_metadata_range")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
     let mut records = Vec::new();
     while let Some(row) = cursor
@@ -687,12 +690,13 @@ async fn fetch_block_metadata_range(
 #[cfg(feature = "disk-cache")]
 async fn fetch_block_time_range(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Vec<BlockTimeRangeRow>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<BlockTimeRangeRow>()
+    let mut cursor = read_endpoint
+        .fetch::<BlockTimeRangeRow>(client, query, "fetch_block_time_range")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
     let mut records = Vec::new();
     while let Some(row) = cursor
@@ -716,12 +720,13 @@ async fn fetch_block_time_range(
 #[cfg(feature = "grpc-streaming")]
 async fn fetch_transaction_range(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<TransactionRow>()
+    let mut cursor = read_endpoint
+        .fetch::<TransactionRow>(client, query, "fetch_transaction_range")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
     let mut records = Vec::new();
     while let Some(row) = cursor
@@ -744,12 +749,13 @@ async fn fetch_transaction_range(
 
 async fn fetch_block_signatures_projection(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Vec<String>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<BlockSignatureRow>()
+    let mut cursor = read_endpoint
+        .fetch::<BlockSignatureRow>(client, query, "fetch_block_signatures_projection")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
     let mut rows = Vec::new();
     while let Some(row) = cursor
@@ -775,12 +781,13 @@ async fn fetch_block_signatures_projection(
 
 async fn fetch_block_accounts_projection(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Vec<StoredAccountsTransactionRecord>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<BlockAccountsTransactionRow>()
+    let mut cursor = read_endpoint
+        .fetch::<BlockAccountsTransactionRow>(client, query, "fetch_block_accounts_projection")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
     let mut rows = Vec::new();
     while let Some(row) = cursor
@@ -808,13 +815,14 @@ async fn fetch_block_accounts_projection(
 
 async fn fetch_block_full_projection(
     client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
     query: &str,
     slot: u64,
 ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<BlockFullTransactionRow>()
+    let mut cursor = read_endpoint
+        .fetch::<BlockFullTransactionRow>(client, query, "fetch_block_full_projection")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
     let mut rows = Vec::new();
     while let Some(row) = cursor
@@ -864,10 +872,7 @@ impl ClickHouseClient {
             );
 
             let row = self
-                .client
-                .query(&query)
-                .fetch_optional::<LatestSlotRow>()
-                .await
+                .read_optional::<LatestSlotRow>(&query, "get_latest_finalized_slot").await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             Ok(row.map(|row| row.slot))
@@ -905,13 +910,12 @@ impl ClickHouseClient {
             );
             let start = Instant::now();
             let mut cursor = self
-                .client
-                .query(&query)
-                .fetch::<PresentRow>()
+                .read::<PresentRow>(&query, "is_blockhash_valid")
+                .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             let row_opt = cursor
-                .next()
+                .next_optional()
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
             let exists = row_opt.is_some_and(|row| row.present == 1);
@@ -950,13 +954,12 @@ impl ClickHouseClient {
 
             let start = Instant::now();
             let mut cursor = self
-                .client
-                .query(&query)
-                .fetch::<MinSlotRow>()
+                .read::<MinSlotRow>(&query, "get_first_available_block")
+                .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             let row_opt = cursor
-                .next()
+                .next_optional()
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
@@ -992,13 +995,12 @@ impl ClickHouseClient {
 
             let start = Instant::now();
             let mut cursor = self
-                .client
-                .query(&query)
-                .fetch::<MinSlotRow>()
+                .read::<MinSlotRow>(&query, "minimum_ledger_slot")
+                .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             let row_opt = cursor
-                .next()
+                .next_optional()
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
@@ -1029,13 +1031,12 @@ impl ClickHouseClient {
 
             let start = Instant::now();
             let mut cursor = self
-                .client
-                .query(&query)
-                .fetch::<TransactionCountRow>()
+                .read::<TransactionCountRow>(&query, operation)
+                .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             let row_opt = cursor
-                .next()
+                .next_optional()
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
@@ -1134,11 +1135,11 @@ impl ClickHouseClient {
                     local_table = local_table.as_str(),
                     "Forcing distributed query path for get_block_slots_by_range in shard-direct HTTP mode"
                 );
-                let (slots, timings) = fetch_slot_rows(&self.client, &distributed_query).await?;
+                let (slots, timings) = fetch_slot_rows(&self.client, &self.read_endpoint, &distributed_query).await?;
                 return Ok((normalize_slots(slots), timings));
             }
 
-            let (slots, timings) = fetch_slot_rows(&self.client, &distributed_query).await?;
+            let (slots, timings) = fetch_slot_rows(&self.client, &self.read_endpoint, &distributed_query).await?;
             Ok((normalize_slots(slots), timings))
         })
         .await
@@ -1173,7 +1174,7 @@ impl ClickHouseClient {
         }
 
         let settings_clause = self.inflation_reward_settings_clause(OPERATION);
-        let (query_client, blocks_metadata_table, cleanup_cluster, query_scope) = if self
+        let (query_client, blocks_metadata_table, read_endpoint, query_scope) = if self
             .scope_shard_direct()
             && let (Some(topology), Some(local_table)) =
                 (&self.shard_topology, &self.blocks_metadata_local_table)
@@ -1182,20 +1183,19 @@ impl ClickHouseClient {
             (
                 shard.http_client.clone(),
                 local_table.clone(),
-                None,
+                shard.read_endpoint.clone(),
                 "shard_local",
             )
         } else {
             (
                 self.client.clone(),
                 self.blocks_metadata_table.clone(),
-                self.shard_routing
-                    .as_ref()
-                    .map(|config| config.cluster.clone()),
+                self.read_endpoint.clone(),
                 "distributed",
             )
         };
         let query_timeout = self.inflation_reward_limits.query_timeout;
+        let read_endpoint = read_endpoint.with_timeout(query_timeout);
         let workflow_started = Instant::now();
         let deadline = tokio::time::Instant::now() + query_timeout;
 
@@ -1224,23 +1224,18 @@ impl ClickHouseClient {
                 end_slot_exclusive,
                 &settings_clause,
             );
-            let (boundary_query, boundary_query_id) =
-                annotate_required_query(boundary_query, "get_inflation_reward_boundary");
-            let mut boundary_cleanup = self.http_query_cleanup_for_client(
-                query_client.clone(),
-                cleanup_cluster.clone(),
-                OPERATION,
-                boundary_query_id.clone(),
-            );
             let boundary_started = Instant::now();
-            let mut boundary_cursor =
-                http_query_with_id(&query_client, &boundary_query, Some(boundary_query_id))
-                    .fetch::<InflationBoundaryRow>()
-                    .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-            let boundary = match boundary_cursor.next().await {
+            let mut boundary_cursor = read_endpoint
+                .fetch::<InflationBoundaryRow>(
+                    &query_client,
+                    &boundary_query,
+                    "get_inflation_reward_boundary",
+                )
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let boundary = match boundary_cursor.next_optional().await {
                 Ok(row) => row,
                 Err(err) => {
-                    boundary_cleanup.spawn_cleanup("error");
                     return Err(ProcessingError::database(err.to_string(), err));
                 }
             };
@@ -1252,7 +1247,6 @@ impl ClickHouseClient {
                 rows_read_unknown: true,
                 rows_returned: u64::from(boundary.is_some()),
             });
-            boundary_cleanup.disarm();
 
             let Some(boundary) = boundary else {
                 crate::metrics::inflation_reward_lookup("unknown", "boundary_missing");
@@ -1310,30 +1304,20 @@ impl ClickHouseClient {
                 boundary_selection,
                 &settings_clause,
             );
-            let (boundary_rewards_query, boundary_rewards_query_id) = annotate_required_query(
-                boundary_rewards_query,
-                "get_inflation_reward_boundary_rewards",
-            );
-            let mut boundary_rewards_cleanup = self.http_query_cleanup_for_client(
-                query_client.clone(),
-                cleanup_cluster.clone(),
-                OPERATION,
-                boundary_rewards_query_id.clone(),
-            );
             let boundary_rewards_started = Instant::now();
-            let mut boundary_rewards_cursor = http_query_with_id(
-                &query_client,
-                &boundary_rewards_query,
-                Some(boundary_rewards_query_id),
-            )
-            .fetch::<InflationRewardRow>()
-            .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let mut boundary_rewards_cursor = read_endpoint
+                .fetch::<InflationRewardRow>(
+                    &query_client,
+                    &boundary_rewards_query,
+                    "get_inflation_reward_boundary_rewards",
+                )
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
             let mut rewards_by_pubkey = HashMap::with_capacity(deduped_addresses.len());
             loop {
                 let next = match boundary_rewards_cursor.next().await {
                     Ok(next) => next,
                     Err(err) => {
-                        boundary_rewards_cleanup.spawn_cleanup("error");
                         return Err(ProcessingError::database(err.to_string(), err));
                     }
                 };
@@ -1377,7 +1361,6 @@ impl ClickHouseClient {
                 rows_read_unknown: true,
                 rows_returned: rewards_by_pubkey.len() as u64,
             });
-            boundary_rewards_cleanup.disarm();
 
             if !partitioned {
                 crate::metrics::inflation_reward_selected_blocks(1);
@@ -1464,24 +1447,15 @@ impl ClickHouseClient {
                 &partition_plan.required_block_heights,
                 &settings_clause,
             );
-            let (partition_slots_query, partition_slots_query_id) = annotate_required_query(
-                partition_slots_query,
-                "get_inflation_reward_partition_slots",
-            );
-            let mut partition_slots_cleanup = self.http_query_cleanup_for_client(
-                query_client.clone(),
-                cleanup_cluster.clone(),
-                OPERATION,
-                partition_slots_query_id.clone(),
-            );
             let partition_slots_started = Instant::now();
-            let mut partition_slots_cursor = http_query_with_id(
-                &query_client,
-                &partition_slots_query,
-                Some(partition_slots_query_id),
-            )
-            .fetch::<InflationSlotRow>()
-            .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let mut partition_slots_cursor = read_endpoint
+                .fetch::<InflationSlotRow>(
+                    &query_client,
+                    &partition_slots_query,
+                    "get_inflation_reward_partition_slots",
+                )
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
             let mut slot_by_block_height =
                 HashMap::with_capacity(partition_plan.required_block_heights.len());
             let mut block_height_by_slot =
@@ -1491,7 +1465,6 @@ impl ClickHouseClient {
                 let next = match partition_slots_cursor.next().await {
                     Ok(next) => next,
                     Err(err) => {
-                        partition_slots_cleanup.spawn_cleanup("error");
                         return Err(ProcessingError::database(err.to_string(), err));
                     }
                 };
@@ -1540,7 +1513,6 @@ impl ClickHouseClient {
                 rows_read_unknown: true,
                 rows_returned: partition_slot_rows,
             });
-            partition_slots_cleanup.disarm();
 
             let missing_block_heights = partition_plan
                 .required_block_heights
@@ -1555,23 +1527,18 @@ impl ClickHouseClient {
                     end_slot_exclusive,
                     &settings_clause,
                 );
-                let (progress_query, progress_query_id) =
-                    annotate_required_query(progress_query, "get_inflation_reward_payout_progress");
-                let mut progress_cleanup = self.http_query_cleanup_for_client(
-                    query_client.clone(),
-                    cleanup_cluster.clone(),
-                    OPERATION,
-                    progress_query_id.clone(),
-                );
                 let progress_started = Instant::now();
-                let mut progress_cursor =
-                    http_query_with_id(&query_client, &progress_query, Some(progress_query_id))
-                        .fetch::<InflationSlotRow>()
-                        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-                let progress = match progress_cursor.next().await {
+                let mut progress_cursor = read_endpoint
+                    .fetch::<InflationSlotRow>(
+                        &query_client,
+                        &progress_query,
+                        "get_inflation_reward_payout_progress",
+                    )
+                    .await
+                    .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+                let progress = match progress_cursor.next_optional().await {
                     Ok(row) => row,
                     Err(err) => {
-                        progress_cleanup.spawn_cleanup("error");
                         return Err(ProcessingError::database(err.to_string(), err));
                     }
                 };
@@ -1583,7 +1550,6 @@ impl ClickHouseClient {
                     rows_read_unknown: true,
                     rows_returned: u64::from(progress.is_some()),
                 });
-                progress_cleanup.disarm();
 
                 let progress = progress.ok_or_else(|| {
                     ProcessingError::database_msg(format!(
@@ -1646,30 +1612,20 @@ impl ClickHouseClient {
                 InflationRewardSelection::StakeOnly,
                 &settings_clause,
             );
-            let (partition_rewards_query, partition_rewards_query_id) = annotate_required_query(
-                partition_rewards_query,
-                "get_inflation_reward_partition_rewards",
-            );
-            let mut partition_rewards_cleanup = self.http_query_cleanup_for_client(
-                query_client.clone(),
-                cleanup_cluster.clone(),
-                OPERATION,
-                partition_rewards_query_id.clone(),
-            );
             let partition_rewards_started = Instant::now();
-            let mut partition_rewards_cursor = http_query_with_id(
-                &query_client,
-                &partition_rewards_query,
-                Some(partition_rewards_query_id),
-            )
-            .fetch::<InflationRewardRow>()
-            .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let mut partition_rewards_cursor = read_endpoint
+                .fetch::<InflationRewardRow>(
+                    &query_client,
+                    &partition_rewards_query,
+                    "get_inflation_reward_partition_rewards",
+                )
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
             let mut partition_reward_count = 0u64;
             loop {
                 let next = match partition_rewards_cursor.next().await {
                     Ok(next) => next,
                     Err(err) => {
-                        partition_rewards_cleanup.spawn_cleanup("error");
                         return Err(ProcessingError::database(err.to_string(), err));
                     }
                 };
@@ -1714,7 +1670,6 @@ impl ClickHouseClient {
                 rows_read_unknown: true,
                 rows_returned: partition_reward_count,
             });
-            partition_rewards_cleanup.disarm();
 
             let selected_block_count = selected_slots.len().saturating_add(1);
             crate::metrics::inflation_reward_selected_blocks(selected_block_count);
@@ -1738,7 +1693,7 @@ impl ClickHouseClient {
             ))
         };
 
-        let execute = Box::pin(execute);
+        let execute = Box::pin(_http_permit.scope(execute));
         match tokio::time::timeout_at(deadline, execute).await {
             Ok(result) => {
                 if let Err(err) = &result {
@@ -1790,10 +1745,22 @@ impl ClickHouseClient {
                 );
 
                 let start = Instant::now();
-                match shard.http_client.query(&query).fetch::<BlockTimeRow>() {
+                let local_cursor = async {
+                    shard
+                        .read_endpoint
+                        .fetch::<BlockTimeRow>(
+                            &shard.http_client,
+                            &query,
+                            "get_block_time_by_slot_local_http",
+                        )
+                        .await
+                        .map_err(|e| ProcessingError::database(e.to_string(), e))
+                }
+                .await;
+                match local_cursor {
                     Ok(mut cursor) => {
                         let row_opt = cursor
-                            .next()
+                            .next_optional()
                             .await
                             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
                         let timings = QueryTimings {
@@ -1825,12 +1792,11 @@ impl ClickHouseClient {
                         );
                         let start = Instant::now();
                         let mut cursor = self
-                            .client
-                            .query(&query)
-                            .fetch::<BlockTimeRow>()
+                            .read::<BlockTimeRow>(&query, "get_block_time_by_slot")
+                            .await
                             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
                         let row_opt = cursor
-                            .next()
+                            .next_optional()
                             .await
                             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
                         let timings = QueryTimings {
@@ -1857,12 +1823,11 @@ impl ClickHouseClient {
                 );
                 let start = Instant::now();
                 let mut cursor = self
-                    .client
-                    .query(&query)
-                    .fetch::<BlockTimeRow>()
+                    .read::<BlockTimeRow>(&query, "get_block_time_by_slot")
+                    .await
                     .map_err(|e| ProcessingError::database(e.to_string(), e))?;
                 let row_opt = cursor
-                    .next()
+                    .next_optional()
                     .await
                     .map_err(|e| ProcessingError::database(e.to_string(), e))?;
                 let timings = QueryTimings {
@@ -1890,12 +1855,11 @@ impl ClickHouseClient {
                 );
                 let start = Instant::now();
                 let mut cursor = self
-                    .client
-                    .query(&query)
-                    .fetch::<BlockTimeRow>()
+                    .read::<BlockTimeRow>(&query, "get_block_time_by_slot")
+                    .await
                     .map_err(|e| ProcessingError::database(e.to_string(), e))?;
                 let fallback_opt = cursor
-                    .next()
+                    .next_optional()
                     .await
                     .map_err(|e| ProcessingError::database(e.to_string(), e))?;
                 let fallback_timings = QueryTimings {
@@ -1943,7 +1907,9 @@ impl ClickHouseClient {
                     settings_clause = settings_clause
                 );
 
-                match fetch_blockhash_height_row(&shard.http_client, &query).await {
+                match fetch_blockhash_height_row(&shard.http_client, &shard.read_endpoint, &query)
+                    .await
+                {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
                         tracing::warn!(
@@ -1968,7 +1934,9 @@ impl ClickHouseClient {
                             slot = slot,
                             settings_clause = settings_clause
                         );
-                        let result = fetch_blockhash_height_row(&self.client, &query).await?;
+                        let result =
+                            fetch_blockhash_height_row(&self.client, &self.read_endpoint, &query)
+                                .await?;
                         (result.0, result.1, false)
                     }
                 }
@@ -1989,7 +1957,8 @@ impl ClickHouseClient {
                     slot = slot,
                     settings_clause = settings_clause
                 );
-                let result = fetch_blockhash_height_row(&self.client, &query).await?;
+                let result =
+                    fetch_blockhash_height_row(&self.client, &self.read_endpoint, &query).await?;
                 (result.0, result.1, false)
             };
 
@@ -2012,7 +1981,7 @@ impl ClickHouseClient {
                     settings_clause = settings_clause
                 );
                 let (fallback_opt, fallback_timings) =
-                    fetch_blockhash_height_row(&self.client, &query).await?;
+                    fetch_blockhash_height_row(&self.client, &self.read_endpoint, &query).await?;
                 timings.add(fallback_timings);
                 row_opt = fallback_opt;
             }
@@ -2049,8 +2018,13 @@ impl ClickHouseClient {
                     self.blocks_metadata_supports_prewhere,
                 );
 
-                match fetch_block_metadata_projection(&shard.http_client, &query, include_rewards)
-                    .await
+                match fetch_block_metadata_projection(
+                    &shard.http_client,
+                    &shard.read_endpoint,
+                    &query,
+                    include_rewards,
+                )
+                .await
                 {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
@@ -2071,9 +2045,13 @@ impl ClickHouseClient {
                             &settings_clause,
                             self.blocks_metadata_supports_prewhere,
                         );
-                        let result =
-                            fetch_block_metadata_projection(&self.client, &query, include_rewards)
-                                .await?;
+                        let result = fetch_block_metadata_projection(
+                            &self.client,
+                            &self.read_endpoint,
+                            &query,
+                            include_rewards,
+                        )
+                        .await?;
                         (result.0, result.1, false)
                     }
                 }
@@ -2089,8 +2067,13 @@ impl ClickHouseClient {
                     &settings_clause,
                     self.blocks_metadata_supports_prewhere,
                 );
-                let result =
-                    fetch_block_metadata_projection(&self.client, &query, include_rewards).await?;
+                let result = fetch_block_metadata_projection(
+                    &self.client,
+                    &self.read_endpoint,
+                    &query,
+                    include_rewards,
+                )
+                .await?;
                 (result.0, result.1, false)
             };
 
@@ -2106,8 +2089,13 @@ impl ClickHouseClient {
                     &settings_clause,
                     self.blocks_metadata_supports_prewhere,
                 );
-                let (fallback_opt, fallback_timings) =
-                    fetch_block_metadata_projection(&self.client, &query, include_rewards).await?;
+                let (fallback_opt, fallback_timings) = fetch_block_metadata_projection(
+                    &self.client,
+                    &self.read_endpoint,
+                    &query,
+                    include_rewards,
+                )
+                .await?;
                 timings.add(fallback_timings);
                 metadata_opt = fallback_opt;
             }
@@ -2135,7 +2123,13 @@ impl ClickHouseClient {
                 let query =
                     build_block_transactions_query(local_table, slot, projection, &settings_clause);
 
-                match fetch_block_signatures_projection(&shard.http_client, &query).await {
+                match fetch_block_signatures_projection(
+                    &shard.http_client,
+                    &shard.read_endpoint,
+                    &query,
+                )
+                .await
+                {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
                         tracing::warn!(
@@ -2154,8 +2148,12 @@ impl ClickHouseClient {
                             projection,
                             &settings_clause,
                         );
-                        let result =
-                            fetch_block_signatures_projection(&self.client, &query).await?;
+                        let result = fetch_block_signatures_projection(
+                            &self.client,
+                            &self.read_endpoint,
+                            &query,
+                        )
+                        .await?;
                         (result.0, result.1, false)
                     }
                 }
@@ -2170,7 +2168,9 @@ impl ClickHouseClient {
                     projection,
                     &settings_clause,
                 );
-                let result = fetch_block_signatures_projection(&self.client, &query).await?;
+                let result =
+                    fetch_block_signatures_projection(&self.client, &self.read_endpoint, &query)
+                        .await?;
                 (result.0, result.1, false)
             };
 
@@ -2186,7 +2186,8 @@ impl ClickHouseClient {
                     &settings_clause,
                 );
                 let (fallback_signatures, fallback_timings) =
-                    fetch_block_signatures_projection(&self.client, &query).await?;
+                    fetch_block_signatures_projection(&self.client, &self.read_endpoint, &query)
+                        .await?;
                 timings.add(fallback_timings);
                 signatures = fallback_signatures;
             }
@@ -2214,7 +2215,13 @@ impl ClickHouseClient {
                 let query =
                     build_block_transactions_query(local_table, slot, projection, &settings_clause);
 
-                match fetch_block_accounts_projection(&shard.http_client, &query).await {
+                match fetch_block_accounts_projection(
+                    &shard.http_client,
+                    &shard.read_endpoint,
+                    &query,
+                )
+                .await
+                {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
                         tracing::warn!(
@@ -2233,7 +2240,12 @@ impl ClickHouseClient {
                             projection,
                             &settings_clause,
                         );
-                        let result = fetch_block_accounts_projection(&self.client, &query).await?;
+                        let result = fetch_block_accounts_projection(
+                            &self.client,
+                            &self.read_endpoint,
+                            &query,
+                        )
+                        .await?;
                         (result.0, result.1, false)
                     }
                 }
@@ -2248,7 +2260,9 @@ impl ClickHouseClient {
                     projection,
                     &settings_clause,
                 );
-                let result = fetch_block_accounts_projection(&self.client, &query).await?;
+                let result =
+                    fetch_block_accounts_projection(&self.client, &self.read_endpoint, &query)
+                        .await?;
                 (result.0, result.1, false)
             };
 
@@ -2264,7 +2278,8 @@ impl ClickHouseClient {
                     &settings_clause,
                 );
                 let (fallback_records, fallback_timings) =
-                    fetch_block_accounts_projection(&self.client, &query).await?;
+                    fetch_block_accounts_projection(&self.client, &self.read_endpoint, &query)
+                        .await?;
                 timings.add(fallback_timings);
                 records = fallback_records;
             }
@@ -2292,7 +2307,14 @@ impl ClickHouseClient {
                 let query =
                     build_block_transactions_query(local_table, slot, projection, &settings_clause);
 
-                match fetch_block_full_projection(&shard.http_client, &query, slot).await {
+                match fetch_block_full_projection(
+                    &shard.http_client,
+                    &shard.read_endpoint,
+                    &query,
+                    slot,
+                )
+                .await
+                {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
                         tracing::warn!(
@@ -2311,8 +2333,13 @@ impl ClickHouseClient {
                             projection,
                             &settings_clause,
                         );
-                        let result =
-                            fetch_block_full_projection(&self.client, &query, slot).await?;
+                        let result = fetch_block_full_projection(
+                            &self.client,
+                            &self.read_endpoint,
+                            &query,
+                            slot,
+                        )
+                        .await?;
                         (result.0, result.1, false)
                     }
                 }
@@ -2327,7 +2354,9 @@ impl ClickHouseClient {
                     projection,
                     &settings_clause,
                 );
-                let result = fetch_block_full_projection(&self.client, &query, slot).await?;
+                let result =
+                    fetch_block_full_projection(&self.client, &self.read_endpoint, &query, slot)
+                        .await?;
                 (result.0, result.1, false)
             };
 
@@ -2343,7 +2372,8 @@ impl ClickHouseClient {
                     &settings_clause,
                 );
                 let (fallback_records, fallback_timings) =
-                    fetch_block_full_projection(&self.client, &query, slot).await?;
+                    fetch_block_full_projection(&self.client, &self.read_endpoint, &query, slot)
+                        .await?;
                 timings.add(fallback_timings);
                 records = fallback_records;
             }
@@ -2392,7 +2422,7 @@ impl ClickHouseClient {
                         range.end_slot,
                         &settings_clause,
                     );
-                    match fetch_block_metadata_range(&shard.http_client, &query).await {
+                    match fetch_block_metadata_range(&shard.http_client, &shard.read_endpoint.with_timeout(timeout), &query).await {
                         Ok((mut local_records, local_timings)) => {
                             timings.add(local_timings);
                             records.append(&mut local_records);
@@ -2429,7 +2459,7 @@ impl ClickHouseClient {
                 &settings_clause,
             );
 
-            fetch_block_metadata_range(&self.client, &query).await
+            fetch_block_metadata_range(&self.client, &self.read_endpoint.with_timeout(timeout), &query).await
         })
         .await
     }
@@ -2470,7 +2500,7 @@ impl ClickHouseClient {
                         range.end_slot,
                         &settings_clause,
                     );
-                    match fetch_block_time_range(&shard.http_client, &query).await {
+                    match fetch_block_time_range(&shard.http_client, &shard.read_endpoint.with_timeout(timeout), &query).await {
                         Ok((mut local_records, local_timings)) => {
                             timings.add(local_timings);
                             records.append(&mut local_records);
@@ -2507,7 +2537,7 @@ impl ClickHouseClient {
                 &settings_clause,
             );
 
-            fetch_block_time_range(&self.client, &query).await
+            fetch_block_time_range(&self.client, &self.read_endpoint.with_timeout(timeout), &query).await
         })
         .await
     }
@@ -2552,7 +2582,7 @@ impl ClickHouseClient {
                             range.end_slot,
                             &settings_clause,
                         );
-                        match fetch_transaction_range(&shard.http_client, &query).await {
+                        match fetch_transaction_range(&shard.http_client, &shard.read_endpoint.with_timeout(timeout), &query).await {
                             Ok((mut local_records, local_timings)) => {
                                 timings.add(local_timings);
                                 records.append(&mut local_records);
@@ -2589,7 +2619,7 @@ impl ClickHouseClient {
                     &settings_clause,
                 );
 
-                fetch_transaction_range(&self.client, &query).await
+                fetch_transaction_range(&self.client, &self.read_endpoint.with_timeout(timeout), &query).await
             },
         )
         .await

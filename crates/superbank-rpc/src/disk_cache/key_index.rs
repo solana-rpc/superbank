@@ -346,10 +346,9 @@ impl DiskCache {
         &self,
         partition: u64,
     ) -> Result<[Option<Bloom>; 3], DiskCacheError> {
-        // A separate lane: never consume the interactive query semaphore.
-        let client = self
-            .inner
-            .local
+        // The persistent address-builder lane is independent of interactive reads.
+        let mut builder = self.inner.address_index_reader.clone();
+        builder.client = builder
             .client
             .clone()
             .with_setting("max_threads", "1")
@@ -357,8 +356,6 @@ impl DiskCache {
             .with_setting("max_execution_time", "300")
             .with_setting("max_block_size", "8192")
             .with_setting("preferred_block_size_bytes", "1048576");
-        let mut builder = self.inner.local.clone();
-        builder.client = client;
         builder.cache_partition = Some((self.inner.cfg.partition_slots, partition));
         builder.query_timeout = Duration::from_secs(300);
         let snapshot = self.source_schema();
@@ -432,19 +429,10 @@ async fn cardinality(
     client: &crate::clickhouse::ClickHouseClient,
     sql: &str,
 ) -> Result<u64, DiskCacheError> {
-    let (sql, id, mut cleanup) =
-        client.annotate_lookup_query(sql.to_string(), "key_index_cardinality");
     let row = client
-        .client
-        .clone()
-        .with_setting("query_id", id.unwrap_or_default())
-        .query(&sql)
-        .fetch_one::<Cardinality>()
+        .read_one::<Cardinality>(sql, "key_index_cardinality")
         .await
         .map_err(|e| DiskCacheError::ClickHouse(e.to_string()))?;
-    if let Some(cleanup) = &mut cleanup {
-        cleanup.disarm();
-    }
     Ok(row.n)
 }
 
@@ -453,15 +441,10 @@ async fn read_keys<const N: usize>(
     sql: &str,
     bloom: &mut Bloom,
 ) -> Result<(), DiskCacheError> {
-    let (sql, id, mut cleanup) = client.annotate_lookup_query(sql.to_string(), "key_index_keys");
-    let client = client
-        .client
-        .clone()
-        .with_setting("query_id", id.unwrap_or_default());
     let mut count = 0u64;
     let mut rows = client
-        .query(&sql)
-        .fetch::<KeyRow<N>>()
+        .read::<KeyRow<N>>(sql, "key_index_keys")
+        .await
         .map_err(|e| DiskCacheError::ClickHouse(e.to_string()))?;
     while let Some(row) = rows
         .next()
@@ -473,9 +456,6 @@ async fn read_keys<const N: usize>(
         if count.is_multiple_of(8192) {
             tokio::task::yield_now().await;
         }
-    }
-    if let Some(cleanup) = &mut cleanup {
-        cleanup.disarm();
     }
     Ok(())
 }

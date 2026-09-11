@@ -50,14 +50,36 @@ struct Topology {
 
 struct Pending {
     _permit: OwnedSemaphorePermit,
+    _additional: Vec<OwnedSemaphorePermit>,
+    _workflow: Vec<Arc<OwnedSemaphorePermit>>,
     abandoned_at: Instant,
     quiet_observations: u8,
     unconfirmed: bool,
+    operation: &'static str,
+    target: &'static str,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        crate::metrics::signature_status_disconnect_pending_dec();
+        record_pending(self.operation, self.target, -1);
+    }
+}
+
+fn record_pending(operation: &'static str, target: &'static str, delta: i64) {
+    crate::metrics::read_disconnect_pending(operation, target, delta);
+    if operation == "signature_statuses" {
+        if delta > 0 {
+            crate::metrics::signature_status_disconnect_pending_inc();
+        } else {
+            crate::metrics::signature_status_disconnect_pending_dec();
+        }
+    }
+}
+
+fn record_verification(entry: &Pending, outcome: &'static str) {
+    crate::metrics::read_disconnect_verification(entry.operation, entry.target, outcome);
+    if entry.operation == "signature_statuses" {
+        crate::metrics::signature_status_disconnect_verification(outcome);
     }
 }
 
@@ -65,6 +87,11 @@ pub(crate) struct DisconnectGuard {
     owner: Arc<Inner>,
     query_id: String,
     permit: Option<OwnedSemaphorePermit>,
+    operation: &'static str,
+    target: &'static str,
+    submitted: bool,
+    additional: Vec<OwnedSemaphorePermit>,
+    workflow: Vec<Arc<OwnedSemaphorePermit>>,
 }
 
 impl DisconnectVerifier {
@@ -82,6 +109,7 @@ impl DisconnectVerifier {
 
     /// Discover complete coverage and validate required HTTP settings before
     /// submitting source work. Discovery failure is safe to release admission.
+    #[cfg(test)]
     pub(crate) async fn arm(
         &self,
         query_id: String,
@@ -96,6 +124,49 @@ impl DisconnectVerifier {
             owner: self.0.clone(),
             query_id,
             permit: Some(permit),
+            operation: "signature_statuses",
+            target: "primary",
+            submitted: true,
+            additional: Vec::new(),
+            workflow: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn initialize_ready(&self) -> ProcessingResult<()> {
+        self.0
+            .topology
+            .get_or_try_init(|| self.initialize())
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) fn require_ready(&self) -> ProcessingResult<()> {
+        if self.0.topology.get().is_some() {
+            Ok(())
+        } else {
+            Err(ProcessingError::database_msg(
+                "ClickHouse read cancellation is not initialized",
+            ))
+        }
+    }
+
+    pub(crate) fn arm_ready(
+        &self,
+        query_id: String,
+        permit: OwnedSemaphorePermit,
+        operation: &'static str,
+        target: &'static str,
+    ) -> ProcessingResult<DisconnectGuard> {
+        self.require_ready()?;
+        Ok(DisconnectGuard {
+            owner: self.0.clone(),
+            query_id,
+            permit: Some(permit),
+            operation,
+            target,
+            submitted: false,
+            additional: Vec::new(),
+            workflow: Vec::new(),
         })
     }
 
@@ -143,34 +214,66 @@ impl Drop for InitializationAttempt<'_> {
 }
 
 impl DisconnectGuard {
+    #[cfg(all(test, feature = "disk-cache"))]
+    pub(crate) fn query_id(&self) -> &str {
+        &self.query_id
+    }
+    pub(crate) fn retain_workflow(&mut self, leases: Vec<Arc<OwnedSemaphorePermit>>) {
+        self.workflow = leases;
+    }
+    pub(crate) fn retain(&mut self, permit: OwnedSemaphorePermit) {
+        self.additional.push(permit);
+    }
+    pub(crate) fn submitted(&mut self) {
+        self.submitted = true;
+    }
+    #[cfg(any(test, feature = "disk-cache"))]
+    pub(crate) fn set_query_id(&mut self, id: String) {
+        self.query_id = id;
+    }
+
     /// Only call after a fully consumed successful response, or before submission.
     pub(crate) fn disarm(&mut self) {
         self.permit = None;
+        self.additional.clear();
+        self.workflow.clear();
     }
 }
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        crate::metrics::signature_status_disconnect_pending_inc();
-        let pending = Pending {
-            _permit: permit,
-            abandoned_at: Instant::now(),
-            quiet_observations: 0,
-            unconfirmed: false,
-        };
-        // Required query IDs are unique across the client lifetime. Keeping the
-        // map in the owner also retains admission if no runtime can run probes.
-        self.owner
-            .pending
-            .lock()
-            .expect("disconnect state poisoned")
-            .insert(self.query_id.clone(), pending);
-        start_worker(&self.owner);
-        self.owner.notify.notify_one();
+        enqueue_abandoned(self);
     }
+}
+
+fn enqueue_abandoned(guard: &mut DisconnectGuard) {
+    if !guard.submitted {
+        return;
+    }
+    let Some(permit) = guard.permit.take() else {
+        return;
+    };
+    record_pending(guard.operation, guard.target, 1);
+    let pending = Pending {
+        _permit: permit,
+        _additional: std::mem::take(&mut guard.additional),
+        _workflow: std::mem::take(&mut guard.workflow),
+        abandoned_at: Instant::now(),
+        quiet_observations: 0,
+        unconfirmed: false,
+        operation: guard.operation,
+        target: guard.target,
+    };
+    // Required query IDs are unique across the client lifetime. Keeping the
+    // map in the owner also retains admission if no runtime can run probes.
+    guard
+        .owner
+        .pending
+        .lock()
+        .expect("disconnect state poisoned")
+        .insert(guard.query_id.clone(), pending);
+    start_worker(&guard.owner);
+    guard.owner.notify.notify_one();
 }
 
 struct WorkerExit(Weak<Inner>);
@@ -219,15 +322,33 @@ async fn worker(weak: Weak<Inner>, notify: Arc<Notify>, _exit: WorkerExit) {
             }
             continue;
         }
-        let result = probe(&owner, &ids).await;
-        let interval = apply_observation(&owner, &ids, result.as_ref().ok());
-        if let Err(error) = result {
-            tracing::warn!(%error, "Unable to verify abandoned primary status queries");
-        }
+        let interval = probe_batches(&owner, &ids).await;
         drop(owner);
         // New arrivals cannot accelerate an existing ID's second quiet check.
         tokio::time::sleep(interval).await;
     }
+}
+
+async fn probe_batches(owner: &Inner, ids: &[String]) -> Duration {
+    let mut interval = POLL_INTERVAL;
+    for batch in ids.chunks(128) {
+        let started = Instant::now();
+        let result = probe(owner, batch).await;
+        crate::metrics::read_disconnect_probe(
+            if owner.cluster.is_some() {
+                "cluster"
+            } else {
+                "local"
+            },
+            started.elapsed().as_secs_f64(),
+            if result.is_ok() { "success" } else { "error" },
+        );
+        interval = apply_observation(owner, batch, result.as_ref().ok());
+        if let Err(error) = result {
+            tracing::warn!(%error, "Unable to verify abandoned ClickHouse reads");
+        }
+    }
+    interval
 }
 
 fn apply_observation(owner: &Inner, ids: &[String], active: Option<&HashSet<String>>) -> Duration {
@@ -241,13 +362,13 @@ fn apply_observation(owner: &Inner, ids: &[String], active: Option<&HashSet<Stri
             _ => 0,
         };
         if entry.quiet_observations >= 2 {
-            tracing::debug!(query_id = %id, "Observed primary status query termination");
-            crate::metrics::signature_status_disconnect_verification("confirmed_absent");
+            tracing::debug!(query_id = %id, "Observed ClickHouse read termination");
+            record_verification(entry, "confirmed_absent");
             pending.remove(id);
         } else if entry.abandoned_at.elapsed() >= UNCONFIRMED_AFTER && !entry.unconfirmed {
             entry.unconfirmed = true;
-            tracing::warn!(query_id = %id, "Primary status termination unconfirmed; retaining admission");
-            crate::metrics::signature_status_disconnect_verification("unconfirmed");
+            tracing::warn!(query_id = %id, "ClickHouse read termination unconfirmed; retaining admission");
+            record_verification(entry, "unconfirmed");
         }
     }
     if pending.values().all(|entry| entry.unconfirmed) {
@@ -532,9 +653,13 @@ mod tests {
             id.into(),
             Pending {
                 _permit: semaphore.clone().try_acquire_owned().unwrap(),
+                _additional: Vec::new(),
+                _workflow: Vec::new(),
                 abandoned_at: Instant::now(),
                 quiet_observations: 0,
                 unconfirmed: false,
+                operation: "signature_statuses",
+                target: "primary",
             },
         );
     }
@@ -628,6 +753,11 @@ mod tests {
             owner: verifier.0.clone(),
             query_id: "q".into(),
             permit: Some(semaphore.clone().try_acquire_owned().unwrap()),
+            operation: "signature_statuses",
+            target: "primary",
+            submitted: true,
+            additional: Vec::new(),
+            workflow: Vec::new(),
         };
         drop(guard);
         assert_eq!(semaphore.available_permits(), 0);
@@ -644,6 +774,11 @@ mod tests {
             owner: verifier.0.clone(),
             query_id: "q".into(),
             permit: Some(semaphore.clone().try_acquire_owned().unwrap()),
+            operation: "signature_statuses",
+            target: "primary",
+            submitted: true,
+            additional: Vec::new(),
+            workflow: Vec::new(),
         };
         guard.disarm();
         drop(guard);

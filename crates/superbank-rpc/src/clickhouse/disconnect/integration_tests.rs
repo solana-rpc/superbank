@@ -70,8 +70,12 @@ impl Fixture {
     }
 
     async fn wait_active(&self, id: &str) {
+        self.wait_active_count(id, 3).await;
+    }
+
+    async fn wait_active_count(&self, id: &str, count: usize) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while self.active_nodes(id).await.len() != 3 {
+            while self.active_nodes(id).await.len() != count {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
@@ -96,10 +100,14 @@ impl Fixture {
     }
 
     async fn assert_cancelled(&self, id: &str) {
+        self.assert_cancelled_count(id, 3).await;
+    }
+
+    async fn assert_cancelled_count(&self, id: &str, count: usize) {
         let rows = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let rows = self.terminals(id).await;
-                if rows.len() == 3 {
+                if rows.len() == count {
                     break rows;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -112,7 +120,7 @@ impl Fixture {
                 .map(|row| &row.node)
                 .collect::<HashSet<_>>()
                 .len(),
-            3
+            count
         );
         assert_eq!(rows.iter().filter(|row| row.initial == 1).count(), 1);
         for row in rows {
@@ -174,7 +182,7 @@ impl TerminalRow {
     }
 }
 
-#[derive(clickhouse::Row, Deserialize)]
+#[derive(Debug, clickhouse::Row, Deserialize)]
 struct SumRow {
     total: u64,
 }
@@ -243,6 +251,7 @@ async fn real_protocol_discovery_probe_and_status_results() {
     let mut client = ClickHouseClient::new(&fixture.url, "default", "", "", options);
     client.signature_statuses_table = "default.fixture_signatures".into();
     client.bucket_moduli.signatures = 32;
+    client.initialize_read_cancellation().await.unwrap();
     let known = bs58::encode([0x11; 64]).into_string();
     let missing = bs58::encode([0x22; 64]).into_string();
     let failed = bs58::encode([0x33; 64]).into_string();
@@ -370,4 +379,319 @@ async fn real_protocol_replica_outage_retains_admission_until_recovery() {
     );
     fixture.control("resume-replica").await;
     wait_released(&semaphore).await;
+}
+
+async fn shared_slow_query(
+    fixture: &Fixture,
+    endpoint: &super::super::read_query::ReadEndpoint,
+    semaphore: &Arc<Semaphore>,
+    id: &str,
+    sql: &str,
+) -> super::super::read_query::ReadQuery {
+    let mut query = endpoint
+        .query_with_id(&fixture.client, sql, "read_integration", Some(id.into()))
+        .await
+        .unwrap()
+        .with_setting("max_threads", "1")
+        .with_setting("max_block_size", "1")
+        .with_setting("max_parallel_replicas", "1")
+        .with_setting("use_hedged_requests", "0")
+        .with_setting("max_execution_time", "35")
+        .with_setting("max_execution_time_leaf", "35")
+        .with_setting("wait_end_of_query", "0")
+        .with_setting("buffer_size", "1")
+        .with_setting("log_query_settings", "1");
+    query.retain(semaphore.clone().acquire_owned().await.unwrap());
+    query
+}
+
+async fn consume_shared_stream(
+    query: super::super::read_query::ReadQuery,
+    native_bytes: bool,
+    fixture: &Fixture,
+    id: &str,
+    nodes: usize,
+) {
+    if native_bytes {
+        let mut cursor = query.fetch_bytes("Native").unwrap();
+        let chunk = tokio::time::timeout(Duration::from_secs(5), cursor.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!chunk.is_empty());
+        fixture.wait_active_count(id, nodes).await;
+        drop(cursor);
+    } else {
+        let mut cursor = query.fetch::<StreamRow>().unwrap();
+        let row = tokio::time::timeout(Duration::from_secs(5), cursor.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.padding.len(), 262144);
+        fixture.wait_active_count(id, nodes).await;
+        drop(cursor);
+    }
+}
+
+async fn shared_cancel_case(fixture: &Fixture, cluster: bool, streaming: bool, native_bytes: bool) {
+    let endpoint = super::super::read_query::ReadEndpoint::new(
+        fixture.client.clone(),
+        cluster.then(|| "{cluster}".into()),
+        1,
+        Duration::from_secs(35),
+        "integration",
+    );
+    endpoint.initialize().await.unwrap();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let id = next_required_query_id("shared_read_integration");
+    let table = if cluster { "slow_all" } else { "slow" };
+    let nodes = if cluster { 3 } else { 1 };
+    let projection = if streaming {
+        "number,delay,arrayStringConcat(arrayMap(x -> hex(SHA512(concat(toString(number), ':', toString(x)))), range(2048))) AS padding"
+    } else {
+        "sum(delay) AS total"
+    };
+    let sql = format!("SELECT {projection} FROM {table}");
+    let query = shared_slow_query(fixture, &endpoint, &semaphore, &id, &sql).await;
+    if streaming {
+        consume_shared_stream(query, native_bytes, fixture, &id, nodes).await;
+    } else {
+        let query = query
+            .with_setting("wait_end_of_query", "1")
+            .with_setting("send_progress_in_http_headers", "0");
+        let task = tokio::spawn(async move {
+            if native_bytes {
+                let mut cursor = query.fetch_bytes("Native").unwrap();
+                while cursor.next().await.unwrap().is_some() {}
+            } else {
+                query.fetch_all::<SumRow>().await.unwrap();
+            }
+        });
+        fixture.wait_active_count(&id, nodes).await;
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    wait_released(&semaphore).await;
+    assert!(fixture.active_nodes(&id).await.is_empty());
+    fixture.assert_cancelled_count(&id, nodes).await;
+    let healthy = endpoint
+        .query(
+            &fixture.client,
+            "SELECT toUInt64(42) AS total",
+            "read_integration_healthy",
+        )
+        .await
+        .unwrap()
+        .fetch_one::<SumRow>()
+        .await
+        .unwrap();
+    assert_eq!(healthy.total, 42);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated pinned three-node ClickHouse fixture"]
+async fn real_shared_reader_cancels_rows_and_native_bytes_locally_and_through_cluster() {
+    let fixture = Fixture::new();
+    for cluster in [false, true] {
+        for streaming in [false, true] {
+            for native_bytes in [false, true] {
+                shared_cancel_case(&fixture, cluster, streaming, native_bytes).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated pinned three-node ClickHouse fixture"]
+async fn real_shared_reader_replica_outage_retains_admission_until_recovery() {
+    let fixture = Fixture::new();
+    let endpoint = super::super::read_query::ReadEndpoint::new(
+        fixture.client.clone(),
+        Some("{cluster}".into()),
+        1,
+        Duration::from_secs(35),
+        "integration",
+    );
+    endpoint.initialize().await.unwrap();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let id = next_required_query_id("shared_read_outage");
+    let query = shared_slow_query(
+        &fixture,
+        &endpoint,
+        &semaphore,
+        &id,
+        "SELECT sum(delay) AS total FROM slow_all",
+    )
+    .await
+    .with_setting("wait_end_of_query", "1");
+    let task = tokio::spawn(query.fetch_all::<SumRow>());
+    fixture.wait_active(&id).await;
+    fixture.control("pause-replica").await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(semaphore.available_permits(), 0);
+    fixture.control("resume-replica").await;
+    wait_released(&semaphore).await;
+    assert!(fixture.active_nodes(&id).await.is_empty());
+}
+
+async fn timed_successful_read(
+    fixture: &Fixture,
+    endpoint: &super::super::read_query::ReadEndpoint,
+    guarded: bool,
+) -> f64 {
+    let sql = "SELECT toUInt64(42) AS total";
+    let started = Instant::now();
+    let rows = if guarded {
+        endpoint
+            .query(&fixture.client, sql, "read_benchmark")
+            .await
+            .unwrap()
+            .fetch_all::<SumRow>()
+            .await
+            .unwrap()
+    } else {
+        fixture
+            .client
+            .query(sql)
+            .with_setting("readonly", "2")
+            .with_setting("cancel_http_readonly_queries_on_client_close", "1")
+            .fetch_all::<SumRow>()
+            .await
+            .unwrap()
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].total, 42);
+    elapsed_ms
+}
+
+fn latency_percentile(samples: &mut [f64], percentile: usize) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[(samples.len() * percentile).div_ceil(100).saturating_sub(1)]
+}
+
+async fn benchmark_successful_reads(
+    fixture: &Fixture,
+    endpoint: &super::super::read_query::ReadEndpoint,
+    scenario: &str,
+) {
+    // Alternate ordering to avoid consistently favoring the second pooled request.
+    for index in 0..20 {
+        timed_successful_read(fixture, endpoint, index % 2 == 0).await;
+        timed_successful_read(fixture, endpoint, index % 2 != 0).await;
+    }
+    let mut gate_failures = [0; 2];
+    for batch in 0..3 {
+        let mut bare = Vec::with_capacity(100);
+        let mut guarded = Vec::with_capacity(100);
+        for index in 0..100 {
+            let first_guarded = index % 2 == 0;
+            let first = timed_successful_read(fixture, endpoint, first_guarded).await;
+            let second = timed_successful_read(fixture, endpoint, !first_guarded).await;
+            if first_guarded {
+                guarded.push(first);
+                bare.push(second);
+            } else {
+                bare.push(first);
+                guarded.push(second);
+            }
+        }
+        let bare_values = [
+            latency_percentile(&mut bare, 50),
+            latency_percentile(&mut bare, 99),
+        ];
+        let guarded_values = [
+            latency_percentile(&mut guarded, 50),
+            latency_percentile(&mut guarded, 99),
+        ];
+        let delta = [
+            guarded_values[0] - bare_values[0],
+            guarded_values[1] - bare_values[1],
+        ];
+        let threshold = [
+            (bare_values[0] * 0.05).max(1.0),
+            (bare_values[1] * 0.05).max(1.0),
+        ];
+        for index in 0..2 {
+            gate_failures[index] += usize::from(delta[index] > threshold[index]);
+        }
+        println!(
+            "read_latency_benchmark {}",
+            serde_json::json!({
+                "scenario": scenario, "batch": batch + 1, "pairs": 100,
+                "bare_ms": {"p50": bare_values[0], "p99": bare_values[1]},
+                "shared_ms": {"p50": guarded_values[0], "p99": guarded_values[1]},
+                "delta_ms": {"p50": delta[0], "p99": delta[1]},
+                "allowed_delta_ms": {"p50": threshold[0], "p99": threshold[1]}
+            })
+        );
+    }
+    // Record repeated evidence rather than making a noisy shared-host timing a
+    // unit-test failure. The rollout gate assesses these three independent batches.
+    println!(
+        "read_latency_benchmark {}",
+        serde_json::json!({
+            "scenario": scenario, "batches": 3,
+            "batches_above_gate": {"p50": gate_failures[0], "p99": gate_failures[1]},
+            "repeatable_regression": gate_failures.iter().any(|count| *count >= 2)
+        })
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated pinned three-node ClickHouse fixture"]
+async fn real_shared_reader_successful_latency_comparison() {
+    let fixture = Fixture::new();
+    // Control probes have a separate HTTP pool, as in the production reader.
+    let control = super::super::client::build_clickhouse_http_client(
+        &fixture.url,
+        "default",
+        "",
+        "",
+        Duration::from_secs(2),
+    );
+    let endpoint = super::super::read_query::ReadEndpoint::new(
+        control,
+        Some("{cluster}".into()),
+        4,
+        Duration::from_secs(35),
+        "integration",
+    );
+    endpoint.initialize().await.unwrap();
+    benchmark_successful_reads(&fixture, &endpoint, "normal").await;
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let id = next_required_query_id("read_benchmark_cancel");
+    let query = shared_slow_query(
+        &fixture,
+        &endpoint,
+        &semaphore,
+        &id,
+        "SELECT sum(delay) AS total FROM slow_all",
+    )
+    .await
+    .with_setting("wait_end_of_query", "1");
+    let task = tokio::spawn(query.fetch_all::<SumRow>());
+    fixture.wait_active(&id).await;
+    fixture.control("pause-replica").await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // Keep an actual abandoned read unconfirmed throughout the paired requests.
+    // SELECT 42 executes at the available coordinator and remains independent.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    benchmark_successful_reads(
+        &fixture,
+        &endpoint,
+        "pending_cancellation_replica_unavailable",
+    )
+    .await;
+    assert_eq!(semaphore.available_permits(), 0);
+    fixture.control("resume-replica").await;
+    wait_released(&semaphore).await;
+    assert!(fixture.active_nodes(&id).await.is_empty());
 }

@@ -95,6 +95,7 @@ impl BlockIndex {
             )));
         }
         let database = quote_identifier(&cfg.database)?;
+        // Bootstrap DDL stays on the writable admin connection.
         admin
             .client
             .query(&format!(
@@ -125,8 +126,9 @@ impl BlockIndex {
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
 
-        let mut local = admin.clone();
+        let mut local = admin.background_read_client(1);
         local.database = cfg.database.clone();
+        local.query_timeout = cfg.query_timeout;
         local.client = local.client.clone().with_database(cfg.database.clone());
         Ok(Self {
             cfg,
@@ -353,12 +355,13 @@ impl BlockIndex {
         let database = quote_identifier(&self.cfg.database)?;
         let ranges = self
             .local
-            .client
-            .query(&format!(
-                "SELECT range_start, argMax(range_end, version) AS range_end \
+            .read_all::<HydrateCoverageRow>(
+                &format!(
+                    "SELECT range_start, argMax(range_end, version) AS range_end \
                  FROM {database}.{COVERAGE_TABLE} GROUP BY range_start ORDER BY range_start DESC"
-            ))
-            .fetch_all::<HydrateCoverageRow>()
+                ),
+                "block_index_hydrate_coverage",
+            )
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         for range in ranges {
@@ -368,14 +371,11 @@ impl BlockIndex {
                 .insert_range(range.range_start, range.range_end);
             let rows = self
                 .local
-                .client
-                .query(&format!(
+                .read_all::<BlockTimeRangeRow>(&format!(
                     "SELECT slot, tupleElement(argMax(tuple(block_time), version), 1) AS block_time \
                      FROM {database}.{DATA_TABLE} WHERE slot BETWEEN {} AND {} GROUP BY slot ORDER BY slot",
                     range.range_start, range.range_end
-                ))
-                .fetch_all::<BlockTimeRangeRow>()
-                .await
+                ), "block_index_hydrate_rows").await
                 .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
             let _ = self.publish_memory(range.range_start, range.range_end, &rows);
         }
@@ -447,6 +447,8 @@ impl BlockIndex {
         source: ClickHouseClient,
         mut shutdown: tokio::sync::broadcast::Receiver<()>,
     ) {
+        // One historical scan runs at a time, independently of interactive reads.
+        let source = source.background_read_client(1);
         crate::metrics::block_index_enabled(true);
         if let Err(err) = self.load_local().await {
             crate::metrics::block_index_error("hydrate");

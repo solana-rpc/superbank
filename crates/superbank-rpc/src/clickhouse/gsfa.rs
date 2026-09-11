@@ -19,12 +19,12 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
 use super::queries::{build_hot_position_pagination_clauses, build_pagination_clauses};
+use super::read_query::admission;
 use super::sharding::{ShardTarget, ShardTopology};
 use super::types::{QueryTimings, SignatureRecord, SlotBoundary};
 use super::util::{
-    GsfaFallbackMode, annotate_query, annotate_required_query, append_max_execution_time_setting,
-    format_gsfa_memo, gsfa_fallback_mode, http_query_with_id, parse_err_json, pubkey_literal,
-    transient_shard_local_error_reason,
+    GsfaFallbackMode, append_max_execution_time_setting, format_gsfa_memo, gsfa_fallback_mode,
+    parse_err_json, pubkey_literal, transient_shard_local_error_reason,
 };
 
 #[derive(Clone)]
@@ -199,9 +199,14 @@ impl ClickHouseClient {
 
         let hot_table = &self.gsfa_hot_table;
         let total_rows = match self
-            .client
-            .query(&format!("SELECT COUNT(*) FROM {}", hot_table))
-            .fetch_one::<u64>()
+            .with_http_query_timeout("initialize_gsfa_hot_table", async {
+                self.read_one::<u64>(
+                    &format!("SELECT COUNT(*) FROM {}", hot_table),
+                    "initialize_gsfa_hot_table",
+                )
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))
+            })
             .await
         {
             Ok(count) => count,
@@ -232,7 +237,14 @@ impl ClickHouseClient {
                 "SELECT COUNT(*) FROM {hot_table} \
                  PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}"
             );
-            match self.client.query(&query).fetch_one::<u64>().await {
+            match self
+                .with_http_query_timeout("initialize_gsfa_hot_address", async {
+                    self.read_one::<u64>(&query, "initialize_gsfa_hot_address")
+                        .await
+                        .map_err(|e| ProcessingError::database(e.to_string(), e))
+                })
+                .await
+            {
                 Ok(count) if count > 0 => {
                     active.insert(pubkey);
                 }
@@ -389,82 +401,95 @@ impl ClickHouseClient {
             let settings_clause = settings_clause.clone();
             let fanout_sem = fanout_sem.clone();
 
-            join_set.spawn(async move {
-                let _permit = fanout_sem.acquire().await.ok();
-                let query = build_gsfa_signatures_query(
-                    with_clause.as_ref(),
-                    local_table.as_ref(),
-                    addr_bucket,
-                    address_literal.as_ref(),
-                    where_clause.as_ref(),
-                    limit,
-                    settings_clause.as_ref(),
-                );
+            let inherited_admission = admission::current();
+            join_set.spawn(admission::scope_with(inherited_admission, async move {
+                admission::run_with_permit(
+                    fanout_sem,
+                    |_| {
+                        (
+                            shard.host.clone(),
+                            shard.tcp_port,
+                            ProcessingError::database_msg("ClickHouse fanout admission closed"),
+                        )
+                    },
+                    async {
+                        let query = build_gsfa_signatures_query(
+                            with_clause.as_ref(),
+                            local_table.as_ref(),
+                            addr_bucket,
+                            address_literal.as_ref(),
+                            where_clause.as_ref(),
+                            limit,
+                            settings_clause.as_ref(),
+                        );
 
-                match execute_shard_tcp_query_block(
-                    shard.clone(),
-                    query_timeout,
-                    "get_signatures_for_address_hot_local_tcp",
-                    "gsfa_hot_signatures_local_tcp",
-                    query,
+                        match execute_shard_tcp_query_block(
+                            shard.clone(),
+                            query_timeout,
+                            "get_signatures_for_address_hot_local_tcp",
+                            "gsfa_hot_signatures_local_tcp",
+                            query,
+                        )
+                        .await
+                        {
+                            Ok((block, timings)) => {
+                                let mut records = Vec::new();
+                                for row in block.rows() {
+                                    let query_row = GsfaSignatureQueryRow {
+                                        signature: row.get("signature").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        slot: row.get("slot").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        slot_idx: row.get("slot_idx").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        err: row.get("err").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        memo: row.get("memo").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        block_time: row.get("block_time").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                    };
+                                    records.push(map_gsfa_signature_row(query_row));
+                                }
+
+                                Ok((records, timings))
+                            }
+                            Err(err) => Err((shard.host.clone(), shard.tcp_port, err)),
+                        }
+                    },
                 )
                 .await
-                {
-                    Ok((block, timings)) => {
-                        let mut records = Vec::new();
-                        for row in block.rows() {
-                            let query_row = GsfaSignatureQueryRow {
-                                signature: row.get("signature").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                slot: row.get("slot").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                slot_idx: row.get("slot_idx").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                err: row.get("err").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                memo: row.get("memo").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                block_time: row.get("block_time").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                            };
-                            records.push(map_gsfa_signature_row(query_row));
-                        }
-
-                        Ok((records, timings))
-                    }
-                    Err(err) => Err((shard.host.clone(), shard.tcp_port, err)),
-                }
-            });
+            }));
         }
 
         let mut records = Vec::new();
@@ -524,62 +549,82 @@ impl ClickHouseClient {
             let settings_clause = settings_clause.clone();
             let fanout_sem = fanout_sem.clone();
 
-            join_set.spawn(async move {
-                let _permit = fanout_sem.acquire().await.ok();
-                let query = build_gsfa_signatures_query(
-                    with_clause.as_ref(),
-                    local_table.as_ref(),
-                    addr_bucket,
-                    address_literal.as_ref(),
-                    where_clause.as_ref(),
-                    limit,
-                    settings_clause.as_ref(),
-                );
-                let (query, query_id) = annotate_query(query, "gsfa_hot_signatures_local_http");
-
-                let timed = tokio::time::timeout(query_timeout, async {
-                    let start = Instant::now();
-                    let mut cursor = http_query_with_id(&shard.http_client, &query, query_id)
-                        .fetch::<GsfaSignatureQueryRow>()
-                        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-
-                    let mut records = Vec::new();
-                    while let Some(row) = cursor
-                        .next()
-                        .await
-                        .map_err(|e| ProcessingError::database(e.to_string(), e))?
-                    {
-                        records.push(map_gsfa_signature_row(row));
-                    }
-
-                    let shard_timings = QueryTimings {
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                        received_bytes: cursor.received_bytes(),
-                        decoded_bytes: cursor.decoded_bytes(),
-                        rows_read: Some(0),
-                        rows_read_unknown: true,
-                        rows_returned: records.len() as u64,
-                    };
-                    Ok::<_, ProcessingError>((records, shard_timings))
-                })
-                .await;
-
-                match timed {
-                    Ok(result) => result.map_err(|e| (shard.host.clone(), shard.tcp_port, e)),
-                    Err(_) => {
-                        crate::metrics::clickhouse_timeout(
-                            "get_signatures_for_address_hot_local_http",
-                        );
-                        Err((
+            let inherited_admission = admission::current();
+            join_set.spawn(admission::scope_with(inherited_admission, async move {
+                admission::run_with_permit(
+                    fanout_sem,
+                    |_| {
+                        (
                             shard.host.clone(),
                             shard.tcp_port,
-                            ProcessingError::timeout_msg(
-                                "Shard-local GSFA hot HTTP query timed out",
-                            ),
-                        ))
-                    }
-                }
-            });
+                            ProcessingError::database_msg("ClickHouse fanout admission closed"),
+                        )
+                    },
+                    async {
+                        let query = build_gsfa_signatures_query(
+                            with_clause.as_ref(),
+                            local_table.as_ref(),
+                            addr_bucket,
+                            address_literal.as_ref(),
+                            where_clause.as_ref(),
+                            limit,
+                            settings_clause.as_ref(),
+                        );
+
+                        let timed = tokio::time::timeout(query_timeout, async {
+                            let start = Instant::now();
+                            let mut cursor = shard
+                                .read_endpoint
+                                .fetch::<GsfaSignatureQueryRow>(
+                                    &shard.http_client,
+                                    &query,
+                                    "gsfa_hot_signatures_local_http",
+                                )
+                                .await
+                                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+
+                            let mut records = Vec::new();
+                            while let Some(row) = cursor
+                                .next()
+                                .await
+                                .map_err(|e| ProcessingError::database(e.to_string(), e))?
+                            {
+                                records.push(map_gsfa_signature_row(row));
+                            }
+
+                            let shard_timings = QueryTimings {
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                                received_bytes: cursor.received_bytes(),
+                                decoded_bytes: cursor.decoded_bytes(),
+                                rows_read: Some(0),
+                                rows_read_unknown: true,
+                                rows_returned: records.len() as u64,
+                            };
+                            Ok::<_, ProcessingError>((records, shard_timings))
+                        })
+                        .await;
+
+                        match timed {
+                            Ok(result) => {
+                                result.map_err(|e| (shard.host.clone(), shard.tcp_port, e))
+                            }
+                            Err(_) => {
+                                crate::metrics::clickhouse_timeout(
+                                    "get_signatures_for_address_hot_local_http",
+                                );
+                                Err((
+                                    shard.host.clone(),
+                                    shard.tcp_port,
+                                    ProcessingError::timeout_msg(
+                                        "Shard-local GSFA hot HTTP query timed out",
+                                    ),
+                                ))
+                            }
+                        }
+                    },
+                )
+                .await
+            }));
         }
 
         let mut records = Vec::new();
@@ -728,12 +773,11 @@ impl ClickHouseClient {
                 limit,
                 &settings_clause,
             );
-            let (query, query_id, mut cleanup) = self.annotate_lookup_query(query, "gsfa_signatures");
 
             let start = Instant::now();
 
-            let mut cursor = http_query_with_id(&self.client, &query, query_id)
-                .fetch::<GsfaSignatureQueryRow>()
+            let mut cursor = self
+                .read::<GsfaSignatureQueryRow>(&query, "gsfa_signatures").await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             let mut results = Vec::new();
@@ -750,7 +794,6 @@ impl ClickHouseClient {
                 .map(map_gsfa_signature_row)
                 .collect::<Vec<_>>();
 
-            super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
             let timings = QueryTimings {
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 received_bytes: cursor.received_bytes(),
@@ -848,17 +891,11 @@ impl ClickHouseClient {
             limit = limit,
             settings_clause = settings_clause
         );
-        // This fallback is a full transaction-table scan, so register a KILL-on-drop cleanup:
-        // if the caller times out or cancels, the heavy server-side query is aborted instead of
-        // running to `max_execution_time`. Cleanup dispatch is concurrency-capped (see
-        // kill_query_semaphore), so it cannot itself storm ClickHouse.
-        let (query, query_id) = annotate_required_query(query, "gsfa_fallback");
-        let mut cleanup =
-            self.http_query_cleanup("get_signatures_for_address_fallback", query_id.clone());
-
+        // Full transaction-table scans use the same verified disconnect cleanup as point reads.
         let start = Instant::now();
-        let mut cursor = http_query_with_id(&self.client, &query, Some(query_id))
-            .fetch::<GsfaSignatureQueryRow>()
+        let mut cursor = self
+            .read::<GsfaSignatureQueryRow>(&query, "get_signatures_for_address_fallback")
+            .await
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
         let mut results = Vec::new();
@@ -884,7 +921,6 @@ impl ClickHouseClient {
             rows_returned: signature_records.len() as u64,
         };
 
-        cleanup.disarm();
         Ok((signature_records, timings))
     }
 }
@@ -1001,7 +1037,6 @@ impl GsfaShardRouter {
             limit,
             &settings_clause,
         );
-        let (query, query_id) = annotate_query(query, "gsfa_signatures_local_http");
 
         #[derive(Deserialize, clickhouse::Row)]
         struct QueryResult {
@@ -1014,8 +1049,10 @@ impl GsfaShardRouter {
         }
 
         let start = Instant::now();
-        let mut cursor = http_query_with_id(&shard.http_client, &query, query_id)
-            .fetch::<QueryResult>()
+        let mut cursor = shard
+            .read_endpoint
+            .fetch::<QueryResult>(&shard.http_client, &query, "gsfa_signatures_local_http")
+            .await
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
         let mut results = Vec::new();
