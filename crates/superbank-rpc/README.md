@@ -40,6 +40,8 @@ Notes:
   Missing rewards are returned as `null` only after the address's required partition is available.
   Dedicated address, concurrency, timeout, thread, memory, and read-byte limits are enabled by
   default.
+  Historical non-partitioned rewards do not require block height metadata. Partitioned rewards
+  still require it to locate payout blocks and determine reward availability.
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
@@ -222,6 +224,15 @@ eligible item promotes the whole HTTP response to `503`.
 For `getInflationReward`, both boundary-unavailable (`-32004`) and rewards-period-active (`-32017`)
 are data-condition errors and remain HTTP `200`; ClickHouse query, metadata, and integrity failures
 continue to use internal error (`-32603`) and are eligible for HTTP `503`.
+
+The `JSON-RPC HTTP response` log event reports the final envelope `status` after promotion,
+including batch responses, and `http_elapsed_ms`. It is emitted at INFO for server errors or
+slow responses and DEBUG otherwise. Per-method timing and slow-request logs use `handler_status`
+for the status before envelope promotion; that field is not the HTTP status seen by the client.
+For a mixed batch, successful items can have `handler_status=200` while the envelope has
+`status=503`. Queries for final HTTP status should select the envelope event. INFO logs omit fast successful
+responses and cannot provide a total-request denominator. Per-method request metrics continue
+to describe handler outcomes before envelope promotion.
 
 ## Optional gRPC head cache (`grpc-head-cache`)
 
