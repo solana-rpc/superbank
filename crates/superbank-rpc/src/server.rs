@@ -95,9 +95,6 @@ fn ignored_distributed_shard_settings(args: &RpcConfig) -> Vec<&'static str> {
     }
 
     let mut ignored = Vec::new();
-    if args.clickhouse_cluster.trim() != "{cluster}" {
-        ignored.push("CLICKHOUSE_CLUSTER");
-    }
     if has_nonempty_setting(args.clickhouse_topology_config.as_deref()) {
         ignored.push("CLICKHOUSE_TOPOLOGY_CONFIG");
     }
@@ -196,6 +193,27 @@ fn epoch_schedule_from_config(args: &RpcConfig) -> RpcResult<EpochSchedule> {
     Ok(schedule)
 }
 
+fn validate_query_resource_limits(args: &RpcConfig) -> RpcResult<()> {
+    if args.get_signature_statuses_max_concurrency == 0
+        || args.get_signature_statuses_max_threads == 0
+    {
+        return Err(RpcError::Config(
+            "GET_SIGNATURE_STATUSES_MAX_CONCURRENCY and GET_SIGNATURE_STATUSES_MAX_THREADS must be positive".to_string(),
+        ));
+    }
+    if args.get_inflation_reward_max_threads == 0
+        || args.get_inflation_reward_max_memory_bytes == 0
+        || args.get_inflation_reward_max_bytes_to_read == 0
+        || args.get_inflation_reward_query_timeout_ms == 0
+    {
+        return Err(RpcError::Config(
+            "getInflationReward ClickHouse resource limits must all be greater than zero"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     info!("Starting Solana RPC server on {}:{}", args.host, args.port);
     let rpc_parameter_filters =
@@ -231,16 +249,8 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
                 .to_string(),
         ));
     }
-    if args.get_inflation_reward_max_threads == 0
-        || args.get_inflation_reward_max_memory_bytes == 0
-        || args.get_inflation_reward_max_bytes_to_read == 0
-        || args.get_inflation_reward_query_timeout_ms == 0
-    {
-        return Err(RpcError::Config(
-            "getInflationReward ClickHouse resource limits must all be greater than zero"
-                .to_string(),
-        ));
-    }
+    validate_query_resource_limits(&args)?;
+
     if args.get_inflation_reward_max_addresses == 0 {
         warn!("getInflationReward address admission limit is disabled");
     }
@@ -278,6 +288,11 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             args.clickhouse_hot_addresses.clone(),
             args.clickhouse_gsfa_hot_table.clone(),
             args.clickhouse_gsfa_hot_local_table.clone(),
+        )
+        .with_query_cleanup_cluster(args.clickhouse_cluster.clone())
+        .with_signature_status_limits(
+            args.get_signature_statuses_max_concurrency,
+            args.get_signature_statuses_max_threads,
         )
         .with_query_timeout(Duration::from_millis(args.clickhouse_query_timeout_ms))
         .with_tcp_access_check_timeout(Duration::from_millis(
@@ -1032,6 +1047,22 @@ mod tests {
     }
 
     #[test]
+    fn signature_status_limits_require_positive_values() {
+        use clap::Parser;
+
+        let _env_lock = crate::config::ENV_TEST_LOCK.lock().expect("env lock");
+        let mut cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert!(super::validate_query_resource_limits(&cfg).is_ok());
+        cfg.get_signature_statuses_max_concurrency = 0;
+        assert!(super::validate_query_resource_limits(&cfg).is_err());
+        cfg.get_signature_statuses_max_concurrency = 1;
+        cfg.get_signature_statuses_max_threads = 0;
+        assert!(super::validate_query_resource_limits(&cfg).is_err());
+        cfg.get_signature_statuses_max_threads = 1;
+        assert!(super::validate_query_resource_limits(&cfg).is_ok());
+    }
+
+    #[test]
     fn distributed_scope_reports_explicit_shard_settings_as_ignored() {
         use clap::Parser;
 
@@ -1057,7 +1088,6 @@ mod tests {
         assert_eq!(
             ignored_distributed_shard_settings(&cfg),
             vec![
-                "CLICKHOUSE_CLUSTER",
                 "CLICKHOUSE_TOPOLOGY_CONFIG",
                 "CLICKHOUSE_GSFA_LOCAL_TABLE",
                 "CLICKHOUSE_SIGNATURES_LOCAL_TABLE",

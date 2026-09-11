@@ -7,6 +7,7 @@ mod blocks;
 mod cache;
 mod client;
 mod constants;
+mod disconnect;
 mod gsfa;
 mod queries;
 mod rows;
