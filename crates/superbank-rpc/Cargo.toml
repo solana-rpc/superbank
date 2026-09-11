@@ -95,6 +95,7 @@ yellowstone-grpc-proto = { version = "12.6.0", optional = true }
 
 [dev-dependencies]
 base64 = "0.22"
+clickhouse = { version = "0.15", features = ["test-util"] }
 tempfile = "3"
 
 [build-dependencies]
