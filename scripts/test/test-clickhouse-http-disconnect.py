@@ -47,8 +47,8 @@ def wait_for(check, seconds=30):
 
 
 class Cluster:
-    def __init__(self, output, image):
-        self.output, self.image = output, image
+    def __init__(self, output, image, memory="2g"):
+        self.output, self.image, self.memory = output, image, memory
         self.name = "ch-disconnect-" + uuid.uuid4().hex[:10]
         self.nodes = [self.name + f"-{i}" for i in range(3)]
         self.created = []
@@ -80,7 +80,7 @@ class Cluster:
 </server></raft_configuration></keeper_server></clickhouse>""")
         for i, name in enumerate(self.nodes):
             args = ["run", "-d", "--name", name, "--hostname", name, "--network", self.name,
-                    "--cpus", "2", "--memory", "2g", "-p", "127.0.0.1::8123",
+                    "--cpus", "2", "--memory", self.memory, "-p", "127.0.0.1::8123",
                     "-e", "CLICKHOUSE_SKIP_USER_SETUP=1", "-v",
                     f"{common}:/etc/clickhouse-server/config.d/fixture.xml:ro"]
             if i == 0:

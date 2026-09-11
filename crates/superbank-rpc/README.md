@@ -427,6 +427,13 @@ ClickHouse instance and pausing its RPC task, an operator can remove the remaini
 (substitute the configured cache database). This deletes the remaining cache data; restart RPC
 to recreate and refill it. Do not recreate an ownership marker over unidentified tables.
 
+`getTransaction` retains the cached `(slot, slot_idx)` for payload lookup, with a
+slot-only retry for stale/legacy positions. A pinned-slot null requires a successful
+signature miss and coverage valid throughout the attempt. Admission timeouts, query
+errors, invalidation, and slots first covered during the lookup fall back to the primary.
+An index entry whose payload is unavailable also falls back. Cache format and retention
+are unchanged.
+
 The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors, and timeouts.
 `superbank_disk_cache_key_seconds` records complete attempts, admission waits, and index builds;
 `superbank_disk_cache_key_index_bytes` reports reserved index memory, and
