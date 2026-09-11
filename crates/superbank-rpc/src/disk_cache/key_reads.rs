@@ -250,7 +250,7 @@ impl DiskCache {
                 &read,
             );
             let (record, _) = client
-                .get_transaction_by_signature_and_slot(&signature.to_string(), position.slot)
+                .get_cached_transaction_by_position(&signature.to_string(), position)
                 .await?;
             Ok(record.filter(|record| self.covers_slot(record.slot)))
         })

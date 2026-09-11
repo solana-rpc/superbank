@@ -219,6 +219,9 @@ pub(crate) struct DiskCacheInner {
     pub(crate) cfg: DiskCacheConfig,
     admin: ClickHouseClient,
     pub(crate) local: ClickHouseClient,
+    maintenance_reader: ClickHouseClient,
+    address_index_reader: ClickHouseClient,
+    signature_index_reader: ClickHouseClient,
     query_client: RwLock<ClickHouseClient>,
     pub(crate) http: reqwest::Client,
     pub(crate) schema: RwLock<Arc<SourceSchemaSnapshot>>,
@@ -260,6 +263,7 @@ impl DiskCache {
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),
         );
         admin.use_table_names(table_names.clone());
+        admin.read_endpoint = admin.read_endpoint.with_target("cache");
         let mut local = ClickHouseClient::new(
             &cfg.url,
             &cfg.database,
@@ -281,22 +285,14 @@ impl DiskCache {
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),
         );
         local.use_table_names(table_names);
+        local.read_endpoint = local.read_endpoint.with_target("cache");
         local.client = local
             .client
             .clone()
             .with_setting("max_threads", cfg.query_max_threads.to_string());
         local.set_blocks_metadata_supports_prewhere(!cfg.memory_blocks_metadata);
 
-        let schema_config = cfg.schema_config();
-        let snapshot = schema::inspect_source_schema(source, &schema_config).await?;
-        let rebuilt = schema::initialize_cache_schema(&admin, &snapshot, &schema_config).await?;
-        if rebuilt {
-            crate::metrics::disk_cache_wipe();
-        }
-        local
-            .create_tables()
-            .await
-            .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+        let snapshot = bootstrap_schema(&cfg, source, &admin, &mut local).await?;
         let block_index = match cfg.block_index.clone() {
             Some(config) => Some(Arc::new(
                 block_index::BlockIndex::open(config, &admin).await?,
@@ -305,12 +301,19 @@ impl DiskCache {
         };
 
         let key_index = Arc::new(key_index::KeyIndex::new(&cfg));
+        // Persist admission across retries; long scans have dedicated single-reader lanes.
+        let maintenance_reader = local.background_read_client(cfg.query_concurrency);
+        let address_index_reader = local.background_read_client(1);
+        let signature_index_reader = local.background_read_client(1);
         let inner = Arc::new(DiskCacheInner {
             key_index,
             cfg,
             admin,
             query_client: RwLock::new(local.clone()),
             local,
+            maintenance_reader,
+            address_index_reader,
+            signature_index_reader,
             http: reqwest::Client::new(),
             schema: RwLock::new(Arc::new(snapshot)),
             coverage: RwLock::new(CoverageMap::new()),
@@ -346,6 +349,7 @@ impl DiskCache {
     }
 
     async fn ping(&self) -> bool {
+        // Bounded readiness control probe must not wait for data-read admission.
         matches!(
             tokio::time::timeout(
                 self.inner.cfg.query_timeout,
@@ -353,6 +357,10 @@ impl DiskCache {
                     .local
                     .client
                     .query("SELECT toUInt8(1) AS ok")
+                    .with_setting("readonly", "2")
+                    .with_setting("cancel_http_readonly_queries_on_client_close", "1")
+                    .with_setting("max_execution_time", "1")
+                    .with_setting("max_threads", "1")
                     .fetch_one::<HealthRow>(),
             )
             .await,
@@ -422,10 +430,8 @@ impl DiskCache {
         );
         let rows = self
             .inner
-            .local
-            .client
-            .query(&query)
-            .fetch_all::<CoverageReadRow>()
+            .maintenance_reader
+            .read_all::<CoverageReadRow>(&query, "disk_cache_coverage_reload")
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         let mut map = CoverageMap::new();
@@ -497,9 +503,7 @@ impl DiskCache {
         let result = self
             .inner
             .local
-            .client
-            .query(&query)
-            .fetch_optional::<CoverageReadRow>()
+            .read_optional::<CoverageReadRow>(&query, "disk_cache_slot_status")
             .await;
         let status = match result {
             Ok(Some(row)) if row.status == 1 => SlotStatus::Covered {
@@ -699,14 +703,12 @@ impl DiskCache {
             "SELECT slot FROM {} FINAL WHERE status = 1 AND slot BETWEEN {start} AND {end} ORDER BY slot",
             schema::COVERAGE_TABLE
         );
-        match self
+        let result = self
             .inner
             .local
-            .client
-            .query(&query)
-            .fetch_all::<SlotRow>()
-            .await
-        {
+            .read_all::<SlotRow>(&query, "disk_cache_range_coverage")
+            .await;
+        match result {
             Ok(rows) => Some(rows.into_iter().map(|row| row.slot).collect()),
             Err(err) => {
                 warn!("disk cache: range coverage read failed: {err}");
@@ -776,10 +778,8 @@ impl DiskCache {
         );
         let rows = self
             .inner
-            .local
-            .client
-            .query(&query)
-            .fetch_all::<CountRow>()
+            .maintenance_reader
+            .read_all::<CountRow>(&query, "disk_cache_validate_counts")
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         let actual: HashMap<u64, u64> = rows.into_iter().map(|row| (row.slot, row.count)).collect();
@@ -987,13 +987,10 @@ impl DiskCache {
         let database = self.inner.cfg.database.replace('\'', "''");
         let row = self
             .inner
-            .local
-            .client
-            .query(&format!(
+            .maintenance_reader
+            .read_one::<BytesRow>(&format!(
                 "SELECT toUInt64(coalesce(sum(bytes_on_disk), 0)) AS bytes FROM system.parts WHERE active AND database = '{database}'"
-            ))
-            .fetch_one::<BytesRow>()
-            .await
+            ), "disk_cache_bytes").await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         Ok(row.bytes)
     }
@@ -1027,10 +1024,8 @@ impl DiskCache {
         );
         let partitions = self
             .inner
-            .local
-            .client
-            .query(&query)
-            .fetch_all::<PartitionRow>()
+            .maintenance_reader
+            .read_all::<PartitionRow>(&query, "disk_cache_partition_list")
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         for partition in partitions {
@@ -1045,6 +1040,7 @@ impl DiskCache {
                 "ALTER TABLE `{}`.`{}` DROP PARTITION ID '{partition_id}'",
                 self.inner.cfg.database, table
             );
+            // Partition DDL remains on the writable client.
             self.inner
                 .local
                 .client
@@ -1055,6 +1051,39 @@ impl DiskCache {
         }
         Ok(())
     }
+}
+
+/// Validate cancellation before schema reads, create the cache database through
+/// the default-database admin, then enable reads using the cache database.
+async fn bootstrap_schema(
+    cfg: &DiskCacheConfig,
+    source: &ClickHouseClient,
+    admin: &ClickHouseClient,
+    local: &mut ClickHouseClient,
+) -> Result<SourceSchemaSnapshot, DiskCacheError> {
+    admin
+        .initialize_read_cancellation()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    source
+        .initialize_read_cancellation()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    let schema_config = cfg.schema_config();
+    let snapshot = schema::inspect_source_schema(source, &schema_config).await?;
+    let rebuilt = schema::initialize_cache_schema(admin, &snapshot, &schema_config).await?;
+    if rebuilt {
+        crate::metrics::disk_cache_wipe();
+    }
+    local
+        .initialize_read_cancellation()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    local
+        .create_tables()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    Ok(snapshot)
 }
 
 fn validate_config(cfg: &DiskCacheConfig) -> Result<(), DiskCacheError> {

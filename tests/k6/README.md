@@ -1104,9 +1104,9 @@ python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/clickhouse
 
 The output directory must not exist. The script builds the all-feature RPC test executable
 before starting the cluster; `--rust-test-binary /absolute/path/to/test-executable` reuses
-an existing build. The three Rust integration tests are ignored in ordinary unit-test runs
+an existing build. The six Rust integration tests are ignored in ordinary unit-test runs
 because they require this disposable fixture; the dedicated CI job explicitly runs all
-three and fails if any are absent, skipped, or fail. Production validation and compression
+six and fails if any are absent, skipped, or fail. Production validation and compression
 remain enabled. The fixture removes its own containers and network on exit and retains
 `report.json`, `rust-integration.log`, generated configuration, and container logs.
 
@@ -1116,3 +1116,51 @@ observations. These controls must fail the cancellation gate for the overall fix
 The production gateway must promptly close the upstream connection and discard queued work
 when the caller disconnects. This local protocol gate does not replace the staged customer
 replay or prove the deployed gateway follows that contract.
+
+
+#### Shared HTTP SELECT coverage and promotion requirements
+
+The status replay and protocol fixture above cover a specific workload. Extending the
+shared HTTP SELECT wrapper requires additional lifecycle and method coverage; neither
+an HTTP `200` nor a successful status-only replay establishes that every RPC read path
+returns complete, correct results.
+
+Run the deterministic shared-reader lifecycle tests alongside the existing protocol gate:
+
+```sh
+cargo test -p superbank-rpc --all-features --locked clickhouse::read_query::tests
+```
+
+Retain evidence for the following cases before promotion:
+
+| Area | Required evidence |
+| --- | --- |
+| Initialization | Endpoint discovery and real process inspection finish before protected reads; permission failures, missing replicas, and failed preflight fail closed. |
+| Normal responses | Empty, one-row, and multi-row reads drain EOF; trailing errors are surfaced; sequential successful reads reuse a data connection and issue zero per-request verification probes after initialization. |
+| Cancellation phases | Abandon before response headers, after a decoded row, and during byte streaming. Verify the exact query family disappears from all expected nodes and held admission is restored only after two complete absence observations. |
+| Admission and control | Timeout while waiting submits no source query; dropping an unsubmitted query releases permits. Saturated data lanes cannot block the separate control pool. More than 128 pending IDs are verified in bounded batches. |
+| Failure and recovery | Active queries, partial observations, unavailable nodes, and probe errors retain permits. Five-second `unconfirmed` outcomes retain capacity; later complete absence restores it. |
+| Method families | Exercise primary signature and payload stages of `getTransaction`, status and address lookups, block/reward reads, local-cache coverage/reads, shard HTTP fallback, and background/index/range readers. Keep native TCP cleanup coverage separate. |
+| Background and writes | Index/backfill reads retain their explicit long deadlines and independent admission; inserts and DDL retain writable behavior. No protected HTTP SELECT cleanup sends KILL or enters the distributed DDL queue. |
+| Response correctness | Compare known finalized transactions and metadata with the reference result, all supported encodings/version limits, pinned slots, ordered status batches, valid empty results, and backend errors. Do not count an unexpected null or truncated body as a latency improvement. |
+
+Use the same endpoint, source snapshot, cache state, corpus, request mix, concurrency,
+arrival rate, and observation duration for baseline and candidate normal-traffic runs.
+Compare successful **nonempty** responses separately from valid empty results, errors,
+and abandoned requests. Record stage timings, CPU, active queries, and the shared
+`superbank_clickhouse_read_disconnect_*` metrics; preserve the status-specific metrics
+for the customer-pattern replay. These tests must not silently alter configured concurrency.
+
+The normal-path regression gate is, independently for **p50 and p99**:
+
+```text
+candidate latency <= baseline latency + max(1 ms, 0.05 * baseline latency)
+```
+
+This is an acceptance target, not a measured result. Repeat matched windows when sample
+size or run-to-run variation prevents a reliable comparison. Cancellation validation must
+also establish termination within the five-second budget with bounded clock uncertainty,
+no orphaned work after drain, and no unexplained CPU or active-query accumulation. A
+normal-path latency pass does not replace cancellation evidence, and vice versa. Keep
+new findings about transaction lookup/null semantics as separate correctness work; this
+cancellation change does not establish that those independent issues are fixed.

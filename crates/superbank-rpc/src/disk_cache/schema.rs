@@ -235,9 +235,7 @@ async fn fetch_table(
          FROM system.tables WHERE database = '{database}' AND name = '{name}' LIMIT 1"
     );
     let row = source
-        .client
-        .query(&table_query)
-        .fetch_optional::<TableRow>()
+        .read_optional::<TableRow>(&table_query, "disk_cache_schema_table")
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))?;
     let Some(row) = row else {
@@ -249,9 +247,7 @@ async fn fetch_table(
          FROM system.columns WHERE database = '{database}' AND table = '{name}' ORDER BY position"
     );
     let columns = source
-        .client
-        .query(&columns_query)
-        .fetch_all::<ColumnRow>()
+        .read_all::<ColumnRow>(&columns_query, "disk_cache_schema_columns")
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))?;
     if columns.is_empty() {
@@ -574,6 +570,7 @@ fn create_cache_view_sql(
 }
 
 async fn execute(client: &ClickHouseClient, sql: &str) -> Result<(), SchemaError> {
+    // Schema DDL and INSERTs must remain writable; this helper never executes SELECTs.
     client
         .client
         .query(sql)
@@ -588,11 +585,10 @@ async fn database_tables(
 ) -> Result<Vec<String>, SchemaError> {
     let database = database.replace('\'', "''");
     local
-        .client
-        .query(&format!(
-            "SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name"
-        ))
-        .fetch_all::<NameRow>()
+        .read_all::<NameRow>(
+            &format!("SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name"),
+            "disk_cache_schema_tables",
+        )
         .await
         .map(|rows| rows.into_iter().map(|row| row.name).collect())
         .map_err(|err| SchemaError::Query(err.to_string()))
@@ -604,11 +600,10 @@ async fn read_meta(
 ) -> Result<Vec<MetaRow>, SchemaError> {
     let table = quote_table(&config.database, META_TABLE);
     local
-        .client
-        .query(&format!(
-            "SELECT key, argMax(value, updated_at) AS value FROM {table} GROUP BY key"
-        ))
-        .fetch_all::<MetaRow>()
+        .read_all::<MetaRow>(
+            &format!("SELECT key, argMax(value, updated_at) AS value FROM {table} GROUP BY key"),
+            "disk_cache_schema_meta",
+        )
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))
 }
@@ -678,11 +673,10 @@ async fn reset_coverage_after_memory_restart(
     }
     let runtime = quote_table(&config.database, RUNTIME_TABLE);
     let marker = local
-        .client
-        .query(&format!(
-            "SELECT count() AS count FROM {runtime} WHERE key = 'clickhouse_generation'"
-        ))
-        .fetch_one::<CountRow>()
+        .read_one::<CountRow>(
+            &format!("SELECT count() AS count FROM {runtime} WHERE key = 'clickhouse_generation'"),
+            "disk_cache_schema_generation",
+        )
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))?;
     if marker.count > 0 {
@@ -719,6 +713,7 @@ async fn rebuild_owned_tables(
     let mut tables: Vec<_> = existing.iter().filter(|name| *name != META_TABLE).collect();
     tables.sort_by_key(|name| !name.ends_with("__mv"));
     for name in tables {
+        // Destructive schema DDL requires the writable admin client.
         local
             .client
             .clone()

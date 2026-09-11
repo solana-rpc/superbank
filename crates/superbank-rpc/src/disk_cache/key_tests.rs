@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in integration against a disposable, loopback ClickHouse server.
+//! Raw queries below are fixture setup and independent observation probes;
+//! cancellation assertions exercise the guarded application read path.
 use super::*;
 use crate::clickhouse::{NumericFilter, SortOrder, TransactionStatusFilter};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -191,6 +193,33 @@ async fn assert_pagination(cache: &DiskCache) {
         assert_eq!(slots, expected);
     }
 }
+
+async fn assert_transaction_position_fallback(cache: &DiskCache) {
+    let mut client = cache.query_client();
+    client.cache_partition = Some((10, 1));
+    // The fallback must reuse the first query's permit instead of deadlocking at capacity one.
+    client.http_query_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let position = crate::clickhouse::SignatureSlot {
+        slot: 15,
+        slot_idx: 99,
+    };
+    let (record, _) = client
+        .get_cached_transaction_by_position(&signature(15).to_string(), position)
+        .await
+        .unwrap();
+    let record = record.unwrap();
+    assert_eq!((record.slot, record.slot_idx), (15, 0));
+    let (missing, _) = client
+        .get_cached_transaction_by_position(&signature(500).to_string(), position)
+        .await
+        .unwrap();
+    assert!(missing.is_none());
+    let (wrong_slot, _) = client
+        .get_cached_transaction_by_position(&signature(25).to_string(), position)
+        .await
+        .unwrap();
+    assert!(wrong_slot.is_none());
+}
 async fn assert_cross_partition_duplicates(client: &clickhouse::Client, cache: &DiskCache) {
     let _mutation = cache.begin_fill(39, 39);
     execute(client, &format!("INSERT INTO {}.transactions (signature,slot,slot_idx,tx_account_keys,meta_status_ok) SELECT signature,39,0,tx_account_keys,1 FROM {}.transactions WHERE slot=49 LIMIT 1", cache.inner.cfg.database,cache.inner.cfg.database)).await;
@@ -229,13 +258,12 @@ async fn wait_for_query(client: &clickhouse::Client, id: &str, running: bool) {
 async fn assert_cancellation(client: &clickhouse::Client, cache: &DiskCache) {
     let mut lookup = cache.query_client();
     lookup.cache_partition = Some((10, 1));
-    let (sql,id,cleanup)=lookup.annotate_lookup_query("SELECT sum(cityHash64(number)) FROM numbers(1000000000000) SETTINGS max_execution_time=2,max_threads=1".into(),"test_cache_cancel");
-    let id = id.unwrap();
-    let query_client = lookup.client.clone().with_setting("query_id", id.clone());
-    let task = tokio::spawn(async move {
-        let _cleanup = cleanup;
-        query_client.query(&sql).execute().await
-    });
+    let query = lookup.read_query(
+        "SELECT sum(cityHash64(number)) FROM numbers(1000000000000) SETTINGS max_execution_time=2,max_threads=1",
+        "test_cache_cancel",
+    ).await.unwrap();
+    let id = query.query_id().to_owned();
+    let task = tokio::spawn(query.fetch_one::<u64>());
     wait_for_query(client, &id, true).await;
     task.abort();
     let _ = task.await;
@@ -536,6 +564,7 @@ async fn key_routing_clickhouse_integration() {
             .slot,
         15
     );
+    assert_transaction_position_fallback(&cache).await;
     assert_pagination(&cache).await;
     assert_pruning(&client, &cache_database).await;
     // Poll migration separately so nested debug lookup futures do not consume

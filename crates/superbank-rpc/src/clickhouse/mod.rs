@@ -10,6 +10,7 @@ mod constants;
 mod disconnect;
 mod gsfa;
 mod queries;
+pub(crate) mod read_query;
 mod rows;
 mod sharding;
 mod signatures;

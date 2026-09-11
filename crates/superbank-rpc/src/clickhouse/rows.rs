@@ -12,6 +12,7 @@ use serde_bytes::ByteBuf;
 
 use crate::processing::{ProcessingError, ProcessingResult};
 
+use super::read_query::ReadEndpoint;
 use super::types::{
     BlockMetadataRecord, QueryTimings, StoredAccountsTransactionRecord, StoredTransactionRecord,
 };
@@ -608,16 +609,17 @@ fn primary_block_signature(tx_signatures: &[[u8; 64]], slot: u64) -> ProcessingR
 
 pub(crate) async fn fetch_single_transaction_row(
     client: &HttpClient,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Option<TransactionRow>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<TransactionRow>()
+    let mut cursor = read_endpoint
+        .fetch::<TransactionRow>(client, query, "fetch_single_transaction_row")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
     let row_opt = cursor
-        .next()
+        .next_optional()
         .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
@@ -635,16 +637,17 @@ pub(crate) async fn fetch_single_transaction_row(
 
 pub(crate) async fn fetch_blockhash_height_row(
     client: &HttpClient,
+    read_endpoint: &ReadEndpoint,
     query: &str,
 ) -> ProcessingResult<(Option<BlockhashHeightRow>, QueryTimings)> {
     let start = Instant::now();
-    let mut cursor = client
-        .query(query)
-        .fetch::<BlockhashHeightRow>()
+    let mut cursor = read_endpoint
+        .fetch::<BlockhashHeightRow>(client, query, "fetch_blockhash_height_row")
+        .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
     let row_opt = cursor
-        .next()
+        .next_optional()
         .await
         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 

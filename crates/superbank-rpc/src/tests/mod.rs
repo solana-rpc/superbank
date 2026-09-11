@@ -3,6 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod latest_slot;
+
 use crate::solana_sdk;
 use crate::solana_sdk::{
     hash::Hash,
