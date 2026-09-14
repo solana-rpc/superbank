@@ -1091,10 +1091,15 @@ DDL is blocked. The before-headers fixture sets `wait_end_of_query=1` to hold it
 response; the streaming fixture uses deterministic hash text so compression produces
 enough wire bytes to decode an early row. These are test controls, not production
 setting changes. A paused replica must retain admission until observation recovers.
-Cancellation checks require prompt termination on all three nodes and a cancellation
-exception on the coordinator. A streaming leaf may instead report a socket reset or
-broken pipe while writing after its coordinator closes the native connection; other
-network errors and natural query completion fail the gate.
+Cancellation checks require prompt termination on every participating node and terminal
+evidence for each execution. Non-streaming coordinator queries require a cancellation
+exception. After the shared-reader test consumes a row or Native chunk and deliberately
+closes the stream, the coordinator may instead report an explicit socket reset or broken
+pipe while writing. A leaf may report the same write failure after its coordinator closes
+the native connection. These socket-close outcomes establish termination after disconnect,
+not execution of a particular server cancellation mechanism. Other network errors and
+natural query completion fail the gate. Admission must remain held until the verifier
+observes complete absence twice and must recover within five seconds.
 
 Run the same gate locally with Docker and the normal Rust build prerequisites:
 
@@ -1161,6 +1166,48 @@ This is an acceptance target, not a measured result. Repeat matched windows when
 size or run-to-run variation prevents a reliable comparison. Cancellation validation must
 also establish termination within the five-second budget with bounded clock uncertainty,
 no orphaned work after drain, and no unexplained CPU or active-query accumulation. A
-normal-path latency pass does not replace cancellation evidence, and vice versa. Keep
-new findings about transaction lookup/null semantics as separate correctness work; this
-cancellation change does not establish that those independent issues are fixed.
+normal-path latency pass does not replace cancellation evidence, and vice versa. Run the
+transaction fallback and full-response parity checks below as an independent correctness
+gate alongside shared-reader cancellation validation.
+
+### getTransaction follow-up benchmarks
+
+Run the basic transaction scenario against a local/staging fixture, then compare full
+JSON-RPC envelopes with a known-present signature corpus covering legacy, v0, and v1:
+
+```sh
+RPC_URL=http://127.0.0.1:18899 SIGNATURE_FILE=/tmp/gettx-signatures.txt \
+VUS=1 DURATION=10s MAX_SUPPORTED_TX_VERSION=1 \
+k6 run tests/k6/scenarios/basic/superbank-rpc-get-transaction.js
+
+RPC_URL=http://127.0.0.1:18899 REFERENCE_RPC_URL=http://127.0.0.1:18900 \
+SIGNATURE_FILE=/tmp/gettx-signatures.txt \
+k6 run tests/k6/scenarios/validation/superbank-rpc-get-transaction-parity.js
+```
+
+The parity scenario checks all four encodings, confirmed/finalized commitment,
+omitted/0/1 maximum supported versions, pinned/mismatched slots, and null/string/number
+request IDs. Existing disk-cache integration tests cover unavailable reads, invalidation,
+concurrent coverage publication, absent signatures, skipped slots, and stale positions.
+
+The SQL benchmark creates its own three-node Docker cluster and transparent local gateway;
+it never connects to an existing ClickHouse endpoint. It uses the repository transaction
+projection and schemas, with separate 8192/1024-granularity payload copies:
+
+```sh
+python3 scripts/test/benchmark-get-transaction.py --output /tmp/gettx-benchmark
+```
+
+The output directory must not exist. Defaults: ClickHouse 26.2.3.2, 3 million rows per
+payload table, 8 GiB memory and 2 CPUs per node, 50 seeded signatures, five alternating
+runs. `--rows 2000 --samples 2 --runs 1` is only a harness smoke test. `--node-memory`
+changes the fixture container limit; the cancellation fixture retains its 2 GiB default.
+`--delay-ms` injects an explicit delay per client request; `modeled_100ms_rtt` is an
+arithmetic sensitivity model, not measured deployed network latency.
+
+`report.json` contains settings, source-script hash, ingestion/merge/part measurements,
+query plans, raw HTTP observations and per-query ClickHouse logs. Payload digests must
+match across variants. Cache-cleared runs drop ClickHouse mark/uncompressed caches;
+filesystem caches remain uncontrolled. SQL timing excludes Rust admission, hydration,
+and serialization. Physical I/O and production-scale capacity are not inferred from
+logical read bytes. See [the findings](../../GETTRANSACTION_BENCHMARKS.md).

@@ -27,6 +27,36 @@ struct Reward {
     commission_bps: Option<u16>,
 }
 
+async fn initialized_state(mock: &Mock) -> Arc<AppState> {
+    #[derive(Serialize, clickhouse::Row)]
+    struct Discovery {
+        node: String,
+        expected: u64,
+        coordinator: u8,
+    }
+    #[derive(Serialize, clickhouse::Row)]
+    struct Probe {
+        node: String,
+        active_id: String,
+    }
+    mock.add(handlers::provide([Discovery {
+        node: "rewards-fixture".into(),
+        expected: 1,
+        coordinator: 1,
+    }]));
+    mock.add(handlers::provide([Probe {
+        node: "rewards-fixture".into(),
+        active_id: String::new(),
+    }]));
+    let state = test_state_with_emit_http_errors(test_state_with_clickhouse_url(mock.url()));
+    state
+        .clickhouse
+        .initialize_read_cancellation()
+        .await
+        .expect("reward fixture cancellation preflight");
+    state
+}
+
 fn boundary(partitions: Option<u64>) -> Boundary {
     Boundary {
         slot: 19_008_000,
@@ -47,6 +77,7 @@ fn request() -> Value {
 #[tokio::test]
 async fn non_partitioned_rewards_do_not_require_block_height() {
     let mock = Mock::new();
+    let state = initialized_state(&mock).await;
     mock.add(handlers::provide([boundary(None)]));
     mock.add(handlers::provide([Reward {
         pubkey: Array([2; 32]),
@@ -56,7 +87,6 @@ async fn non_partitioned_rewards_do_not_require_block_height() {
         commission: None,
         commission_bps: None,
     }]));
-    let state = test_state_with_emit_http_errors(test_state_with_clickhouse_url(mock.url()));
     let response = handle_json_rpc_value(state, &request()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = parse_json_value_response(response).await;
@@ -72,9 +102,9 @@ async fn non_partitioned_rewards_do_not_require_block_height() {
 #[tokio::test]
 async fn partitioned_rewards_still_require_block_height() {
     let mock = Mock::new();
+    let state = initialized_state(&mock).await;
     mock.add(handlers::provide([boundary(Some(1))]));
     mock.add(handlers::provide(Vec::<Reward>::new()));
-    let state = test_state_with_emit_http_errors(test_state_with_clickhouse_url(mock.url()));
     let response = handle_json_rpc_value(state, &request()).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = parse_json_value_response(response).await;

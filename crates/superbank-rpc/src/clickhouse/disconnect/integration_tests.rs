@@ -100,10 +100,10 @@ impl Fixture {
     }
 
     async fn assert_cancelled(&self, id: &str) {
-        self.assert_cancelled_count(id, 3).await;
+        self.assert_cancelled_count(id, 3, false).await;
     }
 
-    async fn assert_cancelled_count(&self, id: &str, count: usize) {
+    async fn assert_cancelled_count(&self, id: &str, count: usize, streamed_to_client: bool) {
         let rows = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let rows = self.terminals(id).await;
@@ -129,7 +129,7 @@ impl Fixture {
                 "slow fixture must cancel, not finish"
             );
             assert!(
-                row.cancelled_by_disconnect(),
+                row.cancelled_by_disconnect(streamed_to_client),
                 "unexpected terminal: {row:?}"
             );
             assert_eq!((row.readonly, row.cancel), (2, 1));
@@ -166,19 +166,72 @@ struct TerminalRow {
 }
 
 impl TerminalRow {
-    fn cancelled_by_disconnect(&self) -> bool {
+    fn cancelled_by_disconnect(&self, streamed_to_client: bool) -> bool {
         if matches!(self.code, 394 | 735) {
             return true;
         }
-        // A streaming leaf can observe the coordinator closing its native
-        // socket before it reads the cancellation packet. Restrict this race
-        // to explicit socket-close errors on leaves; the coordinator must
-        // still report cancellation, and all executions must end promptly.
-        self.initial == 0
-            && self.code == 210
+        // A coordinator socket-close terminal requires a deliberate disconnect
+        // after consuming data; every participant still needs bounded termination.
+        (self.initial == 0 || streamed_to_client) && self.socket_closed_during_write()
+    }
+
+    fn socket_closed_during_write(&self) -> bool {
+        self.code == 210
+            && self.kind == "ExceptionWhileProcessing"
             && self.exception.contains("while writing to socket")
             && (self.exception.contains("Connection reset by peer")
                 || self.exception.contains("Broken pipe"))
+    }
+}
+
+fn socket_terminal(initial: u8, message: &str) -> TerminalRow {
+    TerminalRow {
+        node: "fixture".into(),
+        kind: "ExceptionWhileProcessing".into(),
+        code: 210,
+        exception: message.into(),
+        initial,
+        readonly: 2,
+        cancel: 1,
+    }
+}
+
+#[test]
+fn coordinator_socket_close_requires_consumed_stream() {
+    for reason in ["Broken pipe", "Connection reset by peer"] {
+        let row = socket_terminal(1, &format!("{reason}, while writing to socket"));
+        assert!(!row.cancelled_by_disconnect(false));
+        assert!(row.cancelled_by_disconnect(true));
+        let leaf = socket_terminal(0, &row.exception);
+        assert!(leaf.cancelled_by_disconnect(false));
+    }
+}
+
+#[test]
+fn unrelated_network_errors_are_not_disconnect_evidence() {
+    for message in [
+        "Connection refused, while writing to socket",
+        "Timeout exceeded, while writing to socket",
+        "Broken pipe, while reading from socket",
+    ] {
+        for initial in [0, 1] {
+            assert!(!socket_terminal(initial, message).cancelled_by_disconnect(true));
+        }
+    }
+    let mut row = socket_terminal(1, "Broken pipe, while writing to socket");
+    row.code = 999;
+    assert!(!row.cancelled_by_disconnect(true));
+    row.code = 210;
+    row.kind = "QueryFinish".into();
+    assert!(!row.cancelled_by_disconnect(true));
+}
+
+#[test]
+fn explicit_cancellation_codes_remain_accepted() {
+    for code in [394, 735] {
+        let mut row = socket_terminal(1, "Query was cancelled");
+        row.code = code;
+        assert!(row.cancelled_by_disconnect(false));
     }
 }
 
@@ -476,7 +529,7 @@ async fn shared_cancel_case(fixture: &Fixture, cluster: bool, streaming: bool, n
     }
     wait_released(&semaphore).await;
     assert!(fixture.active_nodes(&id).await.is_empty());
-    fixture.assert_cancelled_count(&id, nodes).await;
+    fixture.assert_cancelled_count(&id, nodes, streaming).await;
     let healthy = endpoint
         .query(
             &fixture.client,
