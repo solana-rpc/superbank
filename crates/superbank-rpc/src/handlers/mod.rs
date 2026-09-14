@@ -856,7 +856,7 @@ async fn dispatch_json_rpc_request(
         let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         debug!(
             method = method.as_str(),
-            status = response.status().as_u16(),
+            handler_status = response.status().as_u16(),
             handler_elapsed_ms = elapsed_ms,
             downstream_elapsed_ms = Option::<u64>::None,
             response_overhead_ms = Option::<u64>::None,
@@ -873,7 +873,7 @@ async fn dispatch_json_rpc_request(
                         json_rpc_request_body_for_slow_log(request);
                     info!(
                         method = method.as_str(),
-                        status = response.status().as_u16(),
+                        handler_status = response.status().as_u16(),
                         handler_elapsed_ms = elapsed_ms,
                         downstream_elapsed_ms = Option::<u64>::None,
                         response_overhead_ms = Option::<u64>::None,
@@ -888,7 +888,7 @@ async fn dispatch_json_rpc_request(
                 None => {
                     info!(
                         method = method.as_str(),
-                        status = response.status().as_u16(),
+                        handler_status = response.status().as_u16(),
                         handler_elapsed_ms = elapsed_ms,
                         downstream_elapsed_ms = Option::<u64>::None,
                         response_overhead_ms = Option::<u64>::None,
@@ -1011,7 +1011,7 @@ async fn dispatch_json_rpc_request(
             }
             debug!(
                 method = method.as_str(),
-                status = status.as_u16(),
+                handler_status = status.as_u16(),
                 handler_elapsed_ms = elapsed_ms,
                 downstream_elapsed_ms = downstream_elapsed_ms,
                 response_overhead_ms = response_overhead_ms,
@@ -1028,7 +1028,7 @@ async fn dispatch_json_rpc_request(
                             json_rpc_request_body_for_slow_log(request);
                         info!(
                             method = method.as_str(),
-                            status = status.as_u16(),
+                            handler_status = status.as_u16(),
                             handler_elapsed_ms = elapsed_ms,
                             downstream_elapsed_ms = downstream_elapsed_ms,
                             response_overhead_ms = response_overhead_ms,
@@ -1043,7 +1043,7 @@ async fn dispatch_json_rpc_request(
                     None => {
                         info!(
                             method = method.as_str(),
-                            status = status.as_u16(),
+                            handler_status = status.as_u16(),
                             handler_elapsed_ms = elapsed_ms,
                             downstream_elapsed_ms = downstream_elapsed_ms,
                             response_overhead_ms = response_overhead_ms,
@@ -1059,7 +1059,7 @@ async fn dispatch_json_rpc_request(
         Err(_) => {
             debug!(
                 method = method.as_str(),
-                status = status.as_u16(),
+                handler_status = status.as_u16(),
                 handler_elapsed_ms = elapsed_ms,
                 downstream_elapsed_ms = Option::<u64>::None,
                 response_overhead_ms = Option::<u64>::None,
@@ -1076,7 +1076,7 @@ async fn dispatch_json_rpc_request(
                             json_rpc_request_body_for_slow_log(request);
                         info!(
                             method = method.as_str(),
-                            status = status.as_u16(),
+                            handler_status = status.as_u16(),
                             handler_elapsed_ms = elapsed_ms,
                             downstream_elapsed_ms = Option::<u64>::None,
                             response_overhead_ms = Option::<u64>::None,
@@ -1091,7 +1091,7 @@ async fn dispatch_json_rpc_request(
                     None => {
                         info!(
                             method = method.as_str(),
-                            status = status.as_u16(),
+                            handler_status = status.as_u16(),
                             handler_elapsed_ms = elapsed_ms,
                             downstream_elapsed_ms = Option::<u64>::None,
                             response_overhead_ms = Option::<u64>::None,
@@ -1311,12 +1311,13 @@ pub(crate) async fn handle_json_rpc_with_headers(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
+    let start = Instant::now();
     let emit_http_errors = state.emit_http_errors;
+    let labels = request_header_metric_labels(&headers, &state.metrics_header_capture);
+    let request_metric_labels = labels.clone();
     let response_header_metrics_context = Arc::new(ResponseHeaderMetricsContext::default());
-    let mut response =
+    let result =
         with_response_header_metrics_context(response_header_metrics_context.clone(), async move {
-            let request_metric_labels =
-                request_header_metric_labels(&headers, &state.metrics_header_capture);
             let payload = match serde_json::from_slice::<Value>(&body) {
                 Ok(payload) => payload,
                 Err(_) => {
@@ -1344,11 +1345,58 @@ pub(crate) async fn handle_json_rpc_with_headers(
                 )),
             }
         })
-        .await?;
+        .await;
 
-    response = promote_http_status_for_json_rpc_errors(response, emit_http_errors).await;
-    add_response_metrics_headers(&mut response, response_header_metrics_context.snapshot());
+    let result =
+        finalize_json_rpc_response(result, emit_http_errors, &response_header_metrics_context)
+            .await;
+    log_http_response(&result, start, &labels);
+    result
+}
+
+async fn finalize_json_rpc_response(
+    result: Result<Response, StatusCode>,
+    emit_http_errors: bool,
+    context: &ResponseHeaderMetricsContext,
+) -> Result<Response, StatusCode> {
+    let mut response = promote_http_status_for_json_rpc_errors(result?, emit_http_errors).await;
+    add_response_metrics_headers(&mut response, context.snapshot());
     Ok(response)
+}
+
+fn log_http_response(
+    result: &Result<Response, StatusCode>,
+    start: Instant,
+    labels: &metrics::RequestHeaderMetricLabels,
+) {
+    let status = match result {
+        Ok(response) => response.status(),
+        Err(status) => *status,
+    };
+    let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    // This event describes the whole HTTP envelope, including mixed batches and timeouts.
+    // Per-method events report handler_status before envelope-level status promotion.
+    if status.is_server_error() || elapsed_ms >= slow_rpc_threshold_ms() {
+        info!(
+            status = status.as_u16(),
+            http_elapsed_ms = elapsed_ms,
+            x_endpoint = labels.x_endpoint_for_logs(),
+            x_rpc_node = labels.x_rpc_node_for_logs(),
+            x_subscription_id = labels.x_subscription_id_for_logs(),
+            x_account_id = labels.x_account_id_for_logs(),
+            "JSON-RPC HTTP response"
+        );
+    } else {
+        debug!(
+            status = status.as_u16(),
+            http_elapsed_ms = elapsed_ms,
+            x_endpoint = labels.x_endpoint_for_logs(),
+            x_rpc_node = labels.x_rpc_node_for_logs(),
+            x_subscription_id = labels.x_subscription_id_for_logs(),
+            x_account_id = labels.x_account_id_for_logs(),
+            "JSON-RPC HTTP response"
+        );
+    }
 }
 
 #[cfg(test)]

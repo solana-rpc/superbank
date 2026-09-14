@@ -4,6 +4,8 @@
  */
 
 use crate::solana_sdk;
+mod http_response_logs;
+mod inflation_rewards;
 use crate::solana_sdk::{
     hash::Hash,
     instruction::InstructionError,
