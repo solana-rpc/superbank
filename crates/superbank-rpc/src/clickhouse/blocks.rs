@@ -1263,14 +1263,6 @@ impl ClickHouseClient {
                 )));
             }
 
-            let boundary_block_height = boundary.block_height.ok_or_else(|| {
-                crate::metrics::inflation_reward_lookup("unknown", "invalid_boundary");
-                ProcessingError::database_msg(format!(
-                    "inflation reward boundary slot {} has no block height",
-                    boundary.slot
-                ))
-            })?;
-
             let num_partitions = match boundary.rewards_num_partitions {
                 Some(num_partitions) => {
                     let num_partitions = usize::try_from(num_partitions).map_err(|_| {
@@ -1383,6 +1375,14 @@ impl ClickHouseClient {
                     timings,
                 ));
             }
+
+            let boundary_block_height = boundary.block_height.ok_or_else(|| {
+                crate::metrics::inflation_reward_lookup("unknown", "invalid_boundary");
+                ProcessingError::database_msg(format!(
+                    "inflation reward boundary slot {} has no block height",
+                    boundary.slot
+                ))
+            })?;
 
             let num_partitions =
                 num_partitions.expect("partitioned boundary has a partition count");
