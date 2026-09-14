@@ -3,6 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod cache_refresh;
+
 use crate::solana_sdk;
 mod http_response_logs;
 mod inflation_rewards;
