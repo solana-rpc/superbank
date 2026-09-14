@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Ordered, partition-scoped reads under one cache-attempt deadline.
 use super::{
-    DiskCache, DiskGsfaPage, DiskSigStatus, clamp_until_to_floor,
+    DiskCache, DiskGsfaPage, DiskSigStatus, DiskTransactionResult, SlotStatus,
+    clamp_until_to_floor,
     index::DiskTfaQuery,
     key_index::{Family, SignatureCandidates, SignatureHash},
     lower_bound_reaches_floor, upper_bound_reaches_tip,
 };
 use crate::clickhouse::{
     ClickHouseClient, NumericFilter, PaginationToken, SignatureRecord, SignatureSlot, SlotBoundary,
-    SortOrder, StoredTransactionRecord, TokenAccountsFilter, TransactionsForAddressQuery,
+    SortOrder, TokenAccountsFilter, TransactionsForAddressQuery,
 };
 use crate::processing::{ProcessingError, ProcessingResult};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use tokio::time::Instant;
 
 // Slot bounds are conservative for position cursors: SQL resolves the index
@@ -108,6 +110,31 @@ impl Read {
             return Err(ProcessingError::timeout_msg("disk cache deadline exceeded"));
         }
         Ok(())
+    }
+}
+fn transaction_outcome(
+    result: Result<ProcessingResult<DiskTransactionResult>, tokio::time::error::Elapsed>,
+    valid: bool,
+) -> (DiskTransactionResult, &'static str) {
+    match result {
+        Ok(Ok(value)) if valid => {
+            let outcome = if matches!(value, DiskTransactionResult::Found(_)) {
+                "hit"
+            } else {
+                "miss"
+            };
+            (value, outcome)
+        }
+        Ok(Ok(_)) => (DiskTransactionResult::Unavailable, "miss"),
+        Ok(Err(ProcessingError::Timeout { .. })) | Err(_) => {
+            (DiskTransactionResult::Unavailable, "timeout")
+        }
+        Ok(Err(ProcessingError::Database { context, .. }))
+            if context.contains("TIMEOUT_EXCEEDED") =>
+        {
+            (DiskTransactionResult::Unavailable, "timeout")
+        }
+        Ok(Err(_)) => (DiskTransactionResult::Unavailable, "error"),
     }
 }
 impl DiskCache {
@@ -238,23 +265,61 @@ impl DiskCache {
         )
         .await
     }
-    pub(crate) async fn get_tx(&self, signature: Signature) -> Option<StoredTransactionRecord> {
-        let read = self.read()?;
-        self.attempt("get_tx", &read, async {
-            let Some(position) = self.find_position(signature, &read).await? else {
-                return Ok(None);
-            };
+    pub(crate) async fn get_tx(
+        &self,
+        signature: Signature,
+        requested_slot: Option<u64>,
+    ) -> DiskTransactionResult {
+        let Some(read) = self.read() else {
+            return DiskTransactionResult::Unavailable;
+        };
+        let started = Instant::now();
+        let result = tokio::time::timeout_at(
+            read.deadline,
+            self.read_transaction(signature, requested_slot, &read),
+        )
+        .await;
+        let (value, outcome) = transaction_outcome(result, self.valid_read(&read));
+        crate::metrics::disk_cache_read("get_tx", outcome);
+        crate::metrics::disk_cache_key_seconds("get_tx", outcome, started.elapsed().as_secs_f64());
+        value
+    }
+
+    async fn read_transaction(
+        &self,
+        signature: Signature,
+        requested_slot: Option<u64>,
+        read: &Read,
+    ) -> ProcessingResult<DiskTransactionResult> {
+        // Appends need not invalidate the epoch. A slot published after the
+        // signature search began cannot turn that earlier miss into proof.
+        let covered_slot = requested_slot.filter(|slot| self.covers_slot(*slot));
+        if let Some(position) = self.find_position(signature, read).await? {
             let client = self.scoped_client(
                 &self.query_client(),
                 position.slot / self.inner.cfg.partition_slots,
-                &read,
+                read,
             );
             let (record, _) = client
-                .get_transaction_by_signature_and_slot(&signature.to_string(), position.slot)
+                .get_transaction_by_signature_and_position(&signature.to_string(), position)
                 .await?;
-            Ok(record.filter(|record| self.covers_slot(record.slot)))
-        })
-        .await
+            // An index entry without its payload is inconsistent, not proof of absence.
+            return Ok(
+                match record.filter(|record| self.covers_slot(record.slot)) {
+                    Some(record) => DiskTransactionResult::Found(Arc::new(record)),
+                    None => DiskTransactionResult::Unavailable,
+                },
+            );
+        }
+        if let Some(slot) = covered_slot
+            && matches!(
+                self.slot_status(slot).await,
+                SlotStatus::Covered { .. } | SlotStatus::Skipped
+            )
+        {
+            return Ok(DiskTransactionResult::Absent);
+        }
+        Ok(DiskTransactionResult::Unavailable)
     }
     pub(crate) async fn get_sig_statuses(
         &self,
@@ -527,6 +592,26 @@ impl DiskCache {
 mod window_tests {
     use super::*;
     use crate::clickhouse::{ResolvedSignatureFilter, TransactionStatusFilter};
+
+    #[test]
+    fn invalidated_absence_is_unavailable() {
+        let (value, _) = transaction_outcome(Ok(Ok(DiskTransactionResult::Absent)), false);
+        assert!(matches!(value, DiskTransactionResult::Unavailable));
+        let (value, _) = transaction_outcome(Ok(Ok(DiskTransactionResult::Absent)), true);
+        assert!(matches!(value, DiskTransactionResult::Absent));
+    }
+
+    #[test]
+    fn transaction_errors_never_prove_absence() {
+        for error in [
+            ProcessingError::timeout_msg("admission"),
+            ProcessingError::database_msg("TIMEOUT_EXCEEDED"),
+            ProcessingError::database_msg("unavailable table"),
+        ] {
+            let (value, _) = transaction_outcome(Ok(Err(error)), true);
+            assert!(matches!(value, DiskTransactionResult::Unavailable));
+        }
+    }
 
     #[test]
     fn gsfa_cursors_skip_newer_partitions_and_preserve_boundary_slots() {

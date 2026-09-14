@@ -1116,3 +1116,45 @@ observations. These controls must fail the cancellation gate for the overall fix
 The production gateway must promptly close the upstream connection and discard queued work
 when the caller disconnects. This local protocol gate does not replace the staged customer
 replay or prove the deployed gateway follows that contract.
+
+### getTransaction follow-up benchmarks
+
+Run the basic transaction scenario against a local/staging fixture, then compare full
+JSON-RPC envelopes with a known-present signature corpus covering legacy, v0, and v1:
+
+```sh
+RPC_URL=http://127.0.0.1:18899 SIGNATURE_FILE=/tmp/gettx-signatures.txt \
+VUS=1 DURATION=10s MAX_SUPPORTED_TX_VERSION=1 \
+k6 run tests/k6/scenarios/basic/superbank-rpc-get-transaction.js
+
+RPC_URL=http://127.0.0.1:18899 REFERENCE_RPC_URL=http://127.0.0.1:18900 \
+SIGNATURE_FILE=/tmp/gettx-signatures.txt \
+k6 run tests/k6/scenarios/validation/superbank-rpc-get-transaction-parity.js
+```
+
+The parity scenario checks all four encodings, confirmed/finalized commitment,
+omitted/0/1 maximum supported versions, pinned/mismatched slots, and null/string/number
+request IDs. Existing disk-cache integration tests cover unavailable reads, invalidation,
+concurrent coverage publication, absent signatures, skipped slots, and stale positions.
+
+The SQL benchmark creates its own three-node Docker cluster and transparent local gateway;
+it never connects to an existing ClickHouse endpoint. It uses the repository transaction
+projection and schemas, with separate 8192/1024-granularity payload copies:
+
+```sh
+python3 scripts/test/benchmark-get-transaction.py --output /tmp/gettx-benchmark
+```
+
+The output directory must not exist. Defaults: ClickHouse 26.2.3.2, 3 million rows per
+payload table, 8 GiB memory and 2 CPUs per node, 50 seeded signatures, five alternating
+runs. `--rows 2000 --samples 2 --runs 1` is only a harness smoke test. `--node-memory`
+changes the fixture container limit; the cancellation fixture retains its 2 GiB default.
+`--delay-ms` injects an explicit delay per client request; `modeled_100ms_rtt` is an
+arithmetic sensitivity model, not measured deployed network latency.
+
+`report.json` contains settings, source-script hash, ingestion/merge/part measurements,
+query plans, raw HTTP observations and per-query ClickHouse logs. Payload digests must
+match across variants. Cache-cleared runs drop ClickHouse mark/uncompressed caches;
+filesystem caches remain uncontrolled. SQL timing excludes Rust admission, hydration,
+and serialization. Physical I/O and production-scale capacity are not inferred from
+logical read bytes. See [the findings](../../GETTRANSACTION_BENCHMARKS.md).

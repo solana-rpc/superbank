@@ -547,100 +547,147 @@ impl ClickHouseClient {
             let Some(position) = slot_opt else {
                 return Ok((None, timings));
             };
-            let slot = position.slot;
-            let slot_idx = position.slot_idx;
             let _http_permit = self.acquire_http_query_permit().await?;
-
-            let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
-                build_get_transaction_by_signature_query(
-                    table,
-                    &signature_literal,
-                    slot,
-                    slot_idx,
-                    settings_clause,
-                )
-            };
-
-            let (mut row_opt, query_timings, used_local) = if self.scope_shard_direct()
-                && self.transport_http()
-                && let (Some(topology), Some(local_table)) =
-                    (&self.shard_topology, &self.transactions_local_table)
-            {
-                let shard = topology.shard_for_hash(slot / SLOT_SHARD_DIVISOR);
-                let settings_clause = topology.get_transaction_settings_clause(
-                    "get_transaction_by_signature_local_http",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(local_table, Some(slot_idx), &settings_clause);
-
-                match fetch_single_transaction_row(&shard.http_client, &query).await {
-                    Ok(result) => (result.0, result.1, true),
-                    Err(err) => {
-                        if transient_shard_local_error_reason(&err).is_some() {
-                            topology.failover_from(&shard);
-                        }
-                        tracing::warn!(
-                            "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
-                            shard.host,
-                            shard.tcp_port,
-                            err
-                        );
-                        let settings_clause = self.select_get_transaction_settings_clause(
-                            "get_transaction_by_signature_fallback_distributed",
-                            QueryFreshnessClass::Historical,
-                        );
-                        let query =
-                            build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                        let result = self.fetch_transaction_lookup(&query).await?;
-                        (result.0, result.1, false)
-                    }
-                }
-            } else {
-                let settings_clause = self.select_get_transaction_settings_clause(
-                    "get_transaction_by_signature_distributed",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                let result = self.fetch_transaction_lookup(&query).await?;
-                (result.0, result.1, false)
-            };
-            timings.add(query_timings);
-
-            if used_local && row_opt.is_none() {
-                // The shard-local table is expected to contain the same data as the distributed table,
-                // but fall back to the distributed table to avoid false negatives if local data is
-                // incomplete (e.g. during backfills or replication lag).
-                let settings_clause = self.select_get_transaction_settings_clause(
-                    "get_transaction_by_signature_distributed_retry",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                let (fallback_opt, fallback_timings) =
-                    self.fetch_transaction_lookup(&query).await?;
-                timings.add(fallback_timings);
-                row_opt = fallback_opt;
-            }
-
-            if row_opt.is_none() {
-                // Fall back to the legacy query that doesn't require slot_idx to match.
-                let settings_clause = self.select_get_transaction_settings_clause(
-                    "get_transaction_by_signature_legacy_fallback",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(&self.transaction_table, None, &settings_clause);
-                let (fallback_opt, fallback_timings) =
-                    self.fetch_transaction_lookup(&query).await?;
-                timings.add(fallback_timings);
-                row_opt = fallback_opt;
-            }
-
-            let Some(row) = row_opt else {
-                return Ok((None, timings));
-            };
-
-            Ok((Some(map_transaction_row(row)), timings))
+            let (record, payload_timings) = self
+                .fetch_transaction_at_position(&signature_literal, position)
+                .await?;
+            timings.add(payload_timings);
+            Ok((record, timings))
         })
         .await
+    }
+
+    /// Read an already resolved position without another signature lookup.
+    /// Admission and all position/legacy attempts share one operation deadline.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn get_transaction_by_signature_and_position(
+        &self,
+        signature: &str,
+        position: SignatureSlot,
+    ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
+        self.with_http_query_timeout("get_transaction_by_signature_and_position", async {
+            let (_, literal) = decode_transaction_signature(signature)?;
+            self.fetch_transaction_at_position(&literal, position).await
+        })
+        .await
+    }
+
+    // The caller owns HTTP admission and the operation deadline.
+    async fn fetch_transaction_at_position(
+        &self,
+        signature_literal: &str,
+        position: SignatureSlot,
+    ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
+        let slot = position.slot;
+        let slot_idx = position.slot_idx;
+
+        let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
+            build_get_transaction_by_signature_query(
+                table,
+                signature_literal,
+                slot,
+                slot_idx,
+                settings_clause,
+            )
+        };
+
+        let (mut row_opt, mut timings, used_local) = self
+            .fetch_first_transaction_position(signature_literal, position)
+            .await?;
+
+        if used_local && row_opt.is_none() {
+            // The shard-local table is expected to contain the same data as the distributed table,
+            // but fall back to the distributed table to avoid false negatives if local data is
+            // incomplete (e.g. during backfills or replication lag).
+            let settings_clause = self.select_get_transaction_settings_clause(
+                "get_transaction_by_signature_distributed_retry",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
+            let (fallback_opt, fallback_timings) = self.fetch_transaction_lookup(&query).await?;
+            timings.add(fallback_timings);
+            row_opt = fallback_opt;
+        }
+
+        if row_opt.is_none() {
+            // Fall back to the legacy query that doesn't require slot_idx to match.
+            let settings_clause = self.select_get_transaction_settings_clause(
+                "get_transaction_by_signature_legacy_fallback",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(&self.transaction_table, None, &settings_clause);
+            let (fallback_opt, fallback_timings) = self.fetch_transaction_lookup(&query).await?;
+            timings.add(fallback_timings);
+            row_opt = fallback_opt;
+        }
+
+        let Some(row) = row_opt else {
+            return Ok((None, timings));
+        };
+
+        Ok((Some(map_transaction_row(row)), timings))
+    }
+
+    async fn fetch_first_transaction_position(
+        &self,
+        signature_literal: &str,
+        position: SignatureSlot,
+    ) -> ProcessingResult<(Option<TransactionRow>, QueryTimings, bool)> {
+        let slot = position.slot;
+        let slot_idx = position.slot_idx;
+        let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
+            build_get_transaction_by_signature_query(
+                table,
+                signature_literal,
+                slot,
+                slot_idx,
+                settings_clause,
+            )
+        };
+        let result = if self.scope_shard_direct()
+            && self.transport_http()
+            && let (Some(topology), Some(local_table)) =
+                (&self.shard_topology, &self.transactions_local_table)
+        {
+            let shard = topology.shard_for_hash(slot / SLOT_SHARD_DIVISOR);
+            let settings_clause = topology.get_transaction_settings_clause(
+                "get_transaction_by_signature_local_http",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(local_table, Some(slot_idx), &settings_clause);
+
+            match fetch_single_transaction_row(&shard.http_client, &query).await {
+                Ok(result) => (result.0, result.1, true),
+                Err(err) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_from(&shard);
+                    }
+                    tracing::warn!(
+                        "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
+                        shard.host,
+                        shard.tcp_port,
+                        err
+                    );
+                    let settings_clause = self.select_get_transaction_settings_clause(
+                        "get_transaction_by_signature_fallback_distributed",
+                        QueryFreshnessClass::Historical,
+                    );
+                    let query =
+                        build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
+                    let result = self.fetch_transaction_lookup(&query).await?;
+                    (result.0, result.1, false)
+                }
+            }
+        } else {
+            let settings_clause = self.select_get_transaction_settings_clause(
+                "get_transaction_by_signature_distributed",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
+            let result = self.fetch_transaction_lookup(&query).await?;
+            (result.0, result.1, false)
+        };
+        Ok(result)
     }
 
     pub async fn get_transaction_by_signature_and_slot(
