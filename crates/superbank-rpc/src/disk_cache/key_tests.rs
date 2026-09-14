@@ -832,3 +832,5 @@ async fn key_routing_clickhouse_integration() {
     execute(&client, &format!("DROP DATABASE {cache_database} SYNC")).await;
     execute(&client, &format!("DROP DATABASE {database} SYNC")).await;
 }
+
+mod diagnostics;

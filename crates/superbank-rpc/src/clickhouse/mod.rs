@@ -47,3 +47,6 @@ pub(crate) use util::transient_shard_local_error_reason;
 pub(crate) use util::extract_memo;
 #[cfg(feature = "disk-cache")]
 pub(crate) use util::parse_err_json;
+
+#[cfg(all(test, feature = "disk-cache"))]
+pub(crate) use transactions::diagnostics::measure_position_reads;

@@ -803,6 +803,21 @@ Hot table schema expectations:
   `slot_idx`, `memo`, `err`, `block_time`).
 - Partitioning and ordering should favor the access pattern (latest-first reads).
 
+## Local getTransaction diagnostics
+
+The ignored `get_transaction_local_diagnostics` test exercises the disk-cache reader against a disposable loopback ClickHouse server. Use the same ClickHouse version as the deployment under investigation. The fixture creates unique source/cache databases and removes them after success; failed assertions can leave those databases for inspection. Do not point this command at an existing service through a forwarded loopback port.
+
+```bash
+DISK_CACHE_TEST_URL=http://127.0.0.1:18193 \
+GETTX_DIAGNOSTIC_OUTPUT=/tmp/gettx-diagnostic.json \
+cargo test -p superbank-rpc --all-features --locked --lib \
+  get_transaction_local_diagnostics -- --ignored --nocapture
+```
+
+The JSON artifact contains twenty samples per combination of unknown/complete signature membership, legacy/v0 hits or misses, and signature-only/slot-pinned requests. It also records guarded signature and payload query IDs, workflow admission, read-endpoint setup/admission, first-row time, and the subsequent wait for successful EOF. Phase queries use the application reader, transaction column projection, and cache query settings. Signature SQL mirrors the production lookup, so keep that diagnostic projection aligned when changing the lookup. `first_row_ms` includes endpoint setup/admission; `complete_ms` includes first-row time. These overlapping measurements must not be added together.
+
+Separate handler samples include fixture state creation, hydration, response construction, and body collection. They are not an isolated serialization benchmark. Assertions verify legacy/v0 response parity, stale-position fallback, invalidated reads, and fallback after a local cache payload error. Synthetic debug-build timings diagnose query sequencing; they do not establish live-server latency or throughput targets. Neither the test nor its timing helper is compiled into the RPC server binary.
+
 ## Metrics
 
 Prometheus metrics are served at `/metrics` on `METRICS_HOST:METRICS_PORT`.

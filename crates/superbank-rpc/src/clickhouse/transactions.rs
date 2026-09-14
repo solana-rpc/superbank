@@ -1495,3 +1495,6 @@ mod tests {
         assert!(!query.contains("ORDER BY slot_idx DESC"));
     }
 }
+
+#[cfg(all(test, feature = "disk-cache"))]
+pub(crate) mod diagnostics;
