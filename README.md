@@ -66,6 +66,9 @@ flowchart LR
 
 ## Quick start
 
+For a native setup without Docker, including testnet genesis configuration, see
+[Local testnet with native ClickHouse](docs/local-testnet.md).
+
 ### 1) Start ClickHouse (local)
 
 ```bash
