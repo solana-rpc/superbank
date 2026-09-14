@@ -49,4 +49,4 @@ pub(crate) use util::extract_memo;
 pub(crate) use util::parse_err_json;
 
 #[cfg(all(test, feature = "disk-cache"))]
-pub(crate) use transactions::diagnostics::measure_position_reads;
+pub(crate) use transactions::diagnostics::{measure_layout_sample, measure_position_reads};

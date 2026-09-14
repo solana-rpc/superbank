@@ -183,3 +183,5 @@ async fn get_transaction_local_diagnostics() {
     execute(&client, &format!("DROP DATABASE {database}")).await;
     std::fs::write(output, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
 }
+
+mod payload_layout;

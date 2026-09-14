@@ -818,6 +818,24 @@ The JSON artifact contains twenty samples per combination of unknown/complete si
 
 Separate handler samples include fixture state creation, hydration, response construction, and body collection. They are not an isolated serialization benchmark. Assertions verify legacy/v0 response parity, stale-position fallback, invalidated reads, and fallback after a local cache payload error. Synthetic debug-build timings diagnose query sequencing; they do not establish live-server latency or throughput targets. Neither the test nor its timing helper is compiled into the RPC server binary.
 
+## Local cache payload layout benchmark
+
+`scripts/test/benchmark-cache-payload-layout.py` compares eight payload-table layouts using an owned native ClickHouse 26.1.2.11 process. It tests row granularity 8192, 1024, 256 and 64 with default compression blocks or 16 KiB minimum / 64 KiB maximum blocks, keeping the byte granularity limit at 10 MiB. Signature-table settings remain fixed. No live endpoint is accepted.
+
+Build the ignored Rust harness and use the `superbank_rpc` library-test executable path printed by Cargo:
+
+```bash
+cargo test -p superbank-rpc --all-features --locked --lib --no-run
+python3 scripts/test/benchmark-cache-payload-layout.py \
+  --clickhouse /path/to/clickhouse-26.1.2.11 \
+  --harness /path/to/target/debug/deps/superbank_rpc-HASH \
+  --output /tmp/superbank-payload-layout-results
+```
+
+The default experiment inserts one million deterministic synthetic legacy/v0 rows per layout, one layout at a time, then measures payload-only and two-query reads using disjoint signature sets. Each mode has three batches of 200 previously unqueried signatures followed by three repeated-signature batches. Previously unqueried does not mean cold disk: insertion, the OS page cache, and shared compressed blocks can warm data. Compare each mode across layouts: the two-query mode follows payload-only reads, which can warm shared blocks. Query-result caching is disabled. Payload digests and hydrated responses are checked outside measured read intervals.
+
+Use `--smoke --rows 2500` with a different output directory to check the fixture and interface first. The owned server binds loopback ports 18195 and 19095, caps ClickHouse tracked memory at 16 GiB, and the experiment stops if its output directory exceeds a 100 GiB disk budget. Existing listeners or output server-data directories cause refusal. The script creates and merges only its own fixture tables, removes fixture databases, and stops its server on completion. Read the raw storage, query-log, part-log, settings and harness artifacts together when comparing latency with insertion, merging and storage costs. Insert timing includes deterministic fixture generation. The memory setting is not an RSS limit, and the disk watchdog checks every three seconds. Small synthetic fixtures and repeated keys do not establish production latency or throughput.
+
 ## Metrics
 
 Prometheus metrics are served at `/metrics` on `METRICS_HOST:METRICS_PORT`.
