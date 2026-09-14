@@ -109,6 +109,8 @@ pub(crate) async fn handle_get_signature_statuses(
         ));
     }
 
+    metrics::signature_status_batch_size("input", signatures.len());
+
     let search_transaction_history = match params.get(1).filter(|value| !value.is_null()) {
         Some(config_value) => {
             match serde_json::from_value::<GetSignatureStatusesConfig>(config_value.clone()) {
@@ -259,6 +261,7 @@ pub(crate) async fn handle_get_signature_statuses(
                 .cloned()
                 .collect();
 
+            metrics::signature_status_batch_size("primary_fallback", to_query.len());
             if to_query.is_empty() {
                 HashMap::new()
             } else {

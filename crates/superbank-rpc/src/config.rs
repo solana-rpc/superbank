@@ -86,6 +86,18 @@ pub struct RpcConfig {
     #[arg(long, env = "RPC_BATCH_CONCURRENCY_LIMIT", default_value_t = 8)]
     pub(crate) rpc_batch_concurrency_limit: usize,
 
+    /// Maximum concurrent primary getSignatureStatuses workflows, including cancellation cleanup.
+    #[arg(
+        long,
+        env = "GET_SIGNATURE_STATUSES_MAX_CONCURRENCY",
+        default_value_t = 4
+    )]
+    pub(crate) get_signature_statuses_max_concurrency: usize,
+
+    /// Primary getSignatureStatuses execution and primary-index filtering thread cap.
+    #[arg(long, env = "GET_SIGNATURE_STATUSES_MAX_THREADS", default_value_t = 2)]
+    pub(crate) get_signature_statuses_max_threads: usize,
+
     /// Maximum number of addresses accepted by getInflationReward; zero disables the limit.
     #[arg(
         long,
@@ -369,8 +381,8 @@ pub struct RpcConfig {
     )]
     pub(crate) clickhouse_replica_health_check_interval_ms: u64,
 
-    /// ClickHouse cluster name used to discover shard topology in shard-direct scope.
-    /// Supports macros such as {cluster}.
+    /// ClickHouse cluster used for primary status-query cancellation and shard-direct discovery.
+    /// Supports macros such as {cluster}; empty selects local-only cancellation on standalone nodes.
     #[arg(long, env = "CLICKHOUSE_CLUSTER", default_value = "{cluster}")]
     pub(crate) clickhouse_cluster: String,
 
@@ -851,6 +863,23 @@ mod config_tests {
     }
 
     #[test]
+    fn signature_status_limits_cli_overrides() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-signature-statuses-max-concurrency",
+            "3",
+            "--get-signature-statuses-max-threads",
+            "1",
+            "--clickhouse-cluster",
+            "rbx2",
+        ]);
+        assert_eq!(cfg.get_signature_statuses_max_concurrency, 3);
+        assert_eq!(cfg.get_signature_statuses_max_threads, 1);
+        assert_eq!(cfg.clickhouse_cluster, "rbx2");
+    }
+
+    #[test]
     fn clickhouse_query_cache_defaults() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let cfg = RpcConfig::parse_from(["superbank-rpc"]);
@@ -866,6 +895,8 @@ mod config_tests {
         assert!(!cfg.metrics_capture_x_rpc_node());
         assert!(!cfg.metrics_capture_x_subscription_id());
         assert!(!cfg.metrics_capture_x_account_id());
+        assert_eq!(cfg.get_signature_statuses_max_concurrency, 4);
+        assert_eq!(cfg.get_signature_statuses_max_threads, 2);
         assert_eq!(cfg.get_inflation_reward_max_addresses, 100);
         assert_eq!(cfg.get_inflation_reward_max_concurrency, 20);
         assert_eq!(cfg.get_inflation_reward_query_timeout_ms, 5_000);

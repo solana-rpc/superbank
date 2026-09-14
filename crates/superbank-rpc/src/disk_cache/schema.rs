@@ -151,6 +151,32 @@ pub(crate) struct SourceSchemaSnapshot {
 }
 
 impl SourceSchemaSnapshot {
+    /// Project the same signature keys as the forwarding view, with the input
+    /// restricted before ARRAY JOIN or other view expressions are evaluated.
+    pub(crate) fn signature_keys_query(
+        &self,
+        database: &str,
+        width: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<String, SchemaError> {
+        let signatures = self
+            .table(CacheTableKind::Signatures)
+            .and_then(|table| table.view_select.as_deref())
+            .ok_or_else(|| SchemaError::Invalid("signatures view unavailable".into()))?;
+        let transactions = self
+            .table(CacheTableKind::Transactions)
+            .ok_or_else(|| SchemaError::Invalid("transactions schema unavailable".into()))?;
+        let local = quote_table(database, "transactions");
+        let bounded = format!(
+            "(SELECT * FROM {local} WHERE intDiv(slot, {width}) BETWEEN {} AND {} AND slot BETWEEN {start} AND {end})",
+            start / width,
+            end / width
+        );
+        let select = replace_table_reference(signatures, &transactions.storage_name, &bounded)?;
+        Ok(format!("SELECT slot, signature AS key FROM ({select})"))
+    }
+
     pub(crate) fn table(&self, kind: CacheTableKind) -> Option<&SourceTableSchema> {
         self.tables.iter().find(|table| table.kind == kind)
     }

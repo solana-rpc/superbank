@@ -19,13 +19,14 @@ use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use reqwest::Url;
 use serde::Deserialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 use crate::config::{ClickHouseStartupTableCheck, has_usable_gsfa_hot_addresses};
 use crate::processing::{ProcessingError, ProcessingResult};
 
 use super::cache::SignatureSlotCache;
 use super::constants::DEFAULT_BUCKET_MODULUS;
+use super::disconnect::{DisconnectGuard, DisconnectVerifier};
 use super::gsfa::GsfaShardRouter;
 use super::queries::{
     GSFA_REQUIRED_COLUMNS, SIGNATURES_REQUIRED_COLUMNS, TOKEN_OWNER_REQUIRED_COLUMNS,
@@ -68,6 +69,32 @@ pub(crate) fn shard_tcp_query_timeout_for(query_timeout: Duration) -> Duration {
 
     let tcp_timeout_ms = timeout_ms.saturating_sub(reserve_ms);
     Duration::from_millis(tcp_timeout_ms.min(u128::from(u64::MAX)) as u64)
+}
+
+pub(crate) enum SignatureStatusCleanup {
+    Http(Box<HttpQueryCleanup>),
+    Disconnect(DisconnectGuard),
+}
+
+impl SignatureStatusCleanup {
+    /// Construction failures precede HTTP submission and need no absence probes.
+    pub(crate) fn before_submission<T>(
+        result: ProcessingResult<T>,
+        cleanup: &mut Option<Self>,
+    ) -> ProcessingResult<T> {
+        if result.is_err() {
+            Self::disarm_optional(cleanup);
+        }
+        result
+    }
+
+    pub(crate) fn disarm_optional(cleanup: &mut Option<Self>) {
+        match cleanup {
+            Some(Self::Http(guard)) => guard.disarm(),
+            Some(Self::Disconnect(guard)) => guard.disarm(),
+            None => {}
+        }
+    }
 }
 
 struct ShardTcpQueryCleanup {
@@ -133,6 +160,8 @@ impl Drop for ShardTcpQueryCleanup {
 }
 
 pub(crate) struct HttpQueryCleanup {
+    // A primary workflow reserves its own cleanup capacity until cleanup completes.
+    source_permit: Option<OwnedSemaphorePermit>,
     client: HttpClient,
     cluster: Option<String>,
     operation: &'static str,
@@ -149,6 +178,7 @@ impl HttpQueryCleanup {
         query_id: String,
     ) -> Self {
         Self {
+            source_permit: None,
             client,
             cluster,
             operation,
@@ -165,6 +195,7 @@ impl HttpQueryCleanup {
 
     pub(crate) fn disarm(&mut self) {
         self.query_id = None;
+        self.source_permit = None;
     }
 
     pub(crate) fn spawn_cleanup(&mut self, reason: &'static str) {
@@ -174,6 +205,7 @@ impl HttpQueryCleanup {
 
         crate::metrics::clickhouse_shard_query_abort(self.operation, "http", reason);
 
+        let source_permit = self.source_permit.take();
         let client = self.client.clone();
         let cluster = self.cluster.clone();
         let operation = self.operation;
@@ -181,7 +213,15 @@ impl HttpQueryCleanup {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    kill_http_query(client, cluster, operation, query_timeout, query_id).await;
+                    kill_http_query(
+                        client,
+                        cluster,
+                        operation,
+                        query_timeout,
+                        query_id,
+                        source_permit,
+                    )
+                    .await;
                 });
             }
             Err(err) => {
@@ -216,16 +256,23 @@ fn kill_query_sql(cluster: Option<&str>, query_id: &str) -> String {
     }
 }
 
+fn acquire_http_cleanup_permit(
+    source_permit: Option<OwnedSemaphorePermit>,
+) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+    // A source permit reserves cleanup capacity; keep it until the KILL finishes or times out.
+    // Only other operations compete for the existing best-effort global cleanup capacity.
+    source_permit.map_or_else(|| kill_query_semaphore().clone().try_acquire_owned(), Ok)
+}
+
 async fn kill_http_query(
     client: HttpClient,
     cluster: Option<String>,
     operation: &'static str,
     query_timeout: Duration,
     query_id: String,
+    source_permit: Option<OwnedSemaphorePermit>,
 ) {
-    // Hard-cap concurrent KILL cleanups; drop this one if the budget is exhausted rather than
-    // opening yet another connection while ClickHouse is already overloaded.
-    let _permit = match kill_query_semaphore().clone().try_acquire_owned() {
+    let _permit = match acquire_http_cleanup_permit(source_permit) {
         Ok(permit) => permit,
         Err(_) => {
             crate::metrics::clickhouse_shard_query_cleanup(operation, "kill_throttled");
@@ -440,6 +487,10 @@ pub struct ClickHouseClient {
     pub(crate) routing_policy: RoutingPolicy,
 
     pub(crate) query_timeout: Duration,
+    pub(crate) signature_status_max_threads: usize,
+    signature_status_sem: Arc<Semaphore>,
+    query_cleanup_cluster: Option<String>,
+    signature_status_disconnect: DisconnectVerifier,
     pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) replica_health_check_interval: Duration,
@@ -493,6 +544,9 @@ pub struct ClickHouseClientOptions {
     pub gsfa_hot_table: String,
     pub gsfa_hot_local_table: String,
     pub query_timeout: Duration,
+    pub signature_status_max_concurrency: usize,
+    pub signature_status_max_threads: usize,
+    pub query_cleanup_cluster: Option<String>,
     pub tcp_access_check_timeout: Duration,
     pub replica_health_check_interval: Duration,
     pub query_cache: QueryCacheConfig,
@@ -548,7 +602,7 @@ const HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 ///
 /// NB: this mirrors the crate default's plain-HTTP connector. superbank builds `clickhouse`
 /// without a TLS feature, so ClickHouse connections are HTTP-only, the same as before.
-fn build_clickhouse_http_client(
+pub(super) fn build_clickhouse_http_client(
     url: &str,
     database: &str,
     username: &str,
@@ -593,6 +647,9 @@ impl ClickHouseClientOptions {
             gsfa_hot_table,
             gsfa_hot_local_table,
             query_timeout: Duration::from_millis(8_000),
+            signature_status_max_concurrency: 4,
+            signature_status_max_threads: 2,
+            query_cleanup_cluster: None,
             tcp_access_check_timeout: Duration::from_secs(2),
             replica_health_check_interval: Duration::from_secs(10),
             query_cache: QueryCacheConfig::default(),
@@ -605,6 +662,23 @@ impl ClickHouseClientOptions {
             startup_table_check: ClickHouseStartupTableCheck::Exists,
             inflation_reward_limits: InflationRewardQueryLimits::default(),
         }
+    }
+
+    pub fn with_signature_status_limits(
+        mut self,
+        max_concurrency: usize,
+        max_threads: usize,
+    ) -> Self {
+        self.signature_status_max_concurrency = max_concurrency.max(1);
+        self.signature_status_max_threads = max_threads.max(1);
+        self
+    }
+
+    /// Cluster identity for primary HTTP cancellation, independent of read routing.
+    pub fn with_query_cleanup_cluster(mut self, cluster: String) -> Self {
+        self.query_cleanup_cluster =
+            (!cluster.trim().is_empty()).then(|| cluster.trim().to_owned());
+        self
     }
 
     pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
@@ -679,6 +753,9 @@ impl ClickHouseClient {
             gsfa_hot_table,
             gsfa_hot_local_table,
             query_timeout,
+            signature_status_max_concurrency,
+            signature_status_max_threads,
+            query_cleanup_cluster,
             tcp_access_check_timeout,
             replica_health_check_interval,
             query_cache,
@@ -695,7 +772,8 @@ impl ClickHouseClient {
             build_clickhouse_http_client(url, database, username, password, http_connect_timeout);
 
         // Distributed scope is coordinator-only. Ignore any injected shard routing so all
-        // startup checks, cleanup queries, and reads stay on the configured HTTP endpoint.
+        // startup checks and reads stay on the configured HTTP endpoint. Primary cancellation
+        // keeps its independently configured cluster identity.
         let shard_routing = if routing_policy.scope == RoutingScope::ShardDirect {
             shard_routing
         } else {
@@ -765,6 +843,8 @@ impl ClickHouseClient {
             config
         });
 
+        let signature_status_disconnect =
+            DisconnectVerifier::new(client.clone(), query_cleanup_cluster.clone());
         Self {
             client,
             url: url.to_string(),
@@ -799,6 +879,10 @@ impl ClickHouseClient {
             routing_policy,
 
             query_timeout,
+            signature_status_max_threads: signature_status_max_threads.max(1),
+            signature_status_sem: Arc::new(Semaphore::new(signature_status_max_concurrency.max(1))),
+            query_cleanup_cluster,
+            signature_status_disconnect,
             inflation_reward_limits,
             tcp_access_check_timeout,
             replica_health_check_interval,
@@ -833,6 +917,7 @@ impl ClickHouseClient {
         self.blocks_metadata_local_table = None;
         self.shard_topology = None;
         self.shard_routing = None;
+        self.query_cleanup_cluster = None;
         self.gsfa_router = None;
     }
 
@@ -940,6 +1025,105 @@ impl ClickHouseClient {
         } else {
             let (query, id) = super::util::annotate_query(query, operation);
             (query, id, None)
+        }
+    }
+
+    /// Acquires source admission before HTTP admission; the caller owns the operation deadline.
+    /// Local-cache reads retain their existing HTTP admission behavior.
+    pub(crate) async fn acquire_signature_status_permits(
+        &self,
+    ) -> ProcessingResult<(Option<OwnedSemaphorePermit>, SemaphorePermit<'_>)> {
+        let source_permit = if self.cache_partition.is_none() {
+            Some(
+                self.signature_status_sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        ProcessingError::database_msg("Signature status source semaphore closed")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let http_permit = self.acquire_http_query_permit().await?;
+        Ok((source_permit, http_permit))
+    }
+
+    /// Arm only immediately before submitting the HTTP request. Required IDs are independent
+    /// of optional query-ID logging. A cancelled source retains admission through cleanup.
+    pub(crate) async fn annotate_signature_status_query(
+        &self,
+        query: String,
+        source_permit: Option<OwnedSemaphorePermit>,
+    ) -> ProcessingResult<(String, Option<String>, Option<SignatureStatusCleanup>)> {
+        let Some(source_permit) = source_permit else {
+            let (query, id, cleanup) = self.annotate_lookup_query(query, "signature_statuses");
+            return Ok((
+                query,
+                id,
+                cleanup.map(Box::new).map(SignatureStatusCleanup::Http),
+            ));
+        };
+        let (query, query_id) = super::util::annotate_required_query(query, "signature_statuses");
+        self.primary_signature_status_cleanup(query_id.clone(), source_permit)
+            .await
+            .map(|cleanup| (query, Some(query_id), Some(cleanup)))
+    }
+
+    async fn primary_signature_status_cleanup(
+        &self,
+        query_id: String,
+        source_permit: OwnedSemaphorePermit,
+    ) -> ProcessingResult<SignatureStatusCleanup> {
+        if self.signature_status_native_disconnect() {
+            return self
+                .signature_status_disconnect
+                .arm(query_id, source_permit)
+                .await
+                .map(SignatureStatusCleanup::Disconnect);
+        }
+        let cluster = self.query_cleanup_cluster.clone().or_else(|| {
+            self.shard_routing
+                .as_ref()
+                .map(|routing| routing.cluster.clone())
+        });
+        let mut cleanup = HttpQueryCleanup::new(
+            self.client.clone(),
+            cluster,
+            "signature_statuses",
+            self.query_timeout,
+            query_id,
+        );
+        cleanup.source_permit = Some(source_permit);
+        Ok(SignatureStatusCleanup::Http(Box::new(cleanup)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_http_client_for_tests(&mut self, client: HttpClient) {
+        self.signature_status_disconnect =
+            DisconnectVerifier::new(client.clone(), self.query_cleanup_cluster.clone());
+        self.client = client;
+    }
+
+    fn signature_status_native_disconnect(&self) -> bool {
+        self.cache_partition.is_none()
+            && self.routing_policy.scope == RoutingScope::Distributed
+            && self.transport_http()
+    }
+
+    pub(crate) fn signature_status_http_query(
+        &self,
+        sql: &str,
+        query_id: Option<String>,
+    ) -> clickhouse::query::Query {
+        let query = super::util::http_query_with_id(&self.client, sql, query_id);
+        if self.signature_status_native_disconnect() {
+            query
+                .with_setting("readonly", "2")
+                .with_setting("cancel_http_readonly_queries_on_client_close", "1")
+        } else {
+            query
         }
     }
 
@@ -2349,6 +2533,269 @@ mod tests {
         ShardRoutingConfig,
     };
     use crate::processing::ProcessingError;
+
+    struct CleanupServer {
+        url: String,
+        requests: tokio::sync::mpsc::UnboundedReceiver<String>,
+        responses: Arc<tokio::sync::Semaphore>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl CleanupServer {
+        async fn new() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let url = format!("http://{}", listener.local_addr().expect("address"));
+            let (sender, requests) = tokio::sync::mpsc::unbounded_channel();
+            let responses = Arc::new(tokio::sync::Semaphore::new(0));
+            let response_gate = responses.clone();
+            let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+                let sender = sender.clone();
+                let response_gate = response_gate.clone();
+                async move {
+                    let _ = sender.send(String::from_utf8(body.to_vec()).expect("SQL text"));
+                    let _permit = response_gate.acquire().await.expect("response gate");
+                    axum::http::StatusCode::OK
+                }
+            });
+            let task =
+                tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
+            Self {
+                url,
+                requests,
+                responses,
+                task,
+            }
+        }
+
+        fn client(&self) -> ClickHouseClient {
+            ClickHouseClient::new(
+                &self.url,
+                "default",
+                "default",
+                "",
+                ClickHouseClientOptions::new(
+                    RoutingPolicy {
+                        transport: RoutingTransport::Http,
+                        scope: RoutingScope::Distributed,
+                    },
+                    None,
+                    Vec::new(),
+                    "default.gsfa_hot".into(),
+                    "default.gsfa_hot_local".into(),
+                )
+                .with_query_cleanup_cluster("rbx2".into())
+                .with_signature_status_limits(1, 2),
+            )
+        }
+
+        async fn next_request(&mut self) -> String {
+            tokio::time::timeout(Duration::from_secs(1), self.requests.recv())
+                .await
+                .expect("cleanup request timeout")
+                .expect("cleanup request")
+        }
+    }
+
+    impl Drop for CleanupServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_status_admission_is_shared_and_precedes_http_admission() {
+        let client = test_client_with_hot_addresses(Vec::new());
+        let other = client.clone();
+        let held = client
+            .signature_status_sem
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .expect("permits");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                other.acquire_signature_status_permits(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(client.http_query_sem.available_permits(), 512);
+        drop(held);
+        assert!(other.acquire_signature_status_permits().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shard_direct_status_cleanup_retains_admission_and_targets_cluster() {
+        let mut server = CleanupServer::new().await;
+        let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
+        let (source, http) = client
+            .acquire_signature_status_permits()
+            .await
+            .expect("admission");
+        let (_, id, cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
+        let id = id.expect("required ID");
+        assert!(client.shard_routing.is_none());
+        assert_eq!(
+            match cleanup.as_ref().expect("guard") {
+                super::SignatureStatusCleanup::Http(guard) => guard.cluster.as_deref(),
+                _ => panic!("expected legacy cleanup"),
+            },
+            Some("rbx2")
+        );
+        drop(http);
+        drop(cleanup);
+        let sql = server.next_request().await;
+        assert!(sql.contains("KILL QUERY ON CLUSTER 'rbx2'"));
+        assert!(sql.contains(&format!("query_id = '{id}' OR initial_query_id = '{id}'")));
+        assert!(sql.contains("ASYNC"));
+        assert_eq!(client.signature_status_sem.available_permits(), 0);
+        server.responses.add_permits(1);
+        let (source, _http) = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.acquire_signature_status_permits(),
+        )
+        .await
+        .expect("cleanup completes")
+        .expect("admission resumes");
+        drop(source);
+    }
+
+    #[tokio::test]
+    async fn shard_direct_status_cleanup_timeout_releases_admission() {
+        let mut server = CleanupServer::new().await;
+        let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
+        client.query_timeout = Duration::from_millis(50);
+        let (source, http) = client
+            .acquire_signature_status_permits()
+            .await
+            .expect("admission");
+        let (_, _, cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
+        drop(http);
+        drop(cleanup);
+        server.next_request().await;
+        let permits = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.acquire_signature_status_permits(),
+        )
+        .await
+        .expect("bounded cleanup")
+        .expect("admission resumes");
+        drop(permits);
+        assert_eq!(client.signature_status_sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn shard_direct_status_cleanup_connection_failure_releases_admission() {
+        let server = CleanupServer::new().await;
+        let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
+        server.task.abort();
+        tokio::task::yield_now().await;
+        let (source, http) = client
+            .acquire_signature_status_permits()
+            .await
+            .expect("admission");
+        let (_, _, cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
+        drop(http);
+        drop(cleanup);
+        let permits = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.acquire_signature_status_permits(),
+        )
+        .await
+        .expect("cleanup failure bounded")
+        .expect("admission resumes");
+        drop(permits);
+        assert_eq!(client.signature_status_sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn shard_direct_status_success_disarms_cleanup_and_releases_admission() {
+        let mut server = CleanupServer::new().await;
+        let mut client = server.client();
+        client.routing_policy.scope = RoutingScope::ShardDirect;
+        let (source, http) = client
+            .acquire_signature_status_permits()
+            .await
+            .expect("admission");
+        let (_, id, mut cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), source)
+            .await
+            .expect("guard");
+        assert!(id.is_some());
+        super::SignatureStatusCleanup::disarm_optional(&mut cleanup);
+        assert_eq!(client.signature_status_sem.available_permits(), 1);
+        drop(http);
+        drop(cleanup);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), server.requests.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_status_admission_does_not_consume_source_capacity() {
+        let mut client = test_client_with_hot_addresses(Vec::new());
+        client.cache_partition = Some((10, 1));
+        let held = client
+            .signature_status_sem
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .expect("permits");
+        let (source, _http) = client
+            .acquire_signature_status_permits()
+            .await
+            .expect("cache admission");
+        assert!(source.is_none());
+        drop(held);
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn local_table_mapping_clears_primary_cleanup_cluster() {
+        let mut client = test_client_with_hot_addresses(Vec::new());
+        client.query_cleanup_cluster = Some("rbx2".into());
+        client.use_table_names(super::ClickHouseTableNames::in_database("cache"));
+        assert!(client.query_cleanup_cluster.is_none());
+    }
+
+    #[test]
+    fn cleanup_cluster_accepts_macros_and_empty_standalone_identity() {
+        let options = ClickHouseClientOptions::new(
+            RoutingPolicy {
+                transport: RoutingTransport::Http,
+                scope: RoutingScope::Distributed,
+            },
+            None,
+            Vec::new(),
+            "default.gsfa_hot".into(),
+            "default.gsfa_hot_local".into(),
+        )
+        .with_query_cleanup_cluster(" {cluster} ".into());
+        assert_eq!(options.query_cleanup_cluster.as_deref(), Some("{cluster}"));
+        assert!(
+            options
+                .with_query_cleanup_cluster(" ".into())
+                .query_cleanup_cluster
+                .is_none()
+        );
+    }
 
     struct TempTopologyConfig {
         path: PathBuf,

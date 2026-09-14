@@ -177,6 +177,15 @@ curl -sS http://localhost:8899 \
 
 ## Configuration
 
+The RPC server bounds primary signature-status history work with
+`GET_SIGNATURE_STATUSES_MAX_CONCURRENCY` (default `4`) and
+`GET_SIGNATURE_STATUSES_MAX_THREADS` (default `2`). `CLICKHOUSE_CLUSTER` identifies the primary
+cluster for gateway-based termination verification in distributed HTTP mode as well as shard
+discovery in shard-direct mode. Abandoned distributed HTTP status reads use native disconnect
+cancellation and retain admission until every expected replica is observed clear twice.
+Use `rbx2` for RBX2 or an empty value for standalone ClickHouse. See the
+[RPC configuration and cancellation requirements](crates/superbank-rpc/README.md#primary-signature-status-overload-protection).
+
 - `superbank` supports YAML config, CLI flags, and environment variables.
   Precedence is: flags > env > config file > defaults.
   See `crates/superbank/README.md` and `superbank.example.yaml`.
