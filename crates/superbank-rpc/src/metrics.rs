@@ -56,6 +56,61 @@ struct DisconnectOutcomeLabels {
     outcome: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReadDisconnectLabels {
+    operation: &'static str,
+    target: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReadDisconnectOutcomeLabels {
+    operation: &'static str,
+    target: &'static str,
+    outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReadDisconnectProbeLabels {
+    target: &'static str,
+    outcome: &'static str,
+}
+
+/// Tracks admission held by abandoned reads without exposing query identifiers.
+pub(crate) fn read_disconnect_pending(operation: &'static str, target: &'static str, delta: i64) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .read_disconnect_pending
+            .get_or_create(&ReadDisconnectLabels { operation, target })
+            .inc_by(delta);
+    }
+}
+
+pub(crate) fn read_disconnect_verification(
+    operation: &'static str,
+    target: &'static str,
+    outcome: &'static str,
+) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .read_disconnect_verification
+            .get_or_create(&ReadDisconnectOutcomeLabels {
+                operation,
+                target,
+                outcome,
+            })
+            .inc();
+    }
+}
+
+pub(crate) fn read_disconnect_probe(target: &'static str, elapsed: f64, outcome: &'static str) {
+    if let Some(metrics) = metrics() {
+        metrics
+            .read_disconnect_probe_seconds
+            .get_or_create(&ReadDisconnectProbeLabels { target, outcome })
+            .observe(elapsed);
+    }
+}
+
 pub(crate) fn signature_status_disconnect_pending_inc() {
     if let Some(metrics) = metrics() {
         metrics.signature_status_disconnect_pending.inc();
@@ -575,6 +630,9 @@ pub struct Metrics {
     rpc_batch_size: Family<BatchLabels, Histogram>,
     signature_status_batch_size: Family<SignatureStatusStageLabels, Histogram>,
     signature_status_admission_seconds: Histogram,
+    read_disconnect_pending: Family<ReadDisconnectLabels, Gauge>,
+    read_disconnect_verification: Family<ReadDisconnectOutcomeLabels, Counter>,
+    read_disconnect_probe_seconds: Family<ReadDisconnectProbeLabels, Histogram>,
     signature_status_disconnect_pending: Gauge,
     signature_status_disconnect_verification: Family<DisconnectOutcomeLabels, Counter>,
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
@@ -709,6 +767,10 @@ impl Metrics {
         let signature_status_batch_size =
             Family::new_with_constructor(signature_status_batch_histogram as fn() -> Histogram);
         let signature_status_admission_seconds = latency_histogram();
+        let read_disconnect_pending = Family::default();
+        let read_disconnect_verification = Family::default();
+        let read_disconnect_probe_seconds =
+            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let signature_status_disconnect_pending = Gauge::default();
         let signature_status_disconnect_verification = Family::default();
         let rpc_batch_rejected = Family::default();
@@ -870,6 +932,21 @@ impl Metrics {
             "rpc_batch_size",
             "Batch size distribution for JSON-RPC envelopes",
             rpc_batch_size.clone(),
+        );
+        registry.register(
+            "clickhouse_read_disconnect_pending",
+            "Abandoned HTTP reads retaining admission until query absence is confirmed",
+            read_disconnect_pending.clone(),
+        );
+        registry.register(
+            "clickhouse_read_disconnect_verification",
+            "Abandoned HTTP read verification outcomes by operation and target class",
+            read_disconnect_verification.clone(),
+        );
+        registry.register(
+            "clickhouse_read_disconnect_probe_seconds",
+            "Duration of abandoned HTTP read verification probes by target class and outcome",
+            read_disconnect_probe_seconds.clone(),
         );
         registry.register(
             "rpc_signature_status_disconnect_pending",
@@ -1251,6 +1328,9 @@ impl Metrics {
             rpc_batch_size,
             signature_status_batch_size,
             signature_status_admission_seconds,
+            read_disconnect_pending,
+            read_disconnect_verification,
+            read_disconnect_probe_seconds,
             signature_status_disconnect_pending,
             signature_status_disconnect_verification,
             rpc_batch_rejected,

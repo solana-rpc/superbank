@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in integration against a disposable, loopback ClickHouse server.
+//! Raw queries below are fixture setup and independent observation probes;
+//! cancellation assertions exercise the guarded application read path.
 use super::*;
 use crate::clickhouse::{NumericFilter, SortOrder, TransactionStatusFilter};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
+
+fn found_transaction(result: DiskTransactionResult) -> Arc<StoredTransactionRecord> {
+    match result {
+        DiskTransactionResult::Found(record) => record,
+        other => panic!("expected transaction, got {other:?}"),
+    }
+}
 
 fn signature(slot: u64) -> Signature {
     named_signature("sig", slot)
@@ -26,11 +35,179 @@ fn signature_candidate(cache: &DiskCache, partition: u64, signature: Signature) 
         .is_empty()
 }
 
+async fn transaction_response(
+    source: &ClickHouseClient,
+    cache: Option<&DiskCache>,
+    signature: Signature,
+    config: serde_json::Value,
+) -> serde_json::Value {
+    let mut state = Arc::try_unwrap(crate::tests::test_state()).ok().unwrap();
+    state.clickhouse = source.clone();
+    state.disk_cache = cache.map(|cache| {
+        Arc::new(tokio::sync::OnceCell::new_with(Some(Arc::new(
+            cache.clone(),
+        ))))
+    });
+    let response = Box::pin(crate::handlers::transactions::handle_get_transaction(
+        Arc::new(state),
+        serde_json::json!("transaction-regression"),
+        Some(vec![serde_json::json!(signature.to_string()), config]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn assert_transaction_fallback(source: &ClickHouseClient, cache: &DiskCache) {
+    for encoding in ["json", "jsonParsed", "base58", "base64"] {
+        let config = serde_json::json!({"slot": 45, "encoding": encoding, "maxSupportedTransactionVersion": 1});
+        let expected = transaction_response(source, None, signature(45), config.clone()).await;
+        assert!(expected.get("error").is_none(), "{expected}");
+        assert_eq!(expected["result"]["slot"], 45);
+        let actual = transaction_response(source, Some(cache), signature(45), config).await;
+        assert_eq!(actual, expected);
+    }
+}
+
+async fn assert_transaction_invalidation(cache: &DiskCache) {
+    let permits = cache
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    let read = cache.get_tx(signature(45), Some(45));
+    tokio::pin!(read);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut read)
+            .await
+            .is_err()
+    );
+    cache.inner.key_index.invalidate_reads();
+    drop(permits);
+    assert!(matches!(read.await, DiskTransactionResult::Unavailable));
+}
+
+async fn assert_transaction_append_race(client: &clickhouse::Client, cache: &DiskCache) {
+    cache.inner.key_index.clear_signatures();
+    let permits = cache
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    let read = cache.get_tx(signature(50), Some(50));
+    tokio::pin!(read);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut read)
+            .await
+            .is_err()
+    );
+    execute(client, &format!("INSERT INTO {}.transactions (signature,slot,slot_idx,tx_signatures) VALUES (toFixedString('sig-50',64),50,7,[toFixedString('sig-50',64)])", cache.inner.cfg.database)).await;
+    cache
+        .publish_range_coverage(vec![(50, SlotStatus::Covered { tx_count: 1 })])
+        .await
+        .unwrap();
+    drop(permits);
+    assert!(matches!(read.await, DiskTransactionResult::Unavailable));
+    let found = found_transaction(cache.get_tx(signature(50), Some(50)).await);
+    assert_eq!(found.slot, 50);
+    cache
+        .publish_range_coverage(vec![(51, SlotStatus::Skipped)])
+        .await
+        .unwrap();
+    assert!(matches!(
+        cache.get_tx(signature(500), Some(51)).await,
+        DiskTransactionResult::Absent
+    ));
+    cache.build_signature_indexes().await;
+}
+
+async fn assert_transaction_positions(cache: &DiskCache) {
+    let mut client = cache.query_client();
+    client.cache_partition = Some((
+        cache.inner.cfg.partition_slots,
+        45 / cache.inner.cfg.partition_slots,
+    ));
+    for slot_idx in [0, 999] {
+        let (record, _) = client
+            .get_transaction_by_signature_and_position(
+                &signature(45).to_string(),
+                crate::clickhouse::SignatureSlot { slot: 45, slot_idx },
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.unwrap().slot, 45);
+    }
+    assert!(
+        client
+            .get_transaction_by_signature_and_position(
+                &signature(500).to_string(),
+                crate::clickhouse::SignatureSlot {
+                    slot: 45,
+                    slot_idx: 0
+                },
+            )
+            .await
+            .unwrap()
+            .0
+            .is_none()
+    );
+}
+
+async fn assert_transaction_reads(
+    client: &clickhouse::Client,
+    source: &ClickHouseClient,
+    cache: &DiskCache,
+) {
+    assert_transaction_positions(cache).await;
+    assert_transaction_invalidation(cache).await;
+    assert_transaction_append_race(client, cache).await;
+    assert!(matches!(
+        cache.get_tx(signature(500), Some(45)).await,
+        DiskTransactionResult::Absent
+    ));
+    assert!(matches!(
+        cache.get_tx(signature(500), Some(500)).await,
+        DiskTransactionResult::Unavailable
+    ));
+    let mismatch = transaction_response(
+        source,
+        Some(cache),
+        signature(45),
+        serde_json::json!({"slot": 44}),
+    )
+    .await;
+    assert!(mismatch["result"].is_null());
+    assert!(mismatch.get("error").is_none());
+    let database = &cache.inner.cfg.database;
+    execute(
+        client,
+        &format!("RENAME TABLE {database}.transactions TO {database}.transactions_unavailable"),
+    )
+    .await;
+    assert_transaction_fallback(source, cache).await;
+    execute(
+        client,
+        &format!("RENAME TABLE {database}.transactions_unavailable TO {database}.transactions"),
+    )
+    .await;
+}
+
 async fn assert_absent_without_admission(cache: &DiskCache) {
     let client = cache.query_client();
     let _permits = client.http_query_sem.acquire_many(2).await.unwrap();
     tokio::time::timeout(Duration::from_millis(50), async {
-        assert!(cache.get_tx(signature(500)).await.is_none());
+        assert!(matches!(
+            cache.get_tx(signature(500), None).await,
+            DiskTransactionResult::Unavailable
+        ));
         assert!(cache.signature_position(signature(500)).await.is_none());
         assert!(cache.get_sig_statuses(vec![signature(500)]).await[0].is_none());
     })
@@ -191,6 +368,33 @@ async fn assert_pagination(cache: &DiskCache) {
         assert_eq!(slots, expected);
     }
 }
+
+async fn assert_transaction_position_fallback(cache: &DiskCache) {
+    let mut client = cache.query_client();
+    client.cache_partition = Some((10, 1));
+    // The fallback must reuse the first query's permit instead of deadlocking at capacity one.
+    client.http_query_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let position = crate::clickhouse::SignatureSlot {
+        slot: 15,
+        slot_idx: 99,
+    };
+    let (record, _) = client
+        .get_transaction_by_signature_and_position(&signature(15).to_string(), position)
+        .await
+        .unwrap();
+    let record = record.unwrap();
+    assert_eq!((record.slot, record.slot_idx), (15, 0));
+    let (missing, _) = client
+        .get_transaction_by_signature_and_position(&signature(500).to_string(), position)
+        .await
+        .unwrap();
+    assert!(missing.is_none());
+    let (wrong_slot, _) = client
+        .get_transaction_by_signature_and_position(&signature(25).to_string(), position)
+        .await
+        .unwrap();
+    assert!(wrong_slot.is_none());
+}
 async fn assert_cross_partition_duplicates(client: &clickhouse::Client, cache: &DiskCache) {
     let _mutation = cache.begin_fill(39, 39);
     execute(client, &format!("INSERT INTO {}.transactions (signature,slot,slot_idx,tx_account_keys,meta_status_ok) SELECT signature,39,0,tx_account_keys,1 FROM {}.transactions WHERE slot=49 LIMIT 1", cache.inner.cfg.database,cache.inner.cfg.database)).await;
@@ -229,13 +433,12 @@ async fn wait_for_query(client: &clickhouse::Client, id: &str, running: bool) {
 async fn assert_cancellation(client: &clickhouse::Client, cache: &DiskCache) {
     let mut lookup = cache.query_client();
     lookup.cache_partition = Some((10, 1));
-    let (sql,id,cleanup)=lookup.annotate_lookup_query("SELECT sum(cityHash64(number)) FROM numbers(1000000000000) SETTINGS max_execution_time=2,max_threads=1".into(),"test_cache_cancel");
-    let id = id.unwrap();
-    let query_client = lookup.client.clone().with_setting("query_id", id.clone());
-    let task = tokio::spawn(async move {
-        let _cleanup = cleanup;
-        query_client.query(&sql).execute().await
-    });
+    let query = lookup.read_query(
+        "SELECT sum(cityHash64(number)) FROM numbers(1000000000000) SETTINGS max_execution_time=2,max_threads=1",
+        "test_cache_cancel",
+    ).await.unwrap();
+    let id = query.query_id().to_owned();
+    let task = tokio::spawn(query.fetch_one::<u64>());
     wait_for_query(client, &id, true).await;
     task.abort();
     let _ = task.await;
@@ -288,17 +491,71 @@ async fn assert_migration(
     let mut cfg = cfg.clone();
     cfg.database.push_str("_migration");
     let cache = DiskCache::open(cfg.clone(), source).await.unwrap();
+    let views = client
+        .query(&format!("SELECT name FROM system.tables WHERE database='{}' AND endsWith(name, '__mv') ORDER BY name", cfg.database))
+        .fetch_all::<String>().await.unwrap();
+    let mut view_ddl = Vec::new();
+    for name in &views {
+        view_ddl.push(
+            client
+                .query(&format!("SHOW CREATE TABLE {}.{name}", cfg.database))
+                .fetch_one::<String>()
+                .await
+                .unwrap(),
+        );
+        execute(client, &format!("DROP TABLE {}.{name} SYNC", cfg.database)).await;
+    }
+    let old_ddl = client
+        .query(&format!("SHOW CREATE TABLE {}.transactions", cfg.database))
+        .fetch_one::<String>()
+        .await
+        .unwrap()
+        .replace("index_granularity = 64", "index_granularity = 8192")
+        .replace(
+            "min_compress_block_size = 16384",
+            "min_compress_block_size = 65536",
+        )
+        .replace(
+            "max_compress_block_size = 65536",
+            "max_compress_block_size = 1048576",
+        );
+    execute(
+        client,
+        &format!("DROP TABLE {}.transactions SYNC", cfg.database),
+    )
+    .await;
+    execute(client, &old_ddl).await;
+    for ddl in view_ddl {
+        execute(client, &ddl).await;
+    }
     insert_transactions(client, &cfg.database).await;
+    cache
+        .publish_range_coverage(vec![(15, SlotStatus::Covered { tx_count: 1 })])
+        .await
+        .unwrap();
+    assert!(cache.covers_slot(15));
     execute(
         client,
         &format!(
-            "ALTER TABLE {}._cache_meta UPDATE value='4' WHERE key='format_version' SETTINGS mutations_sync=2",
+            "ALTER TABLE {}._cache_meta UPDATE value='previous-payload-layout' WHERE key='fingerprint' SETTINGS mutations_sync=2",
             cfg.database
         ),
     )
     .await;
-    assert_resumable_rebuild(&cache, &cfg).await;
     let reopened = DiskCache::open(cfg.clone(), source).await.unwrap();
+    let ddl = client
+        .query(&format!("SHOW CREATE TABLE {}.transactions", cfg.database))
+        .fetch_one::<String>()
+        .await
+        .unwrap();
+    for setting in [
+        "index_granularity = 64",
+        "index_granularity_bytes = 10485760",
+        "min_compress_block_size = 16384",
+        "max_compress_block_size = 65536",
+    ] {
+        assert!(ddl.contains(setting), "{ddl}");
+    }
     let count = reopened
         .inner
         .local
@@ -311,9 +568,26 @@ async fn assert_migration(
     assert!(reopened.tip_span().is_none());
     assert_signature_fill_updates(&reopened, source).await;
     assert!(reopened.covers_slot(15));
-    assert_eq!(reopened.get_tx(signature(15)).await.unwrap().slot, 15);
+    assert_eq!(
+        found_transaction(reopened.get_tx(signature(15), None).await).slot,
+        15
+    );
     let restarted = DiskCache::open(cfg.clone(), source).await.unwrap();
-    assert_eq!(restarted.get_tx(signature(15)).await.unwrap().slot, 15);
+    assert_eq!(
+        found_transaction(restarted.get_tx(signature(15), None).await).slot,
+        15
+    );
+    execute(
+        client,
+        &format!(
+            "ALTER TABLE {}._cache_meta UPDATE value='4' WHERE key='format_version' SETTINGS mutations_sync=2",
+            cfg.database
+        ),
+    )
+    .await;
+    assert_resumable_rebuild(&restarted, &cfg).await;
+    let restarted = DiskCache::open(cfg.clone(), source).await.unwrap();
+    assert_signature_fill_updates(&restarted, source).await;
     execute(
         client,
         &format!("DROP TABLE {}._cache_meta SYNC", cfg.database),
@@ -324,7 +598,10 @@ async fn assert_migration(
         .err()
         .expect("missing marker must fail closed");
     assert!(error.to_string().contains("ownership check failed"));
-    assert_eq!(restarted.get_tx(signature(15)).await.unwrap().slot, 15);
+    assert_eq!(
+        found_transaction(restarted.get_tx(signature(15), None).await).slot,
+        15
+    );
     drop(cache);
     execute(client, &format!("DROP DATABASE {} SYNC", cfg.database)).await;
 }
@@ -476,7 +753,10 @@ async fn key_routing_clickhouse_integration() {
         cache.signature_position(signature(15)).await.unwrap().slot,
         15
     );
-    assert_eq!(cache.get_tx(signature(15)).await.unwrap().slot, 15);
+    assert_eq!(
+        found_transaction(cache.get_tx(signature(15), None).await).slot,
+        15
+    );
     assert!(cache.signature_position(signature(500)).await.is_none());
     let statuses = cache
         .get_sig_statuses(vec![
@@ -536,6 +816,7 @@ async fn key_routing_clickhouse_integration() {
             .slot,
         15
     );
+    assert_transaction_position_fallback(&cache).await;
     assert_pagination(&cache).await;
     assert_pruning(&client, &cache_database).await;
     // Poll migration separately so nested debug lookup futures do not consume
@@ -550,8 +831,19 @@ async fn key_routing_clickhouse_integration() {
     .unwrap();
     assert_cancellation(&client, &cache).await;
     assert_cross_partition_duplicates(&client, &cache).await;
+    let tx_client = client.clone();
+    let tx_source = source.clone();
+    let tx_cache = cache.clone();
+    tokio::spawn(async move {
+        assert_transaction_reads(&tx_client, &tx_source, &tx_cache).await;
+    })
+    .await
+    .unwrap();
     cache.poison_slot(15).await;
-    assert!(cache.get_tx(signature(15)).await.is_none());
+    assert!(matches!(
+        cache.get_tx(signature(15), None).await,
+        DiskTransactionResult::Unavailable
+    ));
     assert!(!signature_candidate(&cache, 1, signature(500)));
     let mut reopened_cfg = cfg;
     reopened_cfg.query_timeout = Duration::from_millis(50);
@@ -581,8 +873,22 @@ async fn key_routing_clickhouse_integration() {
         .await
         .unwrap();
     let started = std::time::Instant::now();
-    assert!(reopened.get_tx(signature(45)).await.is_none());
+    assert!(matches!(
+        reopened.get_tx(signature(45), None).await,
+        DiskTransactionResult::Unavailable
+    ));
     assert!(started.elapsed() < Duration::from_millis(200));
+    assert!(matches!(
+        reopened.slot_status(45).await,
+        SlotStatus::Covered { .. }
+    ));
+    let tx_source = source.clone();
+    let tx_cache = reopened.clone();
+    tokio::spawn(async move {
+        assert_transaction_fallback(&tx_source, &tx_cache).await;
+    })
+    .await
+    .unwrap();
     drop(_permits);
     if std::env::var_os("DISK_CACHE_TEST_KEEP").is_some() {
         eprintln!("Kept source database {database} and cache {cache_database}");
@@ -591,3 +897,5 @@ async fn key_routing_clickhouse_integration() {
     execute(&client, &format!("DROP DATABASE {cache_database} SYNC")).await;
     execute(&client, &format!("DROP DATABASE {database} SYNC")).await;
 }
+
+mod diagnostics;

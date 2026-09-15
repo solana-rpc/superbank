@@ -1091,10 +1091,15 @@ DDL is blocked. The before-headers fixture sets `wait_end_of_query=1` to hold it
 response; the streaming fixture uses deterministic hash text so compression produces
 enough wire bytes to decode an early row. These are test controls, not production
 setting changes. A paused replica must retain admission until observation recovers.
-Cancellation checks require prompt termination on all three nodes and a cancellation
-exception on the coordinator. A streaming leaf may instead report a socket reset or
-broken pipe while writing after its coordinator closes the native connection; other
-network errors and natural query completion fail the gate.
+Cancellation checks require prompt termination on every participating node and terminal
+evidence for each execution. Non-streaming coordinator queries require a cancellation
+exception. After the shared-reader test consumes a row or Native chunk and deliberately
+closes the stream, the coordinator may instead report an explicit socket reset or broken
+pipe while writing. A leaf may report the same write failure after its coordinator closes
+the native connection. These socket-close outcomes establish termination after disconnect,
+not execution of a particular server cancellation mechanism. Other network errors and
+natural query completion fail the gate. Admission must remain held until the verifier
+observes complete absence twice and must recover within five seconds.
 
 Run the same gate locally with Docker and the normal Rust build prerequisites:
 
@@ -1104,9 +1109,9 @@ python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/clickhouse
 
 The output directory must not exist. The script builds the all-feature RPC test executable
 before starting the cluster; `--rust-test-binary /absolute/path/to/test-executable` reuses
-an existing build. The three Rust integration tests are ignored in ordinary unit-test runs
+an existing build. The six Rust integration tests are ignored in ordinary unit-test runs
 because they require this disposable fixture; the dedicated CI job explicitly runs all
-three and fails if any are absent, skipped, or fail. Production validation and compression
+six and fails if any are absent, skipped, or fail. Production validation and compression
 remain enabled. The fixture removes its own containers and network on exit and retains
 `report.json`, `rust-integration.log`, generated configuration, and container logs.
 
@@ -1116,3 +1121,93 @@ observations. These controls must fail the cancellation gate for the overall fix
 The production gateway must promptly close the upstream connection and discard queued work
 when the caller disconnects. This local protocol gate does not replace the staged customer
 replay or prove the deployed gateway follows that contract.
+
+
+#### Shared HTTP SELECT coverage and promotion requirements
+
+The status replay and protocol fixture above cover a specific workload. Extending the
+shared HTTP SELECT wrapper requires additional lifecycle and method coverage; neither
+an HTTP `200` nor a successful status-only replay establishes that every RPC read path
+returns complete, correct results.
+
+Run the deterministic shared-reader lifecycle tests alongside the existing protocol gate:
+
+```sh
+cargo test -p superbank-rpc --all-features --locked clickhouse::read_query::tests
+```
+
+Retain evidence for the following cases before promotion:
+
+| Area | Required evidence |
+| --- | --- |
+| Initialization | Endpoint discovery and real process inspection finish before protected reads; permission failures, missing replicas, and failed preflight fail closed. |
+| Normal responses | Empty, one-row, and multi-row reads drain EOF; trailing errors are surfaced; sequential successful reads reuse a data connection and issue zero per-request verification probes after initialization. |
+| Cancellation phases | Abandon before response headers, after a decoded row, and during byte streaming. Verify the exact query family disappears from all expected nodes and held admission is restored only after two complete absence observations. |
+| Admission and control | Timeout while waiting submits no source query; dropping an unsubmitted query releases permits. Saturated data lanes cannot block the separate control pool. More than 128 pending IDs are verified in bounded batches. |
+| Failure and recovery | Active queries, partial observations, unavailable nodes, and probe errors retain permits. Five-second `unconfirmed` outcomes retain capacity; later complete absence restores it. |
+| Method families | Exercise primary signature and payload stages of `getTransaction`, status and address lookups, block/reward reads, local-cache coverage/reads, shard HTTP fallback, and background/index/range readers. Keep native TCP cleanup coverage separate. |
+| Background and writes | Index/backfill reads retain their explicit long deadlines and independent admission; inserts and DDL retain writable behavior. No protected HTTP SELECT cleanup sends KILL or enters the distributed DDL queue. |
+| Response correctness | Compare known finalized transactions and metadata with the reference result, all supported encodings/version limits, pinned slots, ordered status batches, valid empty results, and backend errors. Do not count an unexpected null or truncated body as a latency improvement. |
+
+Use the same endpoint, source snapshot, cache state, corpus, request mix, concurrency,
+arrival rate, and observation duration for baseline and candidate normal-traffic runs.
+Compare successful **nonempty** responses separately from valid empty results, errors,
+and abandoned requests. Record stage timings, CPU, active queries, and the shared
+`superbank_clickhouse_read_disconnect_*` metrics; preserve the status-specific metrics
+for the customer-pattern replay. These tests must not silently alter configured concurrency.
+
+The normal-path regression gate is, independently for **p50 and p99**:
+
+```text
+candidate latency <= baseline latency + max(1 ms, 0.05 * baseline latency)
+```
+
+This is an acceptance target, not a measured result. Repeat matched windows when sample
+size or run-to-run variation prevents a reliable comparison. Cancellation validation must
+also establish termination within the five-second budget with bounded clock uncertainty,
+no orphaned work after drain, and no unexplained CPU or active-query accumulation. A
+normal-path latency pass does not replace cancellation evidence, and vice versa. Run the
+transaction fallback and full-response parity checks below as an independent correctness
+gate alongside shared-reader cancellation validation.
+
+### getTransaction follow-up benchmarks
+
+Run the basic transaction scenario against a local/staging fixture, then compare full
+JSON-RPC envelopes with a known-present signature corpus covering legacy, v0, and v1:
+
+```sh
+RPC_URL=http://127.0.0.1:18899 SIGNATURE_FILE=/tmp/gettx-signatures.txt \
+VUS=1 DURATION=10s MAX_SUPPORTED_TX_VERSION=1 \
+k6 run tests/k6/scenarios/basic/superbank-rpc-get-transaction.js
+
+RPC_URL=http://127.0.0.1:18899 REFERENCE_RPC_URL=http://127.0.0.1:18900 \
+SIGNATURE_FILE=/tmp/gettx-signatures.txt \
+k6 run tests/k6/scenarios/validation/superbank-rpc-get-transaction-parity.js
+```
+
+The parity scenario checks all four encodings, confirmed/finalized commitment,
+omitted/0/1 maximum supported versions, pinned/mismatched slots, and null/string/number
+request IDs. Existing disk-cache integration tests cover unavailable reads, invalidation,
+concurrent coverage publication, absent signatures, skipped slots, and stale positions.
+
+The SQL benchmark creates its own three-node Docker cluster and transparent local gateway;
+it never connects to an existing ClickHouse endpoint. It uses the repository transaction
+projection and schemas, with separate 8192/1024-granularity payload copies:
+
+```sh
+python3 scripts/test/benchmark-get-transaction.py --output /tmp/gettx-benchmark
+```
+
+The output directory must not exist. Defaults: ClickHouse 26.2.3.2, 3 million rows per
+payload table, 8 GiB memory and 2 CPUs per node, 50 seeded signatures, five alternating
+runs. `--rows 2000 --samples 2 --runs 1` is only a harness smoke test. `--node-memory`
+changes the fixture container limit; the cancellation fixture retains its 2 GiB default.
+`--delay-ms` injects an explicit delay per client request; `modeled_100ms_rtt` is an
+arithmetic sensitivity model, not measured deployed network latency.
+
+`report.json` contains settings, source-script hash, ingestion/merge/part measurements,
+query plans, raw HTTP observations and per-query ClickHouse logs. Payload digests must
+match across variants. Cache-cleared runs drop ClickHouse mark/uncompressed caches;
+filesystem caches remain uncontrolled. SQL timing excludes Rust admission, hydration,
+and serialization. Physical I/O and production-scale capacity are not inferred from
+logical read bytes. See [the findings](../../GETTRANSACTION_BENCHMARKS.md).
