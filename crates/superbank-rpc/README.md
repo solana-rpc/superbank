@@ -473,9 +473,14 @@ and index failures preserve source fallback; a cold index can have higher latenc
 built index.
 
 Cache format **5** preserves the source's portable MergeTree index/mark settings and reverse
-sort directions from canonical DDL. Forwarding views project only insertable columns so the
+sort directions from canonical DDL, except for the local transactions payload layout. Its effective
+settings are `index_granularity=64`, `index_granularity_bytes=10485760`,
+`min_compress_block_size=16384`, and `max_compress_block_size=65536`. The same effective
+settings feed table creation and the schema fingerprint; upstream payload settings cannot override them. Forwarding views project only insertable columns so the
 cache recomputes materialized bucket columns. Upgrading uses
 an ownership-checked table rebuild and temporarily refills through source fallback.
+A payload-layout fingerprint change rebuilds all tables in the owned cache and clears their coverage. The filler repopulates the retention window, and signature indexes rebuild from the new data. Refill can take hours at full retention; a healthy RPC does not prove a warm cache. Restarting with matching settings reuses the data. Rolling back to a build with the previous fingerprint can cause another rebuild.
+
 The rebuild preserves `_cache_meta` until replacement DDL succeeds, so interrupted rebuilds
 can retry. Drops of verified owned tables set `max_table_size_to_drop=0` for that query only;
 server-wide drop protection remains unchanged. The separately owned full-history block index is preserved. Before deployment, run the full-size

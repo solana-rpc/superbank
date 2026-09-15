@@ -122,6 +122,27 @@ pub(crate) struct SourceTableSchema {
 }
 
 impl SourceTableSchema {
+    fn effective_cache_settings(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut settings = self.settings.clone();
+        if self.kind == CacheTableKind::Transactions {
+            settings.extend([
+                ("index_granularity".into(), 64),
+                ("index_granularity_bytes".into(), 10_485_760),
+                ("min_compress_block_size".into(), 16_384),
+                ("max_compress_block_size".into(), 65_536),
+            ]);
+        }
+        if self
+            .storage
+            .sorting_key
+            .to_ascii_uppercase()
+            .contains(" DESC")
+        {
+            settings.insert("allow_experimental_reverse_key".into(), 1);
+        }
+        settings
+    }
+
     fn with_storage_settings(mut self) -> Result<Self, SchemaError> {
         self.settings = super::schema_settings::extract(&self.storage.create_table_query)?;
         if let Some(key) = super::schema_settings::sorting_key(&self.storage.create_table_query) {
@@ -441,7 +462,7 @@ fn schema_fingerprint(tables: &[SourceTableSchema], config: &CacheSchemaConfig) 
                 column.compression_codec
             );
         }
-        let _ = writeln!(input, "settings={:?}", table.settings);
+        let _ = writeln!(input, "settings={:?}", table.effective_cache_settings());
         for index in &table.indexes {
             let _ = writeln!(input, "index={index}");
         }
@@ -508,11 +529,7 @@ fn create_cache_table_sql(
     } else {
         table.storage.primary_key.trim()
     };
-    let mut settings = table.settings.clone();
-    if sorting_key.to_ascii_uppercase().contains(" DESC") {
-        settings.insert("allow_experimental_reverse_key".into(), 1);
-    }
-    let settings = super::schema_settings::clause(&settings);
+    let settings = super::schema_settings::clause(&table.effective_cache_settings());
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS {target} (\n    {columns}\n) \
          ENGINE = ReplacingMergeTree(slot) \
@@ -917,9 +934,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partition_width_is_part_of_fingerprint() {
-        let table = SourceTableSchema {
+    fn fixture_table() -> SourceTableSchema {
+        SourceTableSchema {
             kind: CacheTableKind::Transactions,
             logical_name: "default.transactions".into(),
             storage_name: "default.transactions_local".into(),
@@ -942,17 +958,88 @@ mod tests {
             view_select: None,
             indexes: Vec::new(),
             settings: Default::default(),
-        };
-        let config = |partition_slots| CacheSchemaConfig {
+        }
+    }
+
+    fn fixture_config(partition_slots: u64) -> CacheSchemaConfig {
+        CacheSchemaConfig {
             database: "cache".into(),
             partition_slots,
             memory_blocks_metadata: false,
             memory_retain_slots: None,
             memory_max_bytes: None,
-        };
+        }
+    }
+
+    #[test]
+    fn partition_width_is_part_of_fingerprint() {
+        let table = fixture_table();
         assert_ne!(
-            schema_fingerprint(std::slice::from_ref(&table), &config(10_000)),
-            schema_fingerprint(&[table], &config(20_000))
+            schema_fingerprint(std::slice::from_ref(&table), &fixture_config(10_000)),
+            schema_fingerprint(&[table], &fixture_config(20_000))
         );
+    }
+
+    #[test]
+    fn transaction_layout_overrides_source_settings_in_ddl_and_fingerprint() {
+        let mut table = fixture_table();
+        let config = fixture_config(10_000);
+        let fingerprint = schema_fingerprint(std::slice::from_ref(&table), &config);
+        table.settings.extend([
+            ("index_granularity".into(), 8192),
+            ("index_granularity_bytes".into(), 67_108_864),
+            ("min_compress_block_size".into(), 65_536),
+            ("max_compress_block_size".into(), 1_048_576),
+        ]);
+        assert_eq!(
+            fingerprint,
+            schema_fingerprint(std::slice::from_ref(&table), &config)
+        );
+        let ddl = create_cache_table_sql(&table, &config).unwrap();
+        for setting in [
+            "index_granularity=64",
+            "index_granularity_bytes=10485760",
+            "min_compress_block_size=16384",
+            "max_compress_block_size=65536",
+        ] {
+            assert!(ddl.contains(setting), "{ddl}");
+        }
+        // The previous fingerprint hashed source settings without local overrides.
+        let legacy = "format=5\ndatabase=cache\npartition_slots=10000\nmemory_blocks=false\nmemory_retain=None\nmemory_bytes=None\n\
+            table=Transactions|logical=default.transactions|storage=default.transactions_local|engine=ReplacingMergeTree|partition=intDiv(slot, 432000)|primary=slot|sorting=slot|view=\n\
+            column=slot|UInt64|||\nsettings={}\n";
+        assert_ne!(
+            fingerprint,
+            blake3::hash(legacy.as_bytes()).to_hex().to_string()
+        );
+        table.settings.insert("compress_marks".into(), 1);
+        assert_ne!(
+            fingerprint,
+            schema_fingerprint(std::slice::from_ref(&table), &config)
+        );
+        assert!(
+            create_cache_table_sql(&table, &config)
+                .unwrap()
+                .contains("compress_marks=1")
+        );
+    }
+
+    #[test]
+    fn other_cache_tables_preserve_source_settings() {
+        for kind in [
+            CacheTableKind::Signatures,
+            CacheTableKind::BlocksMetadata,
+            CacheTableKind::Gsfa,
+            CacheTableKind::GsfaHot,
+            CacheTableKind::TokenOwnerActivity,
+        ] {
+            let mut table = fixture_table();
+            table.kind = kind;
+            table.settings.insert("index_granularity".into(), 512);
+            assert_eq!(table.effective_cache_settings(), table.settings);
+            let ddl = create_cache_table_sql(&table, &fixture_config(10_000)).unwrap();
+            assert!(ddl.contains("index_granularity=512"));
+            assert!(!ddl.contains("compress_block_size"));
+        }
     }
 }

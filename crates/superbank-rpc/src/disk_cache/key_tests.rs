@@ -491,17 +491,71 @@ async fn assert_migration(
     let mut cfg = cfg.clone();
     cfg.database.push_str("_migration");
     let cache = DiskCache::open(cfg.clone(), source).await.unwrap();
+    let views = client
+        .query(&format!("SELECT name FROM system.tables WHERE database='{}' AND endsWith(name, '__mv') ORDER BY name", cfg.database))
+        .fetch_all::<String>().await.unwrap();
+    let mut view_ddl = Vec::new();
+    for name in &views {
+        view_ddl.push(
+            client
+                .query(&format!("SHOW CREATE TABLE {}.{name}", cfg.database))
+                .fetch_one::<String>()
+                .await
+                .unwrap(),
+        );
+        execute(client, &format!("DROP TABLE {}.{name} SYNC", cfg.database)).await;
+    }
+    let old_ddl = client
+        .query(&format!("SHOW CREATE TABLE {}.transactions", cfg.database))
+        .fetch_one::<String>()
+        .await
+        .unwrap()
+        .replace("index_granularity = 64", "index_granularity = 8192")
+        .replace(
+            "min_compress_block_size = 16384",
+            "min_compress_block_size = 65536",
+        )
+        .replace(
+            "max_compress_block_size = 65536",
+            "max_compress_block_size = 1048576",
+        );
+    execute(
+        client,
+        &format!("DROP TABLE {}.transactions SYNC", cfg.database),
+    )
+    .await;
+    execute(client, &old_ddl).await;
+    for ddl in view_ddl {
+        execute(client, &ddl).await;
+    }
     insert_transactions(client, &cfg.database).await;
+    cache
+        .publish_range_coverage(vec![(15, SlotStatus::Covered { tx_count: 1 })])
+        .await
+        .unwrap();
+    assert!(cache.covers_slot(15));
     execute(
         client,
         &format!(
-            "ALTER TABLE {}._cache_meta UPDATE value='4' WHERE key='format_version' SETTINGS mutations_sync=2",
+            "ALTER TABLE {}._cache_meta UPDATE value='previous-payload-layout' WHERE key='fingerprint' SETTINGS mutations_sync=2",
             cfg.database
         ),
     )
     .await;
-    assert_resumable_rebuild(&cache, &cfg).await;
     let reopened = DiskCache::open(cfg.clone(), source).await.unwrap();
+    let ddl = client
+        .query(&format!("SHOW CREATE TABLE {}.transactions", cfg.database))
+        .fetch_one::<String>()
+        .await
+        .unwrap();
+    for setting in [
+        "index_granularity = 64",
+        "index_granularity_bytes = 10485760",
+        "min_compress_block_size = 16384",
+        "max_compress_block_size = 65536",
+    ] {
+        assert!(ddl.contains(setting), "{ddl}");
+    }
     let count = reopened
         .inner
         .local
@@ -523,6 +577,17 @@ async fn assert_migration(
         found_transaction(restarted.get_tx(signature(15), None).await).slot,
         15
     );
+    execute(
+        client,
+        &format!(
+            "ALTER TABLE {}._cache_meta UPDATE value='4' WHERE key='format_version' SETTINGS mutations_sync=2",
+            cfg.database
+        ),
+    )
+    .await;
+    assert_resumable_rebuild(&restarted, &cfg).await;
+    let restarted = DiskCache::open(cfg.clone(), source).await.unwrap();
+    assert_signature_fill_updates(&restarted, source).await;
     execute(
         client,
         &format!("DROP TABLE {}._cache_meta SYNC", cfg.database),
