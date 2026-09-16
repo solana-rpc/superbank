@@ -1,7 +1,10 @@
 # getTransaction follow-up: correctness and local measurements
 
-These changes preserve the existing ClickHouse schemas, cache format, and retention
-settings. Measurements below use isolated synthetic fixtures.
+This report records the September 11, 2026 correctness checks and local measurements
+using isolated synthetic fixtures. The Docker benchmark runner and its shared
+ClickHouse protocol harness have since been removed; the recorded results are
+preserved for reference. The changes evaluated here preserved the existing ClickHouse
+schemas, cache format, and retention settings.
 
 ## Implemented
 
@@ -22,8 +25,7 @@ introduced. The existing primary two-request route remains enabled.
 
 ## Benchmark method
 
-Run `python3 scripts/test/benchmark-get-transaction.py --output /tmp/gettx-benchmark`.
-The script creates and removes its own three-node ClickHouse 26.2.3.2 Docker cluster,
+The retired runner created and removed its own three-node ClickHouse 26.2.3.2 Docker cluster,
 with a transparent local TCP gateway, two CPUs and 8 GiB per node. The initial 2 GiB
 fixture limit failed during ingestion and is not a performance result.
 
@@ -66,8 +68,8 @@ it is not proof of getTransaction cancellation through the deployed gateway.
 ## Results
 
 [Machine-readable results](docs/benchmarks/gettransaction-2026-09-11.json) include
-plans, settings, merge/part measurements and the raw-report checksum. The raw report is retained locally; rerun the script to generate the complete query telemetry. All 2,500 observations have terminal
-query telemetry, no query errors, and matching full payload digests.
+plans, settings, merge/part measurements and the raw-report checksum. All 2,500
+observations have terminal query telemetry, no query errors, and matching full payload digests.
 
 Client times are milliseconds. Read counts are per logical lookup; the two-request
 baseline includes both signature and payload queries.
