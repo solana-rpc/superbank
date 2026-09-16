@@ -247,6 +247,7 @@ pub(crate) const TOKEN_OWNER_REQUIRED_COLUMNS: [&str; 9] = [
 ];
 
 pub(crate) struct TransactionsForAddressTables<'a> {
+    pub(crate) cache_partition: Option<(u64, u64)>,
     pub(crate) gsfa_table: &'a str,
     pub(crate) gsfa_bucket_modulus: u64,
     pub(crate) token_owner_table: &'a str,
@@ -720,10 +721,16 @@ pub(crate) fn build_transactions_for_address_query(
         conditions.join(" AND ")
     };
 
+    let slot_scope = tables
+        .cache_partition
+        .map_or_else(String::new, |(width, partition)| {
+            format!(" AND intDiv(slot, {width}) = {partition}")
+        });
+
     let gsfa_subquery = format!(
         "SELECT signature, slot, slot_idx, err, memo, block_time
          FROM {gsfa_table}
-         PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}",
+         PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}{slot_scope}",
         gsfa_table = tables.gsfa_table,
         addr_bucket = gsfa_addr_bucket,
         address_literal = address_literal
@@ -739,7 +746,7 @@ pub(crate) fn build_transactions_for_address_query(
         let token_subquery = format!(
             "SELECT signature, slot, slot_idx, err, memo, block_time
              FROM {token_owner_table}
-             PREWHERE owner_bucket = {addr_bucket} AND owner = {address_literal}{balance_clause}",
+             PREWHERE owner_bucket = {addr_bucket} AND owner = {address_literal}{slot_scope}{balance_clause}",
             token_owner_table = tables.token_owner_table,
             addr_bucket = token_owner_bucket,
             address_literal = address_literal,
@@ -763,7 +770,7 @@ pub(crate) fn build_transactions_for_address_query(
             memo,
             block_time
          FROM {gsfa_table}
-         PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}
+         PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}{slot_scope}
          WHERE {where_clause}",
             with_clause = with_clause,
             gsfa_table = tables.gsfa_table,
@@ -993,6 +1000,7 @@ mod tests {
         };
 
         let tables = TransactionsForAddressTables {
+            cache_partition: None,
             gsfa_table: "default.gsfa",
             gsfa_bucket_modulus: 128,
             token_owner_table: "default.token_owner_activity",
@@ -1058,6 +1066,7 @@ mod tests {
         };
 
         let tables = TransactionsForAddressTables {
+            cache_partition: None,
             gsfa_table: "default.gsfa",
             gsfa_bucket_modulus: 32,
             token_owner_table: "default.token_owner_activity",
@@ -1098,6 +1107,7 @@ mod tests {
             token_accounts: TokenAccountsFilter::None,
         };
         let tables = TransactionsForAddressTables {
+            cache_partition: None,
             gsfa_table: "default.gsfa_local",
             gsfa_bucket_modulus: 32,
             token_owner_table: "default.token_owner_activity_local",
@@ -1139,6 +1149,7 @@ mod tests {
             token_accounts: TokenAccountsFilter::None,
         };
         let tables = TransactionsForAddressTables {
+            cache_partition: None,
             gsfa_table: "cache.gsfa",
             gsfa_bucket_modulus: 32,
             token_owner_table: "cache.token_owner_activity",
@@ -1179,6 +1190,7 @@ mod tests {
             token_accounts: TokenAccountsFilter::None,
         };
         let tables = TransactionsForAddressTables {
+            cache_partition: None,
             gsfa_table: "default.gsfa_local",
             gsfa_bucket_modulus: 32,
             token_owner_table: "default.token_owner_activity_local",

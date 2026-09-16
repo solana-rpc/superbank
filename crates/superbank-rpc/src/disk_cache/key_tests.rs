@@ -1,0 +1,901 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Opt-in integration against a disposable, loopback ClickHouse server.
+//! Raw queries below are fixture setup and independent observation probes;
+//! cancellation assertions exercise the guarded application read path.
+use super::*;
+use crate::clickhouse::{NumericFilter, SortOrder, TransactionStatusFilter};
+use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
+
+fn found_transaction(result: DiskTransactionResult) -> Arc<StoredTransactionRecord> {
+    match result {
+        DiskTransactionResult::Found(record) => record,
+        other => panic!("expected transaction, got {other:?}"),
+    }
+}
+
+fn signature(slot: u64) -> Signature {
+    named_signature("sig", slot)
+}
+fn named_signature(prefix: &str, slot: u64) -> Signature {
+    let mut key = [0; 64];
+    let value = format!("{prefix}-{slot}");
+    key[..value.len()].copy_from_slice(value.as_bytes());
+    Signature::from(key)
+}
+fn signature_candidate(cache: &DiskCache, partition: u64, signature: Signature) -> bool {
+    !cache
+        .inner
+        .key_index
+        .signature_candidates(
+            partition,
+            partition,
+            key_index::SignatureHash::new(signature.as_ref()),
+        )
+        .partitions
+        .is_empty()
+}
+
+async fn transaction_response(
+    source: &ClickHouseClient,
+    cache: Option<&DiskCache>,
+    signature: Signature,
+    config: serde_json::Value,
+) -> serde_json::Value {
+    let mut state = Arc::try_unwrap(crate::tests::test_state()).ok().unwrap();
+    state.clickhouse = source.clone();
+    state.disk_cache = cache.map(|cache| {
+        Arc::new(tokio::sync::OnceCell::new_with(Some(Arc::new(
+            cache.clone(),
+        ))))
+    });
+    let response = Box::pin(crate::handlers::transactions::handle_get_transaction(
+        Arc::new(state),
+        serde_json::json!("transaction-regression"),
+        Some(vec![serde_json::json!(signature.to_string()), config]),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn assert_transaction_fallback(source: &ClickHouseClient, cache: &DiskCache) {
+    for encoding in ["json", "jsonParsed", "base58", "base64"] {
+        let config = serde_json::json!({"slot": 45, "encoding": encoding, "maxSupportedTransactionVersion": 1});
+        let expected = transaction_response(source, None, signature(45), config.clone()).await;
+        assert!(expected.get("error").is_none(), "{expected}");
+        assert_eq!(expected["result"]["slot"], 45);
+        let actual = transaction_response(source, Some(cache), signature(45), config).await;
+        assert_eq!(actual, expected);
+    }
+}
+
+async fn assert_transaction_invalidation(cache: &DiskCache) {
+    let permits = cache
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    let read = cache.get_tx(signature(45), Some(45));
+    tokio::pin!(read);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut read)
+            .await
+            .is_err()
+    );
+    cache.inner.key_index.invalidate_reads();
+    drop(permits);
+    assert!(matches!(read.await, DiskTransactionResult::Unavailable));
+}
+
+async fn assert_transaction_append_race(client: &clickhouse::Client, cache: &DiskCache) {
+    cache.inner.key_index.clear_signatures();
+    let permits = cache
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    let read = cache.get_tx(signature(50), Some(50));
+    tokio::pin!(read);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut read)
+            .await
+            .is_err()
+    );
+    execute(client, &format!("INSERT INTO {}.transactions (signature,slot,slot_idx,tx_signatures) VALUES (toFixedString('sig-50',64),50,7,[toFixedString('sig-50',64)])", cache.inner.cfg.database)).await;
+    cache
+        .publish_range_coverage(vec![(50, SlotStatus::Covered { tx_count: 1 })])
+        .await
+        .unwrap();
+    drop(permits);
+    assert!(matches!(read.await, DiskTransactionResult::Unavailable));
+    let found = found_transaction(cache.get_tx(signature(50), Some(50)).await);
+    assert_eq!(found.slot, 50);
+    cache
+        .publish_range_coverage(vec![(51, SlotStatus::Skipped)])
+        .await
+        .unwrap();
+    assert!(matches!(
+        cache.get_tx(signature(500), Some(51)).await,
+        DiskTransactionResult::Absent
+    ));
+    cache.build_signature_indexes().await;
+}
+
+async fn assert_transaction_positions(cache: &DiskCache) {
+    let mut client = cache.query_client();
+    client.cache_partition = Some((
+        cache.inner.cfg.partition_slots,
+        45 / cache.inner.cfg.partition_slots,
+    ));
+    for slot_idx in [0, 999] {
+        let (record, _) = client
+            .get_transaction_by_signature_and_position(
+                &signature(45).to_string(),
+                crate::clickhouse::SignatureSlot { slot: 45, slot_idx },
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.unwrap().slot, 45);
+    }
+    assert!(
+        client
+            .get_transaction_by_signature_and_position(
+                &signature(500).to_string(),
+                crate::clickhouse::SignatureSlot {
+                    slot: 45,
+                    slot_idx: 0
+                },
+            )
+            .await
+            .unwrap()
+            .0
+            .is_none()
+    );
+}
+
+async fn assert_transaction_reads(
+    client: &clickhouse::Client,
+    source: &ClickHouseClient,
+    cache: &DiskCache,
+) {
+    assert_transaction_positions(cache).await;
+    assert_transaction_invalidation(cache).await;
+    assert_transaction_append_race(client, cache).await;
+    assert!(matches!(
+        cache.get_tx(signature(500), Some(45)).await,
+        DiskTransactionResult::Absent
+    ));
+    assert!(matches!(
+        cache.get_tx(signature(500), Some(500)).await,
+        DiskTransactionResult::Unavailable
+    ));
+    let mismatch = transaction_response(
+        source,
+        Some(cache),
+        signature(45),
+        serde_json::json!({"slot": 44}),
+    )
+    .await;
+    assert!(mismatch["result"].is_null());
+    assert!(mismatch.get("error").is_none());
+    let database = &cache.inner.cfg.database;
+    execute(
+        client,
+        &format!("RENAME TABLE {database}.transactions TO {database}.transactions_unavailable"),
+    )
+    .await;
+    assert_transaction_fallback(source, cache).await;
+    execute(
+        client,
+        &format!("RENAME TABLE {database}.transactions_unavailable TO {database}.transactions"),
+    )
+    .await;
+}
+
+async fn assert_absent_without_admission(cache: &DiskCache) {
+    let client = cache.query_client();
+    let _permits = client.http_query_sem.acquire_many(2).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(50), async {
+        assert!(matches!(
+            cache.get_tx(signature(500), None).await,
+            DiskTransactionResult::Unavailable
+        ));
+        assert!(cache.signature_position(signature(500)).await.is_none());
+        assert!(cache.get_sig_statuses(vec![signature(500)]).await[0].is_none());
+    })
+    .await
+    .expect("complete negative must not wait for admission");
+}
+async fn assert_address_priority_recovery(cache: &DiskCache) {
+    let mut repair = cache.begin_fill(25, 25);
+    assert!(!cache.signature_indexes_ready());
+    cache.build_key_indexes().await;
+    assert!(
+        cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    cache.update_signature_membership(&mut repair, 25, 25).await;
+    drop(repair);
+    assert!(cache.signature_indexes_ready());
+    cache.build_key_indexes().await;
+    assert!(
+        !cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    assert_absent_without_admission(cache).await;
+}
+
+fn address(value: &str) -> Pubkey {
+    let mut key = [0; 32];
+    key[..value.len()].copy_from_slice(value.as_bytes());
+    Pubkey::from(key)
+}
+pub(super) fn config(url: String, database: String) -> DiskCacheConfig {
+    DiskCacheConfig {
+        url,
+        database,
+        username: "default".into(),
+        password: String::new(),
+        required: false,
+        retain_slots: 40,
+        max_bytes: 0,
+        partition_slots: 10,
+        query_timeout: Duration::from_secs(2),
+        key_index_max_memory_bytes: 128 * 1024 * 1024,
+        query_concurrency: 2,
+        query_max_threads: 2,
+        schema_check_interval: Duration::from_secs(300),
+        memory_blocks_metadata: false,
+        memory_retain_slots: None,
+        memory_max_bytes: None,
+        block_index: None,
+    }
+}
+async fn execute(client: &clickhouse::Client, sql: &str) {
+    client
+        .query(sql)
+        .execute()
+        .await
+        .unwrap_or_else(|e| panic!("{e}: {sql}"));
+}
+fn statements(sql: &str) -> Vec<&str> {
+    let mut quote = false;
+    let mut escaped = false;
+    let mut start = 0;
+    let mut result = Vec::new();
+    for (offset, ch) in sql.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quote => escaped = true,
+            '\'' => quote = !quote,
+            ';' if !quote => {
+                result.push(&sql[start..offset]);
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    if !sql[start..].trim().is_empty() {
+        result.push(&sql[start..]);
+    }
+    result
+}
+async fn fixture(client: &clickhouse::Client, database: &str) {
+    execute(client, &format!("CREATE DATABASE {database}")).await;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ddl/local");
+    for table in [
+        "transactions",
+        "blocks_metadata",
+        "signatures",
+        "gsfa",
+        "gsfa_hot",
+        "token_owner_activity",
+    ] {
+        let sql = std::fs::read_to_string(root.join(format!("{table}.sql")))
+            .unwrap()
+            .replace("default.", &format!("{database}."));
+        let sql = if table == "gsfa_hot" {
+            sql.replace("% 32", "% 64").replace(
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                &address("address").to_string(),
+            )
+        } else {
+            sql
+        };
+        for statement in statements(&sql) {
+            execute(client, statement).await;
+        }
+    }
+    execute(client, &format!("INSERT INTO {database}.blocks_metadata (slot,parent_slot,blockhash,parent_blockhash,block_time,block_height,executed_transaction_count) SELECT number,number-1,toFixedString('hash',32),toFixedString('hash',32),1700000000+number,number,1 FROM numbers(10,40)")).await;
+}
+async fn insert_transactions(client: &clickhouse::Client, database: &str) {
+    execute(client, &format!("INSERT INTO {database}.transactions (signature, slot, slot_idx, tx_signatures, tx_account_keys, tx_num_required_signatures, meta_status_ok, meta_post_token_balances_present, meta_post_token_account_index, meta_post_token_mint, meta_post_token_owner, meta_post_token_program_id, meta_post_token_amount, meta_post_token_decimals, meta_post_token_ui_amount, meta_post_token_ui_amount_string) SELECT toFixedString(concat('sig-', toString(number)),64), number, 0, [toFixedString(concat('sig-', toString(number)),64),toFixedString(concat('secondary-', toString(number)),64)], [toFixedString('address',32),toFixedString('signer',32)], 2, 1, 1, [0], [toFixedString('mint',32)], [toFixedString('owner',32)], [toFixedString('program',32)], ['1'], [0], [1.0], ['1'] FROM numbers(10,40)")).await;
+}
+fn tfa(order: SortOrder, tokens: TokenAccountsFilter) -> index::DiskTfaQuery {
+    index::DiskTfaQuery {
+        limit: 100,
+        sort_order: order,
+        pagination: None,
+        slot_filter: Some(NumericFilter::default()),
+        block_time_filter: None,
+        signature_filter: None,
+        status: TransactionStatusFilter::Any,
+        token_accounts: tokens,
+    }
+}
+
+async fn assert_pagination(cache: &DiskCache) {
+    for order in [SortOrder::Asc, SortOrder::Desc] {
+        let mut query = tfa(order, TokenAccountsFilter::All);
+        query.limit = 7;
+        let mut slots = Vec::new();
+        loop {
+            let page = cache
+                .transactions_for_address(address("owner"), query.clone())
+                .await
+                .unwrap();
+            let Some(last) = page.records.last() else {
+                break;
+            };
+            query.pagination = Some(crate::clickhouse::SignatureSlot {
+                slot: last.slot,
+                slot_idx: last.slot_idx,
+            });
+            slots.extend(page.records.iter().map(|r| r.slot));
+            if page.records.len() < query.limit {
+                break;
+            }
+        }
+        let mut expected: Vec<_> = (10..50).collect();
+        if order == SortOrder::Desc {
+            expected.reverse();
+        }
+        assert_eq!(slots, expected);
+    }
+}
+
+async fn assert_transaction_position_fallback(cache: &DiskCache) {
+    let mut client = cache.query_client();
+    client.cache_partition = Some((10, 1));
+    // The fallback must reuse the first query's permit instead of deadlocking at capacity one.
+    client.http_query_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let position = crate::clickhouse::SignatureSlot {
+        slot: 15,
+        slot_idx: 99,
+    };
+    let (record, _) = client
+        .get_transaction_by_signature_and_position(&signature(15).to_string(), position)
+        .await
+        .unwrap();
+    let record = record.unwrap();
+    assert_eq!((record.slot, record.slot_idx), (15, 0));
+    let (missing, _) = client
+        .get_transaction_by_signature_and_position(&signature(500).to_string(), position)
+        .await
+        .unwrap();
+    assert!(missing.is_none());
+    let (wrong_slot, _) = client
+        .get_transaction_by_signature_and_position(&signature(25).to_string(), position)
+        .await
+        .unwrap();
+    assert!(wrong_slot.is_none());
+}
+async fn assert_cross_partition_duplicates(client: &clickhouse::Client, cache: &DiskCache) {
+    let _mutation = cache.begin_fill(39, 39);
+    execute(client, &format!("INSERT INTO {}.transactions (signature,slot,slot_idx,tx_account_keys,meta_status_ok) SELECT signature,39,0,tx_account_keys,1 FROM {}.transactions WHERE slot=49 LIMIT 1", cache.inner.cfg.database,cache.inner.cfg.database)).await;
+    cache
+        .publish_range_coverage(vec![(39, SlotStatus::Covered { tx_count: 2 })])
+        .await
+        .unwrap();
+    drop(_mutation);
+    let mut query = tfa(SortOrder::Desc, TokenAccountsFilter::None);
+    query.limit = 15;
+    let page = cache
+        .transactions_for_address(address("address"), query)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records.iter().map(|r| r.slot).collect::<Vec<_>>(),
+        (35..50).rev().collect::<Vec<_>>()
+    );
+}
+
+async fn wait_for_query(client: &clickhouse::Client, id: &str, running: bool) {
+    for _ in 0..50 {
+        let count = client
+            .query("SELECT count() FROM system.processes WHERE query_id=?")
+            .bind(id)
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        if (count > 0) == running {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("query running state did not become {running}");
+}
+async fn assert_cancellation(client: &clickhouse::Client, cache: &DiskCache) {
+    let mut lookup = cache.query_client();
+    lookup.cache_partition = Some((10, 1));
+    let query = lookup.read_query(
+        "SELECT sum(cityHash64(number)) FROM numbers(1000000000000) SETTINGS max_execution_time=2,max_threads=1",
+        "test_cache_cancel",
+    ).await.unwrap();
+    let id = query.query_id().to_owned();
+    let task = tokio::spawn(query.fetch_one::<u64>());
+    wait_for_query(client, &id, true).await;
+    task.abort();
+    let _ = task.await;
+    wait_for_query(client, &id, false).await;
+}
+
+async fn assert_signature_fill_updates(cache: &DiskCache, source: &ClickHouseClient) {
+    // First fill, append within the same partition, then repair covered slots.
+    for (start, end) in [(10, 14), (15, 19), (15, 19)] {
+        filler::fill_range(
+            cache,
+            source,
+            filler::SlotRange { start, end },
+            &filler::FillerConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(signature_candidate(cache, 1, signature(10)));
+        assert!(signature_candidate(
+            cache,
+            1,
+            named_signature("secondary", end)
+        ));
+        assert_eq!(
+            cache
+                .signature_position(named_signature("secondary", end))
+                .await
+                .unwrap()
+                .slot,
+            end
+        );
+        assert_eq!(
+            cache
+                .get_sig_statuses(vec![named_signature("secondary", end)])
+                .await[0]
+                .as_ref()
+                .unwrap()
+                .slot,
+            end
+        );
+        assert_absent_without_admission(cache).await;
+    }
+}
+
+async fn assert_migration(
+    client: &clickhouse::Client,
+    source: &ClickHouseClient,
+    cfg: &DiskCacheConfig,
+) {
+    let mut cfg = cfg.clone();
+    cfg.database.push_str("_migration");
+    let cache = DiskCache::open(cfg.clone(), source).await.unwrap();
+    let views = client
+        .query(&format!("SELECT name FROM system.tables WHERE database='{}' AND endsWith(name, '__mv') ORDER BY name", cfg.database))
+        .fetch_all::<String>().await.unwrap();
+    let mut view_ddl = Vec::new();
+    for name in &views {
+        view_ddl.push(
+            client
+                .query(&format!("SHOW CREATE TABLE {}.{name}", cfg.database))
+                .fetch_one::<String>()
+                .await
+                .unwrap(),
+        );
+        execute(client, &format!("DROP TABLE {}.{name} SYNC", cfg.database)).await;
+    }
+    let old_ddl = client
+        .query(&format!("SHOW CREATE TABLE {}.transactions", cfg.database))
+        .fetch_one::<String>()
+        .await
+        .unwrap()
+        .replace("index_granularity = 64", "index_granularity = 8192")
+        .replace(
+            "min_compress_block_size = 16384",
+            "min_compress_block_size = 65536",
+        )
+        .replace(
+            "max_compress_block_size = 65536",
+            "max_compress_block_size = 1048576",
+        );
+    execute(
+        client,
+        &format!("DROP TABLE {}.transactions SYNC", cfg.database),
+    )
+    .await;
+    execute(client, &old_ddl).await;
+    for ddl in view_ddl {
+        execute(client, &ddl).await;
+    }
+    insert_transactions(client, &cfg.database).await;
+    cache
+        .publish_range_coverage(vec![(15, SlotStatus::Covered { tx_count: 1 })])
+        .await
+        .unwrap();
+    assert!(cache.covers_slot(15));
+    execute(
+        client,
+        &format!(
+            "ALTER TABLE {}._cache_meta UPDATE value='previous-payload-layout' WHERE key='fingerprint' SETTINGS mutations_sync=2",
+            cfg.database
+        ),
+    )
+    .await;
+    let reopened = DiskCache::open(cfg.clone(), source).await.unwrap();
+    let ddl = client
+        .query(&format!("SHOW CREATE TABLE {}.transactions", cfg.database))
+        .fetch_one::<String>()
+        .await
+        .unwrap();
+    for setting in [
+        "index_granularity = 64",
+        "index_granularity_bytes = 10485760",
+        "min_compress_block_size = 16384",
+        "max_compress_block_size = 65536",
+    ] {
+        assert!(ddl.contains(setting), "{ddl}");
+    }
+    let count = reopened
+        .inner
+        .local
+        .client
+        .query("SELECT count() AS count FROM signatures")
+        .fetch_one::<u64>()
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(reopened.tip_span().is_none());
+    assert_signature_fill_updates(&reopened, source).await;
+    assert!(reopened.covers_slot(15));
+    assert_eq!(
+        found_transaction(reopened.get_tx(signature(15), None).await).slot,
+        15
+    );
+    let restarted = DiskCache::open(cfg.clone(), source).await.unwrap();
+    assert_eq!(
+        found_transaction(restarted.get_tx(signature(15), None).await).slot,
+        15
+    );
+    execute(
+        client,
+        &format!(
+            "ALTER TABLE {}._cache_meta UPDATE value='4' WHERE key='format_version' SETTINGS mutations_sync=2",
+            cfg.database
+        ),
+    )
+    .await;
+    assert_resumable_rebuild(&restarted, &cfg).await;
+    let restarted = DiskCache::open(cfg.clone(), source).await.unwrap();
+    assert_signature_fill_updates(&restarted, source).await;
+    execute(
+        client,
+        &format!("DROP TABLE {}._cache_meta SYNC", cfg.database),
+    )
+    .await;
+    let error = DiskCache::open(cfg.clone(), source)
+        .await
+        .err()
+        .expect("missing marker must fail closed");
+    assert!(error.to_string().contains("ownership check failed"));
+    assert_eq!(
+        found_transaction(restarted.get_tx(signature(15), None).await).slot,
+        15
+    );
+    drop(cache);
+    execute(client, &format!("DROP DATABASE {} SYNC", cfg.database)).await;
+}
+async fn assert_resumable_rebuild(cache: &DiskCache, cfg: &DiskCacheConfig) {
+    let mut admin = cache.inner.admin.clone();
+    admin.client = admin.client.with_setting("max_table_size_to_drop", "1");
+    let table = format!("{}.gsfa", cfg.database);
+    let error = admin
+        .client
+        .query(&format!("DROP TABLE {table} SYNC"))
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("TABLE_SIZE_EXCEEDS_MAX_DROP_SIZE_LIMIT")
+    );
+    let marker_query = format!(
+        "SELECT toString(uuid) FROM system.tables WHERE database='{}' AND name='_cache_meta'",
+        cfg.database
+    );
+    let marker = admin
+        .client
+        .query(&marker_query)
+        .fetch_one::<String>()
+        .await
+        .unwrap();
+    // Fail replacement DDL after deletion, then retry with the real schema.
+    let mut broken = (*cache.source_schema()).clone();
+    broken.tables.clear();
+    assert!(
+        schema::initialize_cache_schema(&admin, &broken, &cfg.schema_config())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        admin
+            .client
+            .query(&marker_query)
+            .fetch_one::<String>()
+            .await
+            .unwrap(),
+        marker
+    );
+    assert!(
+        schema::initialize_cache_schema(&admin, &cache.source_schema(), &cfg.schema_config())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !schema::initialize_cache_schema(&admin, &cache.source_schema(), &cfg.schema_config())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        admin
+            .client
+            .query(&marker_query)
+            .fetch_one::<String>()
+            .await
+            .unwrap(),
+        marker
+    );
+}
+
+async fn assert_pruning(client: &clickhouse::Client, database: &str) {
+    let query = format!(
+        "EXPLAIN indexes=1 SELECT slot FROM {database}.signatures PREWHERE signature=toFixedString('sig-15',64) AND intDiv(slot,10)=1"
+    );
+    let explain = client
+        .query(&query)
+        .fetch_all::<String>()
+        .await
+        .unwrap()
+        .join("\n");
+    assert!(explain.contains("Parts: 1/4"), "{explain}");
+    let ddl = client
+        .query(&format!("SHOW CREATE TABLE {database}.signatures"))
+        .fetch_one::<String>()
+        .await
+        .unwrap();
+    assert!(ddl.contains("slot DESC"), "{ddl}");
+    assert!(ddl.contains("index_granularity = 512"), "{ddl}");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable ClickHouse: DISK_CACHE_TEST_URL=http://127.0.0.1:18123"]
+async fn key_routing_clickhouse_integration() {
+    let url = std::env::var("DISK_CACHE_TEST_URL").expect("explicit disposable ClickHouse URL");
+    assert!(url.starts_with("http://127.0.0.1:"));
+    let database = format!("test_key_router_{}", now_version());
+    let cache_database = format!("{database}_cache");
+    let client = clickhouse::Client::default()
+        .with_url(&url)
+        .with_user("default");
+    fixture(&client, &database).await;
+    insert_transactions(&client, &database).await;
+    let mut source = ClickHouseClient::new(
+        &url,
+        &database,
+        "default",
+        "",
+        ClickHouseClientOptions::new(
+            RoutingPolicy {
+                transport: RoutingTransport::Http,
+                scope: RoutingScope::Distributed,
+            },
+            None,
+            vec![address("address").to_string()],
+            format!("{database}.gsfa_hot"),
+            format!("{database}.gsfa_hot"),
+        ),
+    );
+    source.use_table_names(ClickHouseTableNames::in_database(&database));
+    let cfg = config(url, cache_database.clone());
+    let cache = DiskCache::open(cfg.clone(), &source).await.unwrap();
+    insert_transactions(&client, &cache_database).await;
+    cache
+        .publish_range_coverage(
+            (10..50)
+                .map(|slot| (slot, SlotStatus::Covered { tx_count: 1 }))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    cache.build_key_indexes().await;
+    assert!(
+        cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    assert!(!cache.signature_indexes_ready());
+    cache.build_signature_indexes().await;
+    assert!(cache.signature_indexes_ready());
+    cache.build_key_indexes().await;
+    assert!(
+        !cache
+            .inner
+            .key_index
+            .may_contain(2, &[key_index::Family::Address], b"absent")
+    );
+    assert_address_priority_recovery(&cache).await;
+    assert_absent_without_admission(&cache).await;
+    assert!(!signature_candidate(&cache, 1, signature(35)));
+    assert!(signature_candidate(&cache, 1, signature(15)));
+    assert_eq!(
+        cache.signature_position(signature(15)).await.unwrap().slot,
+        15
+    );
+    assert_eq!(
+        found_transaction(cache.get_tx(signature(15), None).await).slot,
+        15
+    );
+    assert!(cache.signature_position(signature(500)).await.is_none());
+    let statuses = cache
+        .get_sig_statuses(vec![
+            signature(15),
+            signature(500),
+            signature(15),
+            signature(45),
+        ])
+        .await;
+    assert_eq!(
+        statuses
+            .iter()
+            .map(|s| s.as_ref().map(|s| s.slot))
+            .collect::<Vec<_>>(),
+        [Some(15), None, Some(15), Some(45)]
+    );
+    let page = cache
+        .signatures_for_address(address("address"), None, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records.iter().map(|r| r.slot).collect::<Vec<_>>(),
+        (10..50).rev().collect::<Vec<_>>()
+    );
+    for (key, tokens) in [
+        ("address", TokenAccountsFilter::None),
+        ("owner", TokenAccountsFilter::All),
+        ("owner", TokenAccountsFilter::BalanceChanged),
+    ] {
+        let page = cache
+            .transactions_for_address(address(key), tfa(SortOrder::Asc, tokens))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.records.iter().map(|r| r.slot).collect::<Vec<_>>(),
+            (10..50).collect::<Vec<_>>()
+        );
+    }
+    let mut scoped = cache.query_client();
+    scoped.cache_partition = Some((10, 2));
+    assert!(
+        scoped
+            .get_signature_slot(&signature(15).to_string())
+            .await
+            .unwrap()
+            .0
+            .is_none()
+    );
+    assert_eq!(
+        cache
+            .query_client()
+            .get_signature_slot(&signature(15).to_string())
+            .await
+            .unwrap()
+            .0
+            .unwrap()
+            .slot,
+        15
+    );
+    assert_transaction_position_fallback(&cache).await;
+    assert_pagination(&cache).await;
+    assert_pruning(&client, &cache_database).await;
+    // Poll migration separately so nested debug lookup futures do not consume
+    // the fixture task's stack as well as their own.
+    let migration_client = client.clone();
+    let migration_source = source.clone();
+    let migration_cfg = cfg.clone();
+    tokio::spawn(async move {
+        assert_migration(&migration_client, &migration_source, &migration_cfg).await;
+    })
+    .await
+    .unwrap();
+    assert_cancellation(&client, &cache).await;
+    assert_cross_partition_duplicates(&client, &cache).await;
+    let tx_client = client.clone();
+    let tx_source = source.clone();
+    let tx_cache = cache.clone();
+    tokio::spawn(async move {
+        assert_transaction_reads(&tx_client, &tx_source, &tx_cache).await;
+    })
+    .await
+    .unwrap();
+    cache.poison_slot(15).await;
+    assert!(matches!(
+        cache.get_tx(signature(15), None).await,
+        DiskTransactionResult::Unavailable
+    ));
+    assert!(!signature_candidate(&cache, 1, signature(500)));
+    let mut reopened_cfg = cfg;
+    reopened_cfg.query_timeout = Duration::from_millis(50);
+    let reopened = DiskCache::open(reopened_cfg, &source).await.unwrap();
+    assert!(
+        reopened
+            .query_client()
+            .is_gsfa_hot_address(&address("address"))
+    );
+    let hot_page = reopened
+        .signatures_for_address(address("address"), None, None, 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        hot_page
+            .records
+            .iter()
+            .map(|row| row.slot)
+            .collect::<Vec<_>>(),
+        [49, 48, 47]
+    );
+    let _permits = reopened
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        reopened.get_tx(signature(45), None).await,
+        DiskTransactionResult::Unavailable
+    ));
+    assert!(started.elapsed() < Duration::from_millis(200));
+    assert!(matches!(
+        reopened.slot_status(45).await,
+        SlotStatus::Covered { .. }
+    ));
+    let tx_source = source.clone();
+    let tx_cache = reopened.clone();
+    tokio::spawn(async move {
+        assert_transaction_fallback(&tx_source, &tx_cache).await;
+    })
+    .await
+    .unwrap();
+    drop(_permits);
+    if std::env::var_os("DISK_CACHE_TEST_KEEP").is_some() {
+        eprintln!("Kept source database {database} and cache {cache_database}");
+        return;
+    }
+    execute(&client, &format!("DROP DATABASE {cache_database} SYNC")).await;
+    execute(&client, &format!("DROP DATABASE {database} SYNC")).await;
+}
+
+mod diagnostics;

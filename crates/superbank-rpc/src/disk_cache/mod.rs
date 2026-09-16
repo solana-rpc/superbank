@@ -21,9 +21,8 @@ use tracing::{info, warn};
 
 use crate::clickhouse::{
     BlockMetadataRecord, ClickHouseClient, ClickHouseClientOptions, ClickHouseTableNames,
-    PaginationToken, QueryCacheConfig, RoutingPolicy, RoutingScope, RoutingTransport,
-    SignatureRecord, SlotBoundary, SortOrder, StoredBlockPayload, StoredBlockRecord,
-    StoredTransactionRecord, TokenAccountsFilter, TransactionsForAddressQuery,
+    QueryCacheConfig, RoutingPolicy, RoutingScope, RoutingTransport, SignatureRecord, SlotBoundary,
+    StoredBlockPayload, StoredBlockRecord, StoredTransactionRecord, TokenAccountsFilter,
 };
 use crate::config::ClickHouseStartupTableCheck;
 use crate::solana_sdk;
@@ -32,7 +31,12 @@ pub(crate) mod block_index;
 pub(crate) mod coverage;
 pub(crate) mod filler;
 pub(crate) mod index;
+pub(crate) mod key_index;
+mod key_reads;
+#[cfg(test)]
+mod key_tests;
 pub(crate) mod schema;
+mod schema_settings;
 
 pub(crate) use block_index::{BlockIndexConfig, BlockTimeLookup};
 use coverage::CoverageMap;
@@ -70,6 +74,9 @@ pub(crate) struct DiskCacheConfig {
     pub(crate) required: bool,
     pub(crate) retain_slots: u64,
     pub(crate) max_bytes: u64,
+    pub(crate) key_index_max_memory_bytes: u64,
+    pub(crate) query_concurrency: usize,
+    pub(crate) query_max_threads: u64,
     pub(crate) partition_slots: u64,
     pub(crate) query_timeout: Duration,
     pub(crate) schema_check_interval: Duration,
@@ -137,6 +144,15 @@ pub(crate) enum SlotStatus {
     Covered { tx_count: u32 },
     Skipped,
     NotCovered,
+}
+
+/// Only `Absent` authorizes an RPC null response. Unavailable includes ordinary
+/// unpinned cache misses, since the primary may hold older transactions.
+#[derive(Debug)]
+pub(crate) enum DiskTransactionResult {
+    Found(Arc<StoredTransactionRecord>),
+    Absent,
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -212,11 +228,15 @@ pub(crate) struct DiskCacheInner {
     pub(crate) cfg: DiskCacheConfig,
     admin: ClickHouseClient,
     pub(crate) local: ClickHouseClient,
+    maintenance_reader: ClickHouseClient,
+    address_index_reader: ClickHouseClient,
+    signature_index_reader: ClickHouseClient,
     query_client: RwLock<ClickHouseClient>,
     pub(crate) http: reqwest::Client,
     pub(crate) schema: RwLock<Arc<SourceSchemaSnapshot>>,
     coverage: RwLock<CoverageMap>,
     block_index: Option<Arc<block_index::BlockIndex>>,
+    key_index: Arc<key_index::KeyIndex>,
     min_retained: AtomicU64,
     ready: AtomicBool,
 }
@@ -252,6 +272,7 @@ impl DiskCache {
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),
         );
         admin.use_table_names(table_names.clone());
+        admin.read_endpoint = admin.read_endpoint.with_target("cache");
         let mut local = ClickHouseClient::new(
             &cfg.url,
             &cfg.database,
@@ -269,22 +290,18 @@ impl DiskCache {
             )
             .with_query_timeout(cfg.query_timeout)
             .with_query_cache_config(QueryCacheConfig::default())
-            .with_http_concurrency(64)
+            .with_http_concurrency(cfg.query_concurrency)
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),
         );
         local.use_table_names(table_names);
+        local.read_endpoint = local.read_endpoint.with_target("cache");
+        local.client = local
+            .client
+            .clone()
+            .with_setting("max_threads", cfg.query_max_threads.to_string());
         local.set_blocks_metadata_supports_prewhere(!cfg.memory_blocks_metadata);
 
-        let schema_config = cfg.schema_config();
-        let snapshot = schema::inspect_source_schema(source, &schema_config).await?;
-        let rebuilt = schema::initialize_cache_schema(&admin, &snapshot, &schema_config).await?;
-        if rebuilt {
-            crate::metrics::disk_cache_wipe();
-        }
-        local
-            .create_tables()
-            .await
-            .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+        let snapshot = bootstrap_schema(&cfg, source, &admin, &mut local).await?;
         let block_index = match cfg.block_index.clone() {
             Some(config) => Some(Arc::new(
                 block_index::BlockIndex::open(config, &admin).await?,
@@ -292,11 +309,20 @@ impl DiskCache {
             None => None,
         };
 
+        let key_index = Arc::new(key_index::KeyIndex::new(&cfg));
+        // Persist admission across retries; long scans have dedicated single-reader lanes.
+        let maintenance_reader = local.background_read_client(cfg.query_concurrency);
+        let address_index_reader = local.background_read_client(1);
+        let signature_index_reader = local.background_read_client(1);
         let inner = Arc::new(DiskCacheInner {
+            key_index,
             cfg,
             admin,
             query_client: RwLock::new(local.clone()),
             local,
+            maintenance_reader,
+            address_index_reader,
+            signature_index_reader,
             http: reqwest::Client::new(),
             schema: RwLock::new(Arc::new(snapshot)),
             coverage: RwLock::new(CoverageMap::new()),
@@ -332,6 +358,7 @@ impl DiskCache {
     }
 
     async fn ping(&self) -> bool {
+        // Bounded readiness control probe must not wait for data-read admission.
         matches!(
             tokio::time::timeout(
                 self.inner.cfg.query_timeout,
@@ -339,6 +366,10 @@ impl DiskCache {
                     .local
                     .client
                     .query("SELECT toUInt8(1) AS ok")
+                    .with_setting("readonly", "2")
+                    .with_setting("cancel_http_readonly_queries_on_client_close", "1")
+                    .with_setting("max_execution_time", "1")
+                    .with_setting("max_threads", "1")
                     .fetch_one::<HealthRow>(),
             )
             .await,
@@ -408,10 +439,8 @@ impl DiskCache {
         );
         let rows = self
             .inner
-            .local
-            .client
-            .query(&query)
-            .fetch_all::<CoverageReadRow>()
+            .maintenance_reader
+            .read_all::<CoverageReadRow>(&query, "disk_cache_coverage_reload")
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         let mut map = CoverageMap::new();
@@ -439,6 +468,9 @@ impl DiskCache {
         }
 
         self.set_ready(false);
+        self.inner.key_index.invalidate_reads();
+        let _mutation = self.inner.key_index.mutation(0, u64::MAX);
+        self.inner.key_index.clear_signatures();
         let result = async {
             schema::initialize_cache_schema(&self.inner.admin, &snapshot, &schema_config).await?;
             let mut query_client = self.inner.local.clone();
@@ -480,9 +512,7 @@ impl DiskCache {
         let result = self
             .inner
             .local
-            .client
-            .query(&query)
-            .fetch_optional::<CoverageReadRow>()
+            .read_optional::<CoverageReadRow>(&query, "disk_cache_slot_status")
             .await;
         let status = match result {
             Ok(Some(row)) if row.status == 1 => SlotStatus::Covered {
@@ -682,187 +712,18 @@ impl DiskCache {
             "SELECT slot FROM {} FINAL WHERE status = 1 AND slot BETWEEN {start} AND {end} ORDER BY slot",
             schema::COVERAGE_TABLE
         );
-        match self
+        let result = self
             .inner
             .local
-            .client
-            .query(&query)
-            .fetch_all::<SlotRow>()
-            .await
-        {
+            .read_all::<SlotRow>(&query, "disk_cache_range_coverage")
+            .await;
+        match result {
             Ok(rows) => Some(rows.into_iter().map(|row| row.slot).collect()),
             Err(err) => {
                 warn!("disk cache: range coverage read failed: {err}");
                 None
             }
         }
-    }
-
-    pub(crate) async fn get_tx(
-        &self,
-        signature: solana_sdk::signature::Signature,
-    ) -> Option<StoredTransactionRecord> {
-        if !self.ready() {
-            return None;
-        }
-        let signature = signature.to_string();
-        let record = self
-            .inner
-            .local
-            .get_transaction_by_signature(&signature)
-            .await
-            .ok()
-            .and_then(|(record, _)| record)
-            .filter(|record| self.covers_slot(record.slot));
-        crate::metrics::disk_cache_read("get_tx", if record.is_some() { "hit" } else { "miss" });
-        record
-    }
-
-    pub(crate) async fn get_sig_statuses(
-        &self,
-        signatures: Vec<solana_sdk::signature::Signature>,
-    ) -> Vec<Option<DiskSigStatus>> {
-        if !self.ready() {
-            return vec![None; signatures.len()];
-        }
-        let encoded: Vec<String> = signatures.iter().map(ToString::to_string).collect();
-        let records = match self.query_client().get_signature_statuses(&encoded).await {
-            Ok((records, _)) => records,
-            Err(err) => {
-                warn!("disk cache: signature-status read failed: {err}");
-                return vec![None; signatures.len()];
-            }
-        };
-        let by_signature: HashMap<_, _> = records
-            .into_iter()
-            .filter(|record| self.covers_slot(record.slot))
-            .map(|record| {
-                let err = record
-                    .err
-                    .and_then(|value| serde_json::to_string(&value).ok());
-                (
-                    record.signature,
-                    DiskSigStatus {
-                        slot: record.slot,
-                        err,
-                    },
-                )
-            })
-            .collect();
-        encoded
-            .into_iter()
-            .map(|signature| by_signature.get(&signature).cloned())
-            .collect()
-    }
-
-    pub(crate) async fn signature_position(
-        &self,
-        signature: solana_sdk::signature::Signature,
-    ) -> Option<crate::clickhouse::SignatureSlot> {
-        if !self.ready() {
-            return None;
-        }
-        let signature = signature.to_string();
-        self.query_client()
-            .get_signature_slot(&signature)
-            .await
-            .ok()
-            .and_then(|(position, _)| position)
-            .filter(|position| self.covers_slot(position.slot))
-    }
-
-    pub(crate) async fn signatures_for_address(
-        &self,
-        address: solana_sdk::pubkey::Pubkey,
-        before: Option<SlotBoundary>,
-        until: Option<SlotBoundary>,
-        limit: usize,
-    ) -> Option<DiskGsfaPage> {
-        let (floor, tip) = self.tip_span()?;
-        let (until, floor_effective) = clamp_until_to_floor(until, floor);
-        let client = self.query_client_for_address(&address, TokenAccountsFilter::None)?;
-        let (records, _) = client
-            .get_signatures_for_address_with_positions(
-                &address.to_string(),
-                limit as u64,
-                before,
-                until,
-            )
-            .await
-            .ok()?;
-        let reached_floor = records.len() < limit && floor_effective;
-        crate::metrics::disk_cache_read(
-            "signatures_for_address",
-            if records.is_empty() && !reached_floor {
-                "miss"
-            } else {
-                "hit"
-            },
-        );
-        Some(DiskGsfaPage {
-            records,
-            reached_floor,
-            reached_tip: false,
-            floor,
-            tip,
-        })
-    }
-
-    pub(crate) async fn transactions_for_address(
-        &self,
-        address: solana_sdk::pubkey::Pubkey,
-        query: index::DiskTfaQuery,
-    ) -> Option<DiskGsfaPage> {
-        let (floor, tip) = self.tip_span()?;
-        let floor_effective = lower_bound_reaches_floor(&query, floor);
-        let tip_effective = upper_bound_reaches_tip(&query, tip);
-        let mut slot_filter = query.slot_filter.clone().unwrap_or_default();
-        slot_filter.gte = Some(slot_filter.gte.map_or(floor, |value| value.max(floor)));
-        slot_filter.lte = Some(slot_filter.lte.map_or(tip, |value| value.min(tip)));
-        let clickhouse_query = TransactionsForAddressQuery {
-            address: address.to_string(),
-            limit: query.limit as u64,
-            sort_order: query.sort_order,
-            pagination: query.pagination.map(|position| PaginationToken::SlotIndex {
-                slot: position.slot,
-                idx: position.slot_idx,
-            }),
-            resolved_pagination: query.pagination,
-            slot_filter: Some(slot_filter),
-            block_time_filter: query.block_time_filter,
-            signature_filter: None,
-            resolved_signature_filter: query.signature_filter,
-            status: query.status,
-            token_accounts: query.token_accounts,
-        };
-        let client = self.query_client_for_address(&address, query.token_accounts)?;
-        let (records, _) = client
-            .get_transactions_for_address_signatures(&clickhouse_query)
-            .await
-            .ok()?;
-        let records: Vec<SignatureRecord> = records
-            .into_iter()
-            .filter(|record| self.covers_slot(record.slot))
-            .map(|record| SignatureRecord {
-                signature: record.signature,
-                slot: record.slot,
-                slot_idx: record.slot_idx,
-                err: record.err,
-                memo: record.memo,
-                block_time: record.block_time,
-            })
-            .collect();
-        let reached_floor =
-            query.sort_order == SortOrder::Desc && records.len() < query.limit && floor_effective;
-        let reached_tip =
-            query.sort_order == SortOrder::Asc && records.len() < query.limit && tip_effective;
-        Some(DiskGsfaPage {
-            records,
-            reached_floor,
-            reached_tip,
-            floor,
-            tip,
-        })
     }
 
     pub(crate) async fn get_txs_by_position(
@@ -908,6 +769,7 @@ impl DiskCache {
                 return None;
             }
             client.gsfa_table = client.gsfa_hot_table.clone();
+            client.bucket_moduli.gsfa = client.bucket_moduli.gsfa_hot;
             client.gsfa_hot_pubkeys.clear();
         }
         Some(client)
@@ -925,10 +787,8 @@ impl DiskCache {
         );
         let rows = self
             .inner
-            .local
-            .client
-            .query(&query)
-            .fetch_all::<CountRow>()
+            .maintenance_reader
+            .read_all::<CountRow>(&query, "disk_cache_validate_counts")
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         let actual: HashMap<u64, u64> = rows.into_iter().map(|row| (row.slot, row.count)).collect();
@@ -943,6 +803,22 @@ impl DiskCache {
             }
         }
         Ok(())
+    }
+
+    fn begin_fill(&self, start: u64, end: u64) -> key_index::Mutation {
+        let repair = self
+            .inner
+            .coverage
+            .read()
+            .expect("coverage lock")
+            .intersects(start, end);
+        if repair {
+            self.inner.key_index.invalidate_reads();
+        }
+        self.inner
+            .key_index
+            .mutation(start, end)
+            .signature_fill(repair)
     }
 
     pub(crate) async fn publish_range_coverage(
@@ -991,11 +867,14 @@ impl DiskCache {
             drop(coverage);
             self.inner.min_retained.store(floor, Ordering::Relaxed);
             self.publish_coverage_metrics();
+            self.publish_signature_index_metrics();
         }
         Ok(())
     }
 
     async fn poison_slot(&self, slot: u64) {
+        self.inner.key_index.invalidate_reads();
+        let _mutation = self.inner.key_index.mutation(slot, slot);
         self.inner
             .coverage
             .write()
@@ -1098,7 +977,10 @@ impl DiskCache {
         if new_floor <= old_floor {
             return Ok(false);
         }
+        self.inner.key_index.invalidate_reads();
+        let _mutation = self.inner.key_index.mutation(0, new_floor - 1);
         self.drop_partitions_below(new_floor).await?;
+        self.inner.key_index.evict_signatures(new_floor);
         self.inner.min_retained.store(new_floor, Ordering::Relaxed);
         self.inner
             .coverage
@@ -1114,13 +996,10 @@ impl DiskCache {
         let database = self.inner.cfg.database.replace('\'', "''");
         let row = self
             .inner
-            .local
-            .client
-            .query(&format!(
+            .maintenance_reader
+            .read_one::<BytesRow>(&format!(
                 "SELECT toUInt64(coalesce(sum(bytes_on_disk), 0)) AS bytes FROM system.parts WHERE active AND database = '{database}'"
-            ))
-            .fetch_one::<BytesRow>()
-            .await
+            ), "disk_cache_bytes").await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         Ok(row.bytes)
     }
@@ -1154,10 +1033,8 @@ impl DiskCache {
         );
         let partitions = self
             .inner
-            .local
-            .client
-            .query(&query)
-            .fetch_all::<PartitionRow>()
+            .maintenance_reader
+            .read_all::<PartitionRow>(&query, "disk_cache_partition_list")
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
         for partition in partitions {
@@ -1172,6 +1049,7 @@ impl DiskCache {
                 "ALTER TABLE `{}`.`{}` DROP PARTITION ID '{partition_id}'",
                 self.inner.cfg.database, table
             );
+            // Partition DDL remains on the writable client.
             self.inner
                 .local
                 .client
@@ -1182,6 +1060,39 @@ impl DiskCache {
         }
         Ok(())
     }
+}
+
+/// Validate cancellation before schema reads, create the cache database through
+/// the default-database admin, then enable reads using the cache database.
+async fn bootstrap_schema(
+    cfg: &DiskCacheConfig,
+    source: &ClickHouseClient,
+    admin: &ClickHouseClient,
+    local: &mut ClickHouseClient,
+) -> Result<SourceSchemaSnapshot, DiskCacheError> {
+    admin
+        .initialize_read_cancellation()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    source
+        .initialize_read_cancellation()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    let schema_config = cfg.schema_config();
+    let snapshot = schema::inspect_source_schema(source, &schema_config).await?;
+    let rebuilt = schema::initialize_cache_schema(admin, &snapshot, &schema_config).await?;
+    if rebuilt {
+        crate::metrics::disk_cache_wipe();
+    }
+    local
+        .initialize_read_cancellation()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    local
+        .create_tables()
+        .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+    Ok(snapshot)
 }
 
 fn validate_config(cfg: &DiskCacheConfig) -> Result<(), DiskCacheError> {
@@ -1278,6 +1189,7 @@ fn upper_bound_reaches_tip(query: &index::DiskTfaQuery, tip: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clickhouse::SortOrder;
 
     #[test]
     fn automatic_partition_width_is_bounded() {

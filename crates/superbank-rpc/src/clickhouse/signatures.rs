@@ -4,7 +4,7 @@
  */
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ch_cityhash102::cityhash64;
 use serde::Deserialize;
@@ -15,10 +15,11 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::cache::{CacheStart, SignatureBytes};
 use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
+use super::read_query::admission;
 use super::sharding::ShardTopology;
 use super::types::{QueryTimings, SignatureSlot, SignatureStatusRecord};
 use super::util::{
-    annotate_query, append_max_execution_time_setting, http_query_with_id, parse_err_json,
+    append_max_execution_time_setting, build_select_settings_clause, parse_err_json,
     transient_shard_local_error_reason,
 };
 
@@ -54,6 +55,48 @@ fn build_signature_filter(
     bucket_clauses.join(" OR ")
 }
 
+fn build_primary_signature_filter(bucketed: BTreeMap<u64, Vec<String>>) -> String {
+    if bucketed.values().map(Vec::len).sum::<usize>() == 1 {
+        return build_signature_filter(bucketed, 1);
+    }
+    let keys = bucketed
+        .into_iter()
+        .flat_map(|(bucket, signatures)| {
+            signatures
+                .into_iter()
+                .map(move |signature| format!("({bucket}, {signature})"))
+        })
+        .collect::<Vec<_>>();
+    format!("(sig_bucket, signature) IN ({})", keys.join(","))
+}
+
+fn primary_signature_status_settings(
+    base: &str,
+    max_threads: usize,
+    remaining: Duration,
+) -> ProcessingResult<String> {
+    // ClickHouse truncates execution limits to microseconds; zero disables the limit.
+    // Leave at least one millisecond rather than submitting an effectively expired query.
+    if remaining < Duration::from_millis(1) {
+        return Err(ProcessingError::timeout_msg(
+            "Signature status query deadline exhausted",
+        ));
+    }
+    let prefix = if base.trim().is_empty() {
+        "SETTINGS".to_string()
+    } else {
+        format!("{base},")
+    };
+    let seconds = remaining.as_secs_f64();
+    Ok(format!(
+        "{prefix} max_threads={max_threads}, max_threads_for_indexes={max_threads}, \
+        use_hedged_requests=0, max_parallel_replicas=1, \
+        max_execution_time={seconds}, max_execution_time_leaf={seconds}, \
+        timeout_overflow_mode='throw', timeout_overflow_mode_leaf='throw', \
+        timeout_before_checking_execution_speed=0"
+    ))
+}
+
 impl ClickHouseClient {
     pub(crate) async fn get_signature_slot(
         &self,
@@ -87,6 +130,32 @@ impl ClickHouseClient {
         let signature_hex = hex::encode(signature_bytes.as_ref()).to_uppercase();
         let signature_literal = format!("toFixedString(unhex('{signature_hex}'), 64)");
 
+        if self.cache_partition.is_some() {
+            return self
+                .get_signature_slot_by_signature_uncached(
+                    signature_hash,
+                    sig_bucket,
+                    &signature_literal,
+                )
+                .await;
+        }
+
+        self.get_signature_slot_cached(
+            signature_bytes,
+            signature_hash,
+            sig_bucket,
+            &signature_literal,
+        )
+        .await
+    }
+
+    async fn get_signature_slot_cached(
+        &self,
+        signature_bytes: SignatureBytes,
+        signature_hash: u64,
+        sig_bucket: u64,
+        signature_literal: &str,
+    ) -> ProcessingResult<(Option<SignatureSlot>, QueryTimings)> {
         let call_start = Instant::now();
         let mut waited = false;
 
@@ -120,7 +189,7 @@ impl ClickHouseClient {
                         .get_signature_slot_by_signature_uncached(
                             signature_hash,
                             sig_bucket,
-                            &signature_literal,
+                            signature_literal,
                         )
                         .await;
 
@@ -197,27 +266,26 @@ impl ClickHouseClient {
                     slot,
                     slot_idx
                  FROM {signature_statuses_table}
-                 PREWHERE sig_bucket = {sig_bucket} AND signature = {signature_literal}
+                 PREWHERE sig_bucket = {sig_bucket} AND signature = {signature_literal}{cache_scope}
                  ORDER BY slot DESC, slot_idx DESC, signature
                  LIMIT 1
                  {settings_clause}",
+                cache_scope = self.cache_slot_predicate(),
                 signature_statuses_table = signature_statuses_table,
                 sig_bucket = sig_bucket,
                 signature_literal = signature_literal,
                 settings_clause = settings_clause
             );
-            let (query, query_id) = annotate_query(query, "signature_slot");
-
             let start = Instant::now();
-            let mut cursor = http_query_with_id(&self.client, &query, query_id)
-                .fetch::<SignatureSlotRow>()
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-
-            let row_opt = cursor
-                .next()
+            let mut cursor = self
+                .read::<SignatureSlotRow>(&query, "signature_slot")
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
+            let row_opt = cursor
+                .next_optional()
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
             let timings = QueryTimings {
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 received_bytes: cursor.received_bytes(),
@@ -242,7 +310,8 @@ impl ClickHouseClient {
         &self,
         signatures: &[String],
     ) -> ProcessingResult<(Vec<SignatureStatusRecord>, QueryTimings)> {
-        self.with_http_query_timeout("get_signature_statuses", async {
+        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        self.with_operation_timeout("get_signature_statuses", async {
             if signatures.is_empty() {
                 return Ok((
                     Vec::new(),
@@ -256,6 +325,13 @@ impl ClickHouseClient {
                     },
                 ));
             }
+
+            let admission = self
+                .cache_partition
+                .is_none()
+                .then(crate::metrics::SignatureStatusAdmission::start);
+            let (source_permit, _http_permit) = self.acquire_signature_status_permits().await?;
+            drop(admission);
 
             if self.scope_shard_direct()
                 && let (Some(topology), Some(local_table)) =
@@ -282,34 +358,8 @@ impl ClickHouseClient {
                 }
             }
 
-            let signature_bucket_modulus = self.signatures_bucket_modulus();
-            let mut bucketed_signatures: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-            for sig in signatures {
-                let signature_bytes = bs58::decode(sig)
-                    .into_vec()
-                    .map_err(|e| ProcessingError::deserialization("Invalid signature", e))?;
-                if signature_bytes.len() != 64 {
-                    return Err(ProcessingError::deserialization_msg(format!(
-                        "Invalid signature length {} (expected 64 bytes)",
-                        signature_bytes.len()
-                    )));
-                }
-
-                let bucket = cityhash64(signature_bytes.as_slice()) % signature_bucket_modulus;
-                let signature_hex = hex::encode(signature_bytes).to_uppercase();
-                let signature_literal = format!("toFixedString(unhex('{signature_hex}'), 64)");
-                bucketed_signatures
-                    .entry(bucket)
-                    .or_default()
-                    .push(signature_literal);
-            }
-
-            let signature_filter =
-                build_signature_filter(bucketed_signatures, self.in_clause_chunk);
-
+            let signature_filter = self.signature_status_filter(signatures)?;
             let signature_statuses_table = &self.signature_statuses_table;
-            let settings_clause = self
-                .select_settings_clause("get_signature_statuses", QueryFreshnessClass::Historical);
             let query = format!(
                 "SELECT
                     signature,
@@ -320,15 +370,17 @@ impl ClickHouseClient {
                         signature,
                         argMax(tuple(slot, err), tuple(slot, slot_idx)) AS latest
                     FROM {signature_statuses_table}
-                    PREWHERE {signature_filter}
+                    PREWHERE ({signature_filter}){cache_scope}
                     GROUP BY signature
                  )
-                 {settings_clause}",
+                 ",
+                cache_scope = self.cache_slot_predicate(),
                 signature_statuses_table = signature_statuses_table,
-                signature_filter = signature_filter,
-                settings_clause = settings_clause
+                signature_filter = signature_filter
             );
-            let (query, query_id) = annotate_query(query, "signature_statuses");
+            let (query, query_id, mut cleanup) = self
+                .prepare_signature_status_query(query, source_permit, deadline)
+                .await?;
 
             #[derive(Deserialize, clickhouse::Row)]
             struct StatusRow {
@@ -338,9 +390,9 @@ impl ClickHouseClient {
             }
 
             let start = Instant::now();
-            let mut cursor = http_query_with_id(&self.client, &query, query_id)
-                .fetch::<StatusRow>()
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let mut cursor = self
+                .prepared_status_cursor::<StatusRow>(&query, query_id, &mut cleanup)
+                .await?;
 
             let mut results = Vec::new();
             while let Some(row) = cursor
@@ -359,6 +411,7 @@ impl ClickHouseClient {
                 });
             }
 
+            super::client::SignatureStatusCleanup::disarm_optional(&mut cleanup);
             let timings = QueryTimings {
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 received_bytes: cursor.received_bytes(),
@@ -371,6 +424,106 @@ impl ClickHouseClient {
             Ok((results, timings))
         })
         .await
+    }
+
+    async fn prepared_status_cursor<T: clickhouse::Row>(
+        &self,
+        query: &str,
+        query_id: Option<String>,
+        cleanup: &mut Option<super::client::SignatureStatusCleanup>,
+    ) -> ProcessingResult<super::read_query::ReadCursor<T>> {
+        let mut read = super::client::SignatureStatusCleanup::before_submission(
+            self.read_endpoint
+                .query_with_id(&self.client, query, "signature_statuses", query_id)
+                .await,
+            cleanup,
+        )?;
+        if let Some(guard) = cleanup.as_mut() {
+            guard.transfer_to(&mut read);
+        }
+        let cursor = super::client::SignatureStatusCleanup::before_submission(
+            read.fetch::<T>()
+                .map_err(|error| ProcessingError::database(error.to_string(), error)),
+            cleanup,
+        )?;
+        Ok(cursor)
+    }
+
+    async fn prepare_signature_status_query(
+        &self,
+        query: String,
+        source_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
+    ) -> ProcessingResult<(
+        String,
+        Option<String>,
+        Option<super::client::SignatureStatusCleanup>,
+    )> {
+        let (mut query, query_id, mut cleanup) = self
+            .annotate_signature_status_query(query, source_permit)
+            .await?;
+        // Discovery consumes the same operation deadline as admission and execution.
+        let settings = super::client::SignatureStatusCleanup::before_submission(
+            self.signature_status_settings(deadline),
+            &mut cleanup,
+        )?;
+        query.push_str(&settings);
+        Ok((query, query_id, cleanup))
+    }
+
+    fn signature_status_filter(&self, signatures: &[String]) -> ProcessingResult<String> {
+        let mut bucketed_signatures: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for sig in signatures {
+            let signature_bytes = bs58::decode(sig)
+                .into_vec()
+                .map_err(|e| ProcessingError::deserialization("Invalid signature", e))?;
+            if signature_bytes.len() != 64 {
+                return Err(ProcessingError::deserialization_msg(format!(
+                    "Invalid signature length {} (expected 64 bytes)",
+                    signature_bytes.len()
+                )));
+            }
+            let bucket = cityhash64(&signature_bytes) % self.signatures_bucket_modulus();
+            let signature_hex = hex::encode(signature_bytes).to_uppercase();
+            bucketed_signatures
+                .entry(bucket)
+                .or_default()
+                .push(format!("toFixedString(unhex('{signature_hex}'), 64)"));
+        }
+        if self.cache_partition.is_some() {
+            Ok(build_signature_filter(
+                bucketed_signatures,
+                self.in_clause_chunk,
+            ))
+        } else {
+            Ok(build_primary_signature_filter(bucketed_signatures))
+        }
+    }
+
+    fn signature_status_settings(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> ProcessingResult<String> {
+        if self.cache_partition.is_some() {
+            return Ok(self.select_settings_clause(
+                "get_signature_statuses",
+                QueryFreshnessClass::Historical,
+            ));
+        }
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                ProcessingError::timeout_msg("Signature status admission exhausted query deadline")
+            })?;
+        let base = build_select_settings_clause(
+            self.allow_query_settings,
+            QueryFreshnessClass::Historical,
+            &self.query_cache,
+            false,
+            "get_signature_statuses",
+        );
+        primary_signature_status_settings(&base, self.signature_status_max_threads, remaining)
     }
 
     async fn try_signature_slot_by_signature_tcp(
@@ -485,7 +638,11 @@ impl ClickHouseClient {
         );
 
         let start = Instant::now();
-        let mut cursor = match shard.http_client.query(&query).fetch::<SignatureSlotRow>() {
+        let mut cursor = match shard
+            .read_endpoint
+            .fetch::<SignatureSlotRow>(&shard.http_client, &query, "get_signature_slot_local_http")
+            .await
+        {
             Ok(cursor) => cursor,
             Err(err) => {
                 crate::metrics::clickhouse_transport_fallback(
@@ -504,7 +661,7 @@ impl ClickHouseClient {
             }
         };
 
-        let row_opt = match cursor.next().await {
+        let row_opt = match cursor.next_optional().await {
             Ok(row_opt) => row_opt,
             Err(err) => {
                 crate::metrics::clickhouse_transport_fallback(
@@ -611,19 +768,27 @@ impl ClickHouseClient {
             let fanout_sem = fanout_sem.clone();
             let settings_clause = settings_clause.clone();
 
-            join_set.spawn(async move {
-                let _permit = fanout_sem.acquire().await.ok();
-                let mut bucket_map: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-                for entry in bucketed {
-                    bucket_map
-                        .entry(entry.bucket)
-                        .or_default()
-                        .push(entry.literal);
-                }
+            let inherited_admission = admission::current();
+            join_set.spawn(admission::scope_with(inherited_admission, async move {
+                admission::run_with_permit(
+                    fanout_sem,
+                    |_| {
+                        ShardFailure::Error(ProcessingError::database_msg(
+                            "ClickHouse fanout admission closed",
+                        ))
+                    },
+                    async {
+                        let mut bucket_map: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+                        for entry in bucketed {
+                            bucket_map
+                                .entry(entry.bucket)
+                                .or_default()
+                                .push(entry.literal);
+                        }
 
-                let signature_filter = build_signature_filter(bucket_map, in_clause_chunk);
-                let query = format!(
-                    "SELECT
+                        let signature_filter = build_signature_filter(bucket_map, in_clause_chunk);
+                        let query = format!(
+                            "SELECT
                         base58Encode(signature) AS signature,
                         tupleElement(latest, 1) AS slot,
                         tupleElement(latest, 2) AS err
@@ -636,65 +801,68 @@ impl ClickHouseClient {
                         GROUP BY signature
                      )
                      {settings_clause}",
-                    signature_table = local_table,
-                    signature_filter = signature_filter,
-                    settings_clause = settings_clause.as_ref()
-                );
+                            signature_table = local_table,
+                            signature_filter = signature_filter,
+                            settings_clause = settings_clause.as_ref()
+                        );
 
-                match execute_shard_tcp_query_block(
-                    shard.clone(),
-                    query_timeout,
-                    "get_signature_statuses_local",
-                    "signature_statuses_local",
-                    query,
+                        match execute_shard_tcp_query_block(
+                            shard.clone(),
+                            query_timeout,
+                            "get_signature_statuses_local",
+                            "signature_statuses_local",
+                            query,
+                        )
+                        .await
+                        {
+                            Ok((block, timings)) => {
+                                let mut results = Vec::new();
+                                for row in block.rows() {
+                                    let signature: String = row
+                                        .get("signature")
+                                        .map_err(|e| ProcessingError::database(e.to_string(), e))
+                                        .map_err(ShardFailure::Error)?;
+                                    let slot: u64 = row
+                                        .get("slot")
+                                        .map_err(|e| ProcessingError::database(e.to_string(), e))
+                                        .map_err(ShardFailure::Error)?;
+                                    let err: Option<String> = row
+                                        .get("err")
+                                        .map_err(|e| ProcessingError::database(e.to_string(), e))
+                                        .map_err(ShardFailure::Error)?;
+                                    let parsed_err =
+                                        err.and_then(|err_str| parse_err_json(&signature, err_str));
+                                    results.push(SignatureStatusRecord {
+                                        signature,
+                                        slot,
+                                        err: parsed_err,
+                                    });
+                                }
+
+                                Ok((results, timings))
+                            }
+                            Err(err) => {
+                                if let Some(reason) = transient_shard_local_error_reason(&err) {
+                                    crate::metrics::clickhouse_transport_fallback(
+                                        "get_signature_statuses_local",
+                                        "tcp",
+                                        "http",
+                                        reason,
+                                    );
+                                    Err(ShardFailure::Fallback {
+                                        host: shard.host.clone(),
+                                        port: shard.tcp_port,
+                                        reason: reason.to_string(),
+                                    })
+                                } else {
+                                    Err(ShardFailure::Error(err))
+                                }
+                            }
+                        }
+                    },
                 )
                 .await
-                {
-                    Ok((block, timings)) => {
-                        let mut results = Vec::new();
-                        for row in block.rows() {
-                            let signature: String = row
-                                .get("signature")
-                                .map_err(|e| ProcessingError::database(e.to_string(), e))
-                                .map_err(ShardFailure::Error)?;
-                            let slot: u64 = row
-                                .get("slot")
-                                .map_err(|e| ProcessingError::database(e.to_string(), e))
-                                .map_err(ShardFailure::Error)?;
-                            let err: Option<String> = row
-                                .get("err")
-                                .map_err(|e| ProcessingError::database(e.to_string(), e))
-                                .map_err(ShardFailure::Error)?;
-                            let parsed_err =
-                                err.and_then(|err_str| parse_err_json(&signature, err_str));
-                            results.push(SignatureStatusRecord {
-                                signature,
-                                slot,
-                                err: parsed_err,
-                            });
-                        }
-
-                        Ok((results, timings))
-                    }
-                    Err(err) => {
-                        if let Some(reason) = transient_shard_local_error_reason(&err) {
-                            crate::metrics::clickhouse_transport_fallback(
-                                "get_signature_statuses_local",
-                                "tcp",
-                                "http",
-                                reason,
-                            );
-                            Err(ShardFailure::Fallback {
-                                host: shard.host.clone(),
-                                port: shard.tcp_port,
-                                reason: reason.to_string(),
-                            })
-                        } else {
-                            Err(ShardFailure::Error(err))
-                        }
-                    }
-                }
-            });
+            }));
         }
 
         let mut results = Vec::new();
@@ -801,19 +969,28 @@ impl ClickHouseClient {
             let fanout_sem = fanout_sem.clone();
             let settings_clause = settings_clause.clone();
 
-            join_set.spawn(async move {
-                let _permit = fanout_sem.acquire().await.ok();
-
-                let mut bucket_map: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-                for entry in bucketed {
-                    bucket_map
-                        .entry(entry.bucket)
-                        .or_default()
-                        .push(entry.literal);
-                }
-                let signature_filter = build_signature_filter(bucket_map, in_clause_chunk);
-                let query = format!(
-                    "SELECT
+            let inherited_admission = admission::current();
+            join_set.spawn(admission::scope_with(inherited_admission, async move {
+                admission::run_with_permit(
+                    fanout_sem,
+                    |_| {
+                        (
+                            shard.host.clone(),
+                            shard.tcp_port,
+                            ProcessingError::database_msg("ClickHouse fanout admission closed"),
+                        )
+                    },
+                    async {
+                        let mut bucket_map: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+                        for entry in bucketed {
+                            bucket_map
+                                .entry(entry.bucket)
+                                .or_default()
+                                .push(entry.literal);
+                        }
+                        let signature_filter = build_signature_filter(bucket_map, in_clause_chunk);
+                        let query = format!(
+                            "SELECT
                         signature,
                         tupleElement(latest, 1) AS slot,
                         tupleElement(latest, 2) AS err
@@ -826,62 +1003,73 @@ impl ClickHouseClient {
                         GROUP BY signature
                      )
                      {settings_clause}",
-                    signature_table = local_table,
-                    signature_filter = signature_filter,
-                    settings_clause = settings_clause.as_ref()
-                );
+                            signature_table = local_table,
+                            signature_filter = signature_filter,
+                            settings_clause = settings_clause.as_ref()
+                        );
 
-                let timed = tokio::time::timeout(query_timeout, async {
-                    let start = Instant::now();
-                    let mut cursor = shard
-                        .http_client
-                        .query(&query)
-                        .fetch::<StatusRow>()
-                        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+                        let timed = tokio::time::timeout(query_timeout, async {
+                            let start = Instant::now();
+                            let mut cursor = shard
+                                .read_endpoint
+                                .fetch::<StatusRow>(
+                                    &shard.http_client,
+                                    &query,
+                                    "get_signature_statuses_local_http",
+                                )
+                                .await
+                                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
-                    let mut shard_results = Vec::new();
-                    while let Some(row) = cursor
-                        .next()
-                        .await
-                        .map_err(|e| ProcessingError::database(e.to_string(), e))?
-                    {
-                        let signature = bs58::encode(row.signature.0).into_string();
-                        let parsed_err = row
-                            .err
-                            .and_then(|err_str| parse_err_json(&signature, err_str));
-                        shard_results.push(SignatureStatusRecord {
-                            signature,
-                            slot: row.slot,
-                            err: parsed_err,
-                        });
-                    }
-                    let shard_timings = QueryTimings {
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                        received_bytes: cursor.received_bytes(),
-                        decoded_bytes: cursor.decoded_bytes(),
-                        rows_read: Some(0),
-                        rows_read_unknown: true,
-                        rows_returned: shard_results.len() as u64,
-                    };
+                            let mut shard_results = Vec::new();
+                            while let Some(row) = cursor
+                                .next()
+                                .await
+                                .map_err(|e| ProcessingError::database(e.to_string(), e))?
+                            {
+                                let signature = bs58::encode(row.signature.0).into_string();
+                                let parsed_err = row
+                                    .err
+                                    .and_then(|err_str| parse_err_json(&signature, err_str));
+                                shard_results.push(SignatureStatusRecord {
+                                    signature,
+                                    slot: row.slot,
+                                    err: parsed_err,
+                                });
+                            }
+                            let shard_timings = QueryTimings {
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                                received_bytes: cursor.received_bytes(),
+                                decoded_bytes: cursor.decoded_bytes(),
+                                rows_read: Some(0),
+                                rows_read_unknown: true,
+                                rows_returned: shard_results.len() as u64,
+                            };
 
-                    Ok::<_, ProcessingError>((shard_results, shard_timings))
-                })
-                .await;
+                            Ok::<_, ProcessingError>((shard_results, shard_timings))
+                        })
+                        .await;
 
-                match timed {
-                    Ok(result) => result.map_err(|e| (shard.host.clone(), shard.tcp_port, e)),
-                    Err(_) => {
-                        crate::metrics::clickhouse_timeout("get_signature_statuses_local_http");
-                        Err((
-                            shard.host.clone(),
-                            shard.tcp_port,
-                            ProcessingError::timeout_msg(
-                                "Shard-local signature status HTTP query timed out",
-                            ),
-                        ))
-                    }
-                }
-            });
+                        match timed {
+                            Ok(result) => {
+                                result.map_err(|e| (shard.host.clone(), shard.tcp_port, e))
+                            }
+                            Err(_) => {
+                                crate::metrics::clickhouse_timeout(
+                                    "get_signature_statuses_local_http",
+                                );
+                                Err((
+                                    shard.host.clone(),
+                                    shard.tcp_port,
+                                    ProcessingError::timeout_msg(
+                                        "Shard-local signature status HTTP query timed out",
+                                    ),
+                                ))
+                            }
+                        }
+                    },
+                )
+                .await
+            }));
         }
 
         let mut results = Vec::new();
@@ -929,3 +1117,10 @@ impl ClickHouseClient {
         Ok(Some((results, timings)))
     }
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "signatures/settings_tests.rs"]
+mod settings_tests;

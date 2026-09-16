@@ -99,6 +99,13 @@ impl CoverageMap {
             .is_some_and(|(_, &end)| slot <= end)
     }
 
+    pub(crate) fn intersects(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .range(..=end)
+            .next_back()
+            .is_some_and(|(_, range_end)| *range_end >= start)
+    }
+
     /// `(min covered, max covered)` across all ranges.
     pub(crate) fn covered_span(&self) -> Option<(u64, u64)> {
         let (&first_start, _) = self.ranges.first_key_value()?;

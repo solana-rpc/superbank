@@ -90,3 +90,6 @@ jobs:
 
       - name: Test optional features (superbank-rpc)
         run: cargo test -p superbank-rpc --all-features --locked
+
+      - name: Test final HTTP status logs in isolation
+        run: cargo test -p superbank-rpc --all-features --locked http_response_logs_match_final_status -- --ignored --test-threads=1

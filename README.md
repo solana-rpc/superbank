@@ -18,7 +18,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 
 > [!NOTE]
 > Superbank is licensed under **AGPL-3.0-only** (see `LICENSE`).
-> `superbank-rpc` supports an optional in-memory gRPC "head cache" (`--features grpc-head-cache`) to reduce perceived ingestion lag and (optionally) expose `processed` commitment for a subset of methods. It also supports an independent localhost ClickHouse forward cache (`--features disk-cache`) for recent finalized slots. See `crates/superbank-rpc/README.md` for details.
+> `superbank-rpc` supports an optional in-memory gRPC "head cache" (`--features grpc-head-cache`) to reduce perceived ingestion lag and (optionally) expose `processed` commitment for a subset of methods. It also supports an independent localhost ClickHouse forward cache (`--features disk-cache`) for recent finalized slots, with bounded in-process signature/address partition routing (`DISK_CACHE_KEY_INDEX_MAX_MEMORY_BYTES`, default 4 GiB). See `crates/superbank-rpc/README.md` for details.
 
 ## Features
 
@@ -65,6 +65,9 @@ flowchart LR
 - [License](#license)
 
 ## Quick start
+
+For a native setup without Docker, including testnet genesis configuration, see
+[Local testnet with native ClickHouse](docs/local-testnet.md).
 
 ### 1) Start ClickHouse (local)
 
@@ -176,6 +179,18 @@ curl -sS http://localhost:8899 \
 ```
 
 ## Configuration
+
+The RPC server bounds primary signature-status history work with
+`GET_SIGNATURE_STATUSES_MAX_CONCURRENCY` (default `4`) and
+`GET_SIGNATURE_STATUSES_MAX_THREADS` (default `2`). `CLICKHOUSE_CLUSTER` identifies the primary
+cluster for gateway-based termination verification in distributed HTTP mode as well as shard
+discovery in shard-direct mode. HTTP SELECT reads use shared disconnect cancellation across
+RPC methods, local-cache reads, background readers, and shard-local HTTP reads. Cancellation
+capability is initialized before an endpoint can serve reads. Successful responses drain to EOF
+without extra probes; abandoned reads retain admission until every expected node is observed
+clear twice through a separate control connection pool. Writes and native TCP reads retain
+their existing behavior. Use `rbx2` for RBX2 or an empty value for standalone ClickHouse. See the
+[RPC configuration and cancellation requirements](crates/superbank-rpc/README.md#http-select-lifetime-and-cancellation).
 
 - `superbank` supports YAML config, CLI flags, and environment variables.
   Precedence is: flags > env > config file > defaults.

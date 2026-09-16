@@ -5,7 +5,8 @@
 
 use super::*;
 use crate::processing::ProcessingError;
-use axum::{Router, routing::post};
+use axum::{Router, extract::Query};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{mpsc, oneshot};
 
@@ -32,24 +33,33 @@ impl Backend {
         let (send, requests) = mpsc::unbounded_channel();
         let calls = Arc::new(AtomicUsize::new(0));
         let handler_calls = calls.clone();
-        let app = Router::new().route(
-            "/",
-            post(move |body: Bytes| {
+        let app = Router::new().fallback(
+            move |Query(params): Query<HashMap<String, String>>, body: Bytes| {
                 let send = send.clone();
                 let calls = handler_calls.clone();
                 async move {
+                    let sql = if body.is_empty() {
+                        params.get("query").cloned().unwrap_or_default()
+                    } else {
+                        String::from_utf8(body.to_vec()).expect("SQL body")
+                    };
+                    if let Some(control) = super::latest_slot::cancellation_response(
+                        &sql,
+                        params
+                            .get("default_format")
+                            .is_some_and(|format| format == "RowBinaryWithNamesAndTypes"),
+                    ) {
+                        return (StatusCode::OK, control);
+                    }
                     calls.fetch_add(1, Ordering::SeqCst);
                     let (reply, response) = oneshot::channel();
-                    send.send(PendingQuery {
-                        sql: String::from_utf8(body.to_vec()).expect("SQL body"),
-                        reply,
-                    })
-                    .expect("test receiver");
+                    send.send(PendingQuery { sql, reply })
+                        .expect("test receiver");
                     response
                         .await
                         .unwrap_or((StatusCode::SERVICE_UNAVAILABLE, Vec::new()))
                 }
-            }),
+            },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -69,7 +79,7 @@ impl Backend {
             .expect("backend request");
         assert!(
             query.sql.contains(match kind {
-                CacheKind::Slot => "maxOrNull(slot)",
+                CacheKind::Slot => "ORDER BY slot DESC LIMIT 1",
                 CacheKind::Height => "block_height",
             }),
             "unexpected query: {}",
@@ -82,19 +92,26 @@ impl Backend {
         self.calls.load(Ordering::SeqCst)
     }
 
-    fn state(&self) -> Arc<AppState> {
+    async fn state(&self) -> Arc<AppState> {
         let mut state = test_state_with_clickhouse_url(&self.url);
         let state_mut = Arc::get_mut(&mut state).unwrap();
         state_mut.latest_slot_cache = LatestSlotCache::new(Duration::from_secs(60));
         state_mut.latest_block_height_cache = LatestBlockHeightCache::new(Duration::from_secs(60));
         // The fixture returns plain RowBinary; exercise real queries and decoding without
         // duplicating ClickHouse's compression and schema-header protocols in the mock.
-        state_mut.clickhouse.client = state_mut
+        state_mut.clickhouse.set_http_client_for_tests(
+            state_mut
+                .clickhouse
+                .client
+                .clone()
+                .with_compression(clickhouse::Compression::None)
+                .with_validation(false),
+        );
+        state_mut
             .clickhouse
-            .client
-            .clone()
-            .with_compression(clickhouse::Compression::None)
-            .with_validation(false);
+            .initialize_read_cancellation()
+            .await
+            .expect("cancellation preflight");
         state
     }
 }
@@ -143,13 +160,15 @@ impl CacheKind {
     }
 
     fn respond(self, query: PendingQuery, value: Option<u64>) {
-        // FixedString(32) blockhash followed by Nullable(UInt64), or just Nullable(UInt64).
+        // Height: FixedString(32) plus Nullable(UInt64). Slot: UInt64 or an empty result.
         let mut bytes = if matches!(self, Self::Height) {
             vec![7; 32]
         } else {
             Vec::new()
         };
-        bytes.push(u8::from(value.is_none()));
+        if matches!(self, Self::Height) {
+            bytes.push(u8::from(value.is_none()));
+        }
         if let Some(value) = value {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -179,7 +198,7 @@ async fn assert_recovered(
 async fn cache_refresh_cancelled_leader_releases_existing_waiters() {
     for kind in [CacheKind::Slot, CacheKind::Height] {
         let mut backend = Backend::start().await;
-        let state = backend.state();
+        let state = backend.state().await;
         let leader = tokio::spawn(kind.refresh(state.clone()));
         let pending = backend.next(kind).await;
         let mut waiters = Vec::new();
@@ -210,7 +229,7 @@ async fn cache_refresh_singleflight_and_error_recovery() {
     for kind in [CacheKind::Slot, CacheKind::Height] {
         for fail in [false, true] {
             let mut backend = Backend::start().await;
-            let state = backend.state();
+            let state = backend.state().await;
             let leader = tokio::spawn(kind.refresh(state.clone()));
             let pending = backend.next(kind).await;
             let mut waiters = Vec::new();
@@ -253,7 +272,7 @@ async fn cache_refresh_singleflight_and_error_recovery() {
 #[tokio::test]
 async fn cache_refresh_empty_slot_retries_and_missing_height_is_cached_by_slot() {
     let mut backend = Backend::start().await;
-    let state = backend.state();
+    let state = backend.state().await;
     let leader = tokio::spawn(CacheKind::Slot.refresh(state.clone()));
     CacheKind::Slot.respond(backend.next(CacheKind::Slot).await, None);
     let error = tokio::time::timeout(TEST_TIMEOUT, leader)
@@ -302,7 +321,7 @@ async fn cache_refresh_empty_slot_retries_and_missing_height_is_cached_by_slot()
 async fn cache_refresh_recovers_after_batch_envelope_deadline() {
     for kind in [CacheKind::Slot, CacheKind::Height] {
         let mut backend = Backend::start().await;
-        let mut state = backend.state();
+        let mut state = backend.state().await;
         let state_mut = Arc::get_mut(&mut state).unwrap();
         // Shorter than the client's 8s query budget: cancellation must come from the batch.
         state_mut.rpc_request_timeout = Duration::from_millis(250);
