@@ -19,7 +19,7 @@ use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use reqwest::Url;
 use serde::Deserialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{ClickHouseStartupTableCheck, has_usable_gsfa_hot_addresses};
 use crate::processing::{ProcessingError, ProcessingResult};
@@ -68,6 +68,37 @@ pub(crate) fn shard_tcp_query_timeout_for(query_timeout: Duration) -> Duration {
 
     let tcp_timeout_ms = timeout_ms.saturating_sub(reserve_ms);
     Duration::from_millis(tcp_timeout_ms.min(u128::from(u64::MAX)) as u64)
+}
+
+/// Source admission reserved before the protected HTTP read is constructed.
+/// Dropping this holder before transfer releases admission without network IO.
+pub(crate) struct SignatureStatusCleanup {
+    source_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl SignatureStatusCleanup {
+    pub(crate) fn transfer_to(&mut self, query: &mut super::read_query::ReadQuery) {
+        if let Some(permit) = self.source_permit.take() {
+            query.retain(permit);
+        }
+    }
+
+    /// Construction failures precede HTTP submission and need no absence probes.
+    pub(crate) fn before_submission<T>(
+        result: ProcessingResult<T>,
+        cleanup: &mut Option<Self>,
+    ) -> ProcessingResult<T> {
+        if result.is_err() {
+            Self::disarm_optional(cleanup);
+        }
+        result
+    }
+
+    pub(crate) fn disarm_optional(cleanup: &mut Option<Self>) {
+        if let Some(cleanup) = cleanup {
+            cleanup.source_permit = None;
+        }
+    }
 }
 
 struct ShardTcpQueryCleanup {
@@ -129,133 +160,6 @@ impl ShardTcpQueryCleanup {
 impl Drop for ShardTcpQueryCleanup {
     fn drop(&mut self) {
         self.spawn_cleanup("future_dropped");
-    }
-}
-
-pub(crate) struct HttpQueryCleanup {
-    client: HttpClient,
-    cluster: Option<String>,
-    operation: &'static str,
-    query_timeout: Duration,
-    query_id: Option<String>,
-}
-
-impl HttpQueryCleanup {
-    fn new(
-        client: HttpClient,
-        cluster: Option<String>,
-        operation: &'static str,
-        query_timeout: Duration,
-        query_id: String,
-    ) -> Self {
-        Self {
-            client,
-            cluster,
-            operation,
-            query_timeout,
-            query_id: Some(query_id),
-        }
-    }
-
-    pub(crate) fn disarm(&mut self) {
-        self.query_id = None;
-    }
-
-    pub(crate) fn spawn_cleanup(&mut self, reason: &'static str) {
-        let Some(query_id) = self.query_id.take() else {
-            return;
-        };
-
-        crate::metrics::clickhouse_shard_query_abort(self.operation, "http", reason);
-
-        let client = self.client.clone();
-        let cluster = self.cluster.clone();
-        let operation = self.operation;
-        let query_timeout = self.query_timeout;
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    kill_http_query(client, cluster, operation, query_timeout, query_id).await;
-                });
-            }
-            Err(err) => {
-                crate::metrics::clickhouse_shard_query_cleanup(operation, "no_runtime");
-                tracing::warn!(
-                    "Unable to schedule HTTP ClickHouse cleanup for query {}: {}",
-                    query_id,
-                    err
-                );
-            }
-        }
-    }
-}
-
-impl Drop for HttpQueryCleanup {
-    fn drop(&mut self) {
-        self.spawn_cleanup("future_dropped");
-    }
-}
-
-fn kill_query_sql(cluster: Option<&str>, query_id: &str) -> String {
-    let escaped_query_id = escape_clickhouse_string(query_id);
-    let predicate =
-        format!("(query_id = '{escaped_query_id}' OR initial_query_id = '{escaped_query_id}')");
-
-    match cluster {
-        Some(cluster) => {
-            let escaped_cluster = escape_clickhouse_string(cluster);
-            format!("KILL QUERY ON CLUSTER '{escaped_cluster}' WHERE {predicate} ASYNC")
-        }
-        None => format!("KILL QUERY WHERE {predicate} ASYNC"),
-    }
-}
-
-async fn kill_http_query(
-    client: HttpClient,
-    cluster: Option<String>,
-    operation: &'static str,
-    query_timeout: Duration,
-    query_id: String,
-) {
-    // Hard-cap concurrent KILL cleanups; drop this one if the budget is exhausted rather than
-    // opening yet another connection while ClickHouse is already overloaded.
-    let _permit = match kill_query_semaphore().clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            crate::metrics::clickhouse_shard_query_cleanup(operation, "kill_throttled");
-            return;
-        }
-    };
-    let cleanup_query_id = next_required_query_id("http_query_cleanup");
-    let kill_sql = kill_query_sql(cluster.as_deref(), &query_id);
-    let cleanup_timeout = query_timeout.min(Duration::from_secs(2));
-
-    match tokio::time::timeout(
-        cleanup_timeout,
-        client
-            .query(&kill_sql)
-            .with_setting("query_id", cleanup_query_id)
-            .execute(),
-    )
-    .await
-    {
-        Ok(Ok(())) => crate::metrics::clickhouse_shard_query_cleanup(operation, "kill_dispatched"),
-        Ok(Err(err)) => {
-            crate::metrics::clickhouse_shard_query_cleanup(operation, "kill_failed");
-            tracing::warn!(
-                "Failed to dispatch HTTP ClickHouse cleanup query for {}: {}",
-                query_id,
-                err
-            );
-        }
-        Err(_) => {
-            crate::metrics::clickhouse_shard_query_cleanup(operation, "kill_timeout");
-            tracing::warn!(
-                "Timed out dispatching HTTP ClickHouse cleanup query for {} after {:?}",
-                query_id,
-                cleanup_timeout
-            );
-        }
     }
 }
 
@@ -404,11 +308,13 @@ impl Default for BucketModuli {
 #[derive(Clone)]
 pub struct ClickHouseClient {
     pub(crate) client: HttpClient,
+    pub(crate) read_endpoint: super::read_query::ReadEndpoint,
     pub(crate) url: String,
     pub(crate) database: String,
     pub(crate) username: String,
     pub(crate) password: String,
     pub(crate) signature_slot_cache: Arc<SignatureSlotCache>,
+    pub(crate) cache_partition: Option<(u64, u64)>,
     pub(crate) transaction_table: String,
     pub(crate) blocks_metadata_table: String,
     pub(crate) gsfa_table: String,
@@ -433,6 +339,10 @@ pub struct ClickHouseClient {
     pub(crate) routing_policy: RoutingPolicy,
 
     pub(crate) query_timeout: Duration,
+    pub(crate) signature_status_max_threads: usize,
+    signature_status_sem: Arc<Semaphore>,
+    #[cfg(any(test, feature = "disk-cache"))]
+    query_cleanup_cluster: Option<String>,
     pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) replica_health_check_interval: Duration,
@@ -486,6 +396,9 @@ pub struct ClickHouseClientOptions {
     pub gsfa_hot_table: String,
     pub gsfa_hot_local_table: String,
     pub query_timeout: Duration,
+    pub signature_status_max_concurrency: usize,
+    pub signature_status_max_threads: usize,
+    pub query_cleanup_cluster: Option<String>,
     pub tcp_access_check_timeout: Duration,
     pub replica_health_check_interval: Duration,
     pub query_cache: QueryCacheConfig,
@@ -541,7 +454,7 @@ const HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 ///
 /// NB: this mirrors the crate default's plain-HTTP connector. superbank builds `clickhouse`
 /// without a TLS feature, so ClickHouse connections are HTTP-only, the same as before.
-fn build_clickhouse_http_client(
+pub(super) fn build_clickhouse_http_client(
     url: &str,
     database: &str,
     username: &str,
@@ -586,6 +499,9 @@ impl ClickHouseClientOptions {
             gsfa_hot_table,
             gsfa_hot_local_table,
             query_timeout: Duration::from_millis(8_000),
+            signature_status_max_concurrency: 4,
+            signature_status_max_threads: 2,
+            query_cleanup_cluster: None,
             tcp_access_check_timeout: Duration::from_secs(2),
             replica_health_check_interval: Duration::from_secs(10),
             query_cache: QueryCacheConfig::default(),
@@ -598,6 +514,23 @@ impl ClickHouseClientOptions {
             startup_table_check: ClickHouseStartupTableCheck::Exists,
             inflation_reward_limits: InflationRewardQueryLimits::default(),
         }
+    }
+
+    pub fn with_signature_status_limits(
+        mut self,
+        max_concurrency: usize,
+        max_threads: usize,
+    ) -> Self {
+        self.signature_status_max_concurrency = max_concurrency.max(1);
+        self.signature_status_max_threads = max_threads.max(1);
+        self
+    }
+
+    /// Cluster identity for primary HTTP cancellation, independent of read routing.
+    pub fn with_query_cleanup_cluster(mut self, cluster: String) -> Self {
+        self.query_cleanup_cluster =
+            (!cluster.trim().is_empty()).then(|| cluster.trim().to_owned());
+        self
     }
 
     pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
@@ -672,6 +605,9 @@ impl ClickHouseClient {
             gsfa_hot_table,
             gsfa_hot_local_table,
             query_timeout,
+            signature_status_max_concurrency,
+            signature_status_max_threads,
+            query_cleanup_cluster,
             tcp_access_check_timeout,
             replica_health_check_interval,
             query_cache,
@@ -688,7 +624,8 @@ impl ClickHouseClient {
             build_clickhouse_http_client(url, database, username, password, http_connect_timeout);
 
         // Distributed scope is coordinator-only. Ignore any injected shard routing so all
-        // startup checks, cleanup queries, and reads stay on the configured HTTP endpoint.
+        // startup checks and reads stay on the configured HTTP endpoint. Primary cancellation
+        // keeps its independently configured cluster identity.
         let shard_routing = if routing_policy.scope == RoutingScope::ShardDirect {
             shard_routing
         } else {
@@ -758,6 +695,15 @@ impl ClickHouseClient {
             config
         });
 
+        let control =
+            build_clickhouse_http_client(url, database, username, password, http_connect_timeout);
+        let read_endpoint = super::read_query::ReadEndpoint::new(
+            control,
+            query_cleanup_cluster.clone(),
+            http_concurrency,
+            query_timeout,
+            "primary",
+        );
         Self {
             client,
             url: url.to_string(),
@@ -765,6 +711,7 @@ impl ClickHouseClient {
             username: username.to_string(),
             password: password.to_string(),
             signature_slot_cache: Arc::new(SignatureSlotCache::from_env()),
+            cache_partition: None,
             transaction_table,
             blocks_metadata_table,
             gsfa_table,
@@ -791,6 +738,11 @@ impl ClickHouseClient {
             routing_policy,
 
             query_timeout,
+            signature_status_max_threads: signature_status_max_threads.max(1),
+            signature_status_sem: Arc::new(Semaphore::new(signature_status_max_concurrency.max(1))),
+            #[cfg(any(test, feature = "disk-cache"))]
+            query_cleanup_cluster,
+            read_endpoint,
             inflation_reward_limits,
             tcp_access_check_timeout,
             replica_health_check_interval,
@@ -804,6 +756,81 @@ impl ClickHouseClient {
             #[cfg(test)]
             latest_finalized_slot_for_tests: None,
         }
+    }
+
+    pub(crate) async fn initialize_read_cancellation(&self) -> ProcessingResult<()> {
+        self.read_endpoint.initialize().await?;
+        if let Some(topology) = self.shard_topology.as_ref() {
+            for shard in topology.replicas.iter().flatten() {
+                if let Err(error) = shard.read_endpoint.initialize().await {
+                    tracing::warn!(%error, "Shard HTTP reads disabled until cancellation preflight succeeds");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn read_query(
+        &self,
+        sql: &str,
+        operation: &'static str,
+    ) -> ProcessingResult<super::read_query::ReadQuery> {
+        self.read_endpoint
+            .with_timeout(self.query_timeout)
+            .query(&self.client, sql, operation)
+            .await
+    }
+
+    pub(crate) async fn read<T: clickhouse::Row>(
+        &self,
+        sql: &str,
+        operation: &'static str,
+    ) -> clickhouse::error::Result<super::read_query::ReadCursor<T>> {
+        self.read_endpoint
+            .with_timeout(self.query_timeout)
+            .fetch::<T>(&self.client, sql, operation)
+            .await
+    }
+
+    pub(crate) async fn read_one<T: clickhouse::RowOwned + clickhouse::RowRead>(
+        &self,
+        sql: &str,
+        operation: &'static str,
+    ) -> clickhouse::error::Result<T> {
+        self.read_endpoint
+            .with_timeout(self.query_timeout)
+            .fetch_one::<T>(&self.client, sql, operation)
+            .await
+    }
+
+    pub(crate) async fn read_optional<T: clickhouse::RowOwned + clickhouse::RowRead>(
+        &self,
+        sql: &str,
+        operation: &'static str,
+    ) -> clickhouse::error::Result<Option<T>> {
+        self.read_endpoint
+            .with_timeout(self.query_timeout)
+            .fetch_optional::<T>(&self.client, sql, operation)
+            .await
+    }
+
+    pub(crate) async fn read_all<T: clickhouse::RowOwned + clickhouse::RowRead>(
+        &self,
+        sql: &str,
+        operation: &'static str,
+    ) -> clickhouse::error::Result<Vec<T>> {
+        self.read_endpoint
+            .with_timeout(self.query_timeout)
+            .fetch_all::<T>(&self.client, sql, operation)
+            .await
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn background_read_client(&self, concurrency: usize) -> Self {
+        let mut client = self.clone();
+        client.read_endpoint = self.read_endpoint.background(concurrency);
+        client
     }
 
     pub fn token_owner_activity_available(&self) -> bool {
@@ -825,6 +852,7 @@ impl ClickHouseClient {
         self.blocks_metadata_local_table = None;
         self.shard_topology = None;
         self.shard_routing = None;
+        self.query_cleanup_cluster = None;
         self.gsfa_router = None;
     }
 
@@ -863,38 +891,6 @@ impl ClickHouseClient {
         shard_tcp_query_timeout_for(self.query_timeout)
     }
 
-    pub(crate) fn http_query_cleanup(
-        &self,
-        operation: &'static str,
-        query_id: String,
-    ) -> HttpQueryCleanup {
-        HttpQueryCleanup::new(
-            self.client.clone(),
-            self.shard_routing
-                .as_ref()
-                .map(|config| config.cluster.clone()),
-            operation,
-            self.query_timeout,
-            query_id,
-        )
-    }
-
-    pub(crate) fn http_query_cleanup_for_client(
-        &self,
-        client: HttpClient,
-        cluster: Option<String>,
-        operation: &'static str,
-        query_id: String,
-    ) -> HttpQueryCleanup {
-        HttpQueryCleanup::new(
-            client,
-            cluster,
-            operation,
-            self.inflation_reward_limits.query_timeout,
-            query_id,
-        )
-    }
-
     pub(crate) fn signatures_bucket_modulus(&self) -> u64 {
         self.bucket_moduli.signatures
     }
@@ -920,6 +916,110 @@ impl ClickHouseClient {
         })
     }
 
+    /// Acquires source admission before HTTP admission; the caller owns the operation deadline.
+    /// Local-cache reads retain their existing HTTP admission behavior.
+    pub(crate) async fn acquire_signature_status_permits(
+        &self,
+    ) -> ProcessingResult<(
+        Option<OwnedSemaphorePermit>,
+        super::read_query::admission::AdmissionLease,
+    )> {
+        let source_permit = if self.cache_partition.is_none() {
+            Some(
+                self.signature_status_sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        ProcessingError::database_msg("Signature status source semaphore closed")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let http_permit = self.acquire_http_query_permit().await?;
+        Ok((source_permit, http_permit))
+    }
+
+    /// Reserve source ownership locally. The guarded HTTP read takes this permit
+    /// before submission and owns any subsequent termination verification.
+    pub(crate) async fn annotate_signature_status_query(
+        &self,
+        query: String,
+        source_permit: Option<OwnedSemaphorePermit>,
+    ) -> ProcessingResult<(String, Option<String>, Option<SignatureStatusCleanup>)> {
+        let (query, query_id) = super::util::annotate_required_query(query, "signature_statuses");
+        let cleanup = source_permit.map(|permit| SignatureStatusCleanup {
+            source_permit: Some(permit),
+        });
+        Ok((query, Some(query_id), cleanup))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_http_client_for_tests(&mut self, client: HttpClient) {
+        self.read_endpoint = super::read_query::ReadEndpoint::new(
+            client.clone(),
+            self.query_cleanup_cluster.clone(),
+            self.http_query_sem.available_permits().max(1),
+            self.query_timeout,
+            "primary",
+        );
+        self.client = client;
+    }
+
+    #[cfg(test)]
+    #[cfg(test)]
+    fn signature_status_native_disconnect(&self) -> bool {
+        self.cache_partition.is_none()
+            && self.routing_policy.scope == RoutingScope::Distributed
+            && self.transport_http()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signature_status_http_query(
+        &self,
+        sql: &str,
+        query_id: Option<String>,
+    ) -> clickhouse::query::Query {
+        let query = super::util::http_query_with_id(&self.client, sql, query_id);
+        if self.signature_status_native_disconnect() {
+            query
+                .with_setting("readonly", "2")
+                .with_setting("cancel_http_readonly_queries_on_client_close", "1")
+        } else {
+            query
+        }
+    }
+
+    fn cache_settings_or(&self, settings: String, timeout: Duration) -> String {
+        if self.cache_partition.is_some() {
+            format!(
+                "SETTINGS max_execution_time={}, timeout_overflow_mode='throw', use_query_cache=0, use_uncompressed_cache=1",
+                timeout.as_secs_f64().max(0.001)
+            )
+        } else {
+            settings
+        }
+    }
+
+    #[cfg(feature = "disk-cache")]
+    fn record_cache_admission(&self, started: std::time::Instant) {
+        if self.cache_partition.is_some() {
+            crate::metrics::disk_cache_key_seconds(
+                "admission",
+                "acquired",
+                started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+
+    pub(crate) fn cache_slot_predicate(&self) -> String {
+        self.cache_partition
+            .map_or_else(String::new, |(width, partition)| {
+                format!(" AND intDiv(slot, {width}) = {partition}")
+            })
+    }
+
     pub(crate) fn select_settings_clause(
         &self,
         operation: &'static str,
@@ -936,7 +1036,7 @@ impl ClickHouseClient {
     ) -> String {
         // Bound the server-side query lifetime so a query ClickHouse keeps running after
         // `with_http_query_timeout` drops the HTTP future does not linger and hold a connection.
-        append_max_execution_time_setting(
+        let settings = append_max_execution_time_setting(
             &build_select_settings_clause(
                 self.allow_query_settings,
                 freshness,
@@ -945,7 +1045,8 @@ impl ClickHouseClient {
                 operation,
             ),
             timeout,
-        )
+        );
+        self.cache_settings_or(settings, timeout)
     }
 
     pub(crate) fn select_settings_clause_with_condition_cache(
@@ -970,7 +1071,7 @@ impl ClickHouseClient {
         operation: &'static str,
         freshness: QueryFreshnessClass,
     ) -> String {
-        append_max_execution_time_setting(
+        let settings = append_max_execution_time_setting(
             &build_select_settings_clause_with_overrides(
                 self.allow_query_settings,
                 freshness,
@@ -980,7 +1081,8 @@ impl ClickHouseClient {
                 operation,
             ),
             self.query_timeout,
-        )
+        );
+        self.cache_settings_or(settings, self.query_timeout)
     }
 
     pub(crate) fn inflation_reward_settings_clause(&self, operation: &'static str) -> String {
@@ -1054,7 +1156,7 @@ impl ClickHouseClient {
         // the call tree and overflow the (2 MiB) worker/test thread stack; boxing keeps each
         // timeout future pointer-sized in its caller.
         let fut = Box::pin(fut);
-        match tokio::time::timeout(timeout, fut).await {
+        match tokio::time::timeout(timeout, super::read_query::admission::scope(fut)).await {
             Ok(result) => result,
             Err(_) => {
                 crate::metrics::clickhouse_timeout(operation);
@@ -1069,11 +1171,15 @@ impl ClickHouseClient {
     /// so admission and execution share the same bounded budget.
     pub(crate) async fn acquire_http_query_permit(
         &self,
-    ) -> ProcessingResult<tokio::sync::SemaphorePermit<'_>> {
-        self.http_query_sem
-            .acquire()
+    ) -> ProcessingResult<super::read_query::admission::AdmissionLease> {
+        #[cfg(feature = "disk-cache")]
+        let started = std::time::Instant::now();
+        let permit = super::read_query::admission::acquire(&self.http_query_sem)
             .await
-            .map_err(|_| ProcessingError::database_msg("ClickHouse HTTP query semaphore closed"))
+            .map_err(|_| ProcessingError::database_msg("ClickHouse HTTP query semaphore closed"));
+        #[cfg(feature = "disk-cache")]
+        self.record_cache_admission(started);
+        permit
     }
 
     async fn describe_table_http(&self, table: &str) -> ProcessingResult<Vec<DescribeTableRow>> {
@@ -1088,9 +1194,7 @@ impl ClickHouseClient {
                  ORDER BY position"
             );
             let rows = self
-                .client
-                .query(&query)
-                .fetch_all::<DescribeTableRow>()
+                .read_all::<DescribeTableRow>(&query, "describe_table_http")
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
@@ -1148,9 +1252,7 @@ impl ClickHouseClient {
                  LIMIT 1"
             );
             let rows = self
-                .client
-                .query(&query)
-                .fetch_all::<TableDefinitionRow>()
+                .read_all::<TableDefinitionRow>(&query, "fetch_table_definition_http")
                 .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
@@ -1327,6 +1429,8 @@ impl ClickHouseClient {
         Ok(())
     }
 
+    // Bootstrap control exception: forcing readonly=2 here would conceal the account
+    // profile that determines whether startup may execute schema writes.
     async fn detect_readonly_setting(&self) -> ProcessingResult<u8> {
         #[derive(Deserialize, clickhouse::Row)]
         struct ReadonlyRow {
@@ -1346,25 +1450,23 @@ impl ClickHouseClient {
         Ok(row.readonly)
     }
 
-    pub async fn create_tables(&mut self) -> ProcessingResult<()> {
+    async fn check_gsfa_startup(&self) -> ProcessingResult<()> {
         let table_access_context = |table: &str| {
             format!(
                 "Cannot access ClickHouse table '{table}'. Ensure ClickHouse is running, credentials are correct, the table exists, and network connectivity is available"
             )
         };
-
         let gsfa_table = &self.gsfa_table;
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
                 let row_count = self
                     .with_http_query_timeout("startup_gsfa_count", async {
-                        self.client
-                            .query(&format!("SELECT COUNT(*) FROM {}", gsfa_table))
-                            .fetch_one::<u64>()
-                            .await
-                            .map_err(|e| {
-                                ProcessingError::database(table_access_context(gsfa_table), e)
-                            })
+                        self.read_one::<u64>(
+                            &format!("SELECT COUNT(*) FROM {}", gsfa_table),
+                            "create_tables",
+                        )
+                        .await
+                        .map_err(|e| ProcessingError::database(table_access_context(gsfa_table), e))
                     })
                     .await?;
 
@@ -1376,36 +1478,48 @@ impl ClickHouseClient {
             }
             ClickHouseStartupTableCheck::Exists => {
                 self.with_http_query_timeout("startup_gsfa_exists", async {
-                    self.client
-                        .query(&format!("SELECT count() FROM {} WHERE 0", gsfa_table))
-                        .fetch_one::<u64>()
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| ProcessingError::database(table_access_context(gsfa_table), e))
+                    self.read_one::<u64>(
+                        &format!("SELECT count() FROM {} WHERE 0", gsfa_table),
+                        "create_tables",
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| ProcessingError::database(table_access_context(gsfa_table), e))
                 })
                 .await?;
                 tracing::info!("📊 Database initialized - {} table accessible", gsfa_table);
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn create_tables(&mut self) -> ProcessingResult<()> {
+        self.initialize_read_cancellation().await?;
+        let table_access_context = |table: &str| {
+            format!(
+                "Cannot access ClickHouse table '{table}'. Ensure ClickHouse is running, credentials are correct, the table exists, and network connectivity is available"
+            )
+        };
+
+        self.check_gsfa_startup().await?;
+
         let signature_statuses_table = &self.signature_statuses_table;
         match self.startup_table_check {
             ClickHouseStartupTableCheck::Count => {
                 let signature_row_count = self
                     .with_http_query_timeout("startup_signatures_count", async {
-                        self.client
-                            .query(&format!(
-                                "SELECT COUNT(*) FROM {}",
-                                signature_statuses_table
-                            ))
-                            .fetch_one::<u64>()
-                            .await
-                            .map_err(|e| {
-                                ProcessingError::database(
-                                    table_access_context(signature_statuses_table),
-                                    e,
-                                )
-                            })
+                        self.read_one::<u64>(
+                            &format!("SELECT COUNT(*) FROM {}", signature_statuses_table),
+                            "create_tables",
+                        )
+                        .await
+                        .map_err(|e| {
+                            ProcessingError::database(
+                                table_access_context(signature_statuses_table),
+                                e,
+                            )
+                        })
                     })
                     .await?;
 
@@ -1417,20 +1531,15 @@ impl ClickHouseClient {
             }
             ClickHouseStartupTableCheck::Exists => {
                 self.with_http_query_timeout("startup_signatures_exists", async {
-                    self.client
-                        .query(&format!(
-                            "SELECT count() FROM {} WHERE 0",
-                            signature_statuses_table
-                        ))
-                        .fetch_one::<u64>()
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| {
-                            ProcessingError::database(
-                                table_access_context(signature_statuses_table),
-                                e,
-                            )
-                        })
+                    self.read_one::<u64>(
+                        &format!("SELECT count() FROM {} WHERE 0", signature_statuses_table),
+                        "create_tables",
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        ProcessingError::database(table_access_context(signature_statuses_table), e)
+                    })
                 })
                 .await?;
                 tracing::info!(
@@ -1445,14 +1554,12 @@ impl ClickHouseClient {
             ClickHouseStartupTableCheck::Count => {
                 match self
                     .with_http_query_timeout("startup_token_owner_activity_count", async {
-                        self.client
-                            .query(&format!(
-                                "SELECT COUNT(*) FROM {}",
-                                token_owner_activity_table
-                            ))
-                            .fetch_one::<u64>()
-                            .await
-                            .map_err(|e| ProcessingError::database(e.to_string(), e))
+                        self.read_one::<u64>(
+                            &format!("SELECT COUNT(*) FROM {}", token_owner_activity_table),
+                            "create_tables",
+                        )
+                        .await
+                        .map_err(|e| ProcessingError::database(e.to_string(), e))
                     })
                     .await
                 {
@@ -1477,15 +1584,13 @@ impl ClickHouseClient {
             ClickHouseStartupTableCheck::Exists => {
                 match self
                     .with_http_query_timeout("startup_token_owner_activity_exists", async {
-                        self.client
-                            .query(&format!(
-                                "SELECT count() FROM {} WHERE 0",
-                                token_owner_activity_table
-                            ))
-                            .fetch_one::<u64>()
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| ProcessingError::database(e.to_string(), e))
+                        self.read_one::<u64>(
+                            &format!("SELECT count() FROM {} WHERE 0", token_owner_activity_table),
+                            "create_tables",
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| ProcessingError::database(e.to_string(), e))
                     })
                     .await
                 {
@@ -1513,16 +1618,17 @@ impl ClickHouseClient {
             ClickHouseStartupTableCheck::Count => {
                 let blocks_row_count = self
                     .with_http_query_timeout("startup_blocks_metadata_count", async {
-                        self.client
-                            .query(&format!("SELECT COUNT(*) FROM {}", blocks_metadata_table))
-                            .fetch_one::<u64>()
-                            .await
-                            .map_err(|e| {
-                                ProcessingError::database(
-                                    table_access_context(blocks_metadata_table),
-                                    e,
-                                )
-                            })
+                        self.read_one::<u64>(
+                            &format!("SELECT COUNT(*) FROM {}", blocks_metadata_table),
+                            "create_tables",
+                        )
+                        .await
+                        .map_err(|e| {
+                            ProcessingError::database(
+                                table_access_context(blocks_metadata_table),
+                                e,
+                            )
+                        })
                     })
                     .await?;
 
@@ -1534,20 +1640,15 @@ impl ClickHouseClient {
             }
             ClickHouseStartupTableCheck::Exists => {
                 self.with_http_query_timeout("startup_blocks_metadata_exists", async {
-                    self.client
-                        .query(&format!(
-                            "SELECT count() FROM {} WHERE 0",
-                            blocks_metadata_table
-                        ))
-                        .fetch_one::<u64>()
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| {
-                            ProcessingError::database(
-                                table_access_context(blocks_metadata_table),
-                                e,
-                            )
-                        })
+                    self.read_one::<u64>(
+                        &format!("SELECT count() FROM {} WHERE 0", blocks_metadata_table),
+                        "create_tables",
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        ProcessingError::database(table_access_context(blocks_metadata_table), e)
+                    })
                 })
                 .await?;
                 tracing::info!(
@@ -1562,16 +1663,14 @@ impl ClickHouseClient {
             ClickHouseStartupTableCheck::Count => {
                 let tx_row_count = self
                     .with_http_query_timeout("startup_transactions_count", async {
-                        self.client
-                            .query(&format!("SELECT COUNT(*) FROM {}", transaction_table))
-                            .fetch_one::<u64>()
-                            .await
-                            .map_err(|e| {
-                                ProcessingError::database(
-                                    table_access_context(transaction_table),
-                                    e,
-                                )
-                            })
+                        self.read_one::<u64>(
+                            &format!("SELECT COUNT(*) FROM {}", transaction_table),
+                            "create_tables",
+                        )
+                        .await
+                        .map_err(|e| {
+                            ProcessingError::database(table_access_context(transaction_table), e)
+                        })
                     })
                     .await?;
 
@@ -1583,17 +1682,15 @@ impl ClickHouseClient {
             }
             ClickHouseStartupTableCheck::Exists => {
                 self.with_http_query_timeout("startup_transactions_exists", async {
-                    self.client
-                        .query(&format!(
-                            "SELECT count() FROM {} WHERE 0",
-                            transaction_table
-                        ))
-                        .fetch_one::<u64>()
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| {
-                            ProcessingError::database(table_access_context(transaction_table), e)
-                        })
+                    self.read_one::<u64>(
+                        &format!("SELECT count() FROM {} WHERE 0", transaction_table),
+                        "create_tables",
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| {
+                        ProcessingError::database(table_access_context(transaction_table), e)
+                    })
                 })
                 .await?;
                 tracing::info!(
@@ -1722,6 +1819,7 @@ impl ClickHouseClient {
             }
         }
 
+        self.initialize_read_cancellation().await?;
         self.discover_bucket_moduli().await?;
         self.initialize_gsfa_hot_addresses().await;
 
@@ -1789,6 +1887,13 @@ impl ClickHouseClient {
             shard_num,
             tcp_pool,
             http_client: self.build_http_client(shard_url.as_str()),
+            read_endpoint: super::read_query::ReadEndpoint::new(
+                self.build_http_client(shard_url.as_str()),
+                None,
+                self.http_query_sem.available_permits().max(1),
+                self.query_timeout,
+                "shard",
+            ),
             host,
             tcp_port,
         })
@@ -1927,9 +2032,7 @@ impl ClickHouseClient {
 
         let rows: Vec<ClusterRow> = self
             .with_http_query_timeout("build_shard_topology", async {
-                self.client
-                    .query(&cluster_query)
-                    .fetch_all()
+                self.read_all::<ClusterRow>(&cluster_query, "build_shard_topology")
                     .await
                     .map_err(|e| {
                         ProcessingError::database(
@@ -2202,11 +2305,28 @@ async fn probe_replica_tcp(replica: &ShardTarget, timeout: Duration) -> Result<(
 }
 
 async fn probe_replica_http(replica: &ShardTarget, timeout: Duration) -> Result<(), String> {
-    match tokio::time::timeout(timeout, replica.http_client.query("SELECT 1").execute()).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(_) => Err("timeout executing HTTP SELECT 1".to_string()),
-    }
+    tokio::time::timeout(timeout, initialize_and_probe_http(replica))
+        .await
+        .map_err(|_| "timeout executing HTTP capability/health probe".to_string())?
+}
+
+async fn initialize_and_probe_http(replica: &ShardTarget) -> Result<(), String> {
+    // Control traffic never takes application admission and retries preflight off the RPC path.
+    replica
+        .read_endpoint
+        .initialize()
+        .await
+        .map_err(|error| error.to_string())?;
+    replica
+        .http_client
+        .query("SELECT 1")
+        .with_setting("readonly", "2")
+        .with_setting("cancel_http_readonly_queries_on_client_close", "1")
+        .with_setting("max_execution_time", "1")
+        .with_setting("max_threads", "1")
+        .execute()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn normalize_clickhouse_ddl(value: &str) -> String {
@@ -2281,15 +2401,210 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, kill_query_sql,
-        probe_replica, shard_tcp_query_timeout_for, split_table_reference,
-        validate_gsfa_shard_layout_query,
+        ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, probe_replica,
+        shard_tcp_query_timeout_for, split_table_reference, validate_gsfa_shard_layout_query,
     };
     use crate::clickhouse::{
         QueryCacheConfig, QueryFreshnessClass, RoutingPolicy, RoutingScope, RoutingTransport,
         ShardRoutingConfig,
     };
     use crate::processing::ProcessingError;
+
+    #[tokio::test]
+    async fn primary_status_admission_is_shared_and_precedes_http_admission() {
+        let client = test_client_with_hot_addresses(Vec::new());
+        let other = client.clone();
+        let held = client
+            .signature_status_sem
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .expect("permits");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                other.acquire_signature_status_permits(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(client.http_query_sem.available_permits(), 512);
+        drop(held);
+        assert!(other.acquire_signature_status_permits().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unsubmitted_status_annotation_retains_then_releases_source_admission() {
+        // This client has no cancellation preflight: annotation must remain local.
+        let client = test_client_with_hot_addresses(Vec::new());
+        let permit = client
+            .signature_status_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (sql, id, cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), Some(permit))
+            .await
+            .unwrap();
+        assert!(sql.contains("SELECT 1"));
+        assert!(id.is_some());
+        assert_eq!(client.signature_status_sem.available_permits(), 3);
+        drop(cleanup);
+        assert_eq!(client.signature_status_sem.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn status_construction_failure_releases_source_admission() {
+        let client = test_client_with_hot_addresses(Vec::new());
+        let permit = client
+            .signature_status_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (_, _, mut cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), Some(permit))
+            .await
+            .unwrap();
+        let result = super::SignatureStatusCleanup::before_submission(
+            Err::<(), _>(ProcessingError::database_msg("construction failed")),
+            &mut cleanup,
+        );
+        assert!(result.is_err());
+        assert_eq!(client.signature_status_sem.available_permits(), 4);
+        drop(cleanup);
+        assert_eq!(client.signature_status_sem.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn explicit_status_disarm_releases_source_admission() {
+        let client = test_client_with_hot_addresses(Vec::new());
+        let permit = client
+            .signature_status_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (_, _, mut cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), Some(permit))
+            .await
+            .unwrap();
+        super::SignatureStatusCleanup::disarm_optional(&mut cleanup);
+        assert_eq!(client.signature_status_sem.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn status_transfer_keeps_admission_owned_by_the_unsubmitted_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = axum::Router::new().fallback(move |sql: String| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                if sql.contains("system.processes") {
+                    return b"\x04node\x00".to_vec();
+                }
+                let mut bytes = vec![4];
+                bytes.extend_from_slice(b"node");
+                bytes.extend_from_slice(&1_u64.to_le_bytes());
+                bytes.push(1);
+                bytes
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = clickhouse::Client::default()
+            .with_url(url)
+            .with_validation(false)
+            .with_compression(clickhouse::Compression::None);
+        let endpoint = crate::clickhouse::read_query::ReadEndpoint::new(
+            http.clone(),
+            None,
+            2,
+            Duration::from_secs(1),
+            "primary",
+        );
+        endpoint.initialize().await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let client = test_client_with_hot_addresses(Vec::new());
+        let permit = client
+            .signature_status_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (_, _, mut cleanup) = client
+            .annotate_signature_status_query("SELECT 1".into(), Some(permit))
+            .await
+            .unwrap();
+        let mut query = endpoint
+            .query(&http, "SELECT 1", "signature_statuses")
+            .await
+            .unwrap();
+        cleanup.as_mut().unwrap().transfer_to(&mut query);
+        drop(cleanup);
+        assert_eq!(client.signature_status_sem.available_permits(), 3);
+        drop(query);
+        assert_eq!(client.signature_status_sem.available_permits(), 4);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "unsubmitted reads need no verification probes"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cache_status_admission_does_not_consume_source_capacity() {
+        let mut client = test_client_with_hot_addresses(Vec::new());
+        client.cache_partition = Some((10, 1));
+        let held = client
+            .signature_status_sem
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .expect("permits");
+        let (source, _http) = client
+            .acquire_signature_status_permits()
+            .await
+            .expect("cache admission");
+        assert!(source.is_none());
+        drop(held);
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn local_table_mapping_clears_primary_cleanup_cluster() {
+        let mut client = test_client_with_hot_addresses(Vec::new());
+        client.query_cleanup_cluster = Some("rbx2".into());
+        client.use_table_names(super::ClickHouseTableNames::in_database("cache"));
+        assert!(client.query_cleanup_cluster.is_none());
+    }
+
+    #[test]
+    fn cleanup_cluster_accepts_macros_and_empty_standalone_identity() {
+        let options = ClickHouseClientOptions::new(
+            RoutingPolicy {
+                transport: RoutingTransport::Http,
+                scope: RoutingScope::Distributed,
+            },
+            None,
+            Vec::new(),
+            "default.gsfa_hot".into(),
+            "default.gsfa_hot_local".into(),
+        )
+        .with_query_cleanup_cluster(" {cluster} ".into());
+        assert_eq!(options.query_cleanup_cluster.as_deref(), Some("{cluster}"));
+        assert!(
+            options
+                .with_query_cleanup_cluster(" ".into())
+                .query_cleanup_cluster
+                .is_none()
+        );
+    }
 
     struct TempTopologyConfig {
         path: PathBuf,
@@ -2369,10 +2684,6 @@ mod tests {
             ),
         );
 
-        let mut cleanup = client.http_query_cleanup("test", "query-id".to_string());
-        assert!(cleanup.cluster.is_none());
-        cleanup.disarm();
-
         assert!(client.shard_routing.is_none());
         assert!(client.shard_topology.is_none());
         assert!(client.gsfa_router.is_none());
@@ -2409,10 +2720,6 @@ mod tests {
                 "default.gsfa_hot_local".to_string(),
             ),
         );
-
-        let mut cleanup = client.http_query_cleanup("test", "query-id".to_string());
-        assert_eq!(cleanup.cluster.as_deref(), Some("production"));
-        cleanup.disarm();
 
         assert!(client.shard_routing.is_some());
         assert_eq!(
@@ -2453,6 +2760,31 @@ mod tests {
                 QueryCacheConfig::new(true, 10, false, true).with_get_transaction_overrides(300, 2),
             ),
         )
+    }
+
+    #[test]
+    fn uncompressed_cache_is_scoped_to_local_partition_reads() {
+        let mut client = test_client_with_query_cache();
+        let source = client
+            .select_get_transaction_settings_clause("test_source", QueryFreshnessClass::Historical);
+        assert!(source.contains("use_query_cache=1"));
+        assert!(!source.contains("use_uncompressed_cache"));
+
+        client.cache_partition = Some((10, 1));
+        client.query_timeout = Duration::from_millis(50);
+        let transaction = client.select_get_transaction_settings_clause(
+            "test_cache_transaction",
+            QueryFreshnessClass::Historical,
+        );
+        let signature =
+            client.select_settings_clause("test_cache_signature", QueryFreshnessClass::Historical);
+        for settings in [transaction, signature] {
+            assert!(settings.contains("use_uncompressed_cache=1"));
+            assert!(settings.contains("use_query_cache=0"));
+            assert!(!settings.contains("query_cache_ttl"));
+            assert!(settings.contains("max_execution_time=0.05"));
+            assert!(settings.contains("timeout_overflow_mode='throw'"));
+        }
     }
 
     fn test_client_with_http_limit(query_timeout: Duration) -> ClickHouseClient {
@@ -2740,6 +3072,19 @@ nodes:
         );
     }
 
+    fn http_health_fixture_response(sql: &str) -> Vec<u8> {
+        if sql.contains("AS coordinator") {
+            let mut row = b"\x04node".to_vec();
+            row.extend_from_slice(&1_u64.to_le_bytes());
+            row.push(1);
+            row
+        } else if sql.contains("system.processes") {
+            b"\x04node\x00".to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
     #[tokio::test]
     async fn http_replica_probe_does_not_require_native_clickhouse() {
         let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2759,7 +3104,8 @@ nodes:
         drop(tcp_listener);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::OK });
+        let app = axum::Router::new()
+            .fallback(|sql: String| async move { http_health_fixture_response(&sql) });
         let server = tokio::spawn(async move {
             axum::serve(http_listener, app)
                 .with_graceful_shutdown(async {
@@ -2786,7 +3132,7 @@ nodes:
             ),
         );
         let base_url = reqwest::Url::parse("http://127.0.0.1:8123").expect("base URL");
-        let target = client
+        let mut target = client
             .build_shard_target(
                 &base_url,
                 http_port,
@@ -2796,6 +3142,17 @@ nodes:
                 "HTTP-only test",
             )
             .expect("HTTP shard target");
+        target.read_endpoint = super::super::read_query::ReadEndpoint::new(
+            target
+                .http_client
+                .clone()
+                .with_validation(false)
+                .with_compression(clickhouse::Compression::None),
+            None,
+            1,
+            Duration::from_secs(1),
+            "shard",
+        );
 
         assert!(
             probe_replica(&target, RoutingTransport::Http, Duration::from_secs(1),)
@@ -2805,22 +3162,6 @@ nodes:
 
         let _ = shutdown_tx.send(());
         server.await.expect("HTTP probe server task");
-    }
-
-    #[test]
-    fn kill_query_sql_targets_query_and_initial_query_id() {
-        assert_eq!(
-            kill_query_sql(None, "superbank:get_inflation_rewards_for_epoch:7"),
-            "KILL QUERY WHERE (query_id = 'superbank:get_inflation_rewards_for_epoch:7' OR initial_query_id = 'superbank:get_inflation_rewards_for_epoch:7') ASYNC"
-        );
-    }
-
-    #[test]
-    fn kill_query_sql_can_target_cluster() {
-        assert_eq!(
-            kill_query_sql(Some("bhs"), "superbank:get_inflation_rewards_for_epoch:7"),
-            "KILL QUERY ON CLUSTER 'bhs' WHERE (query_id = 'superbank:get_inflation_rewards_for_epoch:7' OR initial_query_id = 'superbank:get_inflation_rewards_for_epoch:7') ASYNC"
-        );
     }
 
     #[test]

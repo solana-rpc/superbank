@@ -3,7 +3,11 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod latest_slot;
+
 use crate::solana_sdk;
+mod http_response_logs;
+mod inflation_rewards;
 use crate::solana_sdk::{
     hash::Hash,
     instruction::InstructionError,
@@ -7110,6 +7114,45 @@ async fn get_block_clickhouse_partial_payload_repair() {
         let body = response.text().await.unwrap();
         assert!(status.is_success(), "ClickHouse {status}: {body}");
     }
+    async fn assert_source_projection(
+        client: &ClickHouseClient,
+        slot: u64,
+        details: &str,
+        expected: usize,
+    ) {
+        let (metadata, _) = client
+            .get_block_metadata_by_slot(slot, true)
+            .await
+            .expect("fixture metadata read");
+        assert_eq!(
+            metadata
+                .expect("fixture metadata")
+                .executed_transaction_count,
+            2
+        );
+        let observed = match details {
+            "full" => client
+                .get_block_full_transactions_by_slot(slot)
+                .await
+                .expect("fixture full projection read")
+                .0
+                .len(),
+            "accounts" => client
+                .get_block_accounts_by_slot(slot)
+                .await
+                .expect("fixture accounts projection read")
+                .0
+                .len(),
+            "signatures" => client
+                .get_block_signatures_by_slot(slot)
+                .await
+                .expect("fixture signatures projection read")
+                .0
+                .len(),
+            _ => unreachable!("unsupported fixture projection"),
+        };
+        assert_eq!(observed, expected, "{details} fixture at slot {slot}");
+    }
     execute(&http, &url, format!("CREATE DATABASE {database}")).await;
     for ddl in [
         include_str!("../../../../ddl/local/transactions.sql"),
@@ -7150,6 +7193,11 @@ async fn get_block_clickhouse_partial_payload_repair() {
             let mutable = Arc::get_mut(&mut state).unwrap();
             mutable.clickhouse.transaction_table = format!("{database}.transactions");
             mutable.clickhouse.blocks_metadata_table = format!("{database}.blocks_metadata");
+            mutable
+                .clickhouse
+                .initialize_read_cancellation()
+                .await
+                .expect("fixture cancellation preflight");
             mutable.block_response_cache = BlockResponseCache::new(cache_bytes);
             mutable.emit_http_errors = cache_bytes > 0;
             #[cfg(feature = "grpc-head-cache")]
@@ -7187,6 +7235,9 @@ async fn get_block_clickhouse_partial_payload_repair() {
                             required: false,
                             retain_slots: 1000,
                             max_bytes: 0,
+                            key_index_max_memory_bytes: 128 * 1024 * 1024,
+                            query_concurrency: 2,
+                            query_max_threads: 2,
                             partition_slots: 100,
                             query_timeout: Duration::from_secs(10),
                             schema_check_interval: Duration::from_secs(60),
@@ -7213,6 +7264,7 @@ async fn get_block_clickhouse_partial_payload_repair() {
                 disk
             };
 
+            assert_source_projection(&state.clickhouse, slot, details, 1).await;
             let params = vec![
                 json!(slot),
                 json!({ "transactionDetails": details, "maxSupportedTransactionVersion": 1 }),
@@ -7234,6 +7286,7 @@ async fn get_block_clickhouse_partial_payload_repair() {
             );
             assert!(partial.headers().contains_key("X-Superbank-Metrics"));
             let partial = parse_json_rpc_response(partial).await;
+            assert_eq!(partial.id, json!(1));
             assert_eq!(partial.error.expect("partial must fail").code, -32603);
             assert!(partial.result.is_none());
             assert_eq!(state.block_response_cache.entry_count(), 0);
@@ -7243,6 +7296,7 @@ async fn get_block_clickhouse_partial_payload_repair() {
                 "incomplete cache slot must be poisoned"
             );
             execute(&http, &url, insert_transaction(1)).await;
+            assert_source_projection(&state.clickhouse, slot, details, 2).await;
             #[cfg(feature = "disk-cache")]
             disk.publish_range_coverage(vec![(
                 slot,

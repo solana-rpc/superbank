@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::clickhouse::ClickHouseClient;
 
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 4;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 5;
 pub(crate) const CACHE_MAGIC: &str = "superbank-clickhouse-forward-cache";
 pub(crate) const META_TABLE: &str = "_cache_meta";
 pub(crate) const COVERAGE_TABLE: &str = "_cache_coverage";
@@ -118,9 +118,39 @@ pub(crate) struct SourceTableSchema {
     storage: TableRow,
     view_select: Option<String>,
     indexes: Vec<String>,
+    settings: std::collections::BTreeMap<String, u64>,
 }
 
 impl SourceTableSchema {
+    fn effective_cache_settings(&self) -> std::collections::BTreeMap<String, u64> {
+        let mut settings = self.settings.clone();
+        if self.kind == CacheTableKind::Transactions {
+            settings.extend([
+                ("index_granularity".into(), 64),
+                ("index_granularity_bytes".into(), 10_485_760),
+                ("min_compress_block_size".into(), 16_384),
+                ("max_compress_block_size".into(), 65_536),
+            ]);
+        }
+        if self
+            .storage
+            .sorting_key
+            .to_ascii_uppercase()
+            .contains(" DESC")
+        {
+            settings.insert("allow_experimental_reverse_key".into(), 1);
+        }
+        settings
+    }
+
+    fn with_storage_settings(mut self) -> Result<Self, SchemaError> {
+        self.settings = super::schema_settings::extract(&self.storage.create_table_query)?;
+        if let Some(key) = super::schema_settings::sorting_key(&self.storage.create_table_query) {
+            self.storage.sorting_key = key;
+        }
+        Ok(self)
+    }
+
     pub(crate) fn insert_columns(&self) -> Vec<String> {
         self.columns
             .iter()
@@ -142,6 +172,32 @@ pub(crate) struct SourceSchemaSnapshot {
 }
 
 impl SourceSchemaSnapshot {
+    /// Project the same signature keys as the forwarding view, with the input
+    /// restricted before ARRAY JOIN or other view expressions are evaluated.
+    pub(crate) fn signature_keys_query(
+        &self,
+        database: &str,
+        width: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<String, SchemaError> {
+        let signatures = self
+            .table(CacheTableKind::Signatures)
+            .and_then(|table| table.view_select.as_deref())
+            .ok_or_else(|| SchemaError::Invalid("signatures view unavailable".into()))?;
+        let transactions = self
+            .table(CacheTableKind::Transactions)
+            .ok_or_else(|| SchemaError::Invalid("transactions schema unavailable".into()))?;
+        let local = quote_table(database, "transactions");
+        let bounded = format!(
+            "(SELECT * FROM {local} WHERE intDiv(slot, {width}) BETWEEN {} AND {} AND slot BETWEEN {start} AND {end})",
+            start / width,
+            end / width
+        );
+        let select = replace_table_reference(signatures, &transactions.storage_name, &bounded)?;
+        Ok(format!("SELECT slot, signature AS key FROM ({select})"))
+    }
+
     pub(crate) fn table(&self, kind: CacheTableKind) -> Option<&SourceTableSchema> {
         self.tables.iter().find(|table| table.kind == kind)
     }
@@ -200,9 +256,7 @@ async fn fetch_table(
          FROM system.tables WHERE database = '{database}' AND name = '{name}' LIMIT 1"
     );
     let row = source
-        .client
-        .query(&table_query)
-        .fetch_optional::<TableRow>()
+        .read_optional::<TableRow>(&table_query, "disk_cache_schema_table")
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))?;
     let Some(row) = row else {
@@ -214,9 +268,7 @@ async fn fetch_table(
          FROM system.columns WHERE database = '{database}' AND table = '{name}' ORDER BY position"
     );
     let columns = source
-        .client
-        .query(&columns_query)
-        .fetch_all::<ColumnRow>()
+        .read_all::<ColumnRow>(&columns_query, "disk_cache_schema_columns")
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))?;
     if columns.is_empty() {
@@ -291,7 +343,7 @@ async fn inspect_table(
     }
 
     let indexes = extract_index_definitions(&storage.create_table_query);
-    Ok(SourceTableSchema {
+    SourceTableSchema {
         kind,
         logical_name,
         storage_name,
@@ -299,7 +351,9 @@ async fn inspect_table(
         storage,
         view_select,
         indexes,
-    })
+        settings: Default::default(),
+    }
+    .with_storage_settings()
 }
 
 pub(crate) async fn inspect_source_schema(
@@ -408,6 +462,7 @@ fn schema_fingerprint(tables: &[SourceTableSchema], config: &CacheSchemaConfig) 
                 column.compression_codec
             );
         }
+        let _ = writeln!(input, "settings={:?}", table.effective_cache_settings());
         for index in &table.indexes {
             let _ = writeln!(input, "index={index}");
         }
@@ -474,15 +529,11 @@ fn create_cache_table_sql(
     } else {
         table.storage.primary_key.trim()
     };
-    let reverse_setting = if sorting_key.to_ascii_uppercase().contains(" DESC") {
-        " SETTINGS allow_experimental_reverse_key = 1"
-    } else {
-        ""
-    };
+    let settings = super::schema_settings::clause(&table.effective_cache_settings());
     Ok(format!(
         "CREATE TABLE IF NOT EXISTS {target} (\n    {columns}\n) \
          ENGINE = ReplacingMergeTree(slot) \
-         PARTITION BY intDiv(slot, {}) PRIMARY KEY ({primary_key}) ORDER BY ({sorting_key}){reverse_setting}",
+         PARTITION BY intDiv(slot, {}) PRIMARY KEY ({primary_key}) ORDER BY ({sorting_key}){settings}",
         config.partition_slots
     ))
 }
@@ -522,12 +573,21 @@ fn create_cache_view_sql(
     let view_name = format!("{}__mv", table.kind.local_name());
     let view = quote_table(&config.database, &view_name);
     let target = quote_table(&config.database, table.kind.local_name());
+    // Source views may explicitly emit materialized bucket columns. The target
+    // recomputes them, so insert only ordinary columns into the forwarding view.
+    let columns = table
+        .insert_columns()
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ");
     Ok(format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS {view} TO {target} AS {rewritten}"
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {view} TO {target} AS SELECT {columns} FROM ({rewritten})"
     ))
 }
 
 async fn execute(client: &ClickHouseClient, sql: &str) -> Result<(), SchemaError> {
+    // Schema DDL and INSERTs must remain writable; this helper never executes SELECTs.
     client
         .client
         .query(sql)
@@ -542,11 +602,10 @@ async fn database_tables(
 ) -> Result<Vec<String>, SchemaError> {
     let database = database.replace('\'', "''");
     local
-        .client
-        .query(&format!(
-            "SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name"
-        ))
-        .fetch_all::<NameRow>()
+        .read_all::<NameRow>(
+            &format!("SELECT name FROM system.tables WHERE database = '{database}' ORDER BY name"),
+            "disk_cache_schema_tables",
+        )
         .await
         .map(|rows| rows.into_iter().map(|row| row.name).collect())
         .map_err(|err| SchemaError::Query(err.to_string()))
@@ -558,11 +617,10 @@ async fn read_meta(
 ) -> Result<Vec<MetaRow>, SchemaError> {
     let table = quote_table(&config.database, META_TABLE);
     local
-        .client
-        .query(&format!(
-            "SELECT key, argMax(value, updated_at) AS value FROM {table} GROUP BY key"
-        ))
-        .fetch_all::<MetaRow>()
+        .read_all::<MetaRow>(
+            &format!("SELECT key, argMax(value, updated_at) AS value FROM {table} GROUP BY key"),
+            "disk_cache_schema_meta",
+        )
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))
 }
@@ -632,11 +690,10 @@ async fn reset_coverage_after_memory_restart(
     }
     let runtime = quote_table(&config.database, RUNTIME_TABLE);
     let marker = local
-        .client
-        .query(&format!(
-            "SELECT count() AS count FROM {runtime} WHERE key = 'clickhouse_generation'"
-        ))
-        .fetch_one::<CountRow>()
+        .read_one::<CountRow>(
+            &format!("SELECT count() AS count FROM {runtime} WHERE key = 'clickhouse_generation'"),
+            "disk_cache_schema_generation",
+        )
         .await
         .map_err(|err| SchemaError::Query(err.to_string()))?;
     if marker.count > 0 {
@@ -659,6 +716,34 @@ async fn reset_coverage_after_memory_restart(
     )
     .await?;
     Ok(true)
+}
+
+/// Called only after validating the ownership marker. Keep the marker and its
+/// old fingerprint until all replacement DDL succeeds, so interruption retries
+/// the rebuild instead of leaving an unowned, partially dropped database.
+async fn rebuild_owned_tables(
+    local: &ClickHouseClient,
+    config: &CacheSchemaConfig,
+    existing: &[String],
+) -> Result<(), SchemaError> {
+    // Remove forwarding views before their source/target tables.
+    let mut tables: Vec<_> = existing.iter().filter(|name| *name != META_TABLE).collect();
+    tables.sort_by_key(|name| !name.ends_with("__mv"));
+    for name in tables {
+        // Destructive schema DDL requires the writable admin client.
+        local
+            .client
+            .clone()
+            .with_setting("max_table_size_to_drop", "0")
+            .query(&format!(
+                "DROP TABLE IF EXISTS {} SYNC",
+                quote_table(&config.database, name)
+            ))
+            .execute()
+            .await
+            .map_err(|err| SchemaError::Query(err.to_string()))?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn initialize_cache_schema(
@@ -692,11 +777,7 @@ pub(crate) async fn initialize_cache_schema(
         if value("format_version") != Some(expected_version.as_str())
             || value("fingerprint") != Some(snapshot.fingerprint.as_str())
         {
-            execute(
-                local,
-                &format!("DROP DATABASE {} SYNC", quote_identifier(&config.database)),
-            )
-            .await?;
+            rebuild_owned_tables(local, config, &existing).await?;
             rebuilt = true;
         }
     }
@@ -787,7 +868,7 @@ fn extract_index_definitions(create: &str) -> Vec<String> {
         .collect()
 }
 
-fn split_top_level(input: &str) -> Vec<&str> {
+pub(super) fn split_top_level(input: &str) -> Vec<&str> {
     let mut entries = Vec::new();
     let mut start = 0usize;
     let mut depth = 0usize;
@@ -853,9 +934,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partition_width_is_part_of_fingerprint() {
-        let table = SourceTableSchema {
+    fn fixture_table() -> SourceTableSchema {
+        SourceTableSchema {
             kind: CacheTableKind::Transactions,
             logical_name: "default.transactions".into(),
             storage_name: "default.transactions_local".into(),
@@ -877,17 +957,89 @@ mod tests {
             },
             view_select: None,
             indexes: Vec::new(),
-        };
-        let config = |partition_slots| CacheSchemaConfig {
+            settings: Default::default(),
+        }
+    }
+
+    fn fixture_config(partition_slots: u64) -> CacheSchemaConfig {
+        CacheSchemaConfig {
             database: "cache".into(),
             partition_slots,
             memory_blocks_metadata: false,
             memory_retain_slots: None,
             memory_max_bytes: None,
-        };
+        }
+    }
+
+    #[test]
+    fn partition_width_is_part_of_fingerprint() {
+        let table = fixture_table();
         assert_ne!(
-            schema_fingerprint(std::slice::from_ref(&table), &config(10_000)),
-            schema_fingerprint(&[table], &config(20_000))
+            schema_fingerprint(std::slice::from_ref(&table), &fixture_config(10_000)),
+            schema_fingerprint(&[table], &fixture_config(20_000))
         );
+    }
+
+    #[test]
+    fn transaction_layout_overrides_source_settings_in_ddl_and_fingerprint() {
+        let mut table = fixture_table();
+        let config = fixture_config(10_000);
+        let fingerprint = schema_fingerprint(std::slice::from_ref(&table), &config);
+        table.settings.extend([
+            ("index_granularity".into(), 8192),
+            ("index_granularity_bytes".into(), 67_108_864),
+            ("min_compress_block_size".into(), 65_536),
+            ("max_compress_block_size".into(), 1_048_576),
+        ]);
+        assert_eq!(
+            fingerprint,
+            schema_fingerprint(std::slice::from_ref(&table), &config)
+        );
+        let ddl = create_cache_table_sql(&table, &config).unwrap();
+        for setting in [
+            "index_granularity=64",
+            "index_granularity_bytes=10485760",
+            "min_compress_block_size=16384",
+            "max_compress_block_size=65536",
+        ] {
+            assert!(ddl.contains(setting), "{ddl}");
+        }
+        // The previous fingerprint hashed source settings without local overrides.
+        let legacy = "format=5\ndatabase=cache\npartition_slots=10000\nmemory_blocks=false\nmemory_retain=None\nmemory_bytes=None\n\
+            table=Transactions|logical=default.transactions|storage=default.transactions_local|engine=ReplacingMergeTree|partition=intDiv(slot, 432000)|primary=slot|sorting=slot|view=\n\
+            column=slot|UInt64|||\nsettings={}\n";
+        assert_ne!(
+            fingerprint,
+            blake3::hash(legacy.as_bytes()).to_hex().to_string()
+        );
+        table.settings.insert("compress_marks".into(), 1);
+        assert_ne!(
+            fingerprint,
+            schema_fingerprint(std::slice::from_ref(&table), &config)
+        );
+        assert!(
+            create_cache_table_sql(&table, &config)
+                .unwrap()
+                .contains("compress_marks=1")
+        );
+    }
+
+    #[test]
+    fn other_cache_tables_preserve_source_settings() {
+        for kind in [
+            CacheTableKind::Signatures,
+            CacheTableKind::BlocksMetadata,
+            CacheTableKind::Gsfa,
+            CacheTableKind::GsfaHot,
+            CacheTableKind::TokenOwnerActivity,
+        ] {
+            let mut table = fixture_table();
+            table.kind = kind;
+            table.settings.insert("index_granularity".into(), 512);
+            assert_eq!(table.effective_cache_settings(), table.settings);
+            let ddl = create_cache_table_sql(&table, &fixture_config(10_000)).unwrap();
+            assert!(ddl.contains("index_granularity=512"));
+            assert!(!ddl.contains("compress_block_size"));
+        }
     }
 }

@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::solana_sdk::pubkey::Pubkey;
+#[cfg(test)]
 use clickhouse::Client as HttpClient;
 use clickhouse_rs::errors::{DriverError as TcpDriverError, Error as TcpError};
 
@@ -125,14 +126,20 @@ fn internal_query_id_prefix() -> &'static str {
         .as_str()
 }
 
-fn next_query_id_with_prefix(prefix: &str, label: &str) -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}:{label}:{suffix}")
+// Distinguish processes and restarts even when containers share a PID and prefix.
+// RandomState supplies independently seeded hashes without new dependencies.
+fn new_query_id_namespace() -> String {
+    use std::hash::BuildHasher;
+    let seed = std::collections::hash_map::RandomState::new();
+    format!("{:016x}{:016x}", seed.hash_one(0_u8), seed.hash_one(1_u8))
 }
 
-fn next_query_id(label: &str) -> Option<String> {
-    query_id_prefix().map(|prefix| next_query_id_with_prefix(prefix, label))
+fn next_query_id_with_prefix(prefix: &str, label: &str) -> String {
+    static NAMESPACE: OnceLock<String> = OnceLock::new();
+    let namespace = NAMESPACE.get_or_init(new_query_id_namespace);
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}:{label}:{namespace}:{suffix}")
 }
 
 pub(crate) fn next_required_query_id(label: &str) -> String {
@@ -157,19 +164,6 @@ pub(crate) fn kill_query_semaphore() -> &'static std::sync::Arc<tokio::sync::Sem
     })
 }
 
-pub(crate) fn annotate_query(sql: String, label: &str) -> (String, Option<String>) {
-    let Some(query_id) = next_query_id(label) else {
-        return (sql, None);
-    };
-
-    let mut annotated = String::with_capacity(sql.len() + query_id.len() + 20);
-    annotated.push_str("/*superbank_qid=");
-    annotated.push_str(&query_id);
-    annotated.push_str("*/ ");
-    annotated.push_str(&sql);
-    (annotated, Some(query_id))
-}
-
 pub(crate) fn annotate_tcp_query(sql: String, label: &str) -> (String, String) {
     annotate_required_query(sql, label)
 }
@@ -188,6 +182,7 @@ pub(crate) fn annotate_required_query(sql: String, label: &str) -> (String, Stri
     (annotated, query_id)
 }
 
+#[cfg(test)]
 pub(crate) fn http_query_with_id(
     client: &HttpClient,
     sql: &str,
@@ -502,11 +497,26 @@ mod tests {
     use super::{
         QueryCacheConfig, QueryCacheSettingsOverrides, QueryFreshnessClass,
         append_max_execution_time_setting, build_select_settings_clause,
-        build_select_settings_clause_with_overrides, transient_shard_local_error_reason,
+        build_select_settings_clause_with_overrides, new_query_id_namespace,
+        next_query_id_with_prefix, transient_shard_local_error_reason,
     };
     use crate::processing::ProcessingError;
     use clickhouse_rs::errors::{DriverError as TcpDriverError, Error as TcpError, ServerError};
     use std::time::Duration;
+
+    #[test]
+    fn required_query_ids_separate_process_namespaces_and_calls() {
+        let first_namespace = new_query_id_namespace();
+        let second_namespace = new_query_id_namespace();
+        assert_eq!(first_namespace.len(), 32);
+        assert!(first_namespace.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first_namespace, second_namespace);
+        let first = next_query_id_with_prefix("shared-prefix", "read");
+        let second = next_query_id_with_prefix("shared-prefix", "read");
+        assert!(first.starts_with("shared-prefix:read:"));
+        assert_ne!(first, second);
+        assert_eq!(first.split(':').nth(2), second.split(':').nth(2));
+    }
 
     #[test]
     fn settings_clause_empty_when_query_settings_disabled() {
