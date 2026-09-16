@@ -219,8 +219,8 @@ Releases are tag-driven and published by GoReleaser:
 Example:
 
 ```bash
-git tag -s v0.6.0-rc1 -m "Release v0.6.0-rc1"
-git push origin v0.6.0-rc1
+git tag -s v0.6.0 -m "Release v0.6.0"
+git push origin v0.6.0
 ```
 
 Repository settings required (GitHub UI):
