@@ -75,7 +75,7 @@ fn fixture_response(
     (status, body)
 }
 
-fn cancellation_response(sql: &str, validation: bool) -> Option<Vec<u8>> {
+pub(super) fn cancellation_response(sql: &str, validation: bool) -> Option<Vec<u8>> {
     let (columns, row): (&[(&str, &str)], Vec<u8>) = if sql.contains("AS coordinator") {
         let mut row = b"\x05node1".to_vec();
         row.extend_from_slice(&1_u64.to_le_bytes());
