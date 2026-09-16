@@ -152,6 +152,7 @@ pub(crate) struct ShardTarget {
     pub(crate) shard_num: u32,
     pub(crate) tcp_pool: Arc<TcpPool>,
     pub(crate) http_client: HttpClient,
+    pub(crate) read_endpoint: super::read_query::ReadEndpoint,
     pub(crate) host: String,
     pub(crate) tcp_port: u16,
 }

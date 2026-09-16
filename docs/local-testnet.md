@@ -98,9 +98,14 @@ In a separate terminal, set `SUPERBANK_LOCAL_DIR` to the same directory and run:
 ```bash
 RPC_HOST=127.0.0.1 RPC_PORT=8899 METRICS_HOST=127.0.0.1 \
 CLICKHOUSE_URL=http://127.0.0.1:8123 CLICKHOUSE_DATABASE=default \
+CLICKHOUSE_CLUSTER='' \
 GENESIS_PATH="$SUPERBANK_LOCAL_DIR/genesis/genesis.bin" \
 RUST_LOG=info target/release/superbank-rpc
 ```
+
+Set `CLICKHOUSE_CLUSTER` to an empty string for this standalone ClickHouse instance.
+This selects local query-cancellation checks instead of resolving the default
+`{cluster}` macro, which the native configuration above does not define.
 
 CLI flags and environment variables override ingestor YAML. RPC connection
 settings are separate: passing the ingestor YAML to RPC does not configure its

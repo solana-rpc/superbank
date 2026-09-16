@@ -380,15 +380,13 @@ pub(crate) async fn handle_get_transaction(
         route.head_cache_read();
     }
 
-    // Disk tier: everything stored is finalized, which satisfies any commitment
-    // accepted above. A hit answers without ClickHouse. A miss proves nothing by
-    // itself (the signature may be older than the window or in a coverage hole) —
-    // EXCEPT when the request pinned a slot that the disk fully covers: then the
-    // transaction conclusively does not exist there.
+    // Disk results are finalized. Only a successful lookup with matching coverage
+    // can prove absence at a pinned slot; unavailable reads must reach the primary.
     #[cfg(feature = "disk-cache")]
     if let Some(disk) = state.disk_cache() {
         route.disk_cache_read();
-        if let Some(record) = disk.get_tx(signature).await {
+        let disk_result = disk.get_tx(signature, requested_slot).await;
+        if let crate::disk_cache::DiskTransactionResult::Found(record) = disk_result {
             if requested_slot.is_some_and(|slot| record.slot != slot) {
                 route.source_disk_cache();
                 route.not_found();
@@ -400,20 +398,17 @@ pub(crate) async fn handle_get_transaction(
                 id,
                 &mut route,
                 signature_str,
-                Arc::new(record),
+                record,
                 encoding,
                 config.max_supported_transaction_version,
                 None,
             )
             .await;
         }
-        if let Some(slot) = requested_slot
-            && matches!(
-                disk.slot_status(slot).await,
-                crate::disk_cache::SlotStatus::Covered { .. }
-                    | crate::disk_cache::SlotStatus::Skipped
-            )
-        {
+        if matches!(
+            disk_result,
+            crate::disk_cache::DiskTransactionResult::Absent
+        ) {
             route.source_disk_cache();
             route.not_found();
             return Ok(json_rpc_null_response(id));
