@@ -181,10 +181,13 @@ The RPC server bounds primary signature-status history work with
 `GET_SIGNATURE_STATUSES_MAX_CONCURRENCY` (default `4`) and
 `GET_SIGNATURE_STATUSES_MAX_THREADS` (default `2`). `CLICKHOUSE_CLUSTER` identifies the primary
 cluster for gateway-based termination verification in distributed HTTP mode as well as shard
-discovery in shard-direct mode. Abandoned distributed HTTP status reads use native disconnect
-cancellation and retain admission until every expected replica is observed clear twice.
-Use `rbx2` for RBX2 or an empty value for standalone ClickHouse. See the
-[RPC configuration and cancellation requirements](crates/superbank-rpc/README.md#primary-signature-status-overload-protection).
+discovery in shard-direct mode. HTTP SELECT reads use shared disconnect cancellation across
+RPC methods, local-cache reads, background readers, and shard-local HTTP reads. Cancellation
+capability is initialized before an endpoint can serve reads. Successful responses drain to EOF
+without extra probes; abandoned reads retain admission until every expected node is observed
+clear twice through a separate control connection pool. Writes and native TCP reads retain
+their existing behavior. Use `rbx2` for RBX2 or an empty value for standalone ClickHouse. See the
+[RPC configuration and cancellation requirements](crates/superbank-rpc/README.md#http-select-lifetime-and-cancellation).
 
 - `superbank` supports YAML config, CLI flags, and environment variables.
   Precedence is: flags > env > config file > defaults.

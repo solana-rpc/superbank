@@ -128,6 +128,8 @@ pub(crate) async fn run(
     cfg: FillerConfig,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
+    // The existing filler concurrency is a separate, persistent read budget.
+    let source = source.background_read_client(cfg.max_concurrency);
     info!(
         retain_slots = cfg.retain_slots,
         slots_per_query = cfg.slots_per_query,
@@ -494,17 +496,20 @@ async fn next_block_after(
         "SELECT slot, parent_slot FROM {} WHERE slot > {slot} AND slot <= {max_slot} ORDER BY slot LIMIT 1",
         source.blocks_metadata_table
     );
-    tokio::time::timeout(
-        timeout,
-        source.client.query(&query).fetch_optional::<NextBlockRow>(),
-    )
+    tokio::time::timeout(timeout, async {
+        source
+            .read_endpoint
+            .with_timeout(timeout)
+            .fetch_optional::<NextBlockRow>(&source.client, &query, "disk_cache_successor")
+            .await
+            .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))
+    })
     .await
     .map_err(|_| {
         DiskCacheError::ClickHouse(format!(
             "source successor query timed out after {timeout:?}"
         ))
     })?
-    .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))
 }
 
 fn coverage_from_metadata(
@@ -591,7 +596,7 @@ async fn native_forward(
         )
     });
     let select = format!(
-        "SELECT {column_list} FROM {} WHERE slot BETWEEN {} AND {}{order_and_limit}{} FORMAT Native",
+        "SELECT {column_list} FROM {} WHERE slot BETWEEN {} AND {}{order_and_limit}{}",
         table.logical_name,
         range.start,
         range.end,
@@ -608,7 +613,7 @@ async fn native_forward(
 
     tokio::time::timeout(
         timeout,
-        forward_http_stream(cache, source, &select, &insert),
+        forward_http_stream(cache, source, &select, &insert, timeout),
     )
     .await
     .map_err(|_| {
@@ -625,26 +630,27 @@ async fn forward_http_stream(
     source: &ClickHouseClient,
     select: &str,
     insert: &str,
+    timeout: Duration,
 ) -> Result<(), DiskCacheError> {
     let http = &cache.inner.http;
-    let mut source_url = reqwest::Url::parse(&source.url)
-        .map_err(|err| DiskCacheError::ClickHouse(format!("invalid source URL: {err}")))?;
-    source_url
-        .query_pairs_mut()
-        .append_pair("database", &source.database);
-    let mut source_request = http.post(source_url).body(select.to_string());
-    if !source.username.is_empty() {
-        source_request = source_request.basic_auth(&source.username, Some(&source.password));
-    }
-    let source_response = source_request
-        .send()
+    let cursor = source
+        .read_endpoint
+        .with_timeout(timeout)
+        .query(&source.client, select, "disk_cache_native_forward")
         .await
+        .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?
+        .fetch_bytes("Native")
         .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
-    if !source_response.status().is_success() {
-        return Err(http_error("source SELECT", source_response).await);
-    }
-
-    let body = reqwest::Body::wrap_stream(source_response.bytes_stream());
+    // Moving the guarded cursor into the INSERT body keeps source admission until
+    // EOF, or verifies source termination if either side abandons the stream.
+    let stream = futures_util::stream::try_unfold(cursor, |mut cursor| async move {
+        cursor
+            .next()
+            .await
+            .map(|chunk| chunk.map(|bytes| (bytes, cursor)))
+    });
+    let body = reqwest::Body::wrap_stream(stream);
+    // INSERT must remain writable and keep its end-of-query acknowledgement.
     let mut local_url = reqwest::Url::parse(&cache.inner.cfg.url)
         .map_err(|err| DiskCacheError::ClickHouse(format!("invalid cache URL: {err}")))?;
     local_url

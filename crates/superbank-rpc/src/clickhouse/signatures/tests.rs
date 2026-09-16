@@ -135,6 +135,7 @@ impl MockClickHouse {
                 .with_compression(clickhouse::Compression::None),
         );
         client.allow_query_settings = false;
+        client.initialize_read_cancellation().await.unwrap();
         Self {
             client,
             queries,

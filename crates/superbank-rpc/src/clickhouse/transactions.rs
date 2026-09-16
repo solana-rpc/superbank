@@ -24,6 +24,7 @@ use super::queries::{
     build_transactions_by_slot_signatures_query, build_transactions_for_address_hot_query,
     build_transactions_for_address_query,
 };
+use super::read_query::admission;
 use super::rows::{TransactionRow, fetch_single_transaction_row, map_transaction_row};
 use super::sharding::ShardTopology;
 use super::types::{
@@ -343,11 +344,10 @@ impl ClickHouseClient {
         };
         let query = build_transactions_for_address_query(&tables, query, &settings_clause)?;
 
-        let (query, query_id, mut cleanup) =
-            self.annotate_lookup_query(query, "cache_address_transactions");
         let start = Instant::now();
-        let mut cursor = super::util::http_query_with_id(&self.client, &query, query_id)
-            .fetch::<TransactionsForAddressQueryRow>()
+        let mut cursor = self
+            .read::<TransactionsForAddressQueryRow>(&query, "cache_address_transactions")
+            .await
             .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
         let mut results = Vec::new();
@@ -359,7 +359,6 @@ impl ClickHouseClient {
             results.push(row);
         }
 
-        super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
         let records = results
             .into_iter()
             .map(map_transactions_for_address_row)
@@ -491,9 +490,8 @@ impl ClickHouseClient {
 
             let start = Instant::now();
             let mut cursor = self
-                .client
-                .query(&query)
-                .fetch::<TransactionRow>()
+                .read::<TransactionRow>(&query, "get_transactions_by_slot_signatures")
+                .await
                 .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
             let mut records = Vec::new();
@@ -523,15 +521,7 @@ impl ClickHouseClient {
         &self,
         query: &str,
     ) -> ProcessingResult<(Option<TransactionRow>, QueryTimings)> {
-        let (query, query_id, mut cleanup) =
-            self.annotate_lookup_query(query.to_string(), "transaction_lookup");
-        let client = query_id.map_or_else(
-            || self.client.clone(),
-            |id| self.client.clone().with_setting("query_id", id),
-        );
-        let result = fetch_single_transaction_row(&client, &query).await?;
-        super::client::HttpQueryCleanup::disarm_optional(&mut cleanup);
-        Ok(result)
+        fetch_single_transaction_row(&self.client, &self.read_endpoint, query).await
     }
 
     pub async fn get_transaction_by_signature(
@@ -547,100 +537,149 @@ impl ClickHouseClient {
             let Some(position) = slot_opt else {
                 return Ok((None, timings));
             };
-            let slot = position.slot;
-            let slot_idx = position.slot_idx;
             let _http_permit = self.acquire_http_query_permit().await?;
-
-            let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
-                build_get_transaction_by_signature_query(
-                    table,
-                    &signature_literal,
-                    slot,
-                    slot_idx,
-                    settings_clause,
-                )
-            };
-
-            let (mut row_opt, query_timings, used_local) = if self.scope_shard_direct()
-                && self.transport_http()
-                && let (Some(topology), Some(local_table)) =
-                    (&self.shard_topology, &self.transactions_local_table)
-            {
-                let shard = topology.shard_for_hash(slot / SLOT_SHARD_DIVISOR);
-                let settings_clause = topology.get_transaction_settings_clause(
-                    "get_transaction_by_signature_local_http",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(local_table, Some(slot_idx), &settings_clause);
-
-                match fetch_single_transaction_row(&shard.http_client, &query).await {
-                    Ok(result) => (result.0, result.1, true),
-                    Err(err) => {
-                        if transient_shard_local_error_reason(&err).is_some() {
-                            topology.failover_from(&shard);
-                        }
-                        tracing::warn!(
-                            "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
-                            shard.host,
-                            shard.tcp_port,
-                            err
-                        );
-                        let settings_clause = self.select_get_transaction_settings_clause(
-                            "get_transaction_by_signature_fallback_distributed",
-                            QueryFreshnessClass::Historical,
-                        );
-                        let query =
-                            build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                        let result = self.fetch_transaction_lookup(&query).await?;
-                        (result.0, result.1, false)
-                    }
-                }
-            } else {
-                let settings_clause = self.select_get_transaction_settings_clause(
-                    "get_transaction_by_signature_distributed",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                let result = self.fetch_transaction_lookup(&query).await?;
-                (result.0, result.1, false)
-            };
-            timings.add(query_timings);
-
-            if used_local && row_opt.is_none() {
-                // The shard-local table is expected to contain the same data as the distributed table,
-                // but fall back to the distributed table to avoid false negatives if local data is
-                // incomplete (e.g. during backfills or replication lag).
-                let settings_clause = self.select_get_transaction_settings_clause(
-                    "get_transaction_by_signature_distributed_retry",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
-                let (fallback_opt, fallback_timings) =
-                    self.fetch_transaction_lookup(&query).await?;
-                timings.add(fallback_timings);
-                row_opt = fallback_opt;
-            }
-
-            if row_opt.is_none() {
-                // Fall back to the legacy query that doesn't require slot_idx to match.
-                let settings_clause = self.select_get_transaction_settings_clause(
-                    "get_transaction_by_signature_legacy_fallback",
-                    QueryFreshnessClass::Historical,
-                );
-                let query = build_query(&self.transaction_table, None, &settings_clause);
-                let (fallback_opt, fallback_timings) =
-                    self.fetch_transaction_lookup(&query).await?;
-                timings.add(fallback_timings);
-                row_opt = fallback_opt;
-            }
-
-            let Some(row) = row_opt else {
-                return Ok((None, timings));
-            };
-
-            Ok((Some(map_transaction_row(row)), timings))
+            let (record, payload_timings) = self
+                .fetch_transaction_at_position(&signature_literal, position)
+                .await?;
+            timings.add(payload_timings);
+            Ok((record, timings))
         })
         .await
+    }
+
+    /// Read an already resolved position without another signature lookup.
+    /// Admission and all position/legacy attempts share one operation deadline.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) async fn get_transaction_by_signature_and_position(
+        &self,
+        signature: &str,
+        position: SignatureSlot,
+    ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
+        self.with_http_query_timeout("get_transaction_by_signature_and_position", async {
+            let (_, literal) = decode_transaction_signature(signature)?;
+            self.fetch_transaction_at_position(&literal, position).await
+        })
+        .await
+    }
+
+    // The caller owns HTTP admission and the operation deadline.
+    async fn fetch_transaction_at_position(
+        &self,
+        signature_literal: &str,
+        position: SignatureSlot,
+    ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
+        let slot = position.slot;
+        let slot_idx = position.slot_idx;
+
+        let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
+            build_get_transaction_by_signature_query(
+                table,
+                signature_literal,
+                slot,
+                slot_idx,
+                settings_clause,
+            )
+        };
+
+        let (mut row_opt, mut timings, used_local) = self
+            .fetch_first_transaction_position(signature_literal, position)
+            .await?;
+
+        if used_local && row_opt.is_none() {
+            // The shard-local table is expected to contain the same data as the distributed table,
+            // but fall back to the distributed table to avoid false negatives if local data is
+            // incomplete (e.g. during backfills or replication lag).
+            let settings_clause = self.select_get_transaction_settings_clause(
+                "get_transaction_by_signature_distributed_retry",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
+            let (fallback_opt, fallback_timings) = self.fetch_transaction_lookup(&query).await?;
+            timings.add(fallback_timings);
+            row_opt = fallback_opt;
+        }
+
+        if row_opt.is_none() {
+            // Fall back to the legacy query that doesn't require slot_idx to match.
+            let settings_clause = self.select_get_transaction_settings_clause(
+                "get_transaction_by_signature_legacy_fallback",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(&self.transaction_table, None, &settings_clause);
+            let (fallback_opt, fallback_timings) = self.fetch_transaction_lookup(&query).await?;
+            timings.add(fallback_timings);
+            row_opt = fallback_opt;
+        }
+
+        let Some(row) = row_opt else {
+            return Ok((None, timings));
+        };
+
+        Ok((Some(map_transaction_row(row)), timings))
+    }
+
+    async fn fetch_first_transaction_position(
+        &self,
+        signature_literal: &str,
+        position: SignatureSlot,
+    ) -> ProcessingResult<(Option<TransactionRow>, QueryTimings, bool)> {
+        let slot = position.slot;
+        let slot_idx = position.slot_idx;
+        let build_query = |table: &str, slot_idx: Option<u32>, settings_clause: &str| {
+            build_get_transaction_by_signature_query(
+                table,
+                signature_literal,
+                slot,
+                slot_idx,
+                settings_clause,
+            )
+        };
+        let result = if self.scope_shard_direct()
+            && self.transport_http()
+            && let (Some(topology), Some(local_table)) =
+                (&self.shard_topology, &self.transactions_local_table)
+        {
+            let shard = topology.shard_for_hash(slot / SLOT_SHARD_DIVISOR);
+            let settings_clause = topology.get_transaction_settings_clause(
+                "get_transaction_by_signature_local_http",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(local_table, Some(slot_idx), &settings_clause);
+
+            match fetch_single_transaction_row(&shard.http_client, &shard.read_endpoint, &query)
+                .await
+            {
+                Ok(result) => (result.0, result.1, true),
+                Err(err) => {
+                    if transient_shard_local_error_reason(&err).is_some() {
+                        topology.failover_from(&shard);
+                    }
+                    tracing::warn!(
+                        "Shard {}:{} HTTP query failed; falling back to distributed table: {}",
+                        shard.host,
+                        shard.tcp_port,
+                        err
+                    );
+                    let settings_clause = self.select_get_transaction_settings_clause(
+                        "get_transaction_by_signature_fallback_distributed",
+                        QueryFreshnessClass::Historical,
+                    );
+                    let query =
+                        build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
+                    let result = self.fetch_transaction_lookup(&query).await?;
+                    (result.0, result.1, false)
+                }
+            }
+        } else {
+            let settings_clause = self.select_get_transaction_settings_clause(
+                "get_transaction_by_signature_distributed",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_query(&self.transaction_table, Some(slot_idx), &settings_clause);
+            let result = self.fetch_transaction_lookup(&query).await?;
+            (result.0, result.1, false)
+        };
+        Ok(result)
     }
 
     pub async fn get_transaction_by_signature_and_slot(
@@ -672,7 +711,9 @@ impl ClickHouseClient {
                 );
                 let query = build_query(local_table, &settings_clause);
 
-                match fetch_single_transaction_row(&shard.http_client, &query).await {
+                match fetch_single_transaction_row(&shard.http_client, &shard.read_endpoint, &query)
+                    .await
+                {
                     Ok(result) => (result.0, result.1, true),
                     Err(err) => {
                         if transient_shard_local_error_reason(&err).is_some() {
@@ -853,80 +894,93 @@ impl ClickHouseClient {
             let settings_clause = settings_clause.clone();
             let hot_query = query.clone();
 
-            join_set.spawn(async move {
-                let _permit = fanout_sem.acquire().await.ok();
-                let query_sql = build_transactions_for_address_hot_query(
-                    local_table.as_ref(),
-                    gsfa_bucket_modulus,
-                    &hot_query,
-                    settings_clause.as_ref(),
-                )
-                .map_err(|e| (shard.host.clone(), shard.tcp_port, e))?;
+            let inherited_admission = admission::current();
+            join_set.spawn(admission::scope_with(inherited_admission, async move {
+                admission::run_with_permit(
+                    fanout_sem,
+                    |_| {
+                        (
+                            shard.host.clone(),
+                            shard.tcp_port,
+                            ProcessingError::database_msg("ClickHouse fanout admission closed"),
+                        )
+                    },
+                    async {
+                        let query_sql = build_transactions_for_address_hot_query(
+                            local_table.as_ref(),
+                            gsfa_bucket_modulus,
+                            &hot_query,
+                            settings_clause.as_ref(),
+                        )
+                        .map_err(|e| (shard.host.clone(), shard.tcp_port, e))?;
 
-                match execute_shard_tcp_query_block(
-                    shard.clone(),
-                    query_timeout,
-                    "get_transactions_for_address_hot_local_tcp",
-                    "transactions_for_address_hot_local_tcp",
-                    query_sql,
+                        match execute_shard_tcp_query_block(
+                            shard.clone(),
+                            query_timeout,
+                            "get_transactions_for_address_hot_local_tcp",
+                            "transactions_for_address_hot_local_tcp",
+                            query_sql,
+                        )
+                        .await
+                        {
+                            Ok((block, timings)) => {
+                                let mut records = Vec::new();
+                                for row in block.rows() {
+                                    let query_row = TransactionsForAddressQueryRow {
+                                        signature: row.get("signature").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        slot: row.get("slot").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        slot_idx: row.get("slot_idx").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        err: row.get("err").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        memo: row.get("memo").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                        block_time: row.get("block_time").map_err(|e| {
+                                            (
+                                                shard.host.clone(),
+                                                shard.tcp_port,
+                                                ProcessingError::database(e.to_string(), e),
+                                            )
+                                        })?,
+                                    };
+                                    records.push(map_transactions_for_address_row(query_row));
+                                }
+
+                                Ok((records, timings))
+                            }
+                            Err(err) => Err((shard.host.clone(), shard.tcp_port, err)),
+                        }
+                    },
                 )
                 .await
-                {
-                    Ok((block, timings)) => {
-                        let mut records = Vec::new();
-                        for row in block.rows() {
-                            let query_row = TransactionsForAddressQueryRow {
-                                signature: row.get("signature").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                slot: row.get("slot").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                slot_idx: row.get("slot_idx").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                err: row.get("err").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                memo: row.get("memo").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                                block_time: row.get("block_time").map_err(|e| {
-                                    (
-                                        shard.host.clone(),
-                                        shard.tcp_port,
-                                        ProcessingError::database(e.to_string(), e),
-                                    )
-                                })?,
-                            };
-                            records.push(map_transactions_for_address_row(query_row));
-                        }
-
-                        Ok((records, timings))
-                    }
-                    Err(err) => Err((shard.host.clone(), shard.tcp_port, err)),
-                }
-            });
+            }));
         }
 
         let mut records = Vec::new();
@@ -1003,7 +1057,15 @@ impl ClickHouseClient {
         }
 
         let start = Instant::now();
-        let mut cursor = match shard.http_client.query(&query_sql).fetch::<QueryResult>() {
+        let mut cursor = match shard
+            .read_endpoint
+            .fetch::<QueryResult>(
+                &shard.http_client,
+                &query_sql,
+                "get_transactions_for_address_signatures_local_http",
+            )
+            .await
+        {
             Ok(cursor) => cursor,
             Err(err) => {
                 return Err(ProcessingError::database(
@@ -1081,8 +1143,15 @@ impl ClickHouseClient {
             let fanout_sem = fanout_sem.clone();
             let hot_query = query.clone();
 
-            join_set.spawn(async move {
-                let _permit = fanout_sem.acquire().await.ok();
+            let inherited_admission = admission::current();
+            join_set.spawn(admission::scope_with(inherited_admission, async move {
+                admission::run_with_permit(fanout_sem, |_| {
+                    (
+                        shard.host.clone(),
+                        shard.tcp_port,
+                        ProcessingError::database_msg("ClickHouse fanout admission closed"),
+                    )
+                }, async {
                 let timed = tokio::time::timeout(query_timeout, async {
                     let query_sql = build_transactions_for_address_hot_query(
                         local_table.as_ref(),
@@ -1092,9 +1161,13 @@ impl ClickHouseClient {
                     )?;
                     let start = Instant::now();
                     let mut cursor = shard
-                        .http_client
-                        .query(&query_sql)
-                        .fetch::<TransactionsForAddressQueryRow>()
+                        .read_endpoint
+                        .fetch::<TransactionsForAddressQueryRow>(
+                            &shard.http_client,
+                            &query_sql,
+                            "get_transactions_for_address_hot_local_http",
+                        )
+                        .await
                         .map_err(|e| ProcessingError::database(e.to_string(), e))?;
 
                     let mut records = Vec::new();
@@ -1133,7 +1206,8 @@ impl ClickHouseClient {
                         ))
                     }
                 }
-            });
+                }).await
+            }));
         }
 
         let mut records = Vec::new();
@@ -1204,59 +1278,80 @@ impl ClickHouseClient {
             let fanout_sem = fanout_sem.clone();
             let settings_clause = settings_clause.clone();
 
-            join_set.spawn(async move {
-                let _permit = fanout_sem.acquire().await.ok();
-                let query = build_transactions_by_slot_signatures_query(
-                    local_table.as_ref(),
-                    &shard_pairs,
-                    version_filter.as_ref(),
-                    settings_clause.as_ref(),
-                    in_clause_chunk,
-                );
-
-                let timed = tokio::time::timeout(query_timeout, async {
-                    let start = Instant::now();
-                    let mut cursor = shard
-                        .http_client
-                        .query(&query)
-                        .fetch::<TransactionRow>()
-                        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-
-                    let mut records = Vec::new();
-                    while let Some(row) = cursor
-                        .next()
-                        .await
-                        .map_err(|e| ProcessingError::database(e.to_string(), e))?
-                    {
-                        records.push(map_transaction_row(row));
-                    }
-
-                    let shard_timings = QueryTimings {
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                        received_bytes: cursor.received_bytes(),
-                        decoded_bytes: cursor.decoded_bytes(),
-                        rows_read: Some(0),
-                        rows_read_unknown: true,
-                        rows_returned: records.len() as u64,
-                    };
-                    Ok::<_, ProcessingError>((records, shard_timings))
-                })
-                .await;
-
-                match timed {
-                    Ok(result) => result.map_err(|e| (shard.host.clone(), shard.tcp_port, e)),
-                    Err(_) => {
-                        crate::metrics::clickhouse_timeout(
-                            "get_transactions_by_slot_signatures_local",
-                        );
-                        Err((
+            let inherited_admission = admission::current();
+            join_set.spawn(admission::scope_with(inherited_admission, async move {
+                admission::run_with_permit(
+                    fanout_sem,
+                    |_| {
+                        (
                             shard.host.clone(),
                             shard.tcp_port,
-                            ProcessingError::timeout_msg("Shard-local transaction fetch timed out"),
-                        ))
-                    }
-                }
-            });
+                            ProcessingError::database_msg("ClickHouse fanout admission closed"),
+                        )
+                    },
+                    async {
+                        let query = build_transactions_by_slot_signatures_query(
+                            local_table.as_ref(),
+                            &shard_pairs,
+                            version_filter.as_ref(),
+                            settings_clause.as_ref(),
+                            in_clause_chunk,
+                        );
+
+                        let timed = tokio::time::timeout(query_timeout, async {
+                            let start = Instant::now();
+                            let mut cursor = shard
+                                .read_endpoint
+                                .fetch::<TransactionRow>(
+                                    &shard.http_client,
+                                    &query,
+                                    "get_transactions_by_slot_signatures_local_http",
+                                )
+                                .await
+                                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+
+                            let mut records = Vec::new();
+                            while let Some(row) = cursor
+                                .next()
+                                .await
+                                .map_err(|e| ProcessingError::database(e.to_string(), e))?
+                            {
+                                records.push(map_transaction_row(row));
+                            }
+
+                            let shard_timings = QueryTimings {
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                                received_bytes: cursor.received_bytes(),
+                                decoded_bytes: cursor.decoded_bytes(),
+                                rows_read: Some(0),
+                                rows_read_unknown: true,
+                                rows_returned: records.len() as u64,
+                            };
+                            Ok::<_, ProcessingError>((records, shard_timings))
+                        })
+                        .await;
+
+                        match timed {
+                            Ok(result) => {
+                                result.map_err(|e| (shard.host.clone(), shard.tcp_port, e))
+                            }
+                            Err(_) => {
+                                crate::metrics::clickhouse_timeout(
+                                    "get_transactions_by_slot_signatures_local",
+                                );
+                                Err((
+                                    shard.host.clone(),
+                                    shard.tcp_port,
+                                    ProcessingError::timeout_msg(
+                                        "Shard-local transaction fetch timed out",
+                                    ),
+                                ))
+                            }
+                        }
+                    },
+                )
+                .await
+            }));
         }
 
         let mut records = Vec::new();
@@ -1400,3 +1495,6 @@ mod tests {
         assert!(!query.contains("ORDER BY slot_idx DESC"));
     }
 }
+
+#[cfg(all(test, feature = "disk-cache"))]
+pub(crate) mod diagnostics;

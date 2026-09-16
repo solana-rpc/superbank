@@ -3,6 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod latest_slot;
+
 use crate::solana_sdk;
 mod http_response_logs;
 mod inflation_rewards;
@@ -181,7 +183,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
     })
 }
 
-fn test_state() -> Arc<AppState> {
+pub(crate) fn test_state() -> Arc<AppState> {
     test_state_with_token_owner_activity_available(true)
 }
 

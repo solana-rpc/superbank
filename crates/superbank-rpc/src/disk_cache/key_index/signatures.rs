@@ -347,8 +347,13 @@ impl DiskCache {
             start,
             end,
         )?;
-        self.stream_signature_hashes(&sql, &tokens, self.inner.cfg.query_timeout)
-            .await
+        self.stream_signature_hashes(
+            &self.inner.maintenance_reader,
+            &sql,
+            &tokens,
+            self.inner.cfg.query_timeout,
+        )
+        .await
     }
 
     pub(in crate::disk_cache) fn signature_indexes_ready(&self) -> bool {
@@ -397,7 +402,12 @@ impl DiskCache {
         let started = std::time::Instant::now();
         let built = tokio::time::timeout(
             Duration::from_secs(300),
-            self.stream_signature_hashes(&sql, &tokens, Duration::from_secs(300)),
+            self.stream_signature_hashes(
+                &self.inner.signature_index_reader,
+                &sql,
+                &tokens,
+                Duration::from_secs(300),
+            ),
         )
         .await;
         let outcome = match &built {
@@ -455,11 +465,12 @@ impl DiskCache {
 
     async fn stream_signature_hashes(
         &self,
+        reader: &crate::clickhouse::ClickHouseClient,
         sql: &str,
         tokens: &BTreeMap<u64, u64>,
         timeout: Duration,
     ) -> Result<(), DiskCacheError> {
-        let mut builder = self.inner.local.clone();
+        let mut builder = reader.clone();
         builder.cache_partition = Some((
             self.inner.cfg.partition_slots,
             *tokens
@@ -468,19 +479,15 @@ impl DiskCache {
                 .0,
         ));
         builder.query_timeout = timeout;
-        let (sql, id, mut cleanup) =
-            builder.annotate_lookup_query(sql.into(), "signature_index_keys");
-        let client = builder
-            .client
-            .clone()
-            .with_setting("query_id", id.unwrap_or_default())
+        let mut cursor = builder
+            .read_query(sql, "signature_index_keys")
+            .await
+            .map_err(|e| DiskCacheError::ClickHouse(e.to_string()))?
             .with_setting("max_threads", "1")
             .with_setting("max_memory_usage", "67108864")
             .with_setting("max_block_size", "8192")
             .with_setting("preferred_block_size_bytes", "1048576")
-            .with_setting("max_execution_time", timeout.as_secs_f64().to_string());
-        let mut cursor = client
-            .query(&sql)
+            .with_setting("max_execution_time", timeout.as_secs_f64().to_string())
             .fetch::<SignatureRow>()
             .map_err(|e| DiskCacheError::ClickHouse(e.to_string()))?;
         let mut batch = Vec::with_capacity(UPDATE_BATCH);
@@ -501,9 +508,6 @@ impl DiskCache {
         self.inner
             .key_index
             .insert_signature_hashes(tokens, &batch)?;
-        if let Some(cleanup) = &mut cleanup {
-            cleanup.disarm();
-        }
         Ok(())
     }
 }
