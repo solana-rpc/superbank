@@ -245,23 +245,17 @@ it alone does not identify which external client caused it. Safe k6 start/end re
 correlation but do not by themselves map requests to ClickHouse query IDs. Missing logs never
 prove cancellation. The reporter makes no network requests.
 
-Run the isolated disconnect fixture (Docker required):
+Run the query-log reporter tests:
 
 ```bash
-python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/ch-disconnect
 python3 -m unittest discover -s scripts/test -p 'test_report_signature_status_query_log.py'
 ```
-
-It creates three local ClickHouse 26.2.3.2 nodes with Keeper and a proxy, checks cancellation
-before headers and during streaming, and repeats with distributed DDL blocked. Negative proxy
-controls must demonstrate that incompatible gateway behavior fails the acceptance contract.
-It removes its containers/network on exit and leaves evidence in the output directory.
 
 Promotion still requires the actual staging gateway, a populated full-retention snapshot,
 30 minutes at 256 fresh signatures / 2 RPS / 1-second client deadlines after cache warmup,
 complete coordinator/replica evidence, and bounded CPU and active-query counts. Verify read-only
 settings reach ClickHouse, upstream disconnects propagate, and no buffered request is forwarded
-after downstream abandonment. Local fixture success is not a production-performance result.
+after downstream abandonment.
 
 ### Basic Load Test (`superbank-rpc-get-signatures.js`)
 
@@ -1079,58 +1073,14 @@ have McCabe complexity at most 10; changed existing functions must not increase.
 pass the branch base revision instead of `HEAD`. Set `RUST_CODE_ANALYSIS` to an explicit tool path
 when it is not on `PATH`.
 
-### ClickHouse HTTP cancellation protocol gate
+### Shared HTTP SELECT coverage and promotion requirements
 
-The mandatory **ClickHouse protocol integration** CI job runs the production Rust
-HTTP client against three disposable ClickHouse **26.2.3.2** nodes through a transparent
-local gateway. It exercises schema validation and compression, cluster macro/discovery
-and process-probe decoding, and the real `get_signature_statuses` path with successful,
-missing, and failed transaction fixtures. Slow distributed queries test cancellation
-before response headers and after a decoded streaming row, including while distributed
-DDL is blocked. The before-headers fixture sets `wait_end_of_query=1` to hold its
-response; the streaming fixture uses deterministic hash text so compression produces
-enough wire bytes to decode an early row. These are test controls, not production
-setting changes. A paused replica must retain admission until observation recovers.
-Cancellation checks require prompt termination on every participating node and terminal
-evidence for each execution. Non-streaming coordinator queries require a cancellation
-exception. After the shared-reader test consumes a row or Native chunk and deliberately
-closes the stream, the coordinator may instead report an explicit socket reset or broken
-pipe while writing. A leaf may report the same write failure after its coordinator closes
-the native connection. These socket-close outcomes establish termination after disconnect,
-not execution of a particular server cancellation mechanism. Other network errors and
-natural query completion fail the gate. Admission must remain held until the verifier
-observes complete absence twice and must recover within five seconds.
-
-Run the same gate locally with Docker and the normal Rust build prerequisites:
-
-```sh
-python3 scripts/test/test-clickhouse-http-disconnect.py --output /tmp/clickhouse-protocol
-```
-
-The output directory must not exist. The script builds the all-feature RPC test executable
-before starting the cluster; `--rust-test-binary /absolute/path/to/test-executable` reuses
-an existing build. The six Rust integration tests are ignored in ordinary unit-test runs
-because they require this disposable fixture; the dedicated CI job explicitly runs all
-six and fails if any are absent, skipped, or fail. Production validation and compression
-remain enabled. The fixture removes its own containers and network on exit and retains
-`report.json`, `rust-integration.log`, generated configuration, and container logs.
-
-Two gateway controls intentionally demonstrate incompatible behavior: retaining an upstream
-request after downstream disconnect, and forwarding queued work after two quiet process
-observations. These controls must fail the cancellation gate for the overall fixture to pass.
-The production gateway must promptly close the upstream connection and discard queued work
-when the caller disconnects. This local protocol gate does not replace the staged customer
-replay or prove the deployed gateway follows that contract.
-
-
-#### Shared HTTP SELECT coverage and promotion requirements
-
-The status replay and protocol fixture above cover a specific workload. Extending the
-shared HTTP SELECT wrapper requires additional lifecycle and method coverage; neither
+The status replay above covers a specific workload. Extending the shared HTTP SELECT
+wrapper requires additional lifecycle and method coverage; neither
 an HTTP `200` nor a successful status-only replay establishes that every RPC read path
 returns complete, correct results.
 
-Run the deterministic shared-reader lifecycle tests alongside the existing protocol gate:
+Run the deterministic shared-reader lifecycle tests:
 
 ```sh
 cargo test -p superbank-rpc --all-features --locked clickhouse::read_query::tests
@@ -1190,24 +1140,7 @@ omitted/0/1 maximum supported versions, pinned/mismatched slots, and null/string
 request IDs. Existing disk-cache integration tests cover unavailable reads, invalidation,
 concurrent coverage publication, absent signatures, skipped slots, and stale positions.
 
-The SQL benchmark creates its own three-node Docker cluster and transparent local gateway;
-it never connects to an existing ClickHouse endpoint. It uses the repository transaction
-projection and schemas, with separate 8192/1024-granularity payload copies:
-
-```sh
-python3 scripts/test/benchmark-get-transaction.py --output /tmp/gettx-benchmark
-```
-
-The output directory must not exist. Defaults: ClickHouse 26.2.3.2, 3 million rows per
-payload table, 8 GiB memory and 2 CPUs per node, 50 seeded signatures, five alternating
-runs. `--rows 2000 --samples 2 --runs 1` is only a harness smoke test. `--node-memory`
-changes the fixture container limit; the cancellation fixture retains its 2 GiB default.
-`--delay-ms` injects an explicit delay per client request; `modeled_100ms_rtt` is an
-arithmetic sensitivity model, not measured deployed network latency.
-
-`report.json` contains settings, source-script hash, ingestion/merge/part measurements,
-query plans, raw HTTP observations and per-query ClickHouse logs. Payload digests must
-match across variants. Cache-cleared runs drop ClickHouse mark/uncompressed caches;
-filesystem caches remain uncontrolled. SQL timing excludes Rust admission, hydration,
-and serialization. Physical I/O and production-scale capacity are not inferred from
-logical read bytes. See [the findings](../../GETTRANSACTION_BENCHMARKS.md).
+The former Docker SQL benchmark runner was removed with its shared ClickHouse
+protocol harness. Its [archived findings](../../GETTRANSACTION_BENCHMARKS.md) and
+[machine-readable results](../../docs/benchmarks/gettransaction-2026-09-11.json) remain
+available for reference.

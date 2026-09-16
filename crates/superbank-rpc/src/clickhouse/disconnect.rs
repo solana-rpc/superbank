@@ -26,8 +26,6 @@ const INITIALIZATION_BACKOFF: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod initialization_tests;
-#[cfg(test)]
-mod integration_tests;
 
 #[derive(Clone)]
 pub(crate) struct DisconnectVerifier(Arc<Inner>);

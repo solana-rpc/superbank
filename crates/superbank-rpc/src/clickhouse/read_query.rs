@@ -220,7 +220,7 @@ impl ReadQuery {
         }
     }
 
-    #[cfg(any(test, feature = "disk-cache"))]
+    #[cfg(feature = "disk-cache")]
     pub(crate) fn fetch_bytes(mut self, format: impl AsRef<str>) -> Result<ReadBytesCursor> {
         match Self::protected_query(self.query).fetch_bytes(format) {
             Ok(cursor) => {
@@ -312,14 +312,14 @@ impl<T: RowOwned + RowRead> ReadCursor<T> {
     }
 }
 
-#[cfg(any(test, feature = "disk-cache"))]
+#[cfg(feature = "disk-cache")]
 pub(crate) struct ReadBytesCursor {
     cursor: Option<clickhouse::query::BytesCursor>,
     guard: Option<DisconnectGuard>,
     deadline: Instant,
 }
 
-#[cfg(any(test, feature = "disk-cache"))]
+#[cfg(feature = "disk-cache")]
 impl ReadBytesCursor {
     pub(crate) async fn next(&mut self) -> Result<Option<axum::body::Bytes>> {
         let Some(cursor) = self.cursor.as_mut() else {
