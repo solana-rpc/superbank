@@ -324,6 +324,18 @@ pub struct RpcConfig {
     )]
     pub(crate) clickhouse_http_connect_timeout_ms: u64,
 
+    /// Per-query timeout (ms) for cancellation macro resolution, discovery and startup probes.
+    #[arg(long, env = "CLICKHOUSE_STARTUP_VERIFICATION_TIMEOUT_MS",
+        default_value_t = crate::clickhouse::verification::DEFAULT_STARTUP_VERIFICATION_TIMEOUT_MS,
+        value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) clickhouse_startup_verification_timeout_ms: u64,
+
+    /// Per-batch timeout (ms) for abandoned-query termination verification.
+    #[arg(long, env = "CLICKHOUSE_RUNTIME_VERIFICATION_TIMEOUT_MS",
+        default_value_t = crate::clickhouse::verification::DEFAULT_RUNTIME_VERIFICATION_TIMEOUT_MS,
+        value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) clickhouse_runtime_verification_timeout_ms: u64,
+
     /// Minimum connections retained per shard in each ClickHouse native (TCP) connection pool.
     #[arg(long, env = "CLICKHOUSE_TCP_POOL_MIN", default_value_t = 10)]
     pub(crate) clickhouse_tcp_pool_min: usize,
@@ -860,6 +872,85 @@ mod config_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn verification_timeout_defaults_overrides_and_validation() {
+        // Other feature tests parse configuration without ENV_LOCK. Isolate all env mutation.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::config_tests::verification_timeout_config_in_isolation",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "run by verification_timeout_defaults_overrides_and_validation in an isolated process"]
+    fn verification_timeout_config_in_isolation() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.clickhouse_startup_verification_timeout_ms, 10_000);
+        assert_eq!(cfg.clickhouse_runtime_verification_timeout_ms, 10_000);
+        for (flag, env, startup) in [
+            (
+                "--clickhouse-startup-verification-timeout-ms",
+                "CLICKHOUSE_STARTUP_VERIFICATION_TIMEOUT_MS",
+                true,
+            ),
+            (
+                "--clickhouse-runtime-verification-timeout-ms",
+                "CLICKHOUSE_RUNTIME_VERIFICATION_TIMEOUT_MS",
+                false,
+            ),
+        ] {
+            let values = |cfg: RpcConfig| {
+                if startup {
+                    (
+                        cfg.clickhouse_startup_verification_timeout_ms,
+                        cfg.clickhouse_runtime_verification_timeout_ms,
+                    )
+                } else {
+                    (
+                        cfg.clickhouse_runtime_verification_timeout_ms,
+                        cfg.clickhouse_startup_verification_timeout_ms,
+                    )
+                }
+            };
+            assert_eq!(
+                values(RpcConfig::parse_from(["superbank-rpc", flag, "1234"])),
+                (1234, 10_000)
+            );
+            let _env = EnvVarGuard::set(env, "2345");
+            assert_eq!(
+                values(RpcConfig::parse_from(["superbank-rpc"])),
+                (2345, 10_000)
+            );
+            assert_eq!(
+                values(RpcConfig::parse_from(["superbank-rpc", flag, "3456"])),
+                (3456, 10_000)
+            );
+            for invalid in ["0", "-1", "1.5", "no", "18446744073709551616"] {
+                assert!(RpcConfig::try_parse_from(["superbank-rpc", flag, invalid]).is_err());
+                let _bad_env = EnvVarGuard::set(env, invalid);
+                assert!(RpcConfig::try_parse_from(["superbank-rpc"]).is_err());
+            }
+        }
+        let _startup = EnvVarGuard::set("CLICKHOUSE_STARTUP_VERIFICATION_TIMEOUT_MS", "12000");
+        let _runtime = EnvVarGuard::set("CLICKHOUSE_RUNTIME_VERIFICATION_TIMEOUT_MS", "13000");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.clickhouse_startup_verification_timeout_ms, 12000);
+        assert_eq!(cfg.clickhouse_runtime_verification_timeout_ms, 13000);
     }
 
     #[test]

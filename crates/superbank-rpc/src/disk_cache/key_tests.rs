@@ -716,9 +716,32 @@ async fn key_routing_clickhouse_integration() {
             format!("{database}.gsfa_hot"),
         ),
     );
+    source.verification_timeouts = crate::clickhouse::verification::VerificationTimeouts {
+        startup: Duration::from_millis(1234),
+        runtime: Duration::from_millis(2345),
+    };
     source.use_table_names(ClickHouseTableNames::in_database(&database));
     let cfg = config(url, cache_database.clone());
     let cache = DiskCache::open(cfg.clone(), &source).await.unwrap();
+    assert_eq!(
+        cache.inner.admin.read_endpoint.verification_timeouts(),
+        source.verification_timeouts
+    );
+    assert_eq!(
+        cache.inner.local.read_endpoint.verification_timeouts(),
+        source.verification_timeouts
+    );
+
+    for reader in [
+        &cache.inner.maintenance_reader,
+        &cache.inner.address_index_reader,
+        &cache.inner.signature_index_reader,
+    ] {
+        assert_eq!(
+            reader.read_endpoint.verification_timeouts(),
+            source.verification_timeouts
+        );
+    }
     insert_transactions(&client, &cache_database).await;
     cache
         .publish_range_coverage(

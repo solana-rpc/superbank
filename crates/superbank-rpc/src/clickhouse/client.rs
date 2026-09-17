@@ -347,6 +347,7 @@ pub struct ClickHouseClient {
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) replica_health_check_interval: Duration,
     pub(crate) http_connect_timeout: Duration,
+    pub(crate) verification_timeouts: super::verification::VerificationTimeouts,
     pub(crate) fanout_sem: Arc<Semaphore>,
     // Bounds concurrent direct (scalar/lookup) ClickHouse HTTP queries server-wide so HTTP
     // connection demand does not track raw request/batch concurrency. Acquired only by explicitly
@@ -405,6 +406,7 @@ pub struct ClickHouseClientOptions {
     pub fanout_concurrency: usize,
     pub http_concurrency: usize,
     pub http_connect_timeout: Duration,
+    pub verification_timeouts: super::verification::VerificationTimeouts,
     pub tcp_pool_min: usize,
     pub tcp_pool_max: usize,
     pub in_clause_chunk: usize,
@@ -508,6 +510,7 @@ impl ClickHouseClientOptions {
             fanout_concurrency: 8,
             http_concurrency: 512,
             http_connect_timeout: Duration::from_secs(2),
+            verification_timeouts: super::verification::VerificationTimeouts::default(),
             tcp_pool_min: 10,
             tcp_pool_max: 20,
             in_clause_chunk: 512,
@@ -563,6 +566,14 @@ impl ClickHouseClientOptions {
         self
     }
 
+    pub fn with_verification_timeouts(
+        mut self,
+        timeouts: super::verification::VerificationTimeouts,
+    ) -> Self {
+        self.verification_timeouts = timeouts;
+        self
+    }
+
     pub fn with_http_connect_timeout(mut self, timeout: Duration) -> Self {
         self.http_connect_timeout = timeout;
         self
@@ -614,6 +625,7 @@ impl ClickHouseClient {
             fanout_concurrency,
             http_concurrency,
             http_connect_timeout,
+            verification_timeouts,
             tcp_pool_min,
             tcp_pool_max,
             in_clause_chunk,
@@ -700,6 +712,7 @@ impl ClickHouseClient {
         let read_endpoint = super::read_query::ReadEndpoint::new(
             control,
             query_cleanup_cluster.clone(),
+            verification_timeouts,
             http_concurrency,
             query_timeout,
             "primary",
@@ -747,6 +760,7 @@ impl ClickHouseClient {
             tcp_access_check_timeout,
             replica_health_check_interval,
             http_connect_timeout,
+            verification_timeouts,
             fanout_sem: Arc::new(Semaphore::new(fanout_concurrency.max(1))),
             http_query_sem: Arc::new(Semaphore::new(http_concurrency.max(1))),
             tcp_pool_max: tcp_pool_max.max(1),
@@ -960,6 +974,7 @@ impl ClickHouseClient {
         self.read_endpoint = super::read_query::ReadEndpoint::new(
             client.clone(),
             self.query_cleanup_cluster.clone(),
+            self.verification_timeouts,
             self.http_query_sem.available_permits().max(1),
             self.query_timeout,
             "primary",
@@ -1890,6 +1905,7 @@ impl ClickHouseClient {
             read_endpoint: super::read_query::ReadEndpoint::new(
                 self.build_http_client(shard_url.as_str()),
                 None,
+                self.verification_timeouts,
                 self.http_query_sem.available_permits().max(1),
                 self.query_timeout,
                 "shard",
@@ -2410,6 +2426,66 @@ mod tests {
     };
     use crate::processing::ProcessingError;
 
+    #[test]
+    fn verification_budgets_propagate_to_primary_shards_and_derived_readers() {
+        use crate::clickhouse::verification::VerificationTimeouts;
+        let options = ClickHouseClientOptions::new(
+            RoutingPolicy {
+                transport: RoutingTransport::Http,
+                scope: RoutingScope::ShardDirect,
+            },
+            None,
+            vec![],
+            "default.gsfa_hot".into(),
+            "default.gsfa_hot_local".into(),
+        );
+        assert_eq!(
+            options.verification_timeouts.startup,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            options.verification_timeouts.runtime,
+            Duration::from_secs(10)
+        );
+        let budgets = VerificationTimeouts {
+            startup: Duration::from_millis(1234),
+            runtime: Duration::from_millis(2345),
+        };
+        let mut client = ClickHouseClient::new(
+            "http://127.0.0.1:8123",
+            "default",
+            "",
+            "",
+            options.with_verification_timeouts(budgets),
+        );
+        assert_eq!(client.read_endpoint.verification_timeouts(), budgets);
+        assert_eq!(client.http_connect_timeout, Duration::from_secs(2));
+        assert_eq!(client.query_timeout, Duration::from_secs(8));
+        let cloned = client.clone();
+        assert_eq!(cloned.read_endpoint.verification_timeouts(), budgets);
+        assert_eq!(
+            cloned
+                .read_endpoint
+                .background(2)
+                .with_timeout(Duration::from_secs(60))
+                .verification_timeouts(),
+            budgets
+        );
+        let shard = client
+            .build_shard_target(
+                &reqwest::Url::parse("http://127.0.0.1:8123").unwrap(),
+                8123,
+                1,
+                "127.0.0.1".into(),
+                9000,
+                "test",
+            )
+            .unwrap();
+        assert_eq!(shard.read_endpoint.verification_timeouts(), budgets);
+        client.set_http_client_for_tests(clickhouse::Client::default());
+        assert_eq!(client.read_endpoint.verification_timeouts(), budgets);
+    }
+
     #[tokio::test]
     async fn primary_status_admission_is_shared_and_precedes_http_admission() {
         let client = test_client_with_hot_addresses(Vec::new());
@@ -2522,6 +2598,7 @@ mod tests {
         let endpoint = crate::clickhouse::read_query::ReadEndpoint::new(
             http.clone(),
             None,
+            Default::default(),
             2,
             Duration::from_secs(1),
             "primary",
@@ -3149,6 +3226,7 @@ nodes:
                 .with_validation(false)
                 .with_compression(clickhouse::Compression::None),
             None,
+            client.verification_timeouts,
             1,
             Duration::from_secs(1),
             "shard",

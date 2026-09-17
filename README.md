@@ -188,7 +188,13 @@ discovery in shard-direct mode. HTTP SELECT reads use shared disconnect cancella
 RPC methods, local-cache reads, background readers, and shard-local HTTP reads. Cancellation
 capability is initialized before an endpoint can serve reads. Successful responses drain to EOF
 without extra probes; abandoned reads retain admission until every expected node is observed
-clear twice through a separate control connection pool. Writes and native TCP reads retain
+clear twice through a separate control connection pool. Startup and runtime verification each
+have a 10-second default: `CLICKHOUSE_STARTUP_VERIFICATION_TIMEOUT_MS` applies per initialization
+query and `CLICKHOUSE_RUNTIME_VERIFICATION_TIMEOUT_MS` applies per abandoned-query batch.
+Both accept positive integer milliseconds (CLI flags take precedence). They leave normal query
+deadlines and the independent 2-second HTTP connection timeout unchanged. Longer runtime probes
+retain admission longer; the five-second unconfirmed threshold is evaluated after a probe finishes.
+Writes and native TCP reads retain
 their existing behavior. Use `rbx2` for RBX2 or an empty value for standalone ClickHouse. See the
 [RPC configuration and cancellation requirements](crates/superbank-rpc/README.md#http-select-lifetime-and-cancellation).
 
