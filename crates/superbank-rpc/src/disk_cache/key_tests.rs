@@ -922,3 +922,5 @@ async fn key_routing_clickhouse_integration() {
 }
 
 mod diagnostics;
+
+mod agave43;

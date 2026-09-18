@@ -7364,3 +7364,6 @@ async fn get_block_clickhouse_partial_payload_repair() {
 }
 
 mod agave_43;
+
+#[cfg(feature = "grpc-head-cache")]
+mod agave43_cached_encoding;
