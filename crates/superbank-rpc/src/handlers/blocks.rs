@@ -2363,10 +2363,7 @@ pub(crate) async fn handle_get_inflation_reward(
         return Ok(json_rpc_error_response(
             id,
             -32602,
-            format!(
-                "Invalid params: too many addresses; maximum is {}",
-                max_addresses
-            ),
+            format!("Too many inputs provided; max {}", max_addresses),
             None,
         ));
     }

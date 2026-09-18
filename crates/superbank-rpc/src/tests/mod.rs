@@ -2734,10 +2734,7 @@ async fn get_inflation_reward_rejects_more_than_configured_address_limit() {
     let parsed = parse_json_rpc_response(response).await;
     let err = parsed.error.expect("error present");
     assert_eq!(err.code, -32602);
-    assert_eq!(
-        err.message,
-        "Invalid params: too many addresses; maximum is 100"
-    );
+    assert_eq!(err.message, "Too many inputs provided; max 100");
 }
 
 #[tokio::test]
@@ -7365,3 +7362,5 @@ async fn get_block_clickhouse_partial_payload_repair() {
     }
     execute(&http, &url, format!("DROP DATABASE {database}")).await;
 }
+
+mod agave_43;
