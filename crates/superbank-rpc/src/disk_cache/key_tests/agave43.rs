@@ -175,3 +175,77 @@ async fn assert_block_encoding_matrix(
     }
 }
 
+async fn insert_vat_rewards(
+    client: &clickhouse::Client,
+    database: &str,
+    slot: u64,
+    spelling: &str,
+) {
+    let columns = format!(
+        "rewards_present=1,rewards_pubkey=[toFixedString('vat',32),toFixedString('stake',32)],rewards_lamports=[-10,100],rewards_post_balance=[90,200],rewards_type=['{spelling}','Staking'],rewards_commission=[NULL,7],rewards_commission_bps=[NULL,725]"
+    );
+    execute(client,&format!("ALTER TABLE {database}.blocks_metadata UPDATE {columns} WHERE slot={slot} SETTINGS mutations_sync=2")).await;
+    let tx_columns = columns
+        .replace("rewards_present", "meta_rewards_present")
+        .replace("rewards_", "meta_reward_")
+        .replace("meta_meta_reward_present", "meta_rewards_present");
+    execute(client,&format!("ALTER TABLE {database}.transactions UPDATE {tx_columns} WHERE slot={slot} SETTINGS mutations_sync=2")).await;
+}
+
+fn assert_vat_json(rewards: &Value) {
+    assert_eq!(rewards[0]["rewardType"], "VATDebit");
+    assert_eq!(rewards[0]["lamports"], -10);
+    assert_eq!(rewards[0]["postBalance"], 90);
+    assert_eq!(rewards[1]["commission"], 7);
+    assert_eq!(rewards[1]["commissionBps"], 725);
+}
+
+async fn assert_vat_cache(source: &ClickHouseClient, cache: &DiskCache, slot: u64, spelling: &str) {
+    let stored = found_transaction(cache.get_tx(signature(slot), Some(slot)).await);
+    assert_eq!(
+        stored.meta_reward_type,
+        vec![Some(spelling.to_owned()), Some("Staking".to_owned())]
+    );
+    assert_eq!(stored.meta_reward_lamports, vec![-10, 100]);
+    assert_eq!(stored.meta_reward_post_balance, vec![90, 200]);
+    assert_eq!(stored.meta_reward_commission, vec![None, Some(7)]);
+    assert_eq!(stored.meta_reward_commission_bps, vec![None, Some(725)]);
+    let offline = source_client("http://127.0.0.1:1", "unavailable");
+    let config = json!({"slot":slot,"encoding":"json","maxSupportedTransactionVersion":1});
+    let expected = transaction_response(source, None, signature(slot), config.clone()).await;
+    let actual = transaction_response(&offline, Some(cache), signature(slot), config).await;
+    assert_eq!(actual, expected);
+    assert_vat_json(&actual["result"]["meta"]["rewards"]);
+    let DiskBlockResult::Found(block) = cache.get_block(slot, TransactionDetails::Full, true).await
+    else {
+        panic!("cached block missing")
+    };
+    assert_eq!(block.metadata().rewards_type, stored.meta_reward_type);
+    assert_eq!(
+        block.metadata().rewards_lamports,
+        stored.meta_reward_lamports
+    );
+    let config = json!({"encoding":"json","maxSupportedTransactionVersion":1});
+    let block = block_response(&offline, cache, slot, config).await;
+    assert_vat_json(&block["result"]["rewards"]);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable ClickHouse: DISK_CACHE_TEST_URL"]
+async fn agave43_vat_native_fill_and_restart() {
+    let (client, source, cfg, cache) = setup().await;
+    let database = cfg.database.trim_end_matches("_cache");
+    for (slot, spelling) in [(10, "VATDebit"), (11, "validator-admission-ticket-debit")] {
+        insert_vat_rewards(&client, database, slot, spelling).await;
+    }
+    fill(&cache, &source).await;
+    for (slot, spelling) in [(10, "VATDebit"), (11, "validator-admission-ticket-debit")] {
+        assert_vat_cache(&source, &cache, slot, spelling).await;
+    }
+    drop(cache);
+    let reopened = DiskCache::open(cfg.clone(), &source).await.unwrap();
+    for (slot, spelling) in [(10, "VATDebit"), (11, "validator-admission-ticket-debit")] {
+        assert_vat_cache(&source, &reopened, slot, spelling).await;
+    }
+    cleanup(&client, &cfg).await;
+}
