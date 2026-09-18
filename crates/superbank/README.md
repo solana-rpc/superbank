@@ -395,3 +395,17 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - Bigtable slot lists do not require `RPC_URL` because slots are explicit.
 - Superbank forces `async_insert=0` by default for ClickHouse writes; enable `--clickhouse-async-insert`
   only when your ClickHouse profile and dependent materialized views support it.
+
+## Agave 4.3 archive regression
+
+Build the production binaries and run against a disposable loopback ClickHouse
+26.1 or newer (the test creates and drops only uniquely named test databases):
+
+```sh
+cargo build -p superbank -p superbank-solparq -p superbank-rpc --all-features --locked
+DISK_CACHE_TEST_URL=http://127.0.0.1:18196 python3 scripts/test/agave43-archive-roundtrip.py
+```
+
+This exercises local bundle export, manifest discovery, ingestor restore and RPC
+hydration for VAT debits and historical commission fields. Its local produced-slot
+reference is deterministic test data; it does not qualify a live Agave producer.
