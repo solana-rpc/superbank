@@ -61,7 +61,7 @@ impl Fixture {
             .with_validation(false)
             .with_compression(clickhouse::Compression::None);
         Self {
-            verifier: DisconnectVerifier::new(client, None),
+            verifier: DisconnectVerifier::new(client, None, Default::default()),
             mode,
             requests,
             entered,
@@ -125,7 +125,7 @@ async fn cancelled_initialization_backs_off_and_releases_admission() {
     let verifier = fixture.verifier.clone();
     let permit = permits.clone().try_acquire_owned().unwrap();
     let task = tokio::spawn(async move { verifier.arm("cancelled".into(), permit).await });
-    tokio::time::timeout(PROBE_TIMEOUT, fixture.entered.notified())
+    tokio::time::timeout(Duration::from_secs(1), fixture.entered.notified())
         .await
         .unwrap();
     task.abort();

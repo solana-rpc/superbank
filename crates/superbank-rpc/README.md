@@ -117,7 +117,7 @@ Initialization uses a separate control connection pool, validates unique `hostNa
 identities, and executes the actual process-inspection probe before caching success.
 Ready reads perform no discovery or process probes on their successful path.
 Failed or cancelled initialization shares a one-second retry backoff across client clones;
-internal logs include the failing phase and underlying error.
+internal logs include the failing phase and selected timeout.
 
 Configure `CLICKHOUSE_CLUSTER=rbx2` for RBX2, or an empty string for standalone ClickHouse.
 Existing `{cluster}` macros remain supported. Distributed verification uses the configured
@@ -138,9 +138,25 @@ and associated workflow permits until termination is confirmed.
 One verifier is shared by clones of each endpoint and uses its separate control pool.
 It probes pending IDs in batches of at most **128**, with one probe in flight per verifier.
 Two consecutive fully covered observations must show neither the query ID nor its
-`initial_query_id` on any expected node. Checks run at a 250 ms interval with one-thread,
-one-second HTTP/server probe budgets. After five seconds without confirmation, the read
-records `unconfirmed`, retains its permits, and retries at a one-second interval.
+`initial_query_id` on any expected node. Checks run at a 250 ms interval with one-thread probes.
+The startup and runtime verification budgets each default to **10 seconds**. Set
+`--clickhouse-startup-verification-timeout-ms` / `CLICKHOUSE_STARTUP_VERIFICATION_TIMEOUT_MS`
+for each macro-resolution, topology-discovery, and capability-probe query, including retries.
+This is a per-query budget, not an overall startup deadline. Set
+`--clickhouse-runtime-verification-timeout-ms` / `CLICKHOUSE_RUNTIME_VERIFICATION_TIMEOUT_MS`
+for each runtime batch that verifies abandoned reads. Both options require positive integer
+milliseconds; CLI flags override the environment, and neither option disables verification.
+The client enforces the exact millisecond budget. ClickHouse `max_execution_time` and
+`max_execution_time_leaf` round that budget up to whole seconds. Both budgets propagate to
+primary, shard, and local-cache endpoints, including clones and background readers.
+The independent HTTP connection timeout remains **2 seconds** by default; raising a verification
+budget does not extend connection establishment or change normal query deadlines.
+
+After a probe completes, reads still unconfirmed after five seconds record `unconfirmed`,
+retain their permits, and retry at a one-second interval. A slow 10-second probe can delay
+that warning beyond five seconds. The 250 ms polling delay, one-second unconfirmed retry,
+one-second idle-worker wakeup, and one-second initialization backoff are independent of the
+verification budgets. Longer runtime probes hold admission longer and delay later batches.
 Probe errors, incomplete coverage, or changed topology reset the absence evidence;
 none establishes termination. Later successful verification restores capacity. A failed
 verifier can therefore hold all capacity in the affected admission lane and make new
@@ -679,6 +695,8 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--clickhouse-query-timeout-ms` | `CLICKHOUSE_QUERY_TIMEOUT_MS` | `8000` | ClickHouse operation timeout (ms), including admission and response consumption. HTTP abandonment closes the data response and retains read/workflow admission until termination verification succeeds; optional query `SETTINGS` also carry `max_execution_time`. Explicit method and background range deadlines remain supported. Shard-direct TCP retains its shorter internal attempt timeout and best-effort cleanup. Keep this parent timeout below `RPC_REQUEST_TIMEOUT_MS`. |
 | `--clickhouse-http-max-concurrency` | `CLICKHOUSE_HTTP_MAX_CONCURRENCY` | `512` | Concurrency budget for direct ClickHouse HTTP work, shared across client clones. Abandoned reads retain associated admission through termination verification. Existing shard fanout and method limits remain active; background readers have dedicated lanes, and verifier probes use a separate control pool. Excess reads wait within the applicable operation timeout. Set at or below the ClickHouse per-user connection/query budget. |
 | `--clickhouse-http-connect-timeout-ms` | `CLICKHOUSE_HTTP_CONNECT_TIMEOUT_MS` | `2000` | TCP connect timeout (ms) for ClickHouse HTTP connections, so a new connection attempt fails fast during ClickHouse backpressure instead of hanging. |
+| `--clickhouse-startup-verification-timeout-ms` | `CLICKHOUSE_STARTUP_VERIFICATION_TIMEOUT_MS` | `10000` | Positive per-query cancellation initialization budget (ms), including macro resolution, topology discovery, capability probes and retries. Independent of connection and normal query timeouts. |
+| `--clickhouse-runtime-verification-timeout-ms` | `CLICKHOUSE_RUNTIME_VERIFICATION_TIMEOUT_MS` | `10000` | Positive per-batch abandoned-query verification budget (ms). Slow probes retain admission and can delay the five-second unconfirmed warning until the probe completes. |
 | `--clickhouse-query-cache-enabled` | `CLICKHOUSE_QUERY_CACHE_ENABLED` | `false` | Enables ClickHouse query cache settings for historical read queries. |
 | `--clickhouse-query-cache-ttl-seconds` | `CLICKHOUSE_QUERY_CACHE_TTL_SECONDS` | `1` | TTL for cached historical read query results (seconds). |
 | `--clickhouse-get-transaction-query-cache-ttl-seconds` | `CLICKHOUSE_GET_TRANSACTION_QUERY_CACHE_TTL_SECONDS` | `300` | TTL override applied only to historical `getTransaction` point lookups when query cache is enabled. |

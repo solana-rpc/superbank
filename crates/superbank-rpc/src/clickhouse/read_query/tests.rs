@@ -133,7 +133,14 @@ impl Fixture {
             .with_url(url)
             .with_validation(false)
             .with_compression(clickhouse::Compression::None);
-        let endpoint = ReadEndpoint::new(client.clone(), None, 1, timeout, "primary");
+        let endpoint = ReadEndpoint::new(
+            client.clone(),
+            None,
+            Default::default(),
+            1,
+            timeout,
+            "primary",
+        );
         Self {
             client,
             endpoint,

@@ -267,6 +267,7 @@ impl DiskCache {
                 table_names.gsfa_hot.clone(),
             )
             .with_query_timeout(cfg.query_timeout)
+            .with_verification_timeouts(source.verification_timeouts)
             .with_query_cache_config(QueryCacheConfig::default())
             .with_http_concurrency(8)
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),
@@ -289,6 +290,7 @@ impl DiskCache {
                 table_names.gsfa_hot.clone(),
             )
             .with_query_timeout(cfg.query_timeout)
+            .with_verification_timeouts(source.verification_timeouts)
             .with_query_cache_config(QueryCacheConfig::default())
             .with_http_concurrency(cfg.query_concurrency)
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),

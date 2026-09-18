@@ -17,6 +17,7 @@ mod signatures;
 mod transactions;
 mod types;
 mod util;
+pub mod verification;
 
 #[cfg(feature = "disk-cache")]
 pub(crate) use client::ClickHouseTableNames;

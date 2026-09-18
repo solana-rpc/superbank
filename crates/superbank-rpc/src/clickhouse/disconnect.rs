@@ -17,15 +17,19 @@ use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit};
 use tokio::time::Instant;
 
 use super::util::next_required_query_id;
+use super::verification::VerificationTimeouts;
 use crate::processing::{ProcessingError, ProcessingResult};
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const UNCONFIRMED_RETRY_DELAY: Duration = Duration::from_secs(1);
+const IDLE_WORKER_WAKEUP: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const UNCONFIRMED_AFTER: Duration = Duration::from_secs(5);
 const INITIALIZATION_BACKOFF: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod initialization_tests;
+#[cfg(test)]
+mod timeout_tests;
 
 #[derive(Clone)]
 pub(crate) struct DisconnectVerifier(Arc<Inner>);
@@ -33,6 +37,7 @@ pub(crate) struct DisconnectVerifier(Arc<Inner>);
 struct Inner {
     client: HttpClient,
     cluster: Option<String>,
+    timeouts: VerificationTimeouts,
     topology: OnceCell<Topology>,
     retry_after: Mutex<Option<Instant>>,
     pending: Mutex<BTreeMap<String, Pending>>,
@@ -93,10 +98,20 @@ pub(crate) struct DisconnectGuard {
 }
 
 impl DisconnectVerifier {
-    pub(crate) fn new(client: HttpClient, cluster: Option<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn timeouts(&self) -> VerificationTimeouts {
+        self.0.timeouts
+    }
+
+    pub(crate) fn new(
+        client: HttpClient,
+        cluster: Option<String>,
+        timeouts: VerificationTimeouts,
+    ) -> Self {
         Self(Arc::new(Inner {
             client,
             cluster,
+            timeouts,
             topology: OnceCell::new(),
             retry_after: Mutex::new(None),
             pending: Mutex::new(BTreeMap::new()),
@@ -170,6 +185,11 @@ impl DisconnectVerifier {
 
     async fn initialize(&self) -> ProcessingResult<Topology> {
         let mut attempt = InitializationAttempt::begin(&self.0.retry_after)?;
+        tracing::info!(
+            startup_timeout_ms = self.0.timeouts.startup.as_millis() as u64,
+            runtime_timeout_ms = self.0.timeouts.runtime.as_millis() as u64,
+            "Initializing ClickHouse read verification"
+        );
         let topology = discover(&self.0).await?;
         attempt.succeeded = true;
         Ok(topology)
@@ -316,7 +336,7 @@ async fn worker(weak: Weak<Inner>, notify: Arc<Notify>, _exit: WorkerExit) {
             // Periodic weak upgrade notices service shutdown without retaining it.
             tokio::select! {
                 _ = notify.notified() => {},
-                _ = tokio::time::sleep(PROBE_TIMEOUT) => {},
+                _ = tokio::time::sleep(IDLE_WORKER_WAKEUP) => {},
             }
             continue;
         }
@@ -343,7 +363,7 @@ async fn probe_batches(owner: &Inner, ids: &[String]) -> Duration {
         );
         interval = apply_observation(owner, batch, result.as_ref().ok());
         if let Err(error) = result {
-            tracing::warn!(%error, "Unable to verify abandoned ClickHouse reads");
+            tracing::warn!(phase = "termination_probe", timeout_ms = owner.timeouts.runtime.as_millis() as u64, %error, "Unable to verify abandoned ClickHouse reads");
         }
     }
     interval
@@ -365,12 +385,12 @@ fn apply_observation(owner: &Inner, ids: &[String], active: Option<&HashSet<Stri
             pending.remove(id);
         } else if entry.abandoned_at.elapsed() >= UNCONFIRMED_AFTER && !entry.unconfirmed {
             entry.unconfirmed = true;
-            tracing::warn!(query_id = %id, "ClickHouse read termination unconfirmed; retaining admission");
+            tracing::warn!(phase = "termination_probe", timeout_ms = owner.timeouts.runtime.as_millis() as u64, query_id = %id, "ClickHouse read termination unconfirmed; retaining admission");
             record_verification(entry, "unconfirmed");
         }
     }
     if pending.values().all(|entry| entry.unconfirmed) {
-        PROBE_TIMEOUT
+        UNCONFIRMED_RETRY_DELAY
     } else {
         POLL_INTERVAL
     }
@@ -452,7 +472,13 @@ async fn resolve_cluster(owner: &Inner) -> ProcessingResult<Option<String>> {
     if !cluster.contains('{') {
         return Ok(Some(cluster.into()));
     }
-    let rows = fetch::<MacroRow>(&owner.client, &macro_sql(cluster)?, "macro_resolution").await?;
+    let rows = fetch::<MacroRow>(
+        &owner.client,
+        &macro_sql(cluster)?,
+        "macro_resolution",
+        owner.timeouts.startup,
+    )
+    .await?;
     let mut rows = rows.into_iter();
     let resolved = rows
         .next()
@@ -473,7 +499,14 @@ async fn discover(owner: &Inner) -> ProcessingResult<Topology> {
     // Exercise the same table, decoder, coverage checks and settings needed to
     // release admission. A unique nonempty ID prevents an empty-set shortcut.
     let id = next_required_query_id("status_disconnect_preflight");
-    probe_topology(&owner.client, &topology, &[id], "capability_probe").await?;
+    probe_topology(
+        &owner.client,
+        &topology,
+        &[id],
+        "capability_probe",
+        owner.timeouts.startup,
+    )
+    .await?;
     Ok(topology)
 }
 
@@ -483,6 +516,7 @@ async fn discover_topology(owner: &Inner) -> ProcessingResult<Topology> {
         &owner.client,
         &discovery_sql(cluster.as_deref()),
         "discovery",
+        owner.timeouts.startup,
     )
     .await?;
     Ok(Topology {
@@ -548,7 +582,14 @@ async fn probe(owner: &Inner, ids: &[String]) -> ProcessingResult<HashSet<String
         .topology
         .get()
         .expect("topology precedes source submission");
-    probe_topology(&owner.client, topology, ids, "termination_probe").await
+    probe_topology(
+        &owner.client,
+        topology,
+        ids,
+        "termination_probe",
+        owner.timeouts.runtime,
+    )
+    .await
 }
 
 async fn probe_topology(
@@ -556,9 +597,15 @@ async fn probe_topology(
     topology: &Topology,
     ids: &[String],
     phase: &'static str,
+    timeout: Duration,
 ) -> ProcessingResult<HashSet<String>> {
-    let rows =
-        fetch::<ProbeRow>(client, &probe_sql(topology.cluster.as_deref(), ids), phase).await?;
+    let rows = fetch::<ProbeRow>(
+        client,
+        &probe_sql(topology.cluster.as_deref(), ids),
+        phase,
+        timeout,
+    )
+    .await?;
     validate_observation(rows, &topology.nodes)
 }
 
@@ -588,11 +635,26 @@ fn validate_observation(
     Ok(active)
 }
 
+fn probe_error_kind(error: &clickhouse::error::Error) -> &'static str {
+    match error {
+        clickhouse::error::Error::Network(_) => "network",
+        clickhouse::error::Error::BadResponse(_) => "server_response",
+        clickhouse::error::Error::TimedOut => "timeout",
+        _ => "response_or_configuration",
+    }
+}
+
 async fn fetch<T: clickhouse::RowOwned + clickhouse::RowRead>(
     client: &HttpClient,
     sql: &str,
     phase: &'static str,
+    timeout: Duration,
 ) -> ProcessingResult<Vec<T>> {
+    let execution_seconds = timeout
+        .as_secs()
+        .saturating_add(u64::from(timeout.subsec_nanos() != 0))
+        .max(1)
+        .to_string();
     let query = client
         .query(sql)
         .with_setting(
@@ -606,22 +668,22 @@ async fn fetch<T: clickhouse::RowOwned + clickhouse::RowRead>(
         .with_setting("max_parallel_replicas", "1")
         .with_setting("use_hedged_requests", "0")
         .with_setting("skip_unavailable_shards", "0")
-        .with_setting("max_execution_time", "1")
-        .with_setting("max_execution_time_leaf", "1")
+        .with_setting("max_execution_time", execution_seconds.clone())
+        .with_setting("max_execution_time_leaf", execution_seconds)
         .with_setting("timeout_overflow_mode", "throw")
         .with_setting("timeout_overflow_mode_leaf", "throw")
         .with_setting("timeout_before_checking_execution_speed", "0")
         .with_setting("use_query_cache", "0");
-    tokio::time::timeout(PROBE_TIMEOUT, query.fetch_all::<T>())
+    tokio::time::timeout(timeout, query.fetch_all::<T>())
         .await
         .map_err(|error| {
-            tracing::warn!(phase, %error, "Primary disconnect verification timed out");
+            tracing::warn!(phase, timeout_ms = timeout.as_millis() as u64, %error, "Primary disconnect verification timed out");
             ProcessingError::timeout("primary disconnect verification", error)
         })?
         .map_err(|error| {
-            // Log the SDK cause before wrapping it in the stable RPC-facing context.
-            // Do not log the client, credentials or SQL/request payload.
-            tracing::warn!(phase, ?error, "Primary disconnect verification failed");
+            // Server/SDK messages can echo SQL or connection details. Log only the category.
+            let error_kind = probe_error_kind(&error);
+            tracing::warn!(phase, timeout_ms = timeout.as_millis() as u64, error_kind, "Primary disconnect verification failed");
             ProcessingError::database("primary disconnect verification", error)
         })
 }
@@ -633,7 +695,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     fn verifier() -> DisconnectVerifier {
-        let verifier = DisconnectVerifier::new(HttpClient::default(), None);
+        let verifier = DisconnectVerifier::new(HttpClient::default(), None, Default::default());
         verifier
             .0
             .topology
@@ -645,7 +707,7 @@ mod tests {
         verifier
     }
 
-    fn pending(verifier: &DisconnectVerifier, semaphore: &Arc<Semaphore>, id: &str) {
+    pub(super) fn pending(verifier: &DisconnectVerifier, semaphore: &Arc<Semaphore>, id: &str) {
         crate::metrics::signature_status_disconnect_pending_inc();
         verifier.0.pending.lock().unwrap().insert(
             id.into(),
@@ -734,7 +796,10 @@ mod tests {
             .unwrap()
             .abandoned_at = Instant::now() - Duration::from_secs(6);
         let ids = vec!["q".into()];
-        assert_eq!(apply_observation(&verifier.0, &ids, None), PROBE_TIMEOUT);
+        assert_eq!(
+            apply_observation(&verifier.0, &ids, None),
+            Duration::from_secs(1)
+        );
         assert_eq!(semaphore.available_permits(), 0);
         assert!(verifier.0.pending.lock().unwrap()["q"].unconfirmed);
         apply_observation(&verifier.0, &ids, Some(&HashSet::new()));
@@ -809,7 +874,14 @@ mod tests {
             }
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let verifier = DisconnectVerifier::new(HttpClient::default().with_url(url), None);
+        let verifier = DisconnectVerifier::new(
+            HttpClient::default().with_url(url),
+            None,
+            VerificationTimeouts {
+                runtime: Duration::from_millis(100),
+                ..Default::default()
+            },
+        );
         verifier
             .0
             .topology
@@ -908,7 +980,7 @@ mod tests {
             "default",
             "",
             "",
-            PROBE_TIMEOUT,
+            Duration::from_secs(1),
         )
         .with_validation(false)
         .with_compression(clickhouse::Compression::None);
@@ -940,7 +1012,7 @@ mod tests {
         assert_transport_disconnect(true).await;
     }
 
-    fn string(bytes: &mut Vec<u8>, value: &str) {
+    pub(super) fn string(bytes: &mut Vec<u8>, value: &str) {
         assert!(value.len() < 128);
         bytes.push(value.len() as u8);
         bytes.extend_from_slice(value.as_bytes());
@@ -989,7 +1061,7 @@ mod tests {
             .with_url(url)
             .with_validation(false)
             .with_compression(clickhouse::Compression::None);
-        let verifier = DisconnectVerifier::new(client, None);
+        let verifier = DisconnectVerifier::new(client, None, Default::default());
         let semaphore = Arc::new(Semaphore::new(2));
         let first = verifier
             .arm(
@@ -1021,7 +1093,8 @@ mod tests {
             assert_eq!(params["readonly"], "2");
             assert_eq!(params["cancel_http_readonly_queries_on_client_close"], "1");
             assert_eq!(params["skip_unavailable_shards"], "0");
-            assert_eq!(params["max_execution_time_leaf"], "1");
+            assert_eq!(params["max_execution_time"], "10");
+            assert_eq!(params["max_execution_time_leaf"], "10");
             assert!(params.contains_key("query_id"));
             assert!(!sql.contains("KILL"));
             if is_termination_probe(&sql) {

@@ -25,6 +25,11 @@ pub(crate) struct ReadEndpoint {
 }
 
 impl ReadEndpoint {
+    #[cfg(test)]
+    pub(crate) fn verification_timeouts(&self) -> super::verification::VerificationTimeouts {
+        self.verifier.timeouts()
+    }
+
     #[cfg(feature = "disk-cache")]
     pub(crate) fn with_target(&self, target: &'static str) -> Self {
         Self {
@@ -35,12 +40,13 @@ impl ReadEndpoint {
     pub(crate) fn new(
         control: Client,
         cluster: Option<String>,
+        verification_timeouts: super::verification::VerificationTimeouts,
         capacity: usize,
         timeout: Duration,
         target: &'static str,
     ) -> Self {
         Self {
-            verifier: DisconnectVerifier::new(control, cluster),
+            verifier: DisconnectVerifier::new(control, cluster, verification_timeouts),
             admission: Arc::new(Semaphore::new(capacity.max(1))),
             timeout,
             target,

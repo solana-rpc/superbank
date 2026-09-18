@@ -318,6 +318,10 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         .with_http_connect_timeout(Duration::from_millis(
             args.clickhouse_http_connect_timeout_ms,
         ))
+        .with_verification_timeouts(crate::clickhouse::verification::VerificationTimeouts {
+            startup: Duration::from_millis(args.clickhouse_startup_verification_timeout_ms),
+            runtime: Duration::from_millis(args.clickhouse_runtime_verification_timeout_ms),
+        })
         .with_tcp_pool_sizing(args.clickhouse_tcp_pool_min, args.clickhouse_tcp_pool_max)
         .with_in_clause_chunk(args.clickhouse_in_clause_chunk)
         .with_startup_table_check(args.clickhouse_startup_table_check)
