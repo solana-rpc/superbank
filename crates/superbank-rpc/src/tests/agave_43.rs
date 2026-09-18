@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use crate::handlers::transactions::handle_get_transaction;
+
+const ENCODING_ERROR: &str =
+    "base58 encoding is not supported with maxSupportedTransactionVersion >= 1";
 
 async fn assert_invalid_params(response: Response, message: &str) {
     assert_eq!(response.status(), StatusCode::OK);
@@ -9,6 +13,63 @@ async fn assert_invalid_params(response: Response, message: &str) {
     assert_eq!(error.code, -32602);
     assert_eq!(error.message, message);
     assert!(error.data.is_none());
+}
+
+#[tokio::test]
+async fn encoding_version_is_rejected_before_missing_transaction_lookup() {
+    for encoding in ["binary", "base58"] {
+        for version in [1, 255] {
+            let response = handle_get_transaction(
+                test_state(),
+                json!(1),
+                Some(vec![
+                    json!(solana_sdk::signature::Signature::from([7; 64]).to_string()),
+                    json!({"encoding": encoding, "maxSupportedTransactionVersion": version}),
+                ]),
+            )
+            .await
+            .unwrap();
+            assert_invalid_params(response, ENCODING_ERROR).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn encoding_version_is_rejected_before_every_block_projection() {
+    for details in ["full", "accounts", "signatures", "none"] {
+        for encoding in ["binary", "base58"] {
+            let response = handle_get_block(
+                test_state(),
+                json!(1),
+                Some(vec![
+                    json!(42),
+                    json!({"encoding": encoding, "maxSupportedTransactionVersion": 1,
+                    "transactionDetails": details}),
+                ]),
+            )
+            .await
+            .unwrap();
+            assert_invalid_params(response, ENCODING_ERROR).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_address_method_rejects_version_encoding_before_lookup() {
+    for details in ["signatures", "full"] {
+        let response = handle_get_transactions_for_address(
+            test_state(),
+            json!(1),
+            Some(vec![
+                json!("11111111111111111111111111111111"),
+                json!({"encoding": "base58", "maxSupportedTransactionVersion": 1,
+                "transactionDetails": details}),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_invalid_params(response, ENCODING_ERROR).await;
+    }
 }
 
 #[tokio::test]
@@ -48,3 +109,4 @@ async fn inflation_boundary_and_disabled_limit_reach_address_validation() {
         assert_invalid_params(response, "Invalid param: Invalid").await;
     }
 }
+

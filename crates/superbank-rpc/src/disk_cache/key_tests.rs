@@ -64,7 +64,7 @@ async fn transaction_response(
 
 async fn assert_transaction_fallback(source: &ClickHouseClient, cache: &DiskCache) {
     for encoding in ["json", "jsonParsed", "base58", "base64"] {
-        let config = serde_json::json!({"slot": 45, "encoding": encoding, "maxSupportedTransactionVersion": 1});
+        let config = serde_json::json!({"slot": 45, "encoding": encoding, "maxSupportedTransactionVersion": 0});
         let expected = transaction_response(source, None, signature(45), config.clone()).await;
         assert!(expected.get("error").is_none(), "{expected}");
         assert_eq!(expected["result"]["slot"], 45);
