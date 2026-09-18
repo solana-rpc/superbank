@@ -136,3 +136,105 @@ fn vat_debit_hydrates_both_producer_spellings_without_losing_negative_lamports()
     }
 }
 
+#[test]
+fn confidential_supply_rotation_uses_context_account_key() {
+    use solana_message::{AccountKeys, compiled_instruction::CompiledInstruction};
+    use solana_transaction_status::parse_token::parse_token;
+    let keys: Vec<_> = (1..=4)
+        .map(|byte| solana_sdk::pubkey::Pubkey::from([byte; 32]))
+        .collect();
+    // Token-2022 extension 42, RotateSupplyElGamalPubkey (1), a 32-byte
+    // ElGamal key, and a zero proof offset selecting the context-state account.
+    let mut data = vec![42, 1];
+    data.extend([0; 33]);
+    let instruction = CompiledInstruction {
+        program_id_index: 3,
+        accounts: vec![0, 1, 2],
+        data,
+    };
+    let parsed = parse_token(&instruction, &AccountKeys::new(&keys, None)).unwrap();
+    assert_eq!(parsed.info["proofContextStateAccount"], keys[1].to_string());
+    assert!(parsed.info.get("proofAccount").is_none());
+}
+
+#[test]
+fn confidential_empty_account_does_not_mistake_multisig_owner_for_record() {
+    use solana_message::{AccountKeys, compiled_instruction::CompiledInstruction};
+    use solana_transaction_status::parse_token::parse_token;
+    let keys: Vec<_> = (1..=5)
+        .map(|byte| solana_sdk::pubkey::Pubkey::from([byte; 32]))
+        .collect();
+    // ConfidentialTransfer (27), EmptyAccount (4), in-transaction proof (1).
+    let instruction = CompiledInstruction {
+        program_id_index: 4,
+        accounts: vec![0, 1, 2, 3],
+        data: vec![27, 4, 1],
+    };
+    let parsed = parse_token(&instruction, &AccountKeys::new(&keys, None)).unwrap();
+    assert_eq!(parsed.info["instructionsSysvar"], keys[1].to_string());
+    assert_eq!(parsed.info["multisigOwner"], keys[2].to_string());
+    assert_eq!(parsed.info["signers"], json!([keys[3].to_string()]));
+    assert!(parsed.info.get("recordAccount").is_none());
+}
+
+#[test]
+fn confidential_fee_withdrawal_preserves_multisig_authority() {
+    use solana_message::{AccountKeys, compiled_instruction::CompiledInstruction};
+    use solana_transaction_status::parse_token::parse_token;
+    let keys: Vec<_> = (1..=6)
+        .map(|byte| solana_sdk::pubkey::Pubkey::from([byte; 32]))
+        .collect();
+    // ConfidentialTransferFee (37), WithdrawWithheldTokensFromMint (1),
+    // in-transaction proof (1), and a 36-byte decryptable balance.
+    let mut data = vec![37, 1, 1];
+    data.extend([0; 36]);
+    let instruction = CompiledInstruction {
+        program_id_index: 5,
+        accounts: vec![0, 1, 2, 3, 4],
+        data,
+    };
+    let parsed = parse_token(&instruction, &AccountKeys::new(&keys, None)).unwrap();
+    assert_eq!(parsed.info["instructionsSysvar"], keys[2].to_string());
+    assert_eq!(
+        parsed.info["multisigWithdrawWithheldAuthority"],
+        keys[3].to_string()
+    );
+    assert_eq!(parsed.info["signers"], json!([keys[4].to_string()]));
+    assert!(parsed.info.get("recordAccount").is_none());
+}
+
+#[test]
+fn permissioned_burn_mixed_proofs_preserve_trailing_authorities() {
+    use solana_message::{AccountKeys, compiled_instruction::CompiledInstruction};
+    use solana_transaction_status::parse_token::parse_token;
+    let keys: Vec<_> = (1..=7)
+        .map(|byte| solana_sdk::pubkey::Pubkey::from([byte; 32]))
+        .collect();
+    // PermissionedBurn (46), ConfidentialBurn (3), decryptable balance (36),
+    // two ElGamal ciphertexts (64 each), then equality/validity/range offsets.
+    let mut data = vec![46, 3];
+    data.extend([0; 164]);
+    data.extend([1, 1, 0]);
+    let instruction = CompiledInstruction {
+        program_id_index: 6,
+        accounts: vec![0, 1, 2, 3, 4, 5],
+        data,
+    };
+    let parsed = parse_token(&instruction, &AccountKeys::new(&keys, None)).unwrap();
+    assert_eq!(parsed.info["instructionsSysvar"], keys[2].to_string());
+    assert_eq!(
+        parsed.info["rangeProofContextStateAccount"],
+        keys[3].to_string()
+    );
+    assert_eq!(
+        parsed.info["permissionedBurnAuthority"],
+        keys[4].to_string()
+    );
+    assert_eq!(parsed.info["authority"], keys[5].to_string());
+    assert!(
+        parsed
+            .info
+            .get("equalityProofContextStateAccount")
+            .is_none()
+    );
+}
