@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # SPDX-License-Identifier: AGPL-3.0-only
 
-FROM rust:1-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
 
 ARG SUPERBANK_RPC_FEATURES=""
 

@@ -1480,6 +1480,21 @@ async fn respond_with_hydrated_block(
     }
 }
 
+fn parse_block_config(value: Value) -> Result<RpcBlockConfig, String> {
+    reject_unknown_fields(&value, &GET_BLOCK_ALLOWED_FIELDS)?;
+    if value.is_null() {
+        return Ok(RpcBlockConfig::default());
+    }
+    let wrapper: RpcEncodingConfigWrapper<RpcBlockConfig> = serde_json::from_value(value)
+        .map_err(|e| format!("Invalid params: failed to parse config ({e})"))?;
+    let config = wrapper.convert_to_current();
+    super::encoding::validate_transaction_encoding(
+        config.encoding.unwrap_or(UiTransactionEncoding::Json),
+        config.max_supported_transaction_version,
+    )?;
+    Ok(config)
+}
+
 pub(crate) async fn handle_get_block(
     state: Arc<AppState>,
     id: Value,
@@ -1511,35 +1526,13 @@ pub(crate) async fn handle_get_block(
         }
     };
 
-    let config_wrapper = match params.into_iter().next() {
-        Some(config_value) => {
-            if let Err(message) = reject_unknown_fields(&config_value, &GET_BLOCK_ALLOWED_FIELDS) {
-                route.invalid_params();
-                return Ok(json_rpc_error_response(id, -32602, message, None));
-            }
-            if config_value.is_null() {
-                RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig::default()))
-            } else {
-                match serde_json::from_value::<RpcEncodingConfigWrapper<RpcBlockConfig>>(
-                    config_value,
-                ) {
-                    Ok(wrapper) => wrapper,
-                    Err(e) => {
-                        route.invalid_params();
-                        return Ok(json_rpc_error_response(
-                            id,
-                            -32602,
-                            format!("Invalid params: failed to parse config ({e})"),
-                            None,
-                        ));
-                    }
-                }
-            }
+    let config = match parse_block_config(params.into_iter().next().unwrap_or(Value::Null)) {
+        Ok(config) => config,
+        Err(message) => {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(id, -32602, message, None));
         }
-        None => RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig::default())),
     };
-
-    let config = config_wrapper.convert_to_current();
     let commitment = config.commitment.unwrap_or_default();
     let fetch_plan = GetBlockFetchPlan::new(&config);
 
@@ -2363,10 +2356,7 @@ pub(crate) async fn handle_get_inflation_reward(
         return Ok(json_rpc_error_response(
             id,
             -32602,
-            format!(
-                "Invalid params: too many addresses; maximum is {}",
-                max_addresses
-            ),
+            format!("Too many inputs provided; max {}", max_addresses),
             None,
         ));
     }

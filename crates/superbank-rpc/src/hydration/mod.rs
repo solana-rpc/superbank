@@ -14,6 +14,8 @@ pub(crate) use errors::{BlockHydrationError, TransactionHydrationError};
 pub(crate) use meta::build_transaction_status_meta;
 #[cfg(test)]
 pub(crate) use meta::build_transaction_status_meta_for_accounts;
+#[cfg(feature = "grpc-streaming")]
+pub(crate) use meta::parse_reward_type;
 pub(crate) use meta::parse_transaction_error_display;
 #[cfg(any(test, feature = "grpc-streaming"))]
 pub(crate) use transaction::build_versioned_transaction;
