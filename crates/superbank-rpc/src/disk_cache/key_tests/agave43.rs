@@ -249,3 +249,42 @@ async fn agave43_vat_native_fill_and_restart() {
     }
     cleanup(&client, &cfg).await;
 }
+
+#[tokio::test]
+#[ignore = "requires disposable ClickHouse: DISK_CACHE_TEST_URL"]
+async fn agave43_inflation_excludes_vat_for_shared_and_vat_only_addresses() {
+    let (client, source, cfg, _) = setup().await;
+    let database = cfg.database.trim_end_matches("_cache");
+    execute(&client,&format!("ALTER TABLE {database}.blocks_metadata UPDATE rewards_present=1,rewards_pubkey=[toFixedString('stake',32),toFixedString('vote',32),toFixedString('vat',32),toFixedString('stake',32),toFixedString('vote',32)],rewards_lamports=[100,200,-10,-11,-12],rewards_post_balance=[1000,2000,90,989,1988],rewards_type=['Staking','Voting','VATDebit','validator-admission-ticket-debit','VATDebit'],rewards_commission=[7,8,NULL,NULL,NULL],rewards_commission_bps=[725,825,NULL,NULL,NULL] WHERE slot=32 SETTINGS mutations_sync=2")).await;
+    let mut state = Arc::try_unwrap(crate::tests::test_state()).ok().unwrap();
+    state.clickhouse = source;
+    state.epoch_schedule = solana_epoch_schedule::EpochSchedule::custom(32, 32, false);
+    let response = crate::handlers::blocks::handle_get_inflation_reward(
+        Arc::new(state),
+        json!(1),
+        Some(vec![
+            json!([
+                address("stake").to_string(),
+                address("vote").to_string(),
+                address("vat").to_string()
+            ]),
+            json!({"epoch":0}),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(body.get("error").is_none(), "{body}");
+    assert_eq!(body["result"][0]["amount"], 100);
+    assert_eq!(body["result"][0]["commissionBps"], 725);
+    assert_eq!(body["result"][1]["amount"], 200);
+    assert_eq!(body["result"][1]["commissionBps"], 825);
+    assert!(body["result"][2].is_null());
+    cleanup(&client, &cfg).await;
+}
