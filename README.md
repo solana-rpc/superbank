@@ -384,6 +384,9 @@ rows already present on the target by exact table key instead of failing the run
 
 ## Development
 
+Build with Rust **1.97.1**, pinned in `rust-toolchain.toml`. See the
+[Agave 4.3 compatibility and rollout notes](docs/agave-4.3-compatibility.md).
+
 ```bash
 cargo build -p superbank -p superbank-rpc -p superbank-solparq -p superbank-verify
 

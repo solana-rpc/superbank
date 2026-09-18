@@ -7,7 +7,8 @@ Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
 default. The `solparq` source runs in reverse: it restores `superbank-solparq`
 Parquet archive bundles (local or S3) back into ClickHouse.
 
-The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer workspaces
+The main ingestor and RPC server target Agave 4.3 with Rust 1.97.1.
+See the [compatibility and rollout notes](../../docs/agave-4.3-compatibility.md). The standalone Jetstreamer workspaces
 under `ingest/` remain on their upstream Agave 3 line and must not be used for post-v1 Old
 Faithful backfills until they are migrated and added to root CI.
 
