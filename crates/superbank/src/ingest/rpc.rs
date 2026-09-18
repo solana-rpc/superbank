@@ -2600,7 +2600,7 @@ mod tests {
             loaded_accounts_data_size_limit: Some(65_536),
             heap_size: Some(32_768),
         });
-        let tx_bytes = wincode05::serialize(&tx).expect("serialize v1 transaction");
+        let tx_bytes = wincode06::serialize(&tx).expect("serialize v1 transaction");
         assert_eq!(
             crate::message_wire::serialize_versioned_transaction(&tx)
                 .expect("serialize with Superbank schema"),

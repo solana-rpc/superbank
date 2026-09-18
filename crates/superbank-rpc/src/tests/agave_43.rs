@@ -110,3 +110,29 @@ async fn inflation_boundary_and_disabled_limit_reach_address_validation() {
     }
 }
 
+#[test]
+fn vat_debit_hydrates_both_producer_spellings_without_losing_negative_lamports() {
+    for name in ["VATDebit", "validator-admission-ticket-debit"] {
+        let mut block = base_block_record(77);
+        block.metadata.rewards_present = true;
+        block.metadata.rewards_pubkey = vec![[1; 32]];
+        block.metadata.rewards_lamports = vec![-10];
+        block.metadata.rewards_post_balance = vec![90];
+        block.metadata.rewards_type = vec![Some(name.to_owned())];
+        block.metadata.rewards_commission = vec![None];
+        block.metadata.rewards_commission_bps = vec![None];
+        let result = hydrate_block_record(
+            block,
+            UiTransactionEncoding::Json,
+            TransactionDetails::None,
+            true,
+            Some(1),
+        )
+        .unwrap();
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["rewards"][0]["rewardType"], "VATDebit");
+        assert_eq!(value["rewards"][0]["lamports"], -10);
+        assert_eq!(value["rewards"][0]["postBalance"], 90);
+    }
+}
+

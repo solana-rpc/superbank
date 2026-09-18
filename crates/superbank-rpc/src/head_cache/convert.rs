@@ -5,8 +5,8 @@
 
 use thiserror::Error;
 use yellowstone_grpc_proto::prelude::{
-    CompiledInstruction, MessageAddressTableLookup, RewardType, SubscribeUpdateTransactionInfo,
-    TokenBalance, TransactionError, TransactionStatusMeta,
+    CompiledInstruction, MessageAddressTableLookup, SubscribeUpdateTransactionInfo, TokenBalance,
+    TransactionError, TransactionStatusMeta,
 };
 
 use crate::clickhouse::StoredTransactionRecord;
@@ -316,12 +316,22 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
     )
 }
 
-fn reward_type_to_string(value: i32) -> Option<String> {
-    let parsed = RewardType::try_from(value).ok()?;
-    match parsed {
-        RewardType::Unspecified => None,
-        other => Some(other.as_str_name().to_string()),
-    }
+pub(super) fn reward_type_to_string(value: i32) -> Option<String> {
+    // Agave 4.3 assigns VATDebit wire value 6. Yellowstone's published enum
+    // stops at 5, but prost preserves the raw i32, including across Fumarole.
+    const NAMES: [&str; 7] = [
+        "",
+        "Fee",
+        "Rent",
+        "Staking",
+        "Voting",
+        "DeactivatedStake",
+        "VATDebit",
+    ];
+    NAMES
+        .get(usize::try_from(value).ok()?)
+        .filter(|name| !name.is_empty())
+        .map(|name| (*name).to_owned())
 }
 
 fn parse_commission(value: &str) -> Option<u8> {
@@ -641,5 +651,31 @@ mod tests {
             stored_record_from_transaction_info(55, &update),
             Err(ConvertError::InvalidMessage(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod agave_43_tests {
+    use super::*;
+
+    #[test]
+    fn raw_vat_debit_survives_head_cache_reward_conversion() {
+        let rewards = vec![yellowstone_grpc_proto::prelude::Reward {
+            pubkey: "11111111111111111111111111111111".to_owned(),
+            lamports: -10,
+            post_balance: 90,
+            reward_type: 6,
+            commission: String::new(),
+            commission_bps: String::new(),
+        }];
+        let (_, lamports, balances, types, commissions, bps) = convert_rewards(&rewards);
+        assert_eq!(types, vec![Some("VATDebit".to_owned())]);
+        assert_eq!(lamports, vec![-10]);
+        assert_eq!(balances, vec![90]);
+        assert_eq!(commissions, vec![None]);
+        assert_eq!(bps, vec![None]);
+        assert_eq!(reward_type_to_string(0), None);
+        assert_eq!(reward_type_to_string(-1), None);
+        assert_eq!(reward_type_to_string(7), None);
     }
 }
