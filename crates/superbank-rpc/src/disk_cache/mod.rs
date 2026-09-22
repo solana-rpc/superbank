@@ -9,7 +9,7 @@
 //! ranges whose base rows and dependent materialized views completed and whose
 //! coverage marker was published last.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -79,6 +79,7 @@ pub(crate) struct DiskCacheConfig {
     pub(crate) query_max_threads: u64,
     pub(crate) partition_slots: u64,
     pub(crate) query_timeout: Duration,
+    pub(crate) address_query_timeout: Duration,
     pub(crate) schema_check_interval: Duration,
     pub(crate) memory_blocks_metadata: bool,
     pub(crate) memory_retain_slots: Option<u64>,
@@ -816,32 +817,76 @@ impl DiskCache {
 
     pub(crate) async fn get_txs_by_position(
         &self,
-        positions: Vec<(u64, u32)>,
+        positions: &[(u64, u32, String)],
+        deadline: tokio::time::Instant,
     ) -> Vec<Option<StoredTransactionRecord>> {
-        let mut by_slot: HashMap<u64, Vec<StoredTransactionRecord>> = HashMap::new();
-        let unique_slots: HashSet<u64> = positions.iter().map(|(slot, _)| *slot).collect();
-        for slot in unique_slots {
-            if !self.covers_slot(slot) {
-                continue;
-            }
-            if let Ok((records, _)) = self
-                .inner
-                .local
-                .get_block_full_transactions_by_slot(slot)
-                .await
-            {
-                by_slot.insert(slot, records);
-            }
-        }
+        let tokens: HashMap<_, _> = positions
+            .iter()
+            .filter_map(|(slot, _, _)| {
+                self.covers_slot(*slot)
+                    .then(|| {
+                        self.inner
+                            .key_index
+                            .range_read_token(*slot, *slot)
+                            .map(|token| (*slot, token))
+                    })
+                    .flatten()
+            })
+            .collect();
+        let covered: Vec<_> = positions
+            .iter()
+            .filter(|(slot, _, _)| tokens.contains_key(slot))
+            .cloned()
+            .collect();
+        let records = self.read_hydration_positions(&covered, deadline).await;
         positions
-            .into_iter()
-            .map(|(slot, idx)| {
-                by_slot
-                    .get(&slot)
-                    .and_then(|records| records.iter().find(|record| record.slot_idx == idx))
-                    .cloned()
+            .iter()
+            .map(|(slot, _, signature)| {
+                self.valid_hydrated_transaction(&tokens, &records, *slot, signature)
             })
             .collect()
+    }
+
+    async fn read_hydration_positions(
+        &self,
+        positions: &[(u64, u32, String)],
+        deadline: tokio::time::Instant,
+    ) -> HashMap<(u64, String), StoredTransactionRecord> {
+        if positions.is_empty() || tokio::time::Instant::now() >= deadline {
+            return HashMap::new();
+        }
+        let client = self.query_client();
+        let Ok(Ok((fetched, _))) =
+            tokio::time::timeout_at(deadline, client.get_transactions_by_positions(positions))
+                .await
+        else {
+            return HashMap::new();
+        };
+        fetched
+            .into_iter()
+            .map(|record| {
+                (
+                    (record.slot, bs58::encode(record.signature).into_string()),
+                    record,
+                )
+            })
+            .collect()
+    }
+
+    fn valid_hydrated_transaction(
+        &self,
+        tokens: &HashMap<u64, (u64, u64)>,
+        records: &HashMap<(u64, String), StoredTransactionRecord>,
+        slot: u64,
+        signature: &str,
+    ) -> Option<StoredTransactionRecord> {
+        let token = tokens.get(&slot)?;
+        if !self.covers_slot(slot)
+            || self.inner.key_index.range_read_token(slot, slot) != Some(*token)
+        {
+            return None;
+        }
+        records.get(&(slot, signature.to_owned())).cloned()
     }
 
     fn query_client_for_address(

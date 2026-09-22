@@ -36,6 +36,40 @@ use super::util::{
     transient_shard_local_error_reason,
 };
 
+// Keep the signature predicate even on the exact path: an index hint alone is
+// not identity, particularly while repairing historical rows.
+fn transaction_lookup_key(
+    slot: u64,
+    slot_idx: Option<u32>,
+    signature: &str,
+) -> ProcessingResult<(u64, Option<u32>, String)> {
+    let (_, literal) = decode_transaction_signature(signature)?;
+    Ok((slot, slot_idx, literal))
+}
+
+fn unresolved_transaction_pairs(
+    pairs: &[(u64, Option<u32>, String)],
+    records: &[StoredTransactionRecord],
+) -> Vec<(u64, Option<u32>, String)> {
+    let found: HashSet<_> = records
+        .iter()
+        .map(|record| {
+            (
+                record.slot,
+                format!(
+                    "toFixedString(unhex('{}'), 64)",
+                    hex::encode_upper(record.signature)
+                ),
+            )
+        })
+        .collect();
+    pairs
+        .iter()
+        .filter(|(slot, _, literal)| !found.contains(&(*slot, literal.clone())))
+        .map(|(slot, _, literal)| (*slot, None, literal.clone()))
+        .collect()
+}
+
 #[derive(Deserialize, clickhouse::Row)]
 struct TransactionsForAddressQueryRow {
     signature: String,
@@ -416,105 +450,97 @@ impl ClickHouseClient {
         }
     }
 
-    pub async fn get_transactions_by_slot_signatures(
+    /// Hydrate exact positions, retrying historical index mismatches by identity.
+    /// Both passes and every bounded batch share the outer query timeout.
+    /// Return every version; the RPC encoder must report unsupported versions.
+    pub async fn get_transactions_by_positions(
         &self,
-        signatures: &[(u64, String)],
-        max_supported_transaction_version: Option<u8>,
+        positions: &[(u64, u32, String)],
     ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
-        self.with_http_query_timeout("get_transactions_by_slot_signatures", async {
-            if signatures.is_empty() {
-                return Ok((
-                    Vec::new(),
-                    QueryTimings {
-                        elapsed_ms: 0,
-                        received_bytes: 0,
-                        decoded_bytes: 0,
-                        rows_read: Some(0),
-                        rows_read_unknown: true,
-                        rows_returned: 0,
-                    },
-                ));
-            }
-
-            let mut pairs = Vec::with_capacity(signatures.len());
-            for (slot, signature) in signatures {
-                let signature_bytes = bs58::decode(signature)
-                    .into_vec()
-                    .map_err(|e| ProcessingError::deserialization("Invalid signature", e))?;
-                if signature_bytes.len() != 64 {
-                    return Err(ProcessingError::deserialization_msg(format!(
-                        "Invalid signature length {} (expected 64 bytes)",
-                        signature_bytes.len()
-                    )));
+        let mut seen = HashSet::new();
+        let pairs = positions
+            .iter()
+            .filter(|(slot, _, signature)| seen.insert((*slot, signature.as_str())))
+            .map(|(slot, idx, signature)| transaction_lookup_key(*slot, Some(*idx), signature))
+            .collect::<ProcessingResult<Vec<_>>>()?;
+        self.with_http_query_timeout("get_transactions_by_positions", async {
+            let mut records = Vec::with_capacity(pairs.len());
+            let mut timings = QueryTimings::zero();
+            // A full address page is normally <=100 rows. Keep larger internal
+            // callers bounded too, independent of how many slots they span.
+            for chunk in pairs.chunks(100) {
+                let (mut batch, exact_timings) = self.fetch_transaction_pairs(chunk).await?;
+                timings.add(exact_timings);
+                let unresolved = unresolved_transaction_pairs(chunk, &batch);
+                if !unresolved.is_empty() {
+                    let (fallback, fallback_timings) =
+                        self.fetch_transaction_pairs(&unresolved).await?;
+                    batch.extend(fallback);
+                    timings.add(fallback_timings);
                 }
-
-                let signature_hex = hex::encode(signature_bytes).to_uppercase();
-                let signature_literal = format!("toFixedString(unhex('{signature_hex}'), 64)");
-                pairs.push((*slot, signature_literal));
+                records.extend(batch);
             }
-
-            let version_filter = match max_supported_transaction_version {
-                Some(max_version) => {
-                    format!("(tx_version IS NULL OR tx_version <= {max_version})")
-                }
-                None => "tx_version IS NULL".to_string(),
-            };
-
-            if self.scope_shard_direct()
-                && self.transport_http()
-                && let (Some(topology), Some(local_table)) =
-                    (&self.shard_topology, &self.transactions_local_table)
-                && let Some(result) = self
-                    .try_get_transactions_by_slot_signatures_local(
-                        topology,
-                        local_table,
-                        &pairs,
-                        &version_filter,
-                    )
-                    .await?
-            {
-                return Ok(result);
-            }
-
-            let settings_clause = self.select_settings_clause(
-                "get_transactions_by_slot_signatures",
-                QueryFreshnessClass::Historical,
-            );
-            let query = build_transactions_by_slot_signatures_query(
-                &self.transaction_table,
-                &pairs,
-                &version_filter,
-                &settings_clause,
-                self.in_clause_chunk,
-            );
-
-            let start = Instant::now();
-            let mut cursor = self
-                .read::<TransactionRow>(&query, "get_transactions_by_slot_signatures")
-                .await
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-
-            let mut records = Vec::new();
-            while let Some(row) = cursor
-                .next()
-                .await
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?
-            {
-                records.push(map_transaction_row(row));
-            }
-
-            let timings = QueryTimings {
-                elapsed_ms: start.elapsed().as_millis() as u64,
-                received_bytes: cursor.received_bytes(),
-                decoded_bytes: cursor.decoded_bytes(),
-                rows_read: Some(0),
-                rows_read_unknown: true,
-                rows_returned: records.len() as u64,
-            };
-
+            let mut seen = HashSet::new();
+            records.retain(|record| seen.insert((record.slot, record.signature)));
             Ok((records, timings))
         })
         .await
+    }
+
+    async fn fetch_transaction_pairs(
+        &self,
+        pairs: &[(u64, Option<u32>, String)],
+    ) -> ProcessingResult<(Vec<StoredTransactionRecord>, QueryTimings)> {
+        if pairs.is_empty() {
+            return Ok((Vec::new(), QueryTimings::zero()));
+        }
+        if self.scope_shard_direct()
+            && self.transport_http()
+            && let (Some(topology), Some(local_table)) =
+                (&self.shard_topology, &self.transactions_local_table)
+            && let Some(result) = self
+                .try_get_transactions_by_slot_signatures_local(topology, local_table, pairs)
+                .await?
+        {
+            return Ok(result);
+        }
+
+        let settings_clause = self.select_settings_clause(
+            "get_transactions_by_slot_signatures",
+            QueryFreshnessClass::Historical,
+        );
+        let query = build_transactions_by_slot_signatures_query(
+            &self.transaction_table,
+            pairs,
+            &settings_clause,
+            self.in_clause_chunk,
+        );
+
+        let start = Instant::now();
+        let mut cursor = self
+            .read::<TransactionRow>(&query, "get_transactions_by_slot_signatures")
+            .await
+            .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+
+        let mut records = Vec::new();
+        while let Some(row) = cursor
+            .next()
+            .await
+            .map_err(|e| ProcessingError::database(e.to_string(), e))?
+        {
+            records.push(map_transaction_row(row));
+        }
+
+        let timings = QueryTimings {
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            received_bytes: cursor.received_bytes(),
+            decoded_bytes: cursor.decoded_bytes(),
+            rows_read: Some(0),
+            rows_read_unknown: true,
+            rows_returned: records.len() as u64,
+        };
+
+        Ok((records, timings))
     }
 
     async fn fetch_transaction_lookup(
@@ -1244,11 +1270,9 @@ impl ClickHouseClient {
         &self,
         topology: &ShardTopology,
         local_table: &str,
-        pairs: &[(u64, String)],
-        version_filter: &str,
+        pairs: &[(u64, Option<u32>, String)],
     ) -> ProcessingResult<Option<(Vec<StoredTransactionRecord>, QueryTimings)>> {
         let local_table: std::sync::Arc<str> = local_table.to_string().into();
-        let version_filter: std::sync::Arc<str> = version_filter.to_string().into();
         let fanout_sem = self.fanout_sem.clone();
         let query_timeout = self.query_timeout;
         let in_clause_chunk = self.in_clause_chunk;
@@ -1259,10 +1283,11 @@ impl ClickHouseClient {
             )
             .into();
 
-        let mut per_shard: Vec<Vec<(u64, String)>> = vec![Vec::new(); topology.shard_count()];
-        for (slot, literal) in pairs {
+        let mut per_shard: Vec<Vec<(u64, Option<u32>, String)>> =
+            vec![Vec::new(); topology.shard_count()];
+        for (slot, idx, literal) in pairs {
             let shard_idx = topology.shard_index_for_hash(slot / SLOT_SHARD_DIVISOR);
-            per_shard[shard_idx].push((*slot, literal.clone()));
+            per_shard[shard_idx].push((*slot, *idx, literal.clone()));
         }
 
         let mut join_set = JoinSet::new();
@@ -1274,7 +1299,6 @@ impl ClickHouseClient {
                 .shard_at(idx)
                 .expect("validated topology contains every routed shard");
             let local_table = local_table.clone();
-            let version_filter = version_filter.clone();
             let fanout_sem = fanout_sem.clone();
             let settings_clause = settings_clause.clone();
 
@@ -1293,7 +1317,6 @@ impl ClickHouseClient {
                         let query = build_transactions_by_slot_signatures_query(
                             local_table.as_ref(),
                             &shard_pairs,
-                            version_filter.as_ref(),
                             settings_clause.as_ref(),
                             in_clause_chunk,
                         );
@@ -1395,6 +1418,39 @@ impl ClickHouseClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hydration_exact_query_keeps_slot_index_and_signature_for_each_key() {
+        let pairs = vec![
+            transaction_lookup_key(10, Some(3), &bs58::encode([1; 64]).into_string()).unwrap(),
+            transaction_lookup_key(20, Some(7), &bs58::encode([2; 64]).into_string()).unwrap(),
+        ];
+        let sql = build_transactions_by_slot_signatures_query("transactions", &pairs, "", 1);
+        assert_eq!(sql.matches("(slot, slot_idx, signature) IN").count(), 2);
+        assert!(sql.contains("(10, 3, toFixedString("));
+        assert!(sql.contains("(20, 7, toFixedString("));
+        assert!(sql.contains(" OR "));
+        assert!(!sql.contains("tx_version <="));
+        assert!(!sql.contains("tx_version IS NULL"));
+    }
+
+    #[test]
+    fn hydration_fallback_query_keeps_identity_and_drops_only_index() {
+        let pairs = vec![
+            transaction_lookup_key(10, None, &bs58::encode([1; 64]).into_string()).unwrap(),
+            transaction_lookup_key(10, None, &bs58::encode([2; 64]).into_string()).unwrap(),
+        ];
+        let sql = build_transactions_by_slot_signatures_query("transactions", &pairs, "", 100);
+        assert_eq!(sql.matches("(slot, signature) IN").count(), 1);
+        assert!(!sql.contains("(slot, slot_idx, signature) IN"));
+        assert_eq!(sql.matches("(10, toFixedString(").count(), 2);
+    }
+
+    #[test]
+    fn hydration_keys_reject_invalid_signatures_before_building_sql() {
+        assert!(transaction_lookup_key(1, Some(1), "'").is_err());
+        assert!(transaction_lookup_key(1, Some(1), "1").is_err());
+    }
 
     fn normalize_sql(sql: &str) -> String {
         sql.split_whitespace().collect::<Vec<_>>().join(" ")

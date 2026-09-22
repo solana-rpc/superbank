@@ -132,31 +132,98 @@ fn apply_get_transactions_for_address_slot_aliases(
 
 async fn resolve_signature_slot_for_bounds(
     state: &AppState,
+    route: &mut RouteMetric,
     signature: &str,
+    #[cfg(feature = "disk-cache")] disk_request: Option<(
+        &Arc<crate::disk_cache::DiskCache>,
+        tokio::time::Instant,
+    )>,
 ) -> crate::processing::ProcessingResult<(Option<SignatureSlot>, QueryTimings)> {
+    #[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
+    let parsed = Signature::from_str(signature).ok();
     #[cfg(feature = "grpc-head-cache")]
-    if let Some(cache) = state.head_cache.as_ref()
-        && let Ok(parsed) = Signature::from_str(signature)
-        && let Some(pos) = cache.signature_position(&parsed)
-    {
-        return Ok((
-            Some(SignatureSlot {
-                slot: pos.slot,
-                slot_idx: pos.idx,
-            }),
-            QueryTimings::zero(),
-        ));
+    if let (Some(cache), Some(parsed)) = (state.head_cache.as_ref(), parsed) {
+        route.head_cache_read();
+        if let Some(pos) = cache.signature_position(&parsed) {
+            return Ok((
+                Some(SignatureSlot {
+                    slot: pos.slot,
+                    slot_idx: pos.idx,
+                }),
+                QueryTimings::zero(),
+            ));
+        }
     }
 
     #[cfg(feature = "disk-cache")]
-    if let Some(disk) = state.disk_cache()
-        && let Ok(parsed) = Signature::from_str(signature)
-        && let Some(position) = disk.signature_position(parsed).await
-    {
-        return Ok((Some(position), QueryTimings::zero()));
+    if let (Some((disk, deadline)), Some(parsed)) = (disk_request, parsed) {
+        route.disk_cache_read();
+        if let Some(position) = disk.signature_position_until(parsed, deadline).await {
+            return Ok((Some(position), QueryTimings::zero()));
+        }
     }
 
+    route.source_clickhouse();
     state.clickhouse.get_signature_slot(signature).await
+}
+
+/// Collect at most five request-local signatures, preserving lookup order.
+fn unique_bound_signatures(query: &TransactionsForAddressQuery) -> Vec<&str> {
+    let mut signatures = Vec::with_capacity(5);
+    if let Some(PaginationToken::Signature(signature)) = &query.pagination {
+        signatures.push(signature.as_str());
+    }
+    if let Some(filter) = &query.signature_filter {
+        for signature in [
+            filter.gte.as_deref(),
+            filter.gt.as_deref(),
+            filter.lte.as_deref(),
+            filter.lt.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !signatures.contains(&signature) {
+                signatures.push(signature);
+            }
+        }
+    }
+    signatures
+}
+
+/// Called only after every unique lookup succeeds. None is a confirmed miss;
+/// an unresolved or failed lookup never enters this map.
+fn apply_resolved_address_bounds(
+    query: &mut TransactionsForAddressQuery,
+    positions: &HashMap<String, Option<SignatureSlot>>,
+) {
+    query.resolved_pagination = match query.pagination.as_ref() {
+        Some(PaginationToken::Signature(signature)) => positions[signature],
+        Some(PaginationToken::SlotIndex { slot, idx }) => Some(SignatureSlot {
+            slot: *slot,
+            slot_idx: *idx,
+        }),
+        None => None,
+    };
+    query.pagination = query
+        .resolved_pagination
+        .map(|position| PaginationToken::SlotIndex {
+            slot: position.slot,
+            idx: position.slot_idx,
+        });
+    query.resolved_signature_filter = query.signature_filter.as_ref().map(|filter| {
+        let position = |signature: &Option<String>| {
+            signature
+                .as_ref()
+                .and_then(|signature| positions[signature])
+        };
+        ResolvedSignatureFilter {
+            gte: position(&filter.gte),
+            gt: position(&filter.gt),
+            lte: position(&filter.lte),
+            lt: position(&filter.lt),
+        }
+    });
 }
 
 fn unsupported_transaction_version_message(version: u8) -> String {
@@ -470,6 +537,10 @@ pub(crate) async fn handle_get_transactions_for_address(
     params: Option<Vec<Value>>,
 ) -> Result<Response, StatusCode> {
     let mut route = RouteMetric::for_state("getTransactionsForAddress", state.as_ref());
+    #[cfg(feature = "disk-cache")]
+    let disk_request = state
+        .disk_cache()
+        .map(|disk| (disk, disk.address_request_deadline()));
 
     let Some(mut params) = params.filter(|v| !v.is_empty()) else {
         route.invalid_params();
@@ -726,54 +797,6 @@ pub(crate) async fn handle_get_transactions_for_address(
         None
     };
 
-    #[cfg(feature = "grpc-head-cache")]
-    let pagination = {
-        if let Some(cache) = state.head_cache.as_ref() {
-            match pagination {
-                Some(PaginationToken::Signature(sig_str)) => {
-                    route.head_cache_read();
-                    if let Ok(sig) = Signature::from_str(&sig_str)
-                        && let Some(pos) = cache.signature_position(&sig)
-                    {
-                        Some(PaginationToken::SlotIndex {
-                            slot: pos.slot,
-                            idx: pos.idx,
-                        })
-                    } else {
-                        Some(PaginationToken::Signature(sig_str))
-                    }
-                }
-                other => other,
-            }
-        } else {
-            pagination
-        }
-    };
-
-    #[cfg(feature = "disk-cache")]
-    let pagination = {
-        if let Some(disk) = state.disk_cache() {
-            match pagination {
-                Some(PaginationToken::Signature(sig_str)) => {
-                    route.disk_cache_read();
-                    if let Ok(sig) = Signature::from_str(&sig_str)
-                        && let Some(position) = disk.signature_position(sig).await
-                    {
-                        Some(PaginationToken::SlotIndex {
-                            slot: position.slot,
-                            idx: position.slot_idx,
-                        })
-                    } else {
-                        Some(PaginationToken::Signature(sig_str))
-                    }
-                }
-                other => other,
-            }
-        } else {
-            pagination
-        }
-    };
-
     let mut filters = options.filters.unwrap_or_default();
 
     if let Err(message) = apply_get_transactions_for_address_slot_aliases(
@@ -906,6 +929,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         eq: filter.eq,
     });
 
+    #[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
     let address_pubkey = Pubkey::from_str(address).expect("validated address");
 
     let mut query = TransactionsForAddressQuery {
@@ -922,71 +946,32 @@ pub(crate) async fn handle_get_transactions_for_address(
         token_accounts,
     };
 
-    #[cfg(feature = "disk-cache")]
-    let disk_candidate = state.disk_cache.is_some();
-    #[cfg(not(feature = "disk-cache"))]
-    let disk_candidate = false;
-
     let mut prequery_timings = QueryTimings::zero();
-    match query.pagination.clone() {
-        Some(PaginationToken::SlotIndex { slot, idx }) => {
-            query.resolved_pagination = Some(SignatureSlot {
-                slot,
-                slot_idx: idx,
-            });
-        }
-        Some(PaginationToken::Signature(signature)) => {
-            let (position, timings) =
-                match resolve_signature_slot_for_bounds(state.as_ref(), &signature).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        metrics::backend_error("get_signature_slot");
-                        error!("Failed to resolve pagination signature {signature}: {}", e);
-                        return Ok(json_rpc_internal_error_response(id));
-                    }
-                };
-            prequery_timings.add(timings);
-            query.resolved_pagination = position;
-            query.pagination = position.map(|position| PaginationToken::SlotIndex {
-                slot: position.slot,
-                idx: position.slot_idx,
-            });
-        }
-        None => {}
+    let mut bound_positions = HashMap::new();
+    for signature in unique_bound_signatures(&query) {
+        let (position, timings) = match resolve_signature_slot_for_bounds(
+            state.as_ref(),
+            &mut route,
+            signature,
+            #[cfg(feature = "disk-cache")]
+            disk_request,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                metrics::backend_error("get_signature_slot");
+                error!(
+                    "Failed to resolve address request signature bound {signature}: {}",
+                    e
+                );
+                return Ok(json_rpc_internal_error_response(id));
+            }
+        };
+        bound_positions.insert(signature.to_owned(), position);
+        prequery_timings.add(timings);
     }
-
-    let hot_fanout_eligible = state.clickhouse.is_gsfa_hot_address(&address_pubkey)
-        && token_accounts == TokenAccountsFilter::None;
-    if (hot_fanout_eligible || disk_candidate)
-        && let Some(signature_filter) = query.signature_filter.as_ref()
-    {
-        let mut resolved = ResolvedSignatureFilter::default();
-        for (label, maybe_signature, slot_ref) in [
-            ("gte", signature_filter.gte.as_deref(), &mut resolved.gte),
-            ("gt", signature_filter.gt.as_deref(), &mut resolved.gt),
-            ("lte", signature_filter.lte.as_deref(), &mut resolved.lte),
-            ("lt", signature_filter.lt.as_deref(), &mut resolved.lt),
-        ] {
-            let Some(signature) = maybe_signature else {
-                continue;
-            };
-            let (position, timings) =
-                match resolve_signature_slot_for_bounds(state.as_ref(), signature).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        metrics::backend_error("get_signature_slot");
-                        error!(
-                            "Failed to resolve hot signature filter {label}={signature}: {}",
-                            e
-                        );
-                        return Ok(json_rpc_internal_error_response(id));
-                    }
-                };
-            prequery_timings.add(timings);
-            *slot_ref = position;
-        }
-        query.resolved_signature_filter = Some(resolved);
-    }
+    apply_resolved_address_bounds(&mut query, &bound_positions);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum RecordSource {
@@ -1250,7 +1235,7 @@ pub(crate) async fn handle_get_transactions_for_address(
     // whole eligible range lies inside the contiguous covered span.
     #[cfg(feature = "disk-cache")]
     let disk_page = 'disk: {
-        let Some(disk) = state.disk_cache() else {
+        let Some((disk, deadline)) = disk_request else {
             break 'disk None;
         };
 
@@ -1312,7 +1297,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         }
 
         route.disk_cache_read();
-        disk.transactions_for_address(
+        disk.transactions_for_address_until(
             address_pubkey,
             crate::disk_cache::index::DiskTfaQuery {
                 limit: limit as usize,
@@ -1324,6 +1309,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                 status: query.status,
                 token_accounts: query.token_accounts,
             },
+            deadline,
         )
         .await
     };
@@ -1632,12 +1618,8 @@ pub(crate) async fn handle_get_transactions_for_address(
         if disk_records.is_empty() {
             HashMap::new()
         } else {
-            let disk = state.disk_cache().expect("disk records imply disk cache");
-            let positions: Vec<(u64, u32)> = disk_records
-                .iter()
-                .map(|(slot, idx, _)| (*slot, *idx))
-                .collect();
-            let fetched = disk.get_txs_by_position(positions).await;
+            let (disk, deadline) = disk_request.expect("disk records imply disk cache");
+            let fetched = disk.get_txs_by_position(&disk_records, deadline).await;
             disk_records
                 .into_iter()
                 .zip(fetched)
@@ -1650,7 +1632,7 @@ pub(crate) async fn handle_get_transactions_for_address(
 
     // Disk-sourced rows whose full record vanished (eviction race) are fetched
     // from ClickHouse with the rest, so the page never silently drops entries.
-    let signature_pairs = merged_records
+    let signature_positions = merged_records
         .iter()
         .filter(|record| match record.source {
             RecordSource::ClickHouse => true,
@@ -1659,24 +1641,21 @@ pub(crate) async fn handle_get_transactions_for_address(
             #[cfg(feature = "disk-cache")]
             RecordSource::Disk => !disk_transaction_map.contains_key(&record.signature),
         })
-        .map(|record| (record.slot, record.signature.clone()))
+        .map(|record| (record.slot, record.slot_idx, record.signature.clone()))
         .collect::<Vec<_>>();
 
-    let (transactions, tx_timings) = if signature_pairs.is_empty() {
+    let (transactions, tx_timings) = if signature_positions.is_empty() {
         (Vec::new(), crate::clickhouse::QueryTimings::zero())
     } else {
         route.source_clickhouse();
         match state
             .clickhouse
-            .get_transactions_by_slot_signatures(
-                &signature_pairs,
-                max_supported_transaction_version,
-            )
+            .get_transactions_by_positions(&signature_positions)
             .await
         {
             Ok(result) => result,
             Err(e) => {
-                metrics::backend_error("get_transactions_by_slot_signatures");
+                metrics::backend_error("get_transactions_by_positions");
                 error!("Failed to query ClickHouse for full transactions: {}", e);
                 let mut resp = json_rpc_internal_error_response(id);
                 add_downstream_header(&mut resp, &timings);
@@ -1857,16 +1836,16 @@ pub(crate) async fn handle_get_transactions_for_address(
     };
 
     #[cfg(feature = "grpc-head-cache")]
-    if skip_clickhouse || (signature_pairs.is_empty() && merged_has_disk) {
+    if skip_clickhouse || (signature_positions.is_empty() && merged_has_disk) {
         #[cfg(feature = "disk-cache")]
         route.source_disk_cache();
-    } else if signature_pairs.is_empty() && merged_has_head {
+    } else if signature_positions.is_empty() && merged_has_head {
         route.source_head_cache();
     } else {
         route.source_clickhouse();
     }
     #[cfg(all(not(feature = "grpc-head-cache"), feature = "disk-cache"))]
-    if skip_clickhouse || (signature_pairs.is_empty() && merged_has_disk) {
+    if skip_clickhouse || (signature_positions.is_empty() && merged_has_disk) {
         route.source_disk_cache();
     } else {
         route.source_clickhouse();
@@ -1884,6 +1863,100 @@ pub(crate) async fn handle_get_transactions_for_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn address_query_with_duplicate_bounds() -> TransactionsForAddressQuery {
+        TransactionsForAddressQuery {
+            address: bs58::encode([7; 32]).into_string(),
+            limit: 100,
+            sort_order: SortOrder::Desc,
+            pagination: Some(PaginationToken::Signature("shared".into())),
+            resolved_pagination: None,
+            slot_filter: None,
+            block_time_filter: None,
+            signature_filter: Some(SignatureFilter {
+                gte: Some("shared".into()),
+                gt: Some("other".into()),
+                lte: Some("shared".into()),
+                lt: Some("other".into()),
+            }),
+            resolved_signature_filter: None,
+            status: TransactionStatusFilter::Any,
+            token_accounts: TokenAccountsFilter::None,
+        }
+    }
+
+    #[test]
+    fn address_bounds_deduplicate_pagination_and_filters_including_misses() {
+        let mut query = address_query_with_duplicate_bounds();
+        let calls = unique_bound_signatures(&query);
+        assert_eq!(calls, ["shared", "other"]);
+        let position = SignatureSlot {
+            slot: 40,
+            slot_idx: 3,
+        };
+        let positions = calls
+            .into_iter()
+            .map(|signature| {
+                (
+                    signature.to_owned(),
+                    (signature == "shared").then_some(position),
+                )
+            })
+            .collect();
+        apply_resolved_address_bounds(&mut query, &positions);
+
+        assert_eq!(query.resolved_pagination, Some(position));
+        assert!(matches!(
+            query.pagination,
+            Some(PaginationToken::SlotIndex { slot: 40, idx: 3 })
+        ));
+        let filter = query.resolved_signature_filter.expect("resolved filter");
+        assert_eq!(filter.gte, Some(position));
+        assert_eq!(filter.lte, Some(position));
+        assert_eq!(filter.gt, None);
+        assert_eq!(filter.lt, None);
+        assert!(
+            query.signature_filter.is_some(),
+            "retain cache eligibility metadata"
+        );
+    }
+
+    #[test]
+    fn missing_pagination_and_bounds_are_unbounded_after_successful_lookup() {
+        let mut query = address_query_with_duplicate_bounds();
+        let positions = unique_bound_signatures(&query)
+            .into_iter()
+            .map(|signature| (signature.to_owned(), None))
+            .collect();
+        apply_resolved_address_bounds(&mut query, &positions);
+        assert!(query.pagination.is_none());
+        assert!(query.resolved_pagination.is_none());
+        let resolved = query
+            .resolved_signature_filter
+            .expect("completed resolution");
+        assert!(
+            [resolved.gte, resolved.gt, resolved.lte, resolved.lt]
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn numeric_pagination_and_absent_filters_need_no_signature_resolution() {
+        let mut query = address_query_with_duplicate_bounds();
+        query.pagination = Some(PaginationToken::SlotIndex { slot: 40, idx: 3 });
+        query.signature_filter = None;
+        assert!(unique_bound_signatures(&query).is_empty());
+        apply_resolved_address_bounds(&mut query, &HashMap::new());
+        assert_eq!(
+            query.resolved_pagination,
+            Some(SignatureSlot {
+                slot: 40,
+                slot_idx: 3
+            })
+        );
+        assert!(query.resolved_signature_filter.is_none());
+    }
 
     #[test]
     fn parse_get_transaction_config_accepts_slot_extension() {

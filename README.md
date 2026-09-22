@@ -180,6 +180,10 @@ curl -sS http://localhost:8899 \
 
 ## Configuration
 
+Address history requests share a separate `DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` cache budget
+(default `100` ms) across signature bounds, address scans, and transaction hydration. Expiry
+falls back to primary ClickHouse; the general cache and maintenance deadlines remain independent.
+
 The RPC server bounds primary signature-status history work with
 `GET_SIGNATURE_STATUSES_MAX_CONCURRENCY` (default `4`) and
 `GET_SIGNATURE_STATUSES_MAX_THREADS` (default `2`). `CLICKHOUSE_CLUSTER` identifies the primary

@@ -173,20 +173,24 @@ impl KeyIndex {
     pub(super) fn epoch(&self) -> u64 {
         self.state.lock().expect("key index lock").epoch
     }
+    #[cfg(test)]
     pub(super) fn may_contain(&self, partition: u64, families: &[Family], key: &[u8]) -> bool {
+        self.membership(partition, families, key) != Some(false)
+    }
+    /// None means incomplete membership, never proven absence.
+    pub(super) fn membership(
+        &self,
+        partition: u64,
+        families: &[Family],
+        key: &[u8],
+    ) -> Option<bool> {
         let state = self.state.lock().expect("key index lock");
-        let Some(filters) = state
-            .entries
-            .get(&partition)
-            .and_then(|e| e.filters.as_ref())
-        else {
-            return true;
-        };
-        families.iter().any(|f| {
-            filters[*f as usize]
-                .as_ref()
-                .is_none_or(|b| b.contains(key))
-        })
+        let filters = state.entries.get(&partition)?.filters.as_ref()?;
+        let mut present = false;
+        for family in families {
+            present |= filters[*family as usize].as_ref()?.contains(key);
+        }
+        Some(present)
     }
     fn begin(&self, partition: u64) -> Option<u64> {
         let mut state = self.state.lock().expect("key index lock");
@@ -525,7 +529,34 @@ mod tests {
         assert!(!index.may_contain(1, &[Family::Address], b"owner"));
         assert!(index.may_contain(1, &[Family::Address, Family::Owner], b"owner"));
         assert!(index.may_contain(2, &[Family::Address], b"unknown"));
+        assert_eq!(
+            index.membership(1, &[Family::Address], b"owner"),
+            Some(false)
+        );
+        assert_eq!(index.membership(1, &[Family::Owner], b"owner"), Some(true));
+        assert_eq!(index.membership(2, &[Family::Address], b"unknown"), None);
     }
+    #[test]
+    fn incomplete_family_never_proves_absence_or_complete_membership() {
+        let index = KeyIndex {
+            state: Mutex::default(),
+            allocation: tokio::sync::Mutex::default(),
+            width: 10,
+            quota: 1024,
+            max_entries: 1,
+        };
+        let token = index.begin(1).unwrap();
+        let mut address = Bloom::new(32, 1).unwrap();
+        address.insert(b"key");
+        index.finish(1, token, Some([Some(address), None, None]));
+        assert_eq!(index.membership(1, &[Family::Address], b"key"), Some(true));
+        assert_eq!(
+            index.membership(1, &[Family::Address, Family::Owner], b"key"),
+            None
+        );
+        assert_eq!(index.membership(1, &[Family::Owner], b"missing"), None);
+    }
+
     #[test]
     fn old_build_cannot_replace_new_generation() {
         let index = Arc::new(KeyIndex {
