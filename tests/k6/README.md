@@ -82,6 +82,15 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for
   -e REFERENCE_RPC_URL=http://localhost:8898 \
   -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
 
+# Agave 4.3 request errors (match the configured address limit; 0 disables this check)
+k6 run tests/k6/scenarios/validation/superbank-rpc-validate-agave43.js -e RPC_URL=http://localhost:8899 -e INFLATION_REWARD_MAX_ADDRESSES=100
+
+# Compare standard request errors with an Agave reference (requires solana-core 4.3.x)
+k6 run tests/k6/scenarios/validation/superbank-rpc-validate-agave43.js \
+  -e RPC_URL=http://localhost:8899 \
+  -e AGAVE43_REFERENCE_RPC_URL=https://your-agave-43-reference \
+  -e INFLATION_REWARD_MAX_ADDRESSES=100
+
 # Validation test for JSON-RPC batch semantics (no reference RPC required)
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-batch.js -e RPC_URL=http://localhost:8899
 
@@ -1154,3 +1163,19 @@ The former Docker SQL benchmark runner was removed with its shared ClickHouse
 protocol harness. Its [archived findings](../../GETTRANSACTION_BENCHMARKS.md) and
 [machine-readable results](../../docs/benchmarks/gettransaction-2026-09-11.json) remain
 available for reference.
+
+### Agave 4.3 request parity
+
+The standard runner always runs the Agave 4.3 request-contract scenario. Set
+`INFLATION_REWARD_MAX_ADDRESSES` to the target's effective limit (default 100;
+zero skips the target limit check). The scenario accepts integers 0–100000 to
+bound its generated request size; larger configured limits need separate testing.
+Set `AGAVE43_REFERENCE_RPC_URL` explicitly to also check the standard methods
+against a reference. The scenario checks `getVersion` and rejects versions outside
+4.3.x; a reported version does not independently certify the deployment.
+
+The reference uses Agave's 32-address limit; the target uses its configured limit.
+`getTransactionsForAddress` is tested only on Superbank. These are request-level
+error checks and do not establish stored-data, successful-response, or producer
+parity. Existing method comparison scenarios cover successful responses when
+appropriate shared fixtures and endpoints are available.

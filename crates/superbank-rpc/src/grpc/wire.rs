@@ -12,9 +12,9 @@ use solana_transaction_status::{Reward, RewardType, TransactionStatusMeta};
 use tonic::{Code, Status};
 
 use crate::clickhouse::{BlockMetadataRecord, StoredTransactionRecord};
-use crate::grpc::generated::confirmed_block as storage_proto;
 use crate::grpc::generated::superbank as superbank_proto;
 use crate::hydration::{build_transaction_status_meta, build_versioned_transaction};
+use solana_storage_proto::convert::generated as storage_proto;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AccountFilters {
@@ -323,44 +323,26 @@ fn encode_rewards(metadata: &BlockMetadataRecord) -> Result<Vec<u8>, Status> {
 }
 
 fn encode_reward(reward: &Reward) -> storage_proto::Reward {
-    storage_proto::Reward {
-        pubkey: reward.pubkey.clone(),
-        lamports: reward.lamports,
-        post_balance: reward.post_balance,
-        reward_type: reward
-            .reward_type
-            .map(encode_reward_type)
-            .unwrap_or_default() as i32,
-        commission: reward
-            .commission
-            .map(|commission| commission.to_string())
-            .unwrap_or_default(),
-        commission_bps: reward
-            .commission_bps
-            .map(|commission_bps| commission_bps.to_string())
-            .unwrap_or_default(),
-    }
+    reward.clone().into()
 }
 
-fn encode_reward_type(reward_type: RewardType) -> storage_proto::RewardType {
+fn storage_reward_type(reward_type: RewardType) -> storage_proto::RewardType {
     match reward_type {
         RewardType::Fee => storage_proto::RewardType::Fee,
         RewardType::Rent => storage_proto::RewardType::Rent,
         RewardType::Staking => storage_proto::RewardType::Staking,
         RewardType::Voting => storage_proto::RewardType::Voting,
         RewardType::DeactivatedStake => storage_proto::RewardType::DeactivatedStake,
+        RewardType::VATDebit => storage_proto::RewardType::VatDebit,
     }
 }
 
 fn reward_type_from_string(value: &str) -> storage_proto::RewardType {
-    match value {
-        "Fee" | "fee" => storage_proto::RewardType::Fee,
-        "Rent" | "rent" => storage_proto::RewardType::Rent,
-        "Staking" | "staking" => storage_proto::RewardType::Staking,
-        "Voting" | "voting" => storage_proto::RewardType::Voting,
-        "DeactivatedStake" | "deactivated-stake" => storage_proto::RewardType::DeactivatedStake,
-        _ => storage_proto::RewardType::Unspecified,
-    }
+    crate::hydration::parse_reward_type(&Some(value.to_owned()))
+        .ok()
+        .flatten()
+        .map(storage_reward_type)
+        .unwrap_or_default()
 }
 
 fn encode_token_balance(
@@ -558,6 +540,174 @@ mod tests {
     }
 
     #[test]
+    fn metadata_wire_matches_agave_for_absent_and_populated_fields() {
+        use solana_account_decoder_client_types::token::UiTokenAmount;
+        use solana_message::{compiled_instruction::CompiledInstruction, v0::LoadedAddresses};
+        use solana_transaction_context::transaction::TransactionReturnData;
+        use solana_transaction_status::{
+            InnerInstruction, InnerInstructions, TransactionTokenBalance,
+        };
+        let populated = TransactionStatusMeta {
+            status: Err(solana_transaction_error::TransactionError::AccountNotFound),
+            fee: 5000,
+            pre_balances: vec![10000, 42],
+            post_balances: vec![5000, 42],
+            inner_instructions: Some(vec![InnerInstructions {
+                index: 1,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 2,
+                        accounts: vec![0, 1],
+                        data: vec![7, 8],
+                    },
+                    stack_height: Some(2),
+                }],
+            }]),
+            log_messages: Some(vec!["program log".to_owned()]),
+            pre_token_balances: Some(vec![TransactionTokenBalance {
+                account_index: 1,
+                mint: Pubkey::from([2; 32]).to_string(),
+                ui_token_amount: UiTokenAmount {
+                    ui_amount: Some(1.25),
+                    decimals: 2,
+                    amount: "125".to_owned(),
+                    ui_amount_string: "1.25".to_owned(),
+                },
+                owner: Pubkey::from([3; 32]).to_string(),
+                program_id: Pubkey::from([4; 32]).to_string(),
+            }]),
+            post_token_balances: Some(vec![]),
+            rewards: Some(vec![Reward {
+                pubkey: Pubkey::from([5; 32]).to_string(),
+                lamports: -10,
+                post_balance: 90,
+                reward_type: Some(RewardType::VATDebit),
+                commission: Some(7),
+                commission_bps: Some(725),
+            }]),
+            loaded_addresses: LoadedAddresses {
+                writable: vec![Pubkey::from([6; 32])],
+                readonly: vec![Pubkey::from([7; 32])],
+            },
+            return_data: Some(TransactionReturnData {
+                program_id: Pubkey::from([8; 32]),
+                data: vec![9, 10],
+            }),
+            compute_units_consumed: Some(1234),
+            cost_units: Some(5678),
+        };
+        for meta in [
+            TransactionStatusMeta::default(),
+            populated,
+            TransactionStatusMeta {
+                inner_instructions: Some(vec![]),
+                log_messages: Some(vec![]),
+                ..Default::default()
+            },
+        ] {
+            let expected = storage_proto::TransactionStatusMeta::from(meta.clone());
+            let bytes = encode_transaction_status_meta(&meta).unwrap();
+            assert_eq!(bytes, expected.encode_to_vec());
+            let decoded = storage_proto::TransactionStatusMeta::decode(bytes.as_slice()).unwrap();
+            assert_eq!(decoded, expected);
+            let restored = TransactionStatusMeta::try_from(decoded).unwrap();
+            assert_eq!(restored.status, meta.status);
+            assert_eq!(restored.rewards, meta.rewards.or(Some(vec![])));
+        }
+    }
+
+    #[test]
+    fn block_reward_wire_matches_agave_including_vat_and_commissions() {
+        for spelling in ["VATDebit", "validator-admission-ticket-debit"] {
+            let metadata = BlockMetadataRecord {
+                slot: 1,
+                parent_slot: 0,
+                blockhash: [1; 32],
+                parent_blockhash: [0; 32],
+                block_time: None,
+                block_height: None,
+                executed_transaction_count: 0,
+                entry_count: 0,
+                rewards_present: true,
+                rewards_pubkey: vec![[2; 32], [3; 32]],
+                rewards_lamports: vec![-10, 100],
+                rewards_post_balance: vec![90, 200],
+                rewards_type: vec![Some(spelling.to_owned()), Some("Staking".to_owned())],
+                rewards_commission: vec![None, Some(7)],
+                rewards_commission_bps: vec![None, Some(725)],
+                rewards_num_partitions: Some(4),
+            };
+            let bytes = encode_rewards(&metadata).unwrap();
+            let decoded = storage_proto::Rewards::decode(bytes.as_slice()).unwrap();
+            assert_eq!(decoded.num_partitions.unwrap().num_partitions, 4);
+            assert_eq!(decoded.rewards[0].reward_type, 6);
+            assert_eq!(decoded.rewards[0].lamports, -10);
+            assert_eq!(decoded.rewards[0].post_balance, 90);
+            assert_eq!(decoded.rewards[1].reward_type, 3);
+            assert_eq!(decoded.rewards[1].commission, "7");
+            assert_eq!(decoded.rewards[1].commission_bps, "725");
+            let vat: Reward = decoded.rewards[0].clone().into();
+            assert_eq!(vat.reward_type, Some(RewardType::VATDebit));
+        }
+    }
+
+    #[test]
+    fn reward_wire_retains_field_tags_and_all_enum_numbers() {
+        let variants = [
+            None,
+            Some(RewardType::Fee),
+            Some(RewardType::Rent),
+            Some(RewardType::Staking),
+            Some(RewardType::Voting),
+            Some(RewardType::DeactivatedStake),
+            Some(RewardType::VATDebit),
+        ];
+        for (number, reward_type) in variants.into_iter().enumerate() {
+            let reward = Reward {
+                pubkey: "1".to_owned(),
+                lamports: -10,
+                post_balance: 90,
+                reward_type,
+                commission: Some(7),
+                commission_bps: Some(725),
+            };
+            let encoded = encode_reward(&reward);
+            assert_eq!(encoded.reward_type, number as i32);
+            let restored: Reward =
+                storage_proto::Reward::decode(encoded.encode_to_vec().as_slice())
+                    .unwrap()
+                    .into();
+            assert_eq!(restored, reward);
+        }
+        // Fixed wire fixture: fields 1..6, signed int64 -10 (not zigzag), VAT=6.
+        let bytes = hex::decode("0a013110f6ffffffffffffffff01185a20062a01373203373235").unwrap();
+        let decoded = storage_proto::Reward::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.reward_type, 6);
+        assert_eq!(decoded.lamports, -10);
+        assert_eq!(decoded.commission_bps, "725");
+        assert_eq!(decoded.encode_to_vec(), bytes);
+    }
+
+    #[test]
+    fn vat_debit_wire_preserves_type_and_signed_amount() {
+        let reward = Reward {
+            pubkey: "11111111111111111111111111111111".to_owned(),
+            lamports: -10,
+            post_balance: 90,
+            reward_type: Some(RewardType::VATDebit),
+            commission: None,
+            commission_bps: None,
+        };
+        let encoded = encode_reward(&reward);
+        assert_eq!(encoded.reward_type, 6);
+        assert_eq!(encoded.lamports, -10);
+        assert_eq!(encoded.post_balance, 90);
+        for spelling in ["VATDebit", "validator-admission-ticket-debit"] {
+            assert_eq!(reward_type_from_string(spelling) as i32, 6);
+        }
+    }
+
+    #[test]
     fn grpc_reward_wire_accepts_both_deactivated_stake_spellings() {
         assert_eq!(storage_proto::RewardType::DeactivatedStake as i32, 5);
         assert_eq!(
@@ -569,7 +719,7 @@ mod tests {
             storage_proto::RewardType::DeactivatedStake as i32
         );
         assert_eq!(
-            encode_reward_type(RewardType::DeactivatedStake) as i32,
+            storage_reward_type(RewardType::DeactivatedStake) as i32,
             storage_proto::RewardType::DeactivatedStake as i32
         );
     }

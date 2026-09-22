@@ -5,6 +5,7 @@
 
 mod block_ranges;
 pub(crate) mod blocks;
+mod encoding;
 pub(crate) mod signatures;
 pub(crate) mod transactions;
 pub(crate) mod types;

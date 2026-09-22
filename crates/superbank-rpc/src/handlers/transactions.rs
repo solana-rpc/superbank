@@ -87,19 +87,37 @@ fn parse_get_transaction_config_value(
 ) -> Result<ParsedGetTransactionConfig, String> {
     reject_unknown_fields(&config_value, &GET_TRANSACTION_ALLOWED_FIELDS)?;
 
-    if config_value.is_null() {
-        return Ok(ParsedGetTransactionConfig {
-            wrapper: RpcEncodingConfigWrapper::Current(Some(RpcTransactionConfig::default())),
-            slot: None,
-        });
-    }
-
     let slot = extract_get_transaction_slot(&mut config_value)?;
     let wrapper =
         serde_json::from_value::<RpcEncodingConfigWrapper<RpcTransactionConfig>>(config_value)
             .map_err(|e| format!("Invalid params: failed to parse config ({e})"))?;
 
-    Ok(ParsedGetTransactionConfig { wrapper, slot })
+    let config = wrapper.convert_to_current();
+    super::encoding::validate_transaction_encoding(
+        config.encoding.unwrap_or(UiTransactionEncoding::Json),
+        config.max_supported_transaction_version,
+    )?;
+    Ok(ParsedGetTransactionConfig {
+        wrapper: RpcEncodingConfigWrapper::Current(Some(config)),
+        slot,
+    })
+}
+
+fn parse_address_options(value: Value) -> Result<GetTransactionsForAddressOptions, String> {
+    let options: GetTransactionsForAddressOptions = serde_json::from_value(value)
+        .map_err(|e| format!("Invalid params: failed to parse options ({e})"))?;
+    // Only base58 is accepted by this custom method; binary remains unsupported.
+    if options
+        .encoding
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("base58"))
+    {
+        super::encoding::validate_transaction_encoding(
+            UiTransactionEncoding::Base58,
+            options.max_supported_transaction_version,
+        )?;
+    }
+    Ok(options)
 }
 
 fn apply_get_transactions_for_address_slot_aliases(
@@ -510,16 +528,11 @@ pub(crate) async fn handle_get_transactions_for_address(
             if options_value.is_null() {
                 GetTransactionsForAddressOptions::default()
             } else {
-                match serde_json::from_value::<GetTransactionsForAddressOptions>(options_value) {
+                match parse_address_options(options_value) {
                     Ok(parsed) => parsed,
                     Err(e) => {
                         route.invalid_params();
-                        return Ok(json_rpc_error_response(
-                            id,
-                            -32602,
-                            format!("Invalid params: failed to parse options ({e})"),
-                            None,
-                        ));
+                        return Ok(json_rpc_error_response(id, -32602, e, None));
                     }
                 }
             }
