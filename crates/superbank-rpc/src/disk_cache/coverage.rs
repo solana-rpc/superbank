@@ -121,6 +121,18 @@ impl CoverageMap {
             .map(|(&start, &end)| (start, end))
     }
 
+    /// Exact covered intersections, including older disjoint intervals.
+    pub(crate) fn intersections(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        self.ranges
+            .range(..=end)
+            .filter_map(|(&floor, &tip)| {
+                let floor = floor.max(start);
+                let tip = tip.min(end);
+                (floor <= tip).then_some((floor, tip))
+            })
+            .collect()
+    }
+
     /// Inclusive sub-ranges of `[start, end]` not covered by the map.
     pub(crate) fn holes_in(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         if end < start {
