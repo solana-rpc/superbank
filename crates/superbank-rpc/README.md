@@ -407,6 +407,38 @@ DRAGONSMOUTH_X_TOKEN=YOUR_OPTIONAL_TOKEN \
 cargo run -p superbank-rpc --features grpc-head-cache --
 ```
 
+### `getBlocks` coverage and latest-slot authority
+
+`getBlocks` plans the complete requested range from the in-memory block index, head cache,
+and local disk coverage before reading primary ClickHouse. Parent slots and hashes from
+one head subscription prove both produced blocks and intervening skipped slots. Missing
+metadata, conflicting forks, and concurrent invalidation leave coverage unknown. The
+primary is queried only for remaining gaps; a failed gap query returns internal error
+(`-32603`), never a partial successful list. The index can answer without a local disk query.
+
+When head cache is enabled, an omitted `endSlot` uses only its commitment-specific tip.
+There is **no primary ClickHouse latest-slot fallback**. Tip trust requires a connected
+subscription, a verified parent edge (or the genesis root), and advancement at the requested commitment within
+one second (inclusive), measured with a monotonic clock. Duplicate or older updates and
+heartbeats do not renew freshness. Finalized progress can satisfy confirmed requests;
+processed progress cannot keep confirmed or finalized tips fresh. A reconnect clears
+proof state and requires new evidence. An uninitialized, disconnected, stale, or
+unverifiable newest tip returns `-32603`; the server never selects an older complete tip.
+This measures observed progress, not upstream distance from the network tip.
+
+Explicit-end requests do not require fresh latest-slot discovery. With head cache disabled,
+the existing primary latest-slot cache remains in use. `getBlocksWithLimit` shares the
+coverage helper and retains its existing slot-window interpretation of the limit.
+
+Existing source labels retain their values (`clickhouse`, `disk_cache`, `head_cache`,
+`none`); the memory block index is classified as `disk_cache`. The histogram
+`superbank_rpc_blocks_range_seconds{method,path,reason,outcome}` distinguishes `local`,
+`partial_cache`, and `primary` paths, with `success`/`error` outcomes. Reasons are bounded
+by `none`, `coverage_gap`, `commitment_unavailable`, `untrusted_tip`, and `cache_changed`.
+Its count measures requests, not submitted queries. Downstream elapsed timing includes
+latest-slot refresh/wait time and range reads; primary latest-slot row counts are marked
+unknown. Source headers describe touched sources, not completeness proofs.
+
 Configuration:
 
 | Option | Environment | Default | Notes |

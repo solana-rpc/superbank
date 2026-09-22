@@ -159,6 +159,17 @@ impl KeyIndex {
     pub(super) fn invalidate_reads(&self) {
         self.state.lock().expect("key index lock").epoch += 1;
     }
+    // Reject an overlapping writer even when its invalidation predates this read.
+    pub(super) fn range_read_token(&self, start: u64, end: u64) -> Option<(u64, u64)> {
+        let state = self.state.lock().expect("key index lock");
+        let range = (start / self.width, end / self.width);
+        let overlaps = state
+            .writers
+            .values()
+            .any(|writer| writer.range.0 <= range.1 && range.0 <= writer.range.1);
+        (state.untracked_writers == 0 && !overlaps).then_some((state.epoch, state.serial))
+    }
+
     pub(super) fn epoch(&self) -> u64 {
         self.state.lock().expect("key index lock").epoch
     }

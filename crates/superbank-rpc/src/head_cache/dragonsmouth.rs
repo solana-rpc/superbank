@@ -13,8 +13,8 @@ use solana_commitment_config::CommitmentLevel;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yellowstone_block_machine::dragonsmouth::{
-    client_ext::{GeyserBlockStream, GeyserGrpcExt},
-    stream::BlockMachineOutput,
+    stream::{BlockMachineOutput, BlockStream},
+    wrapper::RESERVED_FILTER_NAME,
 };
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
@@ -48,8 +48,9 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
     let max_backoff = Duration::from_secs(5);
 
     loop {
-        match connect_and_subscribe(&cfg).await {
+        match connect_and_subscribe(&cfg, cache.clone()).await {
             Ok(mut stream) => {
+                let _session = CoverageSession::new(cache.clone());
                 info!(
                     endpoint = cfg.endpoint.as_str(),
                     min_commitment = ?cfg.min_commitment,
@@ -221,6 +222,10 @@ fn handle_output(cache: &HeadCache, output: BlockMachineOutput) {
         }
         BlockMachineOutput::SlotCommitmentUpdate(update) => {
             cache.note_slot_commitment(update.slot, update.commitment);
+            let mut proof = cache.coverage.write().expect("head coverage lock");
+            proof.validate_parent(update.slot, update.parent_slot);
+            proof.publish(update.slot, update.commitment);
+            proof.retain(cache.latest_slot(), cache.retain_slots);
         }
         BlockMachineOutput::ForkDetected(fork) => {
             warn!(slot = fork.slot, "head cache: fork detected; dropping slot");
@@ -463,7 +468,8 @@ fn parse_block_rewards(
 
 async fn connect_and_subscribe(
     cfg: &DragonsmouthHeadCacheConfig,
-) -> Result<GeyserBlockStream, String> {
+    cache: Arc<HeadCache>,
+) -> Result<impl futures_util::Stream<Item = Result<BlockMachineOutput, String>> + Unpin, String> {
     let mut client = GeyserGrpcClient::build_from_shared(cfg.endpoint.clone().into_bytes())
         .map_err(|e| format!("invalid endpoint: {e}"))?
         .x_token(cfg.x_token.clone())
@@ -475,6 +481,53 @@ async fn connect_and_subscribe(
         .await
         .map_err(|e| format!("connect error: {e}"))?;
 
+    record_upstream_node(&mut client).await;
+
+    // Subscribe to all transaction updates; the block machine will add the reserved slot/meta/entry
+    // filters needed to safely freeze blocks at the requested minimum commitment level.
+    let mut transactions = HashMap::new();
+    transactions.insert(
+        TRANSACTIONS_FILTER_NAME.to_string(),
+        SubscribeRequestFilterTransactions::default(),
+    );
+
+    // Equivalent to subscribe_block's filters, with a tap before the block machine
+    // discards metadata. Proof evidence must come from this same subscription.
+    let mut request = SubscribeRequest {
+        transactions,
+        commitment: Some(0),
+        ..Default::default()
+    };
+    request.slots.insert(
+        RESERVED_FILTER_NAME.to_owned(),
+        yellowstone_grpc_proto::prelude::SubscribeRequestFilterSlots {
+            interslot_updates: Some(true),
+            ..Default::default()
+        },
+    );
+    request
+        .blocks_meta
+        .insert(RESERVED_FILTER_NAME.to_owned(), Default::default());
+    request
+        .entry
+        .insert(RESERVED_FILTER_NAME.to_owned(), Default::default());
+    let (_sink, source) = client
+        .subscribe_with_request(Some(request))
+        .await
+        .map_err(|e| format!("subscribe_block error: {e}"))?;
+    let minimum = cfg.min_commitment;
+    let source = source.inspect(move |event| {
+        let _ = event
+            .as_ref()
+            .map(|update| observe_coverage(&cache, update, minimum));
+    });
+    Ok(
+        BlockStream::new(source, cfg.min_commitment)
+            .map(|result| result.map_err(|e| e.to_string())),
+    )
+}
+
+async fn record_upstream_node(client: &mut GeyserGrpcClient) {
     // Probe response metadata on the active gRPC channel to capture the upstream node label.
     match client.geyser.get_version(GetVersionRequest {}).await {
         Ok(response) => {
@@ -505,25 +558,64 @@ async fn connect_and_subscribe(
             }
         }
     }
+}
 
-    // Subscribe to all transaction updates; the block machine will add the reserved slot/meta/entry
-    // filters needed to safely freeze blocks at the requested minimum commitment level.
-    let mut transactions = HashMap::new();
-    transactions.insert(
-        TRANSACTIONS_FILTER_NAME.to_string(),
-        SubscribeRequestFilterTransactions::default(),
-    );
+struct CoverageSession(Arc<HeadCache>);
+impl CoverageSession {
+    fn new(cache: Arc<HeadCache>) -> Self {
+        cache
+            .coverage
+            .write()
+            .expect("head coverage lock")
+            .connect();
+        Self(cache)
+    }
+}
+impl Drop for CoverageSession {
+    fn drop(&mut self) {
+        self.0
+            .coverage
+            .write()
+            .expect("head coverage lock")
+            .disconnect();
+    }
+}
 
-    let request = SubscribeRequest {
-        transactions,
-        commitment: Some(grpc_commitment(cfg.min_commitment) as i32),
-        ..Default::default()
-    };
-
-    client
-        .subscribe_block(request)
-        .await
-        .map_err(|e| format!("subscribe_block error: {e}"))
+fn observe_coverage(cache: &HeadCache, update: &SubscribeUpdate, minimum: CommitmentLevel) {
+    use super::coverage::Link;
+    use yellowstone_grpc_proto::prelude::{SlotStatus, subscribe_update::UpdateOneof};
+    let mut proof = cache.coverage.write().expect("head coverage lock");
+    match update.update_oneof.as_ref() {
+        Some(UpdateOneof::BlockMeta(meta)) => {
+            let (Some(hash), Some(parent_hash)) = (
+                parse_hash(meta.slot, "blockhash", &meta.blockhash),
+                parse_hash(meta.slot, "parent_blockhash", &meta.parent_blockhash),
+            ) else {
+                proof.invalidate(meta.slot);
+                return;
+            };
+            proof.metadata(Link {
+                slot: meta.slot,
+                hash,
+                parent: meta.parent_slot,
+                parent_hash,
+            });
+            proof.retain(meta.slot, cache.retain_slots);
+        }
+        Some(UpdateOneof::Slot(slot)) => {
+            let commitment = match SlotStatus::try_from(slot.status) {
+                Ok(SlotStatus::SlotProcessed) => CommitmentLevel::Processed,
+                Ok(SlotStatus::SlotConfirmed) => CommitmentLevel::Confirmed,
+                Ok(SlotStatus::SlotFinalized) => CommitmentLevel::Finalized,
+                _ => return,
+            };
+            if super::commitment_meets(commitment, minimum) {
+                proof.observe(slot.slot, commitment, std::time::Instant::now());
+            }
+            proof.retain(slot.slot, cache.retain_slots);
+        }
+        _ => {}
+    }
 }
 
 fn grpc_commitment(level: CommitmentLevel) -> yellowstone_grpc_proto::prelude::CommitmentLevel {
@@ -537,6 +629,84 @@ fn grpc_commitment(level: CommitmentLevel) -> yellowstone_grpc_proto::prelude::C
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coverage_events(slot: u64, parent: u64) -> Vec<SubscribeUpdate> {
+        use yellowstone_grpc_proto::prelude::{
+            SlotStatus, SubscribeUpdateBlockMeta, SubscribeUpdateSlot,
+            subscribe_update::UpdateOneof,
+        };
+        let status = |status: SlotStatus| SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                parent: Some(parent),
+                status: status as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        vec![
+            status(SlotStatus::SlotFirstShredReceived),
+            status(SlotStatus::SlotCompleted),
+            SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                    slot,
+                    parent_slot: parent,
+                    blockhash: Hash::new_from_array([slot as u8; 32]).to_string(),
+                    parent_blockhash: Hash::new_from_array([parent as u8; 32]).to_string(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            status(SlotStatus::SlotProcessed),
+            status(SlotStatus::SlotConfirmed),
+            status(SlotStatus::SlotFinalized),
+        ]
+    }
+
+    #[tokio::test]
+    async fn block_machine_subscription_publishes_matching_range_proofs() {
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone());
+        let events = coverage_events(10, 9)
+            .into_iter()
+            .chain(coverage_events(12, 10));
+        let source =
+            futures_util::stream::iter(events.map(Ok::<_, std::io::Error>)).inspect(|event| {
+                observe_coverage(&cache, event.as_ref().unwrap(), CommitmentLevel::Processed)
+            });
+        let mut stream = BlockStream::new(source, CommitmentLevel::Processed);
+        while let Some(output) = stream.next().await {
+            handle_output(&cache, output.unwrap());
+        }
+        let (tip, proof) = cache
+            .coverage
+            .read()
+            .unwrap()
+            .snapshot(
+                10,
+                None,
+                CommitmentLevel::Finalized,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(tip, 12);
+        assert_eq!(proof.slots, vec![10, 12]);
+        assert!(proof.gaps(10, 12).is_empty());
+        drop(session);
+        assert!(
+            cache
+                .coverage
+                .read()
+                .unwrap()
+                .snapshot(
+                    10,
+                    None,
+                    CommitmentLevel::Finalized,
+                    std::time::Instant::now()
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn apply_block_meta_updates_slot_metadata() {

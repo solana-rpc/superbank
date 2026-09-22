@@ -11,6 +11,16 @@ Install [k6](https://k6.io/) locally, then run:
 # Basic load test
 k6 run tests/k6/scenarios/basic/superbank-rpc-get-signatures.js -e RPC_URL=http://localhost:8899 -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
 
+# Basic getBlocks correctness (fixed bounds; optional independent reference)
+k6 run tests/k6/scenarios/basic/superbank-rpc-get-blocks.js \
+  -e RPC_URL=http://localhost:8899 -e START_SLOT=100 -e END_SLOT=120 \
+  -e REFERENCE_RPC_URL=http://reference:8899 -e ITERATIONS=100
+# Optional EXPECTED_SLOTS=100,102,... checks an independently known fixture.
+# TEST_OMITTED_END=true also exercises latest-slot discovery. Reference parity
+# uses explicit bounds only: independently moving latest tips are not comparable.
+# Latency tags separate local requests from primary-touched requests. Use server
+# range-path metrics to distinguish partial-cache from primary-only responses.
+
 # Basic JSON-RPC batch load test
 k6 run tests/k6/scenarios/basic/superbank-rpc-batch-load.js -e RPC_URL=http://localhost:8899 -e BATCH_SIZE=3
 

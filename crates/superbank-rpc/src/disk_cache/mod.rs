@@ -196,6 +196,26 @@ struct CoverageWriteRow {
 #[derive(Debug, Clone, Deserialize, Row)]
 struct SlotRow {
     slot: u64,
+    status: i8,
+}
+
+fn slots_from_coverage_rows(rows: Vec<SlotRow>, start: u64, end: u64) -> Option<Vec<u64>> {
+    let expected = end.checked_sub(start)?.checked_add(1)?;
+    if rows.len() as u64 != expected {
+        return None;
+    }
+    let mut slots = Vec::new();
+    for (offset, row) in rows.into_iter().enumerate() {
+        if row.slot != start + offset as u64 {
+            return None;
+        }
+        match row.status {
+            1 => slots.push(row.slot),
+            2 => {}
+            _ => return None,
+        }
+    }
+    Some(slots)
 }
 
 #[derive(Debug, Clone, Deserialize, Row)]
@@ -242,6 +262,41 @@ pub(crate) struct DiskCacheInner {
 }
 
 impl DiskCache {
+    #[cfg(test)]
+    pub(crate) fn for_range_tests(
+        local: ClickHouseClient,
+        index: Option<block_index::BlockIndex>,
+        coverage: &[(u64, u64)],
+    ) -> Self {
+        let cfg = key_tests::config(String::new(), "test".into());
+        let key_index = Arc::new(key_index::KeyIndex::new(&cfg));
+        let mut map = CoverageMap::new();
+        for &(a, b) in coverage {
+            map.insert_range(a, b);
+        }
+        Self {
+            inner: Arc::new(DiskCacheInner {
+                cfg,
+                key_index,
+                admin: local.clone(),
+                maintenance_reader: local.clone(),
+                address_index_reader: local.clone(),
+                signature_index_reader: local.clone(),
+                query_client: RwLock::new(local.clone()),
+                local,
+                http: reqwest::Client::new(),
+                schema: RwLock::new(Arc::new(SourceSchemaSnapshot {
+                    tables: Vec::new(),
+                    fingerprint: String::new(),
+                })),
+                coverage: RwLock::new(map),
+                block_index: index.map(Arc::new),
+                min_retained: AtomicU64::new(0),
+                ready: AtomicBool::new(true),
+            }),
+        }
+    }
+
     pub(crate) async fn open(
         cfg: DiskCacheConfig,
         source: &ClickHouseClient,
@@ -705,27 +760,58 @@ impl DiskCache {
         }
     }
 
-    pub(crate) async fn covered_slots_in_range(&self, start: u64, end: u64) -> Option<Vec<u64>> {
-        if !self.ready() || end < start {
-            return None;
+    pub(crate) async fn range_coverage(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> crate::slot_coverage::SlotCoverage {
+        let mut proof = crate::slot_coverage::SlotCoverage::default();
+        if !self.ready() || start > end {
+            return proof;
         }
-        let start = start.max(self.min_retained_slot());
+        let intervals = self
+            .inner
+            .coverage
+            .read()
+            .expect("coverage lock")
+            .intersections(start.max(self.min_retained_slot()), end);
+        for (floor, tip) in intervals {
+            if let Some(slots) = self.read_covered_interval(floor, tip).await {
+                proof.merge(crate::slot_coverage::SlotCoverage::new(slots, floor, tip));
+            }
+        }
+        proof
+    }
+
+    async fn read_covered_interval(&self, start: u64, end: u64) -> Option<Vec<u64>> {
+        let token = self.inner.key_index.range_read_token(start, end)?;
         let query = format!(
-            "SELECT slot FROM {} FINAL WHERE status = 1 AND slot BETWEEN {start} AND {end} ORDER BY slot",
+            "SELECT slot, status FROM {} FINAL WHERE slot BETWEEN {start} AND {end} ORDER BY slot",
             schema::COVERAGE_TABLE
         );
-        let result = self
+        let rows = self
             .inner
             .local
             .read_all::<SlotRow>(&query, "disk_cache_range_coverage")
-            .await;
-        match result {
-            Ok(rows) => Some(rows.into_iter().map(|row| row.slot).collect()),
-            Err(err) => {
-                warn!("disk cache: range coverage read failed: {err}");
-                None
-            }
+            .await
+            .ok()?;
+        if self.inner.key_index.range_read_token(start, end) != Some(token)
+            || !self.ready()
+            || start < self.min_retained_slot()
+        {
+            return None;
         }
+        if !self
+            .inner
+            .coverage
+            .read()
+            .expect("coverage lock")
+            .holes_in(start, end)
+            .is_empty()
+        {
+            return None;
+        }
+        slots_from_coverage_rows(rows, start, end)
     }
 
     pub(crate) async fn get_txs_by_position(
@@ -1192,6 +1278,72 @@ fn upper_bound_reaches_tip(query: &index::DiskTfaQuery, tip: u64) -> bool {
 mod tests {
     use super::*;
     use crate::clickhouse::SortOrder;
+
+    #[test]
+    fn range_rows_require_every_produced_or_skipped_slot() {
+        assert_eq!(
+            slots_from_coverage_rows(
+                vec![
+                    SlotRow {
+                        slot: 10,
+                        status: 1
+                    },
+                    SlotRow {
+                        slot: 11,
+                        status: 2
+                    }
+                ],
+                10,
+                11
+            ),
+            Some(vec![10])
+        );
+        assert_eq!(
+            slots_from_coverage_rows(
+                vec![SlotRow {
+                    slot: 10,
+                    status: 1
+                }],
+                10,
+                11
+            ),
+            None
+        );
+        assert_eq!(
+            slots_from_coverage_rows(
+                vec![SlotRow {
+                    slot: 11,
+                    status: 2
+                }],
+                10,
+                10
+            ),
+            None
+        );
+        assert_eq!(
+            slots_from_coverage_rows(
+                vec![SlotRow {
+                    slot: 10,
+                    status: 0
+                }],
+                10,
+                10
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn range_read_rejects_active_and_completed_mutations() {
+        let cfg = key_tests::config(String::new(), String::new());
+        let index = Arc::new(key_index::KeyIndex::new(&cfg));
+        let token = index.range_read_token(10, 20).unwrap();
+        let mutation = index.mutation(10, 20);
+        assert!(index.range_read_token(10, 20).is_none());
+        drop(mutation);
+        assert_ne!(index.range_read_token(10, 20), Some(token));
+        assert!(index.range_read_token(10, 20).is_some());
+    }
 
     #[test]
     fn automatic_partition_width_is_bounded() {

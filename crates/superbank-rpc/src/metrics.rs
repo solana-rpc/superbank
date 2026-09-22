@@ -601,6 +601,14 @@ struct SuperbankGrpcErrorLabels {
     stage: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BlockRangeLabels {
+    method: String,
+    path: String,
+    reason: String,
+    outcome: String,
+}
+
 pub struct Metrics {
     registry: Registry,
 
@@ -622,6 +630,7 @@ pub struct Metrics {
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
+    rpc_blocks_range_seconds: Family<BlockRangeLabels, Histogram>,
     get_block_response_cache_access: Family<OperationOutcomeLabels, Counter>,
     get_block_response_cache_entries: Gauge,
     get_block_response_cache_weighted_bytes: Gauge,
@@ -762,6 +771,8 @@ impl Metrics {
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let rpc_blocks_slots_returned =
             Family::new_with_constructor(block_slot_count_histogram as fn() -> Histogram);
+        let rpc_blocks_range_seconds =
+            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let get_block_response_cache_access = Family::default();
         let get_block_response_cache_entries = Gauge::default();
         let get_block_response_cache_weighted_bytes = Gauge::default();
@@ -961,6 +972,11 @@ impl Metrics {
             "rpc_response_overhead_seconds",
             "Estimated non-ClickHouse response overhead in seconds by method",
             rpc_response_overhead_seconds.clone(),
+        );
+        registry.register(
+            "rpc_blocks_range_seconds",
+            "Block range latency by local/primary coverage and bounded fallback reason",
+            rpc_blocks_range_seconds.clone(),
         );
         registry.register(
             "rpc_blocks_slots_returned",
@@ -1320,6 +1336,7 @@ impl Metrics {
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
             rpc_blocks_slots_returned,
+            rpc_blocks_range_seconds,
             get_block_response_cache_access,
             get_block_response_cache_entries,
             get_block_response_cache_weighted_bytes,
@@ -2400,6 +2417,25 @@ pub(crate) fn disk_cache_signature_index(ready: u64, unknown: u64) {
     metrics
         .disk_cache_signature_index_unknown_partitions
         .set(clamp_i64(unknown));
+}
+
+pub(crate) fn blocks_range_observation(
+    method: &str,
+    path: &str,
+    reason: &str,
+    success: bool,
+    seconds: f64,
+) {
+    let metrics = metrics();
+    metrics
+        .rpc_blocks_range_seconds
+        .get_or_create(&BlockRangeLabels {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+            outcome: if success { "success" } else { "error" }.to_owned(),
+        })
+        .observe(seconds);
 }
 
 #[cfg(test)]
