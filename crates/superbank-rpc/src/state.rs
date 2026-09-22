@@ -184,21 +184,32 @@ impl LatestSlotCache {
         &self,
         clickhouse: &ClickHouseClient,
     ) -> Result<u64, ProcessingError> {
+        self.get_or_refresh_with_source(clickhouse)
+            .await
+            .map(|(slot, _)| slot)
+    }
+
+    fn fresh_value(&self) -> Option<u64> {
+        let last_ms = self.last_updated_ms.load(Ordering::Relaxed);
+        let cached = self.value.load(Ordering::Relaxed);
+        (last_ms != 0 && current_time_millis().saturating_sub(last_ms) <= ttl_millis(self.ttl))
+            .then_some(cached)
+    }
+
+    pub(crate) async fn get_or_refresh_with_source(
+        &self,
+        clickhouse: &ClickHouseClient,
+    ) -> Result<(u64, bool), ProcessingError> {
+        let mut waited = false;
         loop {
-            let now_ms = current_time_millis();
-            let last_ms = self.last_updated_ms.load(Ordering::Relaxed);
-            let cached = self.value.load(Ordering::Relaxed);
-            if last_ms != 0 && now_ms.saturating_sub(last_ms) <= ttl_millis(self.ttl) {
-                return Ok(cached);
+            if let Some(cached) = self.fresh_value() {
+                return Ok((cached, waited));
             }
 
             let role = {
                 let mut guard = self.refresh_lock.lock().await;
-                let now_ms = current_time_millis();
-                let last_ms = self.last_updated_ms.load(Ordering::Relaxed);
-                let cached = self.value.load(Ordering::Relaxed);
-                if last_ms != 0 && now_ms.saturating_sub(last_ms) <= ttl_millis(self.ttl) {
-                    return Ok(cached);
+                if let Some(cached) = self.fresh_value() {
+                    return Ok((cached, waited));
                 }
 
                 if let Some(inflight) = guard.as_ref() {
@@ -233,7 +244,7 @@ impl LatestSlotCache {
                             self.last_updated_ms
                                 .store(current_time_millis(), Ordering::Relaxed);
                             leader.finish().await;
-                            return Ok(latest);
+                            return Ok((latest, true));
                         }
                         Err(err) => {
                             leader.finish().await;
@@ -242,6 +253,7 @@ impl LatestSlotCache {
                     }
                 }
                 CacheRefreshRole::Waiter(notified) => {
+                    waited = true;
                     notified.await;
                 }
             }

@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod block_ranges;
 pub(crate) mod blocks;
 pub(crate) mod signatures;
 pub(crate) mod transactions;

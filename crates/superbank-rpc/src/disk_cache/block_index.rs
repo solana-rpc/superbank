@@ -83,7 +83,62 @@ pub(crate) struct BlockIndex {
     coverage: RwLock<CoverageMap>,
 }
 
+fn append_segment_coverage(
+    proof: &mut crate::slot_coverage::SlotCoverage,
+    segments: &HashMap<u64, Segment>,
+    start: u64,
+    end: u64,
+) {
+    let mut cursor = start;
+    loop {
+        let segment_id = cursor / SEGMENT_SLOTS;
+        let tip = end.min(cursor.saturating_add(SEGMENT_SLOTS - 1 - cursor % SEGMENT_SLOTS));
+        if let Some(segment) = segments.get(&segment_id) {
+            let slots = segment_slots(segment, segment_id, cursor, tip);
+            proof.merge(crate::slot_coverage::SlotCoverage::new(slots, cursor, tip));
+        }
+        if tip == end {
+            break;
+        }
+        cursor = tip + 1;
+    }
+}
+
+fn segment_slots(segment: &Segment, id: u64, start: u64, end: u64) -> Vec<u64> {
+    let mut slots = Vec::new();
+    let first = start % SEGMENT_SLOTS;
+    let last = end % SEGMENT_SLOTS;
+    for index in first / 64..=last / 64 {
+        let mut word = segment.produced[index as usize].load(Ordering::Relaxed);
+        if index == first / 64 {
+            word &= u64::MAX << (first % 64);
+        }
+        if index == last / 64 && last % 64 != 63 {
+            word &= (1u64 << (last % 64 + 1)) - 1;
+        }
+        while word != 0 {
+            slots.push(id * SEGMENT_SLOTS + index * 64 + u64::from(word.trailing_zeros()));
+            word &= word - 1;
+        }
+    }
+    slots
+}
+
 impl BlockIndex {
+    #[cfg(test)]
+    pub(crate) fn for_range_tests(start: u64, end: u64, slots: &[u64]) -> Self {
+        let index = tests::test_index();
+        let rows = slots
+            .iter()
+            .map(|&slot| BlockTimeRangeRow {
+                slot,
+                block_time: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(index.publish_memory(start, end, &rows));
+        index
+    }
+
     pub(crate) async fn open(
         cfg: BlockIndexConfig,
         admin: &ClickHouseClient,
@@ -173,55 +228,28 @@ impl BlockIndex {
         result
     }
 
+    #[cfg(test)]
     pub(crate) fn slots_in_range(&self, start: u64, end: u64) -> Option<Vec<u64>> {
-        let started = Instant::now();
-        let result = self.slots_in_range_inner(start, end);
-        crate::metrics::block_index_lookup("get_blocks", started.elapsed().as_secs_f64());
-        result
+        let proof = self.range_coverage(start, end);
+        proof.gaps(start, end).is_empty().then_some(proof.slots)
     }
 
-    fn slots_in_range_inner(&self, start: u64, end: u64) -> Option<Vec<u64>> {
-        if end < start {
-            return Some(Vec::new());
-        }
+    pub(crate) fn range_coverage(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> crate::slot_coverage::SlotCoverage {
+        let started = Instant::now();
+        // Lock order matches reserve_segments. Capture coverage and segment identity
+        // together so an evicted segment cannot be replaced beneath a proof.
+        let segments = self.segments.read().expect("block-index segments lock");
         let coverage = self.coverage.read().expect("block-index coverage lock");
-        if !coverage.holes_in(start, end).is_empty() {
-            return None;
+        let mut proof = crate::slot_coverage::SlotCoverage::default();
+        for (floor, tip) in coverage.intersections(start, end) {
+            append_segment_coverage(&mut proof, &segments, floor, tip);
         }
-        drop(coverage);
-        let capacity = usize::try_from(end - start + 1).unwrap_or(0);
-        let mut slots = Vec::with_capacity(capacity);
-        let mut cursor = start;
-        while cursor <= end {
-            let segment_id = cursor / SEGMENT_SLOTS;
-            let segment_end = end.min((segment_id + 1) * SEGMENT_SLOTS - 1);
-            let segment = self
-                .segments
-                .read()
-                .expect("block-index segments lock")
-                .get(&segment_id)
-                .cloned()?;
-            let first = cursor % SEGMENT_SLOTS;
-            let last = segment_end % SEGMENT_SLOTS;
-            let first_word = first / 64;
-            let last_word = last / 64;
-            for word_index in first_word..=last_word {
-                let mut word = segment.produced[word_index as usize].load(Ordering::Relaxed);
-                if word_index == first_word {
-                    word &= u64::MAX << (first % 64);
-                }
-                if word_index == last_word && last % 64 != 63 {
-                    word &= (1u64 << (last % 64 + 1)) - 1;
-                }
-                while word != 0 {
-                    let bit = word.trailing_zeros() as u64;
-                    slots.push(segment_id * SEGMENT_SLOTS + word_index * 64 + bit);
-                    word &= word - 1;
-                }
-            }
-            cursor = segment_end.saturating_add(1);
-        }
-        Some(slots)
+        crate::metrics::block_index_lookup("get_blocks", started.elapsed().as_secs_f64());
+        proof
     }
 
     fn value(&self, slot: u64) -> i64 {
@@ -559,7 +587,7 @@ mod tests {
         ClickHouseClientOptions, RoutingPolicy, RoutingScope, RoutingTransport,
     };
 
-    fn test_index() -> BlockIndex {
+    pub(super) fn test_index() -> BlockIndex {
         let options = ClickHouseClientOptions::new(
             RoutingPolicy {
                 transport: RoutingTransport::Http,
@@ -584,6 +612,17 @@ mod tests {
             durable_coverage: RwLock::new(CoverageMap::new()),
             coverage: RwLock::new(CoverageMap::new()),
         }
+    }
+
+    #[test]
+    fn eviction_between_segment_and_coverage_removal_cannot_claim_empty_success() {
+        let index = BlockIndex::for_range_tests(10, 12, &[10, 12]);
+        let proof = index.range_coverage(10, 12);
+        // Model reserve_segments' window before it removes old coverage.
+        index.segments.write().unwrap().remove(&0);
+        assert_eq!(index.range_coverage(10, 12).gaps(10, 12), vec![(10, 12)]);
+        assert_eq!(proof.slots, vec![10, 12]);
+        assert!(proof.gaps(10, 12).is_empty());
     }
 
     #[test]

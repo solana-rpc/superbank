@@ -18,6 +18,7 @@ use crate::clickhouse::{
 };
 
 mod convert;
+pub(crate) mod coverage;
 pub(crate) mod dragonsmouth;
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +54,7 @@ pub(crate) struct TransactionCountOverlay {
 /// This is optimized for read concurrency (DashMap + immutable `Arc` values) and
 /// fast merges in the RPC handlers.
 pub(crate) struct HeadCache {
+    pub(crate) coverage: std::sync::RwLock<coverage::HeadCoverage>,
     retain_slots: u64,
     max_per_address: usize,
 
@@ -85,6 +87,7 @@ pub(crate) struct HeadCache {
 impl HeadCache {
     pub(crate) fn new(retain_slots: u64, max_per_address: usize) -> Self {
         Self {
+            coverage: std::sync::RwLock::default(),
             retain_slots: retain_slots.max(1),
             max_per_address: max_per_address.max(1),
             latest_slot: AtomicU64::new(0),
@@ -303,30 +306,6 @@ impl HeadCache {
         None
     }
 
-    pub(crate) fn slots_in_range_at_least(
-        &self,
-        start_slot: u64,
-        end_slot: u64,
-        min_commitment: CommitmentLevel,
-    ) -> Vec<u64> {
-        if end_slot < start_slot {
-            return Vec::new();
-        }
-
-        let mut slots = Vec::new();
-        for entry in self.slot_commitment.iter() {
-            let slot = *entry.key();
-            if slot < start_slot || slot > end_slot {
-                continue;
-            }
-            if commitment_meets(*entry.value(), min_commitment) {
-                slots.push(slot);
-            }
-        }
-        slots.sort_unstable();
-        slots
-    }
-
     pub(crate) fn min_retained_slot(&self) -> u64 {
         let latest = self.latest_slot();
         latest.saturating_sub(self.retain_slots.saturating_sub(1))
@@ -499,10 +478,18 @@ impl HeadCache {
     }
 
     pub(crate) fn remove_slot(&self, slot: u64) {
+        self.coverage
+            .write()
+            .expect("head coverage lock")
+            .invalidate_branch(slot);
         self.remove_slot_inner(slot);
     }
 
     fn remove_slot_inner(&self, slot: u64) {
+        let mut proof = self.coverage.write().expect("head coverage lock");
+        proof.invalidate(slot);
+        proof.retain(self.latest_slot(), self.retain_slots);
+        drop(proof);
         self.slot_commitment.remove(&slot);
         self.slot_block_height.remove(&slot);
         self.slot_blockhash.remove(&slot);

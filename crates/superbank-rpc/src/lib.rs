@@ -55,6 +55,7 @@ mod hydration;
 mod profiling;
 mod rpc;
 mod server;
+mod slot_coverage;
 mod state;
 mod util;
 

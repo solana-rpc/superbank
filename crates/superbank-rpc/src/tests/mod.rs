@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod block_ranges;
 mod cache_refresh;
 mod latest_slot;
 
@@ -3141,7 +3142,7 @@ async fn get_blocks_without_end_slot_uses_latest_slot_cache() {
 
 #[cfg(feature = "grpc-head-cache")]
 #[tokio::test]
-async fn get_blocks_without_end_slot_falls_back_to_head_cache_when_clickhouse_unreachable() {
+async fn get_blocks_without_end_slot_rejects_untrusted_head_tip() {
     let cache = Arc::new(HeadCache::new(32, 1024));
     cache.note_slot_commitment(50, CommitmentLevel::Finalized);
 
@@ -3156,12 +3157,7 @@ async fn get_blocks_without_end_slot_falls_back_to_head_cache_when_clickhouse_un
         .expect("response");
 
     let parsed = parse_json_rpc_response(response).await;
-    assert!(
-        parsed.error.is_none(),
-        "expected success: {:?}",
-        parsed.error
-    );
-    assert_eq!(parsed.result, Some(json!([])));
+    assert_eq!(parsed.error.expect("untrusted latest tip").code, -32603);
 }
 
 #[cfg(feature = "grpc-head-cache")]
@@ -3170,6 +3166,8 @@ async fn get_blocks_processed_served_from_head_cache_when_clickhouse_unreachable
     let cache = Arc::new(HeadCache::new(32, 1024));
     cache.note_slot_commitment(10, CommitmentLevel::Processed);
     cache.note_slot_commitment(11, CommitmentLevel::Processed);
+
+    block_ranges::seed_head(&cache, &[10, 11], CommitmentLevel::Processed);
 
     let state = test_state_with_head_cache_and_clickhouse_url(cache, "http://127.0.0.1:1");
 
@@ -3200,6 +3198,8 @@ async fn get_blocks_finalized_served_from_head_cache_when_clickhouse_unreachable
     let cache = Arc::new(HeadCache::new(32, 1024));
     cache.note_slot_commitment(20, CommitmentLevel::Finalized);
     cache.note_slot_commitment(21, CommitmentLevel::Finalized);
+
+    block_ranges::seed_head(&cache, &[20, 21], CommitmentLevel::Finalized);
 
     let state = test_state_with_head_cache_and_clickhouse_url(cache, "http://127.0.0.1:1");
 
@@ -3368,6 +3368,8 @@ async fn get_blocks_with_limit_processed_served_from_head_cache_when_clickhouse_
     cache.note_slot_commitment(10, CommitmentLevel::Processed);
     cache.note_slot_commitment(11, CommitmentLevel::Processed);
 
+    block_ranges::seed_head(&cache, &[10, 11], CommitmentLevel::Processed);
+
     let state = test_state_with_head_cache_and_clickhouse_url(cache, "http://127.0.0.1:1");
 
     let response = handle_get_blocks_with_limit(
@@ -3397,6 +3399,8 @@ async fn get_blocks_with_limit_finalized_served_from_head_cache_when_clickhouse_
     let cache = Arc::new(HeadCache::new(32, 1024));
     cache.note_slot_commitment(30, CommitmentLevel::Finalized);
     cache.note_slot_commitment(31, CommitmentLevel::Finalized);
+
+    block_ranges::seed_head(&cache, &[30, 31], CommitmentLevel::Finalized);
 
     let state = test_state_with_head_cache_and_clickhouse_url(cache, "http://127.0.0.1:1");
 

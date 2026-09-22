@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, warn};
 
+use super::block_ranges::{RangeObservation, get_block_slots_response_for_range, resolve_range};
 use crate::block_response_cache::BlockResponseCacheKey;
 use crate::clickhouse::{
     InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings, StoredBlockPayload,
@@ -205,7 +206,10 @@ fn reject_unsupported_blocks_commitment(
     None
 }
 
-fn merge_sorted_block_slots(clickhouse_slots: Vec<u64>, head_slots: Vec<u64>) -> Vec<u64> {
+pub(super) fn merge_sorted_block_slots(
+    clickhouse_slots: Vec<u64>,
+    head_slots: Vec<u64>,
+) -> Vec<u64> {
     if clickhouse_slots.is_empty() {
         return head_slots;
     }
@@ -265,167 +269,6 @@ fn classify_get_block_miss(slot: u64, clickhouse_latest: u64) -> (i32, String) {
             format!("Slot {slot} was skipped, or missing in long-term storage"),
         )
     }
-}
-
-async fn get_block_slots_response_for_range(
-    state: &Arc<AppState>,
-    route: &mut RouteMetric,
-    id: Value,
-    start_slot: u64,
-    end_slot: u64,
-    commitment: CommitmentConfig,
-    mut timings: QueryTimings,
-) -> Result<Response, StatusCode> {
-    #[cfg(not(feature = "grpc-head-cache"))]
-    let _ = commitment;
-
-    // Full-history memory tier. It is hydrated asynchronously and only claims
-    // ranges whose durable local rows have been loaded completely.
-    #[cfg(feature = "disk-cache")]
-    let (index_slots, index_span): (Vec<u64>, Option<(u64, u64)>) = state
-        .disk_cache()
-        .and_then(|disk| disk.block_index())
-        .and_then(|index| {
-            let (floor, head) = index.tip_span()?;
-            if end_slot < floor || start_slot > head {
-                return None;
-            }
-            let start = start_slot.max(floor);
-            let end = end_slot.min(head);
-            index
-                .slots_in_range(start, end)
-                .map(|slots| (slots, Some((floor, head))))
-        })
-        .unwrap_or_default();
-    #[cfg(not(feature = "disk-cache"))]
-    let (index_slots, index_span): (Vec<u64>, Option<(u64, u64)>) = (Vec::new(), None);
-
-    // Disk tier: the contiguous covered span answers its part of the range, so
-    // ClickHouse is only consulted below the coverage floor and above the
-    // covered head (the latter matters when disk writes lag the chain tip).
-    #[cfg(feature = "disk-cache")]
-    let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) =
-        if let Some(disk) = state.disk_cache() {
-            route.disk_cache_read();
-            match disk.tip_span() {
-                Some((floor, head)) if end_slot >= floor && start_slot <= head => {
-                    match disk
-                        .covered_slots_in_range(start_slot.max(floor), end_slot.min(head))
-                        .await
-                    {
-                        Some(slots) => (slots, Some((floor, head))),
-                        None => (Vec::new(), None),
-                    }
-                }
-                _ => (Vec::new(), None),
-            }
-        } else {
-            (Vec::new(), None)
-        };
-    #[cfg(not(feature = "disk-cache"))]
-    let (disk_slots, disk_span): (Vec<u64>, Option<(u64, u64)>) = (Vec::new(), None);
-
-    let (cached_slots, cached_span) = match (index_span, disk_span) {
-        (Some(index), Some(disk))
-            if index.0 <= disk.1.saturating_add(1) && disk.0 <= index.1.saturating_add(1) =>
-        {
-            (
-                merge_sorted_block_slots(index_slots, disk_slots),
-                Some((index.0.min(disk.0), index.1.max(disk.1))),
-            )
-        }
-        (Some(index), Some(disk)) if index.1 >= disk.1 => (index_slots, Some(index)),
-        (Some(_), Some(disk)) => (disk_slots, Some(disk)),
-        (Some(index), None) => (index_slots, Some(index)),
-        (None, Some(disk)) => (disk_slots, Some(disk)),
-        (None, None) => (Vec::new(), None),
-    };
-
-    let disk_contributed = cached_span.is_some();
-    let mut clickhouse_ranges: Vec<(u64, u64)> = Vec::new();
-    match cached_span {
-        Some((floor, head)) => {
-            if start_slot < floor {
-                clickhouse_ranges.push((start_slot, end_slot.min(floor.saturating_sub(1))));
-            }
-            if end_slot > head {
-                clickhouse_ranges.push((start_slot.max(head + 1), end_slot));
-            }
-        }
-        None => clickhouse_ranges.push((start_slot, end_slot)),
-    }
-
-    let mut clickhouse_slots = Vec::new();
-    let mut clickhouse_read = false;
-    let mut clickhouse_error: Option<String> = None;
-
-    for (range_start, range_end) in clickhouse_ranges {
-        match state
-            .clickhouse
-            .get_block_slots_by_range(range_start, range_end)
-            .await
-        {
-            Ok((slots, query_timings)) => {
-                clickhouse_slots = merge_sorted_block_slots(clickhouse_slots, slots);
-                clickhouse_read = true;
-                timings.add(query_timings);
-            }
-            Err(e) => {
-                metrics::backend_error("get_block_slots_by_range");
-                clickhouse_error = Some(e.to_string());
-            }
-        }
-    }
-
-    #[cfg(feature = "grpc-head-cache")]
-    let head_slots = if let Some(cache) = state.head_cache.as_ref() {
-        route.head_cache_read();
-        cache.slots_in_range_at_least(start_slot, end_slot, commitment.commitment)
-    } else {
-        Vec::new()
-    };
-
-    #[cfg(not(feature = "grpc-head-cache"))]
-    let head_slots: Vec<u64> = Vec::new();
-
-    let head_contributed = !head_slots.is_empty();
-
-    if let Some(err) = clickhouse_error {
-        if disk_contributed || !head_contributed {
-            error!(
-                "Failed to query ClickHouse for the uncovered part of block range {}..={}: {}",
-                start_slot, end_slot, err
-            );
-            return Ok(json_rpc_internal_error_response(id));
-        }
-
-        warn!(
-            "Serving head-cache-only slots for range {}..={} after ClickHouse error: {}",
-            start_slot, end_slot, err
-        );
-    }
-
-    if clickhouse_read {
-        route.source_clickhouse();
-    } else if disk_contributed {
-        #[cfg(feature = "disk-cache")]
-        route.source_disk_cache();
-    } else if head_contributed {
-        #[cfg(feature = "grpc-head-cache")]
-        route.source_head_cache();
-    } else {
-        route.source_none();
-    }
-
-    let slots = merge_sorted_block_slots(
-        merge_sorted_block_slots(clickhouse_slots, cached_slots),
-        head_slots,
-    );
-    metrics::blocks_slots_returned(route.method(), slots.len());
-    route.success();
-    let mut resp = json_rpc_success_response(id, slots);
-    add_downstream_header(&mut resp, &timings);
-    Ok(resp)
 }
 
 pub(crate) async fn handle_get_block_height(
@@ -2012,7 +1855,7 @@ pub(crate) async fn handle_get_blocks(
         return Ok(resp);
     }
 
-    let timings = QueryTimings {
+    let mut timings = QueryTimings {
         elapsed_ms: 0,
         received_bytes: 0,
         decoded_bytes: 0,
@@ -2020,68 +1863,27 @@ pub(crate) async fn handle_get_blocks(
         rows_read_unknown: false,
         rows_returned: 0,
     };
-
-    let end_slot = match end_slot_opt {
-        Some(end_slot) => end_slot,
-        None => {
-            #[cfg(feature = "grpc-head-cache")]
-            let head_latest_opt = if let Some(cache) = state.head_cache.as_ref() {
-                route.head_cache_read();
-                let latest = cache.latest_slot_at_least(commitment.commitment);
-                (latest > 0).then_some(latest)
-            } else {
-                None
-            };
-
-            #[cfg(not(feature = "grpc-head-cache"))]
-            let head_latest_opt: Option<u64> = None;
-
-            let clickhouse_latest_opt = match state
-                .latest_slot_cache
-                .get_or_refresh(&state.clickhouse)
-                .await
-            {
-                Ok(latest) => Some(latest),
-                Err(e) => {
-                    metrics::backend_error("get_latest_finalized_slot");
-                    #[cfg(feature = "grpc-head-cache")]
-                    {
-                        if head_latest_opt.is_some() {
-                            warn!(
-                                "ClickHouse latest slot cache refresh failed for getBlocks; falling back to head cache latest slot: {:?}; error: {}",
-                                head_latest_opt, e
-                            );
-                            None
-                        } else {
-                            error!("Failed to refresh latest slot cache for getBlocks: {}", e);
-                            return Ok(json_rpc_internal_error_response(id));
-                        }
-                    }
-                    #[cfg(not(feature = "grpc-head-cache"))]
-                    {
-                        error!("Failed to refresh latest slot cache for getBlocks: {}", e);
-                        return Ok(json_rpc_internal_error_response(id));
-                    }
-                }
-            };
-
-            let latest_opt = match (clickhouse_latest_opt, head_latest_opt) {
-                (Some(ch), Some(head)) => Some(ch.max(head)),
-                (Some(ch), None) => Some(ch),
-                (None, Some(head)) => Some(head),
-                (None, None) => None,
-            };
-
-            let Some(latest) = latest_opt else {
-                route.success();
-                route.source_none();
-                let mut resp = json_rpc_success_response(id, Vec::<u64>::new());
-                add_downstream_header(&mut resp, &timings);
-                return Ok(resp);
-            };
-            latest
+    let mut observation = RangeObservation::new(route.method());
+    let range = match resolve_range(
+        &state,
+        &mut route,
+        start_slot,
+        end_slot_opt,
+        commitment,
+        &mut timings,
+        &mut observation,
+    )
+    .await
+    {
+        Ok(range) => range,
+        Err(reason) => {
+            observation.reason = reason;
+            let mut response = json_rpc_internal_error_response(id);
+            add_downstream_header(&mut response, &timings);
+            return Ok(response);
         }
     };
+    let end_slot = range.end;
 
     if end_slot < start_slot {
         if end_from_param {
@@ -2095,6 +1897,7 @@ pub(crate) async fn handle_get_blocks(
         }
 
         route.success();
+        observation.success();
         let mut resp = json_rpc_success_response(id, Vec::<u64>::new());
         add_downstream_header(&mut resp, &timings);
         return Ok(resp);
@@ -2113,10 +1916,8 @@ pub(crate) async fn handle_get_blocks(
         ));
     }
 
-    get_block_slots_response_for_range(
-        &state, &mut route, id, start_slot, end_slot, commitment, timings,
-    )
-    .await
+    get_block_slots_response_for_range(&state, &mut route, id, range, timings, &mut observation)
+        .await
 }
 
 pub(crate) async fn handle_get_blocks_with_limit(
@@ -2219,10 +2020,21 @@ pub(crate) async fn handle_get_blocks_with_limit(
 
     let end_slot = start_slot.saturating_add(limit.saturating_sub(1));
 
-    get_block_slots_response_for_range(
-        &state, &mut route, id, start_slot, end_slot, commitment, timings,
+    let mut observation = RangeObservation::new(route.method());
+    let mut timings = timings;
+    let range = resolve_range(
+        &state,
+        &mut route,
+        start_slot,
+        Some(end_slot),
+        commitment,
+        &mut timings,
+        &mut observation,
     )
     .await
+    .expect("explicit range does not resolve a tip");
+    get_block_slots_response_for_range(&state, &mut route, id, range, timings, &mut observation)
+        .await
 }
 
 fn inflation_reward_address_limit_exceeded(
