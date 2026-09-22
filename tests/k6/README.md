@@ -1120,7 +1120,7 @@ normal-path latency pass does not replace cancellation evidence, and vice versa.
 transaction fallback and full-response parity checks below as an independent correctness
 gate alongside shared-reader cancellation validation.
 
-### getTransaction follow-up benchmarks
+### getTransaction validation
 
 Run the basic transaction scenario against a local/staging fixture, then compare full
 JSON-RPC envelopes with a known-present signature corpus covering legacy, v0, and v1:
@@ -1139,8 +1139,3 @@ The parity scenario checks all four encodings, confirmed/finalized commitment,
 omitted/0/1 maximum supported versions, pinned/mismatched slots, and null/string/number
 request IDs. Existing disk-cache integration tests cover unavailable reads, invalidation,
 concurrent coverage publication, absent signatures, skipped slots, and stale positions.
-
-The former Docker SQL benchmark runner was removed with its shared ClickHouse
-protocol harness. Its [archived findings](../../GETTRANSACTION_BENCHMARKS.md) and
-[machine-readable results](../../docs/benchmarks/gettransaction-2026-09-11.json) remain
-available for reference.

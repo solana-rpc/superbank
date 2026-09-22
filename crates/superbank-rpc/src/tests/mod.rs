@@ -4753,7 +4753,7 @@ async fn clickhouse_metrics_include_subscription_account_labels() {
 #[cfg(feature = "grpc-head-cache")]
 #[test]
 fn head_cache_active_metric_tracks_x_rpc_node_labels() {
-    metrics::force_init().expect("metrics init");
+    metrics::force_init();
 
     metrics::head_cache_set_active(false);
     let disabled_text = String::from_utf8(metrics::export_metrics().expect("metrics export"))

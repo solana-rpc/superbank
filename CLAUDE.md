@@ -12,9 +12,10 @@ Superbank is a Rust workspace that ingests Solana ledger data into ClickHouse an
 Source [Fumarole / gRPC / RPC / Bigtable] --> superbank (ingestor) --> ClickHouse --> superbank-rpc (JSON-RPC + optional gRPC server)
 ```
 
-Three crates in the workspace:
+Four component crates in the workspace:
 - **`crates/superbank`** — Ingestor binary. Pulls Solana data from Yellowstone Fumarole, Yellowstone gRPC (DragonsMouth), Solana JSON-RPC (`getBlock`), or Solana Bigtable and writes to ClickHouse.
 - **`crates/superbank-rpc`** — Axum-based JSON-RPC server. Reads from ClickHouse and serves Solana-compatible RPC. Has optional `grpc-head-cache`, `disk-cache`, `grpc-streaming`, and `pyroscope` features.
+- **`crates/superbank-solparq`** — Archives ClickHouse data to Parquet with `superbank-solparq` and reads local or S3 archives with `superbank-solparq-read`.
 - **`crates/superbank-verify`** — Proof-of-History validator. Recomputes the PoH hash chain (or cheap structural invariants) from the stored `blocks_metadata`/`entries`/`transactions` tables for genesis-to-tip or arbitrary slot/epoch ranges.
 
 Other key paths:
@@ -27,7 +28,7 @@ Other key paths:
 
 ```bash
 # Build the workspace binaries
-cargo build -p superbank -p superbank-rpc -p superbank-verify
+cargo build -p superbank -p superbank-rpc -p superbank-solparq -p superbank-verify
 
 # Run ingestor
 cargo run -p superbank -- --config superbank.yaml
@@ -68,7 +69,7 @@ scripts/test/run-k6.sh
 
 - **Rust stable toolchain** with `rustfmt` and `clippy` components (see `rust-toolchain.toml`)
 - **Conventional Commits** required for PR titles (e.g. `fix: ...`, `feat: ...`, `chore: ...`). CI enforces this via `Lint PR title` check.
-- PRs are squash-merged to `main`; releases are published by GoReleaser from `vX.Y.Z` tags.
+- PRs are squash-merged to `main`; releases are published by GoReleaser from signed annotated `vX.Y.Z` tags matching `[workspace.package].version`.
 - Keep diffs scoped — avoid drive-by refactors.
 - When changing CLI flags, env vars, config fields, or scripts, update docs (`README.md`, `superbank.example.yaml`, `crates/*/README.md`) in the same PR.
 - Config precedence: CLI flags > env vars > config file > defaults.
