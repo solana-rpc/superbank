@@ -22,11 +22,10 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 use prometheus_client_derive_encode::EncodeLabelSet;
-use thiserror::Error;
 use tracing::warn;
 
 /// Global metrics registry and collectors used by the RPC service.
-pub static METRICS: Lazy<Result<Metrics, MetricsInitError>> = Lazy::new(Metrics::try_new);
+pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::new);
 
 const LATENCY_BUCKETS: [f64; 13] = [
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -77,12 +76,11 @@ struct ReadDisconnectProbeLabels {
 
 /// Tracks admission held by abandoned reads without exposing query identifiers.
 pub(crate) fn read_disconnect_pending(operation: &'static str, target: &'static str, delta: i64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .read_disconnect_pending
-            .get_or_create(&ReadDisconnectLabels { operation, target })
-            .inc_by(delta);
-    }
+    let metrics = metrics();
+    metrics
+        .read_disconnect_pending
+        .get_or_create(&ReadDisconnectLabels { operation, target })
+        .inc_by(delta);
 }
 
 pub(crate) fn read_disconnect_verification(
@@ -90,46 +88,41 @@ pub(crate) fn read_disconnect_verification(
     target: &'static str,
     outcome: &'static str,
 ) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .read_disconnect_verification
-            .get_or_create(&ReadDisconnectOutcomeLabels {
-                operation,
-                target,
-                outcome,
-            })
-            .inc();
-    }
+    let metrics = metrics();
+    metrics
+        .read_disconnect_verification
+        .get_or_create(&ReadDisconnectOutcomeLabels {
+            operation,
+            target,
+            outcome,
+        })
+        .inc();
 }
 
 pub(crate) fn read_disconnect_probe(target: &'static str, elapsed: f64, outcome: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .read_disconnect_probe_seconds
-            .get_or_create(&ReadDisconnectProbeLabels { target, outcome })
-            .observe(elapsed);
-    }
+    let metrics = metrics();
+    metrics
+        .read_disconnect_probe_seconds
+        .get_or_create(&ReadDisconnectProbeLabels { target, outcome })
+        .observe(elapsed);
 }
 
 pub(crate) fn signature_status_disconnect_pending_inc() {
-    if let Some(metrics) = metrics() {
-        metrics.signature_status_disconnect_pending.inc();
-    }
+    let metrics = metrics();
+    metrics.signature_status_disconnect_pending.inc();
 }
 
 pub(crate) fn signature_status_disconnect_pending_dec() {
-    if let Some(metrics) = metrics() {
-        metrics.signature_status_disconnect_pending.dec();
-    }
+    let metrics = metrics();
+    metrics.signature_status_disconnect_pending.dec();
 }
 
 pub(crate) fn signature_status_disconnect_verification(outcome: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .signature_status_disconnect_verification
-            .get_or_create(&DisconnectOutcomeLabels { outcome })
-            .inc();
-    }
+    let metrics = metrics();
+    metrics
+        .signature_status_disconnect_verification
+        .get_or_create(&DisconnectOutcomeLabels { outcome })
+        .inc();
 }
 
 /// Includes cancelled admission waits; no request identifiers become metric labels.
@@ -143,21 +136,19 @@ impl SignatureStatusAdmission {
 
 impl Drop for SignatureStatusAdmission {
     fn drop(&mut self) {
-        if let Some(metrics) = metrics() {
-            metrics
-                .signature_status_admission_seconds
-                .observe(self.0.elapsed().as_secs_f64());
-        }
+        let metrics = metrics();
+        metrics
+            .signature_status_admission_seconds
+            .observe(self.0.elapsed().as_secs_f64());
     }
 }
 
 pub(crate) fn signature_status_batch_size(stage: &'static str, size: usize) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .signature_status_batch_size
-            .get_or_create(&SignatureStatusStageLabels { stage })
-            .observe(size as f64);
-    }
+    let metrics = metrics();
+    metrics
+        .signature_status_batch_size
+        .get_or_create(&SignatureStatusStageLabels { stage })
+        .observe(size as f64);
 }
 
 const BLOCK_SLOT_COUNT_BUCKETS: [f64; 20] = [
@@ -610,13 +601,6 @@ struct SuperbankGrpcErrorLabels {
     stage: String,
 }
 
-#[derive(Debug, Error)]
-pub enum MetricsInitError {
-    #[allow(dead_code)]
-    #[error("metrics initialization failed: {0}")]
-    Init(String),
-}
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct BlockRangeLabels {
     method: String,
@@ -762,7 +746,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    fn try_new() -> Result<Self, MetricsInitError> {
+    fn new() -> Self {
         let rpc_requests = Family::default();
         let rpc_latency_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
@@ -1333,7 +1317,7 @@ impl Metrics {
             warn!("Failed to register process collector: {err}");
         }
 
-        Ok(Self {
+        Self {
             registry,
             rpc_requests,
             rpc_latency_seconds,
@@ -1459,7 +1443,7 @@ impl Metrics {
             block_index_errors_total,
             #[cfg(feature = "disk-cache")]
             block_index_lookup_seconds,
-        })
+        }
     }
 
     fn method_labels_from_request(
@@ -1926,73 +1910,61 @@ impl Metrics {
     }
 }
 
-fn metrics() -> Option<&'static Metrics> {
-    METRICS.as_ref().ok()
+fn metrics() -> &'static Metrics {
+    &METRICS
 }
 
-pub(crate) fn force_init() -> Result<(), &'static MetricsInitError> {
-    match METRICS.as_ref() {
-        Ok(_) => Ok(()),
-        Err(err) => Err(err),
-    }
+pub(crate) fn force_init() {
+    Lazy::force(&METRICS);
 }
 
-pub(crate) fn track_request(method: &str) -> Option<RequestTracker<'static>> {
-    metrics().map(|metrics| metrics.track_request(method))
+pub(crate) fn track_request(method: &str) -> RequestTracker<'static> {
+    metrics().track_request(method)
 }
 
 pub(crate) fn backend_error(operation: &str) {
-    if let Some(metrics) = metrics() {
-        metrics.backend_error(operation);
-    }
+    let metrics = metrics();
+    metrics.backend_error(operation);
 }
 
 pub(crate) fn inflation_reward_rejection(reason: &str) {
-    if let Some(metrics) = metrics() {
-        metrics.inflation_reward_rejection(reason);
-    }
+    let metrics = metrics();
+    metrics.inflation_reward_rejection(reason);
 }
 
 pub(crate) fn inflation_reward_lookup(path: &'static str, outcome: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics.inflation_reward_lookup(path, outcome);
-    }
+    let metrics = metrics();
+    metrics.inflation_reward_lookup(path, outcome);
 }
 
 pub(crate) fn inflation_reward_selected_blocks(blocks: usize) {
-    if let Some(metrics) = metrics() {
-        metrics.inflation_reward_selected_blocks(blocks);
-    }
+    let metrics = metrics();
+    metrics.inflation_reward_selected_blocks(blocks);
 }
 
 pub(crate) fn rpc_timeout(method: &str) {
-    if let Some(metrics) = metrics() {
-        metrics.rpc_timeout(method);
-    }
+    let metrics = metrics();
+    metrics.rpc_timeout(method);
 }
 
 pub(crate) fn batch_observed(items: u64) {
-    if let Some(metrics) = metrics() {
-        metrics.batch_observed(items);
-    }
+    let metrics = metrics();
+    metrics.batch_observed(items);
 }
 
 pub(crate) fn batch_rejected(reason: &str) {
-    if let Some(metrics) = metrics() {
-        metrics.batch_rejected(reason);
-    }
+    let metrics = metrics();
+    metrics.batch_rejected(reason);
 }
 
 pub(crate) fn clickhouse_timeout(operation: &str) {
-    if let Some(metrics) = metrics() {
-        metrics.clickhouse_timeout(operation);
-    }
+    let metrics = metrics();
+    metrics.clickhouse_timeout(operation);
 }
 
 pub(crate) fn clickhouse_query_cache_classified(operation: &str, eligible: bool) {
-    if let Some(metrics) = metrics() {
-        metrics.clickhouse_query_cache_classified(operation, eligible);
-    }
+    let metrics = metrics();
+    metrics.clickhouse_query_cache_classified(operation, eligible);
 }
 
 pub(crate) fn clickhouse_query_cache_settings_applied(
@@ -2001,9 +1973,8 @@ pub(crate) fn clickhouse_query_cache_settings_applied(
     writes: bool,
     ttl_seconds: u64,
 ) {
-    if let Some(metrics) = metrics() {
-        metrics.clickhouse_query_cache_settings_applied(operation, reads, writes, ttl_seconds);
-    }
+    let metrics = metrics();
+    metrics.clickhouse_query_cache_settings_applied(operation, reads, writes, ttl_seconds);
 }
 
 pub(crate) fn clickhouse_shard_query_abort(
@@ -2011,15 +1982,13 @@ pub(crate) fn clickhouse_shard_query_abort(
     transport: &'static str,
     reason: &'static str,
 ) {
-    if let Some(metrics) = metrics() {
-        metrics.clickhouse_shard_query_abort(operation, transport, reason);
-    }
+    let metrics = metrics();
+    metrics.clickhouse_shard_query_abort(operation, transport, reason);
 }
 
 pub(crate) fn clickhouse_shard_query_cleanup(operation: &'static str, outcome: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics.clickhouse_shard_query_cleanup(operation, outcome);
-    }
+    let metrics = metrics();
+    metrics.clickhouse_shard_query_cleanup(operation, outcome);
 }
 
 pub(crate) fn clickhouse_transport_fallback(
@@ -2028,21 +1997,18 @@ pub(crate) fn clickhouse_transport_fallback(
     to: &'static str,
     reason: &'static str,
 ) {
-    if let Some(metrics) = metrics() {
-        metrics.clickhouse_transport_fallback(operation, from, to, reason);
-    }
+    let metrics = metrics();
+    metrics.clickhouse_transport_fallback(operation, from, to, reason);
 }
 
 pub(crate) fn route(labels: RouteMetricLabels<'_>) {
-    if let Some(metrics) = metrics() {
-        metrics.route(labels);
-    }
+    let metrics = metrics();
+    metrics.route(labels);
 }
 
 pub(crate) fn slot_source(operation: &str, source: &str, commitment: &str) {
-    if let Some(metrics) = metrics() {
-        metrics.slot_source(operation, source, commitment);
-    }
+    let metrics = metrics();
+    metrics.slot_source(operation, source, commitment);
 }
 
 pub(crate) fn clickhouse_timings(
@@ -2051,46 +2017,37 @@ pub(crate) fn clickhouse_timings(
     received_bytes: u64,
     decoded_bytes: u64,
 ) {
-    if let Some(metrics) = metrics() {
-        metrics.observe_clickhouse(method, elapsed_ms, received_bytes, decoded_bytes);
-    }
+    let metrics = metrics();
+    metrics.observe_clickhouse(method, elapsed_ms, received_bytes, decoded_bytes);
 }
 
 pub(crate) fn response_overhead(method: &str, elapsed_ms: u64) {
-    if let Some(metrics) = metrics() {
-        metrics.response_overhead(method, elapsed_ms);
-    }
+    let metrics = metrics();
+    metrics.response_overhead(method, elapsed_ms);
 }
 
 pub(crate) fn blocks_slots_returned(method: &str, slots: usize) {
-    if let Some(metrics) = metrics() {
-        metrics.blocks_slots_returned(method, slots);
-    }
+    let metrics = metrics();
+    metrics.blocks_slots_returned(method, slots);
 }
 
 pub(crate) fn get_block_response_cache_access(outcome: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics.get_block_response_cache_access(outcome);
-    }
+    let metrics = metrics();
+    metrics.get_block_response_cache_access(outcome);
 }
 
 pub(crate) fn get_block_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
-    if let Some(metrics) = metrics() {
-        metrics.get_block_response_cache_state(entries, bytes, max_bytes);
-    }
+    let metrics = metrics();
+    metrics.get_block_response_cache_state(entries, bytes, max_bytes);
 }
 
 pub(crate) fn get_block_phase(phase: &str, elapsed_seconds: f64) {
-    if let Some(metrics) = metrics() {
-        metrics.get_block_phase(phase, elapsed_seconds);
-    }
+    let metrics = metrics();
+    metrics.get_block_phase(phase, elapsed_seconds);
 }
 
 pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {
-    match metrics() {
-        Some(metrics) => metrics.export(),
-        None => Err("metrics are not initialized".to_string()),
-    }
+    metrics().export()
 }
 
 fn clamp_i64(value: u64) -> i64 {
@@ -2104,23 +2061,20 @@ fn clamp_i64_usize(value: usize) -> i64 {
 
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) fn head_cache_set_active(active: bool) {
-    if let Some(metrics) = metrics() {
-        metrics.head_cache_set_active(active);
-    }
+    let metrics = metrics();
+    metrics.head_cache_set_active(active);
 }
 
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) fn head_cache_set_active_node(x_rpc_node: &str) {
-    if let Some(metrics) = metrics() {
-        metrics.head_cache_set_active_node(x_rpc_node);
-    }
+    let metrics = metrics();
+    metrics.head_cache_set_active_node(x_rpc_node);
 }
 
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) fn head_cache_reconnect() {
-    if let Some(metrics) = metrics() {
-        metrics.head_cache_reconnects_total.inc();
-    }
+    let metrics = metrics();
+    metrics.head_cache_reconnects_total.inc();
 }
 
 #[cfg(feature = "grpc-head-cache")]
@@ -2131,20 +2085,19 @@ pub(crate) fn head_cache_observe_block(
     address_entries: usize,
     slot_entries: usize,
 ) {
-    if let Some(metrics) = metrics() {
-        metrics.head_cache_blocks_total.inc();
-        metrics.head_cache_transactions_total.inc_by(ingested_txs);
-        metrics.head_cache_latest_slot.set(clamp_i64(latest_slot));
-        metrics
-            .head_cache_tx_entries
-            .set(clamp_i64_usize(tx_entries));
-        metrics
-            .head_cache_address_entries
-            .set(clamp_i64_usize(address_entries));
-        metrics
-            .head_cache_slot_entries
-            .set(clamp_i64_usize(slot_entries));
-    }
+    let metrics = metrics();
+    metrics.head_cache_blocks_total.inc();
+    metrics.head_cache_transactions_total.inc_by(ingested_txs);
+    metrics.head_cache_latest_slot.set(clamp_i64(latest_slot));
+    metrics
+        .head_cache_tx_entries
+        .set(clamp_i64_usize(tx_entries));
+    metrics
+        .head_cache_address_entries
+        .set(clamp_i64_usize(address_entries));
+    metrics
+        .head_cache_slot_entries
+        .set(clamp_i64_usize(slot_entries));
 }
 
 #[cfg(feature = "grpc-head-cache")]
@@ -2154,19 +2107,18 @@ pub(crate) fn head_cache_drop_slot(
     address_entries: usize,
     slot_entries: usize,
 ) {
-    if let Some(metrics) = metrics() {
-        metrics.head_cache_dropped_slots_total.inc();
-        metrics.head_cache_latest_slot.set(clamp_i64(latest_slot));
-        metrics
-            .head_cache_tx_entries
-            .set(clamp_i64_usize(tx_entries));
-        metrics
-            .head_cache_address_entries
-            .set(clamp_i64_usize(address_entries));
-        metrics
-            .head_cache_slot_entries
-            .set(clamp_i64_usize(slot_entries));
-    }
+    let metrics = metrics();
+    metrics.head_cache_dropped_slots_total.inc();
+    metrics.head_cache_latest_slot.set(clamp_i64(latest_slot));
+    metrics
+        .head_cache_tx_entries
+        .set(clamp_i64_usize(tx_entries));
+    metrics
+        .head_cache_address_entries
+        .set(clamp_i64_usize(address_entries));
+    metrics
+        .head_cache_slot_entries
+        .set(clamp_i64_usize(slot_entries));
 }
 
 #[cfg(feature = "grpc-streaming")]
@@ -2178,52 +2130,47 @@ fn superbank_grpc_method_labels(method: &'static str) -> SuperbankGrpcMethodLabe
 
 #[cfg(feature = "grpc-streaming")]
 pub(crate) fn superbank_grpc_stream_started(method: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .superbank_grpc_stream_requests_total
-            .get_or_create(&superbank_grpc_method_labels(method))
-            .inc();
-    }
+    let metrics = metrics();
+    metrics
+        .superbank_grpc_stream_requests_total
+        .get_or_create(&superbank_grpc_method_labels(method))
+        .inc();
 }
 
 #[cfg(feature = "grpc-streaming")]
 pub(crate) fn superbank_grpc_stream_chunk(method: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .superbank_grpc_stream_chunks_total
-            .get_or_create(&superbank_grpc_method_labels(method))
-            .inc();
-    }
+    let metrics = metrics();
+    metrics
+        .superbank_grpc_stream_chunks_total
+        .get_or_create(&superbank_grpc_method_labels(method))
+        .inc();
 }
 
 #[cfg(feature = "grpc-streaming")]
 pub(crate) fn superbank_grpc_stream_message(method: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .superbank_grpc_stream_messages_total
-            .get_or_create(&superbank_grpc_method_labels(method))
-            .inc();
-    }
+    let metrics = metrics();
+    metrics
+        .superbank_grpc_stream_messages_total
+        .get_or_create(&superbank_grpc_method_labels(method))
+        .inc();
 }
 
 #[cfg(feature = "grpc-streaming")]
 pub(crate) fn superbank_grpc_stream_error(method: &'static str, stage: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .superbank_grpc_stream_errors_total
-            .get_or_create(&SuperbankGrpcErrorLabels {
-                method: method.to_string(),
-                stage: stage.to_string(),
-            })
-            .inc();
-    }
+    let metrics = metrics();
+    metrics
+        .superbank_grpc_stream_errors_total
+        .get_or_create(&SuperbankGrpcErrorLabels {
+            method: method.to_string(),
+            stage: stage.to_string(),
+        })
+        .inc();
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_set_active(active: bool) {
-    if let Some(metrics) = metrics() {
-        metrics.disk_cache_active.set(i64::from(active));
-    }
+    let metrics = metrics();
+    metrics.disk_cache_active.set(i64::from(active));
 }
 
 #[cfg(feature = "disk-cache")]
@@ -2233,157 +2180,142 @@ pub(crate) fn disk_cache_read(operation: &'static str, outcome: &'static str) {
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_read_count(operation: &'static str, outcome: &'static str, count: u64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_reads_total
-            .get_or_create(&DiskCacheReadLabels {
-                operation: operation.to_string(),
-                outcome: outcome.to_string(),
-            })
-            .inc_by(count);
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_reads_total
+        .get_or_create(&DiskCacheReadLabels {
+            operation: operation.to_string(),
+            outcome: outcome.to_string(),
+        })
+        .inc_by(count);
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_coverage(min_covered: u64, max_covered: u64, contiguous_floor: u64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_covered_min_slot
-            .set(clamp_i64(min_covered));
-        metrics
-            .disk_cache_covered_max_slot
-            .set(clamp_i64(max_covered));
-        metrics
-            .disk_cache_contiguous_floor_slot
-            .set(clamp_i64(contiguous_floor));
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_covered_min_slot
+        .set(clamp_i64(min_covered));
+    metrics
+        .disk_cache_covered_max_slot
+        .set(clamp_i64(max_covered));
+    metrics
+        .disk_cache_contiguous_floor_slot
+        .set(clamp_i64(contiguous_floor));
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_size_bytes(bytes: u64) {
-    if let Some(metrics) = metrics() {
-        metrics.disk_cache_size_bytes.set(clamp_i64(bytes));
-    }
+    let metrics = metrics();
+    metrics.disk_cache_size_bytes.set(clamp_i64(bytes));
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_write(source: &'static str, transactions: u64, latency_seconds: f64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_writes_total
-            .get_or_create(&DiskCacheSourceLabels {
-                source: source.to_string(),
-            })
-            .inc();
-        metrics
-            .disk_cache_written_transactions_total
-            .inc_by(transactions);
-        metrics
-            .disk_cache_write_latency_seconds
-            .observe(latency_seconds);
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_writes_total
+        .get_or_create(&DiskCacheSourceLabels {
+            source: source.to_string(),
+        })
+        .inc();
+    metrics
+        .disk_cache_written_transactions_total
+        .inc_by(transactions);
+    metrics
+        .disk_cache_write_latency_seconds
+        .observe(latency_seconds);
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_write_error() {
-    if let Some(metrics) = metrics() {
-        metrics.disk_cache_write_errors_total.inc();
-    }
+    let metrics = metrics();
+    metrics.disk_cache_write_errors_total.inc();
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_evicted(reason: &'static str, slots: u64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_evicted_slots_total
-            .get_or_create(&DiskCacheReasonLabels {
-                reason: reason.to_string(),
-            })
-            .inc_by(slots);
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_evicted_slots_total
+        .get_or_create(&DiskCacheReasonLabels {
+            reason: reason.to_string(),
+        })
+        .inc_by(slots);
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_backfill_remaining(slots: u64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_backfill_slots_remaining
-            .set(clamp_i64(slots));
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_backfill_slots_remaining
+        .set(clamp_i64(slots));
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_backfill_inflight(ranges: usize) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_backfill_inflight_ranges
-            .set(i64::try_from(ranges).unwrap_or(i64::MAX));
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_backfill_inflight_ranges
+        .set(i64::try_from(ranges).unwrap_or(i64::MAX));
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_fill_error() {
-    if let Some(metrics) = metrics() {
-        metrics.disk_cache_fill_errors_total.inc();
-    }
+    let metrics = metrics();
+    metrics.disk_cache_fill_errors_total.inc();
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_poisoned_slot() {
-    if let Some(metrics) = metrics() {
-        metrics.disk_cache_poisoned_slots_total.inc();
-    }
+    let metrics = metrics();
+    metrics.disk_cache_poisoned_slots_total.inc();
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_wipe() {
-    if let Some(metrics) = metrics() {
-        metrics.disk_cache_wipes_total.inc();
-    }
+    let metrics = metrics();
+    metrics.disk_cache_wipes_total.inc();
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn block_index_enabled(active: bool) {
-    if let Some(metrics) = metrics() {
-        metrics.block_index_active.set(i64::from(active));
-    }
+    let metrics = metrics();
+    metrics.block_index_active.set(i64::from(active));
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn block_index_state(floor: u64, head: u64, bytes: u64) {
-    if let Some(metrics) = metrics() {
-        metrics.block_index_floor_slot.set(clamp_i64(floor));
-        metrics.block_index_head_slot.set(clamp_i64(head));
-        metrics.block_index_allocated_bytes.set(clamp_i64(bytes));
-    }
+    let metrics = metrics();
+    metrics.block_index_floor_slot.set(clamp_i64(floor));
+    metrics.block_index_head_slot.set(clamp_i64(head));
+    metrics.block_index_allocated_bytes.set(clamp_i64(bytes));
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn block_index_error(operation: &'static str) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .block_index_errors_total
-            .get_or_create(&OperationLabels {
-                operation: operation.to_string(),
-                x_endpoint: None,
-                x_rpc_node: None,
-                x_subscription_id: None,
-                x_account_id: None,
-            })
-            .inc();
-    }
+    let metrics = metrics();
+    metrics
+        .block_index_errors_total
+        .get_or_create(&OperationLabels {
+            operation: operation.to_string(),
+            x_endpoint: None,
+            x_rpc_node: None,
+            x_subscription_id: None,
+            x_account_id: None,
+        })
+        .inc();
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn block_index_lookup(operation: &'static str, elapsed_seconds: f64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .block_index_lookup_seconds
-            .get_or_create(&BlockIndexLookupLabels {
-                operation: operation.to_string(),
-            })
-            .observe(elapsed_seconds);
-    }
+    let metrics = metrics();
+    metrics
+        .block_index_lookup_seconds
+        .get_or_create(&BlockIndexLookupLabels {
+            operation: operation.to_string(),
+        })
+        .observe(elapsed_seconds);
 }
 
 pub struct RequestTracker<'a> {
@@ -2435,28 +2367,26 @@ pub async fn metrics_handler() -> impl IntoResponse {
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_key_seconds(operation: &'static str, outcome: &'static str, seconds: f64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_key_seconds
-            .get_or_create(&DiskCacheReadLabels {
-                operation: operation.into(),
-                outcome: outcome.into(),
-            })
-            .observe(seconds);
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_key_seconds
+        .get_or_create(&DiskCacheReadLabels {
+            operation: operation.into(),
+            outcome: outcome.into(),
+        })
+        .observe(seconds);
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_key_index(bytes: u64, indexed: u64, unknown: u64) {
-    if let Some(metrics) = metrics() {
-        metrics.disk_cache_key_index_bytes.set(clamp_i64(bytes));
-        metrics
-            .disk_cache_key_index_partitions
-            .set(clamp_i64(indexed));
-        metrics
-            .disk_cache_key_index_unknown_partitions
-            .set(clamp_i64(unknown));
-    }
+    let metrics = metrics();
+    metrics.disk_cache_key_index_bytes.set(clamp_i64(bytes));
+    metrics
+        .disk_cache_key_index_partitions
+        .set(clamp_i64(indexed));
+    metrics
+        .disk_cache_key_index_unknown_partitions
+        .set(clamp_i64(unknown));
 }
 
 #[cfg(feature = "disk-cache")]
@@ -2468,27 +2398,25 @@ fn signature_membership_histogram() -> Histogram {
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_signature_membership(outcome: &'static str, seconds: f64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_signature_membership_seconds
-            .get_or_create(&DiskCacheReadLabels {
-                operation: "signature_membership".into(),
-                outcome: outcome.into(),
-            })
-            .observe(seconds);
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_signature_membership_seconds
+        .get_or_create(&DiskCacheReadLabels {
+            operation: "signature_membership".into(),
+            outcome: outcome.into(),
+        })
+        .observe(seconds);
 }
 
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_signature_index(ready: u64, unknown: u64) {
-    if let Some(metrics) = metrics() {
-        metrics
-            .disk_cache_signature_index_partitions
-            .set(clamp_i64(ready));
-        metrics
-            .disk_cache_signature_index_unknown_partitions
-            .set(clamp_i64(unknown));
-    }
+    let metrics = metrics();
+    metrics
+        .disk_cache_signature_index_partitions
+        .set(clamp_i64(ready));
+    metrics
+        .disk_cache_signature_index_unknown_partitions
+        .set(clamp_i64(unknown));
 }
 
 pub(crate) fn blocks_range_observation(
@@ -2498,15 +2426,48 @@ pub(crate) fn blocks_range_observation(
     success: bool,
     seconds: f64,
 ) {
-    if let Ok(metrics) = METRICS.as_ref() {
-        metrics
-            .rpc_blocks_range_seconds
-            .get_or_create(&BlockRangeLabels {
-                method: method.to_owned(),
-                path: path.to_owned(),
-                reason: reason.to_owned(),
-                outcome: if success { "success" } else { "error" }.to_owned(),
-            })
-            .observe(seconds);
+    let metrics = metrics();
+    metrics
+        .rpc_blocks_range_seconds
+        .get_or_create(&BlockRangeLabels {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+            outcome: if success { "success" } else { "error" }.to_owned(),
+        })
+        .observe(seconds);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_tracker_records_completion_and_releases_inflight_on_drop() {
+        let metrics = Metrics::new();
+        let method = "getSlot";
+        let labels = Metrics::current_method_labels(method);
+        let request_labels = current_request_metric_labels();
+        let status_labels =
+            Metrics::method_status_labels_from_request(method, StatusCode::OK, &request_labels);
+
+        let completed = metrics.track_request(method);
+        assert_eq!(metrics.rpc_inflight.get_or_create(&labels).get(), 1);
+        completed.observe(StatusCode::OK);
+        assert_eq!(metrics.rpc_inflight.get_or_create(&labels).get(), 0);
+        assert_eq!(metrics.rpc_requests.get_or_create(&status_labels).get(), 1);
+
+        let cancelled = metrics.track_request(method);
+        assert_eq!(metrics.rpc_inflight.get_or_create(&labels).get(), 1);
+        drop(cancelled);
+        assert_eq!(metrics.rpc_inflight.get_or_create(&labels).get(), 0);
+        assert_eq!(metrics.rpc_requests.get_or_create(&status_labels).get(), 1);
+
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        assert!(exported.contains("superbank_rpc_inflight_requests{method=\"getSlot\"} 0"));
+        assert!(
+            exported.contains("superbank_rpc_requests_total{method=\"getSlot\",status=\"200\"} 1")
+        );
     }
 }

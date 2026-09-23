@@ -679,9 +679,7 @@ fn json_rpc_error_value(
 }
 
 fn observe_parameter_filter_match(method: &str) {
-    if let Some(tracker) = metrics::track_request(metrics_method_label(method)) {
-        tracker.observe(StatusCode::OK);
-    }
+    metrics::track_request(metrics_method_label(method)).observe(StatusCode::OK);
 }
 
 fn parameter_filter_response(id: Value, method: String, params: Vec<Value>) -> Response {
@@ -850,9 +848,7 @@ async fn dispatch_json_rpc_request(
     if req.jsonrpc != "2.0" {
         let response = json_rpc_error_response(req.id, -32600, "Invalid JSON-RPC version", None);
 
-        if let Some(tracker) = tracker {
-            tracker.observe(response.status());
-        }
+        tracker.observe(response.status());
 
         let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         debug!(
@@ -987,9 +983,7 @@ async fn dispatch_json_rpc_request(
         Ok(resp) => resp.status(),
         Err(code) => *code,
     };
-    if let Some(tracker) = tracker {
-        tracker.observe(status);
-    }
+    tracker.observe(status);
 
     let elapsed_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     match &result {

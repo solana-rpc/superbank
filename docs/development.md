@@ -290,23 +290,20 @@ gh workflow run e2e.yml --ref <branch-name>
 ### Release flow
 
 Releases are tag-driven. Before cutting a release, update the shared package version under
-`[workspace.package]` in the root `Cargo.toml`, then create and push an annotated `vX.Y.Z` tag:
+`[workspace.package]` in the root `Cargo.toml`, then create and push a signed annotated tag
+matching that version (replace `X.Y.Z` below):
 
 ```bash
-git tag -a v0.5.0 -m "Release v0.5.0"
-git push origin v0.5.0
+git tag -s vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
 ```
 
 The release workflow first verifies that the tag version matches the Cargo package versions. It
-then runs the Tilt E2E profile before GoReleaser builds both binaries for Linux amd64 and Linux
-arm64, publishes GitHub release notes, uploads `.tar.gz` archives, and generates
-`SHA256SUMS.txt`.
-
-The same `vX.Y.Z` release tag also publishes the `superbank-solparq` and
-`superbank-solparq-read` Linux amd64 and Linux arm64 archives via the main
-release workflow and `.goreleaser.yaml`. Both binaries are built from the
-`superbank-solparq` crate, so its version moves in lockstep with the main
-release tag.
+then runs the Tilt E2E profile before GoReleaser builds `superbank`, `superbank-rpc`,
+`superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` for Linux amd64 and arm64.
+It publishes GitHub release notes, uploads `.tar.gz` archives, and generates `SHA256SUMS.txt`.
+All five binaries share the workspace version; both Solparq binaries are built from the
+`superbank-solparq` crate.
 
 ### Key environment variables
 

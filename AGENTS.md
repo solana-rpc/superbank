@@ -39,6 +39,7 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
 ## Agent Workflow (Codex)
 - Read `README.md`, `AGENTS.md`, and the relevant crate README(s) before making changes.
 - Keep diffs scoped; avoid drive-by refactors.
+- Keep one-off agent investigations, findings, plans, and measurement output out of tracked documentation; use PR descriptions or the ignored `artifacts/` directory.
 - Prefer non-destructive git operations; do not rewrite history unless explicitly asked.
 - Run the CI-style checks appropriate to the change; for doc-only changes, verify referenced paths/commands exist.
 - When changing CLI flags, env vars, or scripts, update the docs in the same change.

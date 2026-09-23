@@ -4,7 +4,7 @@ Superbank is an open-source Solana transaction indexer built by Triton. It inges
 
 This guide walks through running Superbank on a single node from scratch: ClickHouse setup, DDL, ingestion configuration, and the RPC server. It also covers how to filter the index to only your app's transactions.
 
-> **Scope — live and recent ingestion.** This guide connects Superbank to Dragon's Mouth or Fumarole to index Solana from the current tip forward. For historical backfill from genesis through any past slot, see the companion guide: **[Self-hosting Solana history: step-by-step walkthrough for backfill](guide-self-hosting-history-backfill.md)** — it walks through streaming Old Faithful CAR archives into this same Superbank schema at up to 2.7M TPS using Anza's Jetstreamer.
+> **Scope — live and recent ingestion.** This guide connects Superbank to Dragon's Mouth or Fumarole to index Solana from the current tip forward. For historical ingestion and gap repair, see the [ingestor source options and backfill instructions](../crates/superbank/README.md).
 
 ---
 
@@ -72,7 +72,7 @@ Adding `processed` commitment (in addition to `confirmed`/`finalized`) requires 
 ## Prerequisites
 
 - **ClickHouse** — 26.x or later. Docker is the fastest way to get one running.
-- **Rust** — stable toolchain, 1.80+. Install via [rustup.rs](https://rustup.rs).
+- **Rust** — stable toolchain specified by `rust-toolchain.toml`. Install via [rustup.rs](https://rustup.rs).
 - **A Dragon's Mouth gRPC endpoint or Fumarole subscription** — for live ingestion. Get one at [customers.triton.one](https://customers.triton.one). For backfill only, the JSON-RPC source works with any public endpoint.
 - Git and standard build tools (`gcc`, `pkg-config`, `libssl-dev` on Linux / Xcode Command Line Tools on macOS).
 
@@ -140,7 +140,7 @@ Superbank uses three base tables and several materialized views. Apply the local
 # Base tables
 cat ddl/local/transactions.sql    | docker exec -i superbank-clickhouse clickhouse-client --multiquery
 cat ddl/local/blocks_metadata.sql | docker exec -i superbank-clickhouse clickhouse-client --multiquery
-cat ddl/local/entries.sql         | docker exec -i superbank-clickhouse clickhouse-client --multiquery  # optional — only needed for PoH entry data
+cat ddl/local/entries.sql         | docker exec -i superbank-clickhouse clickhouse-client --multiquery  # required for the Fumarole/gRPC defaults shown below
 
 # Materialized views (derived by ClickHouse at insert time — not by the ingestor)
 cat ddl/local/gsfa.sql                | docker exec -i superbank-clickhouse clickhouse-client --multiquery
@@ -254,9 +254,11 @@ Fumarole is generally preferred for production: it uses a persistent consumer gr
 
 For **historical backfill**, there are two approaches depending on scale:
 
-**Large-scale backfill (recommended): Jetstreamer + Old Faithful**
+**Pre-v1 historical backfill: Jetstreamer + Old Faithful**
 
-For ingesting months or years of history, use the [Jetstreamer adapter](ingest/jetstreamer-clickhouse-plugin/) pointed at Triton's [Old Faithful](https://docs.triton.one/project-yellowstone/old-faithful-historical-archive) archival backend. Old Faithful has full history back to genesis and serves data at wire speed — far faster than polling `getBlock` over HTTP. Bound the range with the epoch or slot arguments; see the [Filtering section](#filtering-to-your-own-transactions) for trade-offs if you also want a program filter.
+The standalone Jetstreamer workspaces remain on Agave 3 and must not be used for post-v1 history. Use the root ingestor’s RPC or Bigtable source for transaction-v1 history; see the [ingestor compatibility notes](../crates/superbank/README.md).
+
+For ingesting months or years of history, use the [Jetstreamer adapter](../ingest/jetstreamer-clickhouse-plugin/) pointed at Triton's [Old Faithful](https://docs.triton.one/project-yellowstone/old-faithful-historical-archive) archival backend. Old Faithful has full history back to genesis and serves data at wire speed — far faster than polling `getBlock` over HTTP. Bound the range with the epoch or slot arguments; see the [Filtering section](#filtering-to-your-own-transactions) for trade-offs if you also want a program filter.
 
 **Small-to-medium backfill: JSON-RPC source**
 
@@ -362,22 +364,22 @@ curl -s http://localhost:8899 \
 
 curl -s http://localhost:8899 \
   -X POST -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["<signature>",{"encoding":"json","maxSupportedTransactionVersion":0}]}' | jq '{slot: .result.slot, blockTime: .result.blockTime, fee: .result.meta.fee}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["<signature>",{"encoding":"json","maxSupportedTransactionVersion":1}]}' | jq '{slot: .result.slot, blockTime: .result.blockTime, fee: .result.meta.fee}'
 # → {"slot": 424274200, "blockTime": 1780588286, "fee": 5000}
 
 curl -s http://localhost:8899 \
   -X POST -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[424274200,{"encoding":"json","maxSupportedTransactionVersion":0,"transactionDetails":"signatures"}]}' | jq '{blockhash: .result.blockhash, blockHeight: .result.blockHeight, numSignatures: (.result.signatures | length)}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[424274200,{"encoding":"json","maxSupportedTransactionVersion":1,"transactionDetails":"signatures"}]}' | jq '{blockhash: .result.blockhash, blockHeight: .result.blockHeight, numSignatures: (.result.signatures | length)}'
 # → {"blockhash": "Hpk2nu2vYpfMVNuW363vtc1JgMWkuCkgkjWVYyKfU14A", "blockHeight": 402357051, "numSignatures": 1582}
 
 # Triton extension — paginated transaction history with full tx data
 curl -s http://localhost:8899 \
   -X POST -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getTransactionsForAddress","params":["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",{"limit":3,"maxSupportedTransactionVersion":0}]}' | jq '{count: (.result.data | length), firstSlot: .result.data[0].slot}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"getTransactionsForAddress","params":["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",{"limit":3,"maxSupportedTransactionVersion":1}]}' | jq '{count: (.result.data | length), firstSlot: .result.data[0].slot}'
 # → {"count": 3, "firstSlot": 424497440}
 ```
 
-Each item in `getTransactionsForAddress` now includes a `version` field (`"legacy"` or `0` for versioned transactions). Pass `maxSupportedTransactionVersion: 0` in the params to receive versioned transactions.
+Full transaction results from `getTransactionsForAddress` include a `version` field (`"legacy"`, `0`, or `1`). Pass `maxSupportedTransactionVersion: 1` to accept transaction-v1 results as well as legacy/v0 transactions.
 
 Your Superbank instance is now serving Solana-compatible RPC at `:8899`.
 

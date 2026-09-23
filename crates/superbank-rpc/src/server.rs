@@ -341,9 +341,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         );
     }
 
-    if let Err(err) = metrics::force_init() {
-        warn!("Metrics initialization failed; metrics disabled: {err}");
-    }
+    metrics::force_init();
 
     #[cfg(feature = "grpc-head-cache")]
     metrics::head_cache_set_active(false);
