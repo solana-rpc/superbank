@@ -1,6 +1,11 @@
 # Superbank ingestor example configuration.
 # Copy to superbank.yaml and pass via --config / SUPERBANK_CONFIG.
 #
+# RPC cache options are CLI/env settings, not YAML fields:
+# DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS=100 bounds all cache stages of one
+# getSignaturesForAddress/getTransactionsForAddress request; expiry uses primary fallback.
+# It is independent of DISK_CACHE_QUERY_TIMEOUT_MS=2000 for other reads/index work.
+#
 # Optional superbank-rpc exact request filters. Pass this same file to
 # superbank-rpc with --config / SUPERBANK_CONFIG. Each entry contains the
 # method followed by its complete params array. Matching calls return HTTP 405

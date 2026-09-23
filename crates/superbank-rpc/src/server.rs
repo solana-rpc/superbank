@@ -717,6 +717,7 @@ async fn start_disk_cache(
             .disk_cache_partition_slots
             .unwrap_or_else(|| automatic_partition_slots(retain_slots)),
         query_timeout: Duration::from_millis(args.disk_cache_query_timeout_ms),
+        address_query_timeout: Duration::from_millis(args.disk_cache_address_query_timeout_ms),
         schema_check_interval: Duration::from_secs(args.disk_cache_schema_check_interval_secs),
         memory_blocks_metadata,
         memory_retain_slots: args.disk_cache_memory_retain_slots,

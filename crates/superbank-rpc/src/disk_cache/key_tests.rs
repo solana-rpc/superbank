@@ -253,6 +253,7 @@ pub(super) fn config(url: String, database: String) -> DiskCacheConfig {
         max_bytes: 0,
         partition_slots: 10,
         query_timeout: Duration::from_secs(2),
+        address_query_timeout: Duration::from_millis(100),
         key_index_max_memory_bytes: 128 * 1024 * 1024,
         query_concurrency: 2,
         query_max_threads: 2,
@@ -922,3 +923,7 @@ async fn key_routing_clickhouse_integration() {
 }
 
 mod diagnostics;
+
+mod address_latency;
+
+mod address_budget;
