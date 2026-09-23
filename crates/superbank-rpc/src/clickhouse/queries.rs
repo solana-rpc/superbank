@@ -379,31 +379,13 @@ fn signature_position_for_signature(
 
 fn slot_idx_condition(expr: &SignaturePositionExpr, comparison: SlotIdxComparison) -> String {
     let (slot_expr, idx_expr) = (&expr.slot_expr, &expr.idx_expr);
-    let slot_col = "slot + toUInt64(0)";
-    let idx_col = "slot_idx + toUInt32(0)";
-    let condition = match comparison {
-        SlotIdxComparison::Lt => {
-            format!(
-                "{slot_col} < {slot_expr} OR ({slot_col} = {slot_expr} AND {idx_col} < {idx_expr})"
-            )
-        }
-        SlotIdxComparison::Lte => {
-            format!(
-                "{slot_col} < {slot_expr} OR ({slot_col} = {slot_expr} AND {idx_col} <= {idx_expr})"
-            )
-        }
-        SlotIdxComparison::Gt => {
-            format!(
-                "{slot_col} > {slot_expr} OR ({slot_col} = {slot_expr} AND {idx_col} > {idx_expr})"
-            )
-        }
-        SlotIdxComparison::Gte => {
-            format!(
-                "{slot_col} > {slot_expr} OR ({slot_col} = {slot_expr} AND {idx_col} >= {idx_expr})"
-            )
-        }
+    let operator = match comparison {
+        SlotIdxComparison::Lt => "<",
+        SlotIdxComparison::Lte => "<=",
+        SlotIdxComparison::Gt => ">",
+        SlotIdxComparison::Gte => ">=",
     };
-
+    let condition = format!("(slot, slot_idx) {operator} ({slot_expr}, {idx_expr})");
     if expr.nullable {
         format!("(isNull({slot_expr}) OR {condition})")
     } else {
@@ -597,17 +579,14 @@ pub(crate) fn build_pagination_clauses(
     until: Option<SlotBoundary>,
 ) -> (String, String) {
     let mut conditions = Vec::new();
-    // Keep these explicit no-op arithmetic casts in place.
-    // On tables using reverse key ordering, bare predicates over key columns
-    // have been observed to trigger analyzer/optimizer rewrites that can drop
-    // same-slot slot_idx branches under some plans. Forcing computed
-    // expressions preserves the intended boundary logic.
+    // Compare slot and index together so position cursors include the
+    // qualifying transactions within the boundary slot.
 
     if let Some(before) = before {
         let condition = match before {
             SlotBoundary::Position(before_pos) => {
                 format!(
-                    "(slot + toUInt64(0) < {slot} OR (slot + toUInt64(0) = {slot} AND slot_idx + toUInt32(0) < {idx}))",
+                    "((slot, slot_idx) < ({slot}, {idx}))",
                     slot = before_pos.slot,
                     idx = before_pos.slot_idx
                 )
@@ -621,7 +600,7 @@ pub(crate) fn build_pagination_clauses(
         let condition = match until {
             SlotBoundary::Position(until_pos) => {
                 format!(
-                    "(slot + toUInt64(0) > {slot} OR (slot + toUInt64(0) = {slot} AND slot_idx + toUInt32(0) > {idx}))",
+                    "((slot, slot_idx) > ({slot}, {idx}))",
                     slot = until_pos.slot,
                     idx = until_pos.slot_idx
                 )
@@ -1052,9 +1031,7 @@ mod tests {
         ));
         assert!(sql.contains("AS FixedString(32))) % 32 AND owner = CAST(base58Decode('"));
         assert!(sql.contains(&format!("{expected_signature_bucket} AS sig_gte_bucket")));
-        assert!(sql.contains(
-            "slot + toUInt64(0) > sig_gte_slot OR (slot + toUInt64(0) = sig_gte_slot AND slot_idx + toUInt32(0) >= sig_gte_idx)"
-        ));
+        assert!(sql.contains("(slot, slot_idx) >= (sig_gte_slot, sig_gte_idx)"));
     }
 
     #[test]
@@ -1151,7 +1128,7 @@ mod tests {
             &build_transactions_for_address_query(&tables, &query, "").expect("query"),
         );
 
-        assert!(sql.contains("WHERE (slot + toUInt64(0) < 436663495 OR (slot + toUInt64(0) = 436663495 AND slot_idx + toUInt32(0) < 1387))"));
+        assert!(sql.contains("WHERE ((slot, slot_idx) < (436663495, 1387))"));
         assert!(!sql.contains("LIMIT BY"));
         assert!(sql.contains("ORDER BY slot DESC, slot_idx DESC, signature DESC LIMIT 64"));
         assert!(!sql.contains("FROM ( SELECT signature"));
@@ -1208,9 +1185,9 @@ mod tests {
                 assert!(!sql.contains("FROM default.signatures"));
                 assert!(!sql.contains("SELECT CAST"));
                 for operator in [">=", ">", "<=", "<"] {
-                    assert!(sql.contains(&format!("slot_idx + toUInt32(0) {operator} 7")));
+                    assert!(sql.contains(&format!("(slot, slot_idx) {operator} (42, 7)")));
                 }
-                assert!(sql.contains("slot + toUInt64(0) = 42"));
+                assert!(sql.contains(&format!("(42, {idx})")));
             }
         }
     }
@@ -1250,9 +1227,7 @@ mod tests {
             &build_transactions_for_address_query(&tables, &query, "").expect("query"),
         );
 
-        assert!(
-            sql.contains("WHERE (slot + toUInt64(0) > 436663495 OR (slot + toUInt64(0) = 436663495 AND slot_idx + toUInt32(0) >= 1387))")
-        );
+        assert!(sql.contains("WHERE ((slot, slot_idx) >= (436663495, 1387))"));
         assert!(!sql.contains("FROM cache.signatures"));
     }
 
@@ -1291,7 +1266,7 @@ mod tests {
             &build_transactions_for_address_query(&tables, &query, "").expect("query"),
         );
 
-        assert!(sql.contains("WHERE (slot + toUInt64(0) > 436663495 OR (slot + toUInt64(0) = 436663495 AND slot_idx + toUInt32(0) > 1387))"));
+        assert!(sql.contains("WHERE ((slot, slot_idx) > (436663495, 1387))"));
         assert!(sql.contains("ORDER BY slot ASC, slot_idx ASC, signature ASC LIMIT 64"));
     }
 

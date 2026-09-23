@@ -1184,11 +1184,9 @@ mod tests {
         );
         let sql = normalize_sql(&sql);
 
-        assert!(
-            sql.contains(
-                "WHERE (slot + toUInt64(0) < 220584742 OR (slot + toUInt64(0) = 220584742 AND slot_idx + toUInt32(0) < 286)) AND (slot + toUInt64(0) > 220580000 OR (slot + toUInt64(0) = 220580000 AND slot_idx + toUInt32(0) > 10))"
-            )
-        );
+        assert!(sql.contains(
+            "WHERE ((slot, slot_idx) < (220584742, 286)) AND ((slot, slot_idx) > (220580000, 10))"
+        ));
     }
 
     #[test]
@@ -1236,8 +1234,8 @@ mod tests {
         // Regression coverage for the incident where:
         // - before signature 2xC1... resolved to (slot=400179920, slot_idx=678)
         // - signature 3gY9... at the same slot with slot_idx=673 was skipped.
-        // The predicate must always preserve the "same slot, smaller idx" branch and
-        // use non-identity arithmetic casts to avoid reverse-key analyzer regressions.
+        // The tuple predicate must retain transactions with smaller indexes
+        // within the boundary slot.
         let (_, where_clause) = build_pagination_clauses(
             Some(SlotBoundary::Position(SignatureSlot {
                 slot: 400_179_920,
@@ -1256,19 +1254,15 @@ mod tests {
         );
         let sql = normalize_sql(&sql);
 
-        assert!(
-            sql.contains(
-                "WHERE (slot + toUInt64(0) < 400179920 OR (slot + toUInt64(0) = 400179920 AND slot_idx + toUInt32(0) < 678))"
-            )
-        );
+        assert!(sql.contains("WHERE ((slot, slot_idx) < (400179920, 678))"));
         assert!(!sql.contains("WHERE (slot < 400179920 OR (slot = 400179920 AND slot_idx < 678))"));
     }
 
     #[test]
     fn gsfa_signatures_query_regression_same_slot_until_boundary_clause() {
         // Regression coverage for the "until"-only pagination case at the same slot.
-        // The predicate must preserve the "same slot, larger idx" branch and use
-        // non-identity arithmetic casts to avoid reverse-key analyzer regressions.
+        // The tuple predicate must retain transactions with larger indexes
+        // within the boundary slot.
         let (_, where_clause) = build_pagination_clauses(
             None,
             Some(SlotBoundary::Position(SignatureSlot {
@@ -1287,11 +1281,7 @@ mod tests {
         );
         let sql = normalize_sql(&sql);
 
-        assert!(
-            sql.contains(
-                "WHERE (slot + toUInt64(0) > 400179920 OR (slot + toUInt64(0) = 400179920 AND slot_idx + toUInt32(0) > 678))"
-            )
-        );
+        assert!(sql.contains("WHERE ((slot, slot_idx) > (400179920, 678))"));
         assert!(!sql.contains("WHERE (slot > 400179920 OR (slot = 400179920 AND slot_idx > 678))"));
     }
 
