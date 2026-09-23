@@ -550,6 +550,11 @@ pub struct RpcConfig {
     pub(crate) disk_cache_query_timeout_ms: u64,
 
     #[cfg(feature = "disk-cache")]
+    /// Shared cache budget for one address request, including cursor lookup and hydration.
+    #[arg(long, env = "DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) disk_cache_address_query_timeout_ms: u64,
+
+    #[cfg(feature = "disk-cache")]
     /// Total partition routing index budget, including build buffers.
     #[arg(long, env = "DISK_CACHE_KEY_INDEX_MAX_MEMORY_BYTES", default_value_t = 4_294_967_296, value_parser = clap::value_parser!(u64).range(67_108_864..))]
     pub(crate) disk_cache_key_index_max_memory_bytes: u64,
@@ -1220,6 +1225,27 @@ mod disk_cache_config_tests {
     use super::RpcConfig;
 
     #[test]
+    fn address_cache_budget_is_positive_and_independent() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--disk-cache-address-query-timeout-ms",
+            "75",
+            "--disk-cache-query-timeout-ms",
+            "1500",
+        ]);
+        assert_eq!(cfg.disk_cache_address_query_timeout_ms, 75);
+        assert_eq!(cfg.disk_cache_query_timeout_ms, 1500);
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--disk-cache-address-query-timeout-ms",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn disk_cache_defaults() {
         let cfg = RpcConfig::parse_from(["superbank-rpc"]);
 
@@ -1230,6 +1256,7 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_max_bytes, 0);
         assert_eq!(cfg.disk_cache_partition_slots, None);
         assert_eq!(cfg.disk_cache_query_timeout_ms, 2_000);
+        assert_eq!(cfg.disk_cache_address_query_timeout_ms, 100);
         assert!(cfg.disk_cache_memory_tables.is_empty());
         assert_eq!(cfg.disk_cache_memory_retain_slots, None);
         assert_eq!(cfg.disk_cache_memory_max_bytes, None);

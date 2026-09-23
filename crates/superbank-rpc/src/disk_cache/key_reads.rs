@@ -100,11 +100,35 @@ impl AddressRows {
     }
 }
 
+// Two unknown partitions allow both intentionally unindexed retention edges.
+// A third needs source fallback: skipping it could silently truncate a page.
+struct ProbeBudget(usize);
+impl ProbeBudget {
+    fn candidate(&mut self, membership: Option<bool>) -> ProcessingResult<bool> {
+        if let Some(present) = membership {
+            return Ok(present);
+        }
+        self.0 = self.0.checked_sub(1).ok_or_else(|| {
+            ProcessingError::timeout_msg("disk cache unknown partition probe budget exhausted")
+        })?;
+        Ok(true)
+    }
+}
+
 struct Read {
     deadline: Instant,
     epoch: u64,
+    unknown_probe_limit: usize,
 }
 impl Read {
+    fn candidate(
+        &self,
+        budget: &mut ProbeBudget,
+        membership: Option<bool>,
+    ) -> ProcessingResult<bool> {
+        self.check()?;
+        budget.candidate(membership)
+    }
     fn check(&self) -> ProcessingResult<()> {
         if Instant::now() >= self.deadline {
             return Err(ProcessingError::timeout_msg("disk cache deadline exceeded"));
@@ -142,7 +166,19 @@ impl DiskCache {
         self.ready().then(|| Read {
             deadline: Instant::now() + self.inner.cfg.query_timeout,
             epoch: self.inner.key_index.epoch(),
+            unknown_probe_limit: usize::MAX,
         })
+    }
+    /// One absolute deadline shared by every cache stage of an address request.
+    pub(crate) fn address_request_deadline(&self) -> Instant {
+        Instant::now() + self.inner.cfg.address_query_timeout
+    }
+    fn read_until(&self, deadline: Instant) -> Option<Read> {
+        let mut read = self.read()?;
+        read.deadline = read.deadline.min(deadline);
+        read.unknown_probe_limit = 2;
+        read.check().ok()?;
+        Some(read)
     }
     fn valid_read(&self, read: &Read) -> bool {
         self.ready() && read.epoch == self.inner.key_index.epoch()
@@ -178,13 +214,24 @@ impl DiskCache {
             SortOrder::Desc => range.next_back(),
         })
     }
-    fn candidate(&self, partition: u64, families: &[Family], key: &[u8]) -> bool {
-        let candidate = self.inner.key_index.may_contain(partition, families, key);
-        crate::metrics::disk_cache_read(
-            "key_partition",
-            if candidate { "probed" } else { "skipped" },
-        );
-        candidate
+    fn candidate(
+        &self,
+        partition: u64,
+        families: &[Family],
+        key: &[u8],
+        budget: &mut ProbeBudget,
+        read: &Read,
+    ) -> ProcessingResult<bool> {
+        read.candidate(
+            budget,
+            self.inner.key_index.membership(partition, families, key),
+        )
+        .inspect(|candidate| {
+            crate::metrics::disk_cache_read(
+                "key_partition",
+                if *candidate { "probed" } else { "skipped" },
+            );
+        })
     }
     fn signature_candidates(
         &self,
@@ -246,8 +293,12 @@ impl DiskCache {
         }
         let base = self.query_client();
         let signature = signature.to_string();
+        let mut budget = ProbeBudget(read.unknown_probe_limit);
         for partition in candidates.partitions {
-            read.check()?;
+            read.candidate(
+                &mut budget,
+                (!candidates.unknown_partitions.contains(&partition)).then_some(true),
+            )?;
             crate::metrics::disk_cache_read("key_partition", "probed");
             let client = self.scoped_client(&base, partition, read);
             if let (Some(position), _) = client.get_signature_slot(&signature).await? {
@@ -256,8 +307,22 @@ impl DiskCache {
         }
         Ok(None)
     }
+    #[cfg(test)]
     pub(crate) async fn signature_position(&self, signature: Signature) -> Option<SignatureSlot> {
         let read = self.read()?;
+        self.attempt(
+            "signature_position",
+            &read,
+            self.find_position(signature, &read),
+        )
+        .await
+    }
+    pub(crate) async fn signature_position_until(
+        &self,
+        signature: Signature,
+        deadline: Instant,
+    ) -> Option<SignatureSlot> {
+        let read = self.read_until(deadline)?;
         self.attempt(
             "signature_position",
             &read,
@@ -422,6 +487,7 @@ impl DiskCache {
             vec![Family::Address, Family::Owner]
         }
     }
+    #[cfg(test)]
     pub(crate) async fn signatures_for_address(
         &self,
         address: Pubkey,
@@ -429,20 +495,37 @@ impl DiskCache {
         until: Option<SlotBoundary>,
         limit: usize,
     ) -> Option<DiskGsfaPage> {
-        let read = self.read()?;
+        self.signatures_for_address_until(
+            address,
+            before,
+            until,
+            limit,
+            self.address_request_deadline(),
+        )
+        .await
+    }
+    pub(crate) async fn signatures_for_address_until(
+        &self,
+        address: Pubkey,
+        before: Option<SlotBoundary>,
+        until: Option<SlotBoundary>,
+        limit: usize,
+        deadline: Instant,
+    ) -> Option<DiskGsfaPage> {
+        let read = self.read_until(deadline)?;
         let (floor, tip) = self.tip_span()?;
         let (until, floor_effective) = clamp_until_to_floor(until, floor);
         let base = self.query_client_for_address(&address, TokenAccountsFilter::None)?;
         let families = self.address_families(&address, TokenAccountsFilter::None);
         self.attempt("signatures_for_address", &read, async {
             let mut records = Vec::new();
+            let mut budget = ProbeBudget(read.unknown_probe_limit);
             let (scan_floor, scan_tip) = gsfa_window((floor, tip), before, until);
             for partition in self.partitions(scan_floor, scan_tip, SortOrder::Desc) {
-                read.check()?;
                 if records.len() >= limit {
                     break;
                 }
-                if !self.candidate(partition, &families, address.as_ref()) {
+                if !self.candidate(partition, &families, address.as_ref(), &mut budget, &read)? {
                     continue;
                 }
                 let client = self.scoped_client(&base, partition, &read);
@@ -461,12 +544,22 @@ impl DiskCache {
         })
         .await
     }
+    #[cfg(test)]
     pub(crate) async fn transactions_for_address(
         &self,
         address: Pubkey,
         query: DiskTfaQuery,
     ) -> Option<DiskGsfaPage> {
-        let read = self.read()?;
+        self.transactions_for_address_until(address, query, self.address_request_deadline())
+            .await
+    }
+    pub(crate) async fn transactions_for_address_until(
+        &self,
+        address: Pubkey,
+        query: DiskTfaQuery,
+        deadline: Instant,
+    ) -> Option<DiskGsfaPage> {
+        let read = self.read_until(deadline)?;
         let (floor, tip) = self.tip_span()?;
         let base = self.query_client_for_address(&address, query.token_accounts)?;
         self.attempt("transactions_for_address", &read, async {
@@ -513,13 +606,13 @@ impl DiskCache {
         };
         let families = self.address_families(&address, query.token_accounts);
         let mut rows = AddressRows::default();
+        let mut budget = ProbeBudget(read.unknown_probe_limit);
         let (scan_floor, scan_tip) = tfa_window((floor, tip), &q);
         for partition in self.partitions(scan_floor, scan_tip, query.sort_order) {
-            read.check()?;
             if rows.records.len() >= query.limit {
                 break;
             }
-            if !self.candidate(partition, &families, address.as_ref()) {
+            if !self.candidate(partition, &families, address.as_ref(), &mut budget, read)? {
                 continue;
             }
             let client = self.scoped_client(base, partition, read);
@@ -592,6 +685,31 @@ impl DiskCache {
 mod window_tests {
     use super::*;
     use crate::clickhouse::{ResolvedSignatureFilter, TransactionStatusFilter};
+
+    #[test]
+    fn unknown_edges_are_probed_but_an_unfinished_page_requires_fallback() {
+        let mut budget = ProbeBudget(2);
+        assert!(budget.candidate(None).unwrap()); // active tip
+        assert!(!budget.candidate(Some(false)).unwrap());
+        assert!(budget.candidate(Some(true)).unwrap());
+        assert!(budget.candidate(None).unwrap()); // partial floor
+        assert!(budget.candidate(None).is_err());
+        // Known membership remains usable; exhaustion is not false absence.
+        assert!(budget.candidate(Some(true)).unwrap());
+    }
+
+    #[test]
+    fn expired_request_does_not_start_another_cursor_or_page_probe() {
+        let read = Read {
+            deadline: Instant::now(),
+            epoch: 0,
+            unknown_probe_limit: 2,
+        };
+        let mut budget = ProbeBudget(read.unknown_probe_limit);
+        assert!(read.candidate(&mut budget, Some(true)).is_err());
+        assert!(read.candidate(&mut budget, None).is_err());
+        assert_eq!(budget.0, 2);
+    }
 
     #[test]
     fn invalidated_absence_is_unavailable() {

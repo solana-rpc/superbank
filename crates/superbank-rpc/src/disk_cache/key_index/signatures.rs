@@ -55,11 +55,11 @@ impl Writer {
 pub(in crate::disk_cache) struct SignatureCandidates {
     pub(in crate::disk_cache) partitions: Vec<u64>,
     pub(in crate::disk_cache) total: u64,
-    unknown: bool,
+    pub(in crate::disk_cache) unknown_partitions: Vec<u64>,
 }
 impl SignatureCandidates {
     pub(in crate::disk_cache) fn outcome(&self) -> &'static str {
-        if self.unknown {
+        if !self.unknown_partitions.is_empty() {
             "unknown"
         } else if self.partitions.is_empty() {
             "absent"
@@ -188,7 +188,7 @@ impl KeyIndex {
         let mut result = SignatureCandidates {
             partitions: Vec::new(),
             total: 0,
-            unknown: false,
+            unknown_partitions: Vec::new(),
         };
         for partition in (floor..=tip).rev() {
             result.total += 1;
@@ -206,7 +206,7 @@ impl KeyIndex {
                     result.partitions.push(partition);
                 }
             } else {
-                result.unknown = true;
+                result.unknown_partitions.push(partition);
                 result.partitions.push(partition);
             }
         }

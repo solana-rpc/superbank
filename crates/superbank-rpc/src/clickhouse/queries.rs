@@ -503,10 +503,12 @@ fn apply_pagination_token(
 
     match pagination {
         PaginationToken::SlotIndex { slot, idx } => {
-            conditions.push(slot_idx_condition_for_position(
-                SignatureSlot {
-                    slot: *slot,
-                    slot_idx: *idx,
+            conditions.push(slot_idx_condition(
+                &SignaturePositionExpr {
+                    slot_expr: slot.to_string(),
+                    idx_expr: idx.to_string(),
+                    nullable: false,
+                    with_parts: Vec::new(),
                 },
                 comparison,
             ));
@@ -525,6 +527,27 @@ fn apply_pagination_token(
     }
 
     Ok(())
+}
+
+fn apply_resolved_signature_filter(filter: &ResolvedSignatureFilter, conditions: &mut Vec<String>) {
+    for (position, comparison) in [
+        (filter.gte, SlotIdxComparison::Gte),
+        (filter.gt, SlotIdxComparison::Gt),
+        (filter.lte, SlotIdxComparison::Lte),
+        (filter.lt, SlotIdxComparison::Lt),
+    ] {
+        if let Some(position) = position {
+            conditions.push(slot_idx_condition(
+                &SignaturePositionExpr {
+                    slot_expr: position.slot.to_string(),
+                    idx_expr: position.slot_idx.to_string(),
+                    nullable: false,
+                    with_parts: Vec::new(),
+                },
+                comparison,
+            ));
+        }
+    }
 }
 
 fn apply_hot_resolved_signature_filter(
@@ -684,7 +707,11 @@ pub(crate) fn build_transactions_for_address_query(
         append_numeric_filter_conditions("block_time", block_time_filter, &mut conditions);
     }
 
-    if let Some(signature_filter) = &query.signature_filter {
+    if let Some(signature_filter) = query.resolved_signature_filter.as_ref() {
+        // Preserve the computed-key workaround used by signature-shaped bounds
+        // on ordinary (including reverse-key) tables, without scalar lookups.
+        apply_resolved_signature_filter(signature_filter, &mut conditions);
+    } else if let Some(signature_filter) = &query.signature_filter {
         apply_signature_filter(
             tables.signatures_table,
             tables.signature_bucket_modulus,
@@ -692,11 +719,6 @@ pub(crate) fn build_transactions_for_address_query(
             &mut with_parts,
             &mut conditions,
         )?;
-    } else if let Some(signature_filter) = query.resolved_signature_filter.as_ref() {
-        // The local finalized cache resolves signature-shaped bounds before it
-        // enters the cache tier. Apply those positions directly instead of
-        // issuing nested signature lookups which could escape cache coverage.
-        apply_hot_resolved_signature_filter(signature_filter, &mut conditions);
     }
 
     if let Some(pagination) = &query.pagination {
@@ -883,22 +905,33 @@ pub(crate) fn build_transactions_for_address_hot_query(
     ))
 }
 
+fn transaction_tuple_predicates(chunk: &[(u64, Option<u32>, String)]) -> [Option<String>; 2] {
+    let exact = chunk
+        .iter()
+        .filter_map(|(slot, idx, literal)| idx.map(|idx| format!("({slot}, {idx}, {literal})")))
+        .collect::<Vec<_>>();
+    let fallback = chunk
+        .iter()
+        .filter(|(_, idx, _)| idx.is_none())
+        .map(|(slot, _, literal)| format!("({slot}, {literal})"))
+        .collect::<Vec<_>>();
+    [
+        (!exact.is_empty())
+            .then(|| format!("(slot, slot_idx, signature) IN ({})", exact.join(", "))),
+        (!fallback.is_empty()).then(|| format!("(slot, signature) IN ({})", fallback.join(", "))),
+    ]
+}
+
 pub(crate) fn build_transactions_by_slot_signatures_query(
     transaction_table: &str,
-    pairs: &[(u64, String)],
-    version_filter: &str,
+    pairs: &[(u64, Option<u32>, String)],
     settings_clause: &str,
     in_clause_chunk: usize,
 ) -> String {
     let chunk_size = in_clause_chunk.max(1);
     let mut prewhere_parts = Vec::new();
     for chunk in pairs.chunks(chunk_size) {
-        let mut tuple_parts = Vec::with_capacity(chunk.len());
-        for (slot, literal) in chunk {
-            tuple_parts.push(format!("({slot}, {literal})"));
-        }
-        let tuples = tuple_parts.join(", ");
-        prewhere_parts.push(format!("(slot, signature) IN ({tuples})"));
+        prewhere_parts.extend(transaction_tuple_predicates(chunk).into_iter().flatten());
     }
     let prewhere_clause = if prewhere_parts.len() == 1 {
         prewhere_parts[0].clone()
@@ -910,12 +943,10 @@ pub(crate) fn build_transactions_by_slot_signatures_query(
             {columns}
          FROM {transaction_table}
          PREWHERE {prewhere_clause}
-         WHERE {version_filter}
          {settings_clause}",
         columns = TRANSACTION_SELECT_COLUMNS,
         transaction_table = transaction_table,
         prewhere_clause = prewhere_clause,
-        version_filter = version_filter,
         settings_clause = settings_clause
     )
 }
@@ -1120,11 +1151,68 @@ mod tests {
             &build_transactions_for_address_query(&tables, &query, "").expect("query"),
         );
 
-        assert!(sql.contains("WHERE (slot < 436663495 OR (slot = 436663495 AND slot_idx < 1387))"));
-        assert!(!sql.contains("slot + toUInt64(0) < 436663495"));
+        assert!(sql.contains("WHERE (slot + toUInt64(0) < 436663495 OR (slot + toUInt64(0) = 436663495 AND slot_idx + toUInt32(0) < 1387))"));
         assert!(!sql.contains("LIMIT BY"));
         assert!(sql.contains("ORDER BY slot DESC, slot_idx DESC, signature DESC LIMIT 64"));
         assert!(!sql.contains("FROM ( SELECT signature"));
+    }
+
+    #[test]
+    fn resolved_bounds_take_precedence_and_refills_never_repeat_scalar_lookups() {
+        let position = SignatureSlot {
+            slot: 42,
+            slot_idx: 7,
+        };
+        let mut query = TransactionsForAddressQuery {
+            address: bs58::encode([9_u8; 32]).into_string(),
+            limit: 64,
+            sort_order: SortOrder::Desc,
+            pagination: Some(super::PaginationToken::SlotIndex { slot: 42, idx: 9 }),
+            resolved_pagination: Some(SignatureSlot {
+                slot: 42,
+                slot_idx: 9,
+            }),
+            slot_filter: None,
+            block_time_filter: None,
+            // Invalid text deliberately verifies no signature decoding or scalar SQL remains.
+            signature_filter: Some(SignatureFilter {
+                gte: Some("already resolved".into()),
+                gt: Some("already resolved".into()),
+                lte: Some("already resolved".into()),
+                lt: Some("already resolved".into()),
+            }),
+            resolved_signature_filter: Some(ResolvedSignatureFilter {
+                gte: Some(position),
+                gt: Some(position),
+                lte: Some(position),
+                lt: Some(position),
+            }),
+            status: TransactionStatusFilter::Any,
+            token_accounts: TokenAccountsFilter::None,
+        };
+        let tables = TransactionsForAddressTables {
+            cache_partition: None,
+            gsfa_table: "default.gsfa_local",
+            gsfa_bucket_modulus: 32,
+            token_owner_table: "default.token_owner_activity_local",
+            token_owner_bucket_modulus: 32,
+            signatures_table: "default.signatures",
+            signature_bucket_modulus: 32,
+        };
+        for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+            query.sort_order = sort_order;
+            for idx in [9, 8] {
+                query.pagination = Some(super::PaginationToken::SlotIndex { slot: 42, idx });
+                let sql = build_transactions_for_address_query(&tables, &query, "")
+                    .expect("resolved query");
+                assert!(!sql.contains("FROM default.signatures"));
+                assert!(!sql.contains("SELECT CAST"));
+                for operator in [">=", ">", "<=", "<"] {
+                    assert!(sql.contains(&format!("slot_idx + toUInt32(0) {operator} 7")));
+                }
+                assert!(sql.contains("slot + toUInt64(0) = 42"));
+            }
+        }
     }
 
     #[test]
@@ -1163,13 +1251,13 @@ mod tests {
         );
 
         assert!(
-            sql.contains("WHERE (slot > 436663495 OR (slot = 436663495 AND slot_idx >= 1387))")
+            sql.contains("WHERE (slot + toUInt64(0) > 436663495 OR (slot + toUInt64(0) = 436663495 AND slot_idx + toUInt32(0) >= 1387))")
         );
         assert!(!sql.contains("FROM cache.signatures"));
     }
 
     #[test]
-    fn transactions_for_address_ascending_cursor_uses_raw_key_predicate() {
+    fn transactions_for_address_ascending_cursor_preserves_computed_key_predicate() {
         let query = TransactionsForAddressQuery {
             address: bs58::encode([9_u8; 32]).into_string(),
             limit: 64,
@@ -1203,7 +1291,7 @@ mod tests {
             &build_transactions_for_address_query(&tables, &query, "").expect("query"),
         );
 
-        assert!(sql.contains("WHERE (slot > 436663495 OR (slot = 436663495 AND slot_idx > 1387))"));
+        assert!(sql.contains("WHERE (slot + toUInt64(0) > 436663495 OR (slot + toUInt64(0) = 436663495 AND slot_idx + toUInt32(0) > 1387))"));
         assert!(sql.contains("ORDER BY slot ASC, slot_idx ASC, signature ASC LIMIT 64"));
     }
 

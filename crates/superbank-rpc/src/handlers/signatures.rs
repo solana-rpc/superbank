@@ -402,6 +402,10 @@ pub(crate) async fn handle_get_signatures_for_address(
     params: Option<Vec<Value>>,
 ) -> Result<Response, StatusCode> {
     let mut route = RouteMetric::for_state("getSignaturesForAddress", state.as_ref());
+    #[cfg(feature = "disk-cache")]
+    let disk_request = state
+        .disk_cache()
+        .map(|disk| (disk, disk.address_request_deadline()));
 
     let Some(mut params) = params.filter(|v| !v.is_empty()) else {
         route.invalid_params();
@@ -647,11 +651,11 @@ pub(crate) async fn handle_get_signatures_for_address(
 
             #[cfg(feature = "disk-cache")]
             if pos.is_none()
-                && let Some(disk) = state.disk_cache()
+                && let Some((disk, deadline)) = disk_request
                 && let Ok(sig) = Signature::from_str(sig_str)
             {
                 route.disk_cache_read();
-                pos = disk.signature_position(sig).await;
+                pos = disk.signature_position_until(sig, deadline).await;
             }
 
             if pos.is_none() {
@@ -693,11 +697,11 @@ pub(crate) async fn handle_get_signatures_for_address(
 
                 #[cfg(feature = "disk-cache")]
                 if pos.is_none()
-                    && let Some(disk) = state.disk_cache()
+                    && let Some((disk, deadline)) = disk_request
                     && let Ok(sig) = Signature::from_str(sig_str)
                 {
                     route.disk_cache_read();
-                    pos = disk.signature_position(sig).await;
+                    pos = disk.signature_position_until(sig, deadline).await;
                 }
 
                 if pos.is_none() {
@@ -768,14 +772,15 @@ pub(crate) async fn handle_get_signatures_for_address(
         // coverage floor — and when it does, the ClickHouse bound is clamped
         // strictly below the floor so the tiers can never overlap.
         #[cfg(feature = "disk-cache")]
-        let disk_page = match state.disk_cache() {
-            Some(disk) => {
+        let disk_page = match disk_request {
+            Some((disk, deadline)) => {
                 route.disk_cache_read();
-                disk.signatures_for_address(
+                disk.signatures_for_address_until(
                     address_pubkey,
                     before_boundary,
                     until_boundary,
                     limit as usize,
+                    deadline,
                 )
                 .await
             }
@@ -921,12 +926,12 @@ pub(crate) async fn handle_get_signatures_for_address(
 
     if let Some(sig_str) = options.before.as_deref() {
         #[cfg(feature = "disk-cache")]
-        if let Some(disk) = state.disk_cache()
+        if let Some((disk, deadline)) = disk_request
             && let Ok(signature) = Signature::from_str(sig_str)
         {
             route.disk_cache_read();
             before_boundary = disk
-                .signature_position(signature)
+                .signature_position_until(signature, deadline)
                 .await
                 .map(SlotBoundary::Position);
         }
@@ -957,12 +962,12 @@ pub(crate) async fn handle_get_signatures_for_address(
             until_boundary = before_boundary;
         } else {
             #[cfg(feature = "disk-cache")]
-            if let Some(disk) = state.disk_cache()
+            if let Some((disk, deadline)) = disk_request
                 && let Ok(signature) = Signature::from_str(sig_str)
             {
                 route.disk_cache_read();
                 until_boundary = disk
-                    .signature_position(signature)
+                    .signature_position_until(signature, deadline)
                     .await
                     .map(SlotBoundary::Position);
             }
@@ -990,13 +995,14 @@ pub(crate) async fn handle_get_signatures_for_address(
     }
 
     #[cfg(feature = "disk-cache")]
-    let disk_page = if let Some(disk) = state.disk_cache() {
+    let disk_page = if let Some((disk, deadline)) = disk_request {
         route.disk_cache_read();
-        disk.signatures_for_address(
+        disk.signatures_for_address_until(
             Pubkey::from_str(address).expect("validated address"),
             before_boundary,
             until_boundary,
             limit as usize,
+            deadline,
         )
         .await
     } else {

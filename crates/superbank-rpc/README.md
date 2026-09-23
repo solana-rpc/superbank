@@ -482,8 +482,25 @@ partitions before querying ClickHouse. This preserves whole-partition eviction w
 key lookups search every retained partition. Signature status batches, pagination-bound signature
 lookups, regular/hot address history, and token-owner history use the same routing mechanism.
 Candidate partitions are queried in result order, one at a time, until the answer is complete or
-the shared `DISK_CACHE_QUERY_TIMEOUT_MS` deadline expires. Admission waiting and transaction
-hydration count against that deadline. Incomplete address pages use source fallback.
+their deadline expires. `getSignaturesForAddress` and `getTransactionsForAddress` share one
+`DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` deadline (default 100 ms) across cursor/bound resolution,
+address scans, and full transaction hydration, including admission waiting. This is separate from
+`DISK_CACHE_QUERY_TIMEOUT_MS` (default 2000 ms), which still governs other reads and index work.
+The 100 ms default leaves room above the observed roughly 3 ms mean cache hit while limiting the
+historical 2-second timeout penalty; it is a latency policy, not a measured tail-latency guarantee.
+Each address scan or cursor lookup probes at most two unknown partitions, allowing useful recent
+hits and both intentionally unindexed retention edges. If another unknown partition is required,
+or the deadline expires, the incomplete page is discarded and the source answers the original
+bounds. Unknown membership never proves absence. Complete Bloom candidates do not consume the
+unknown-probe allowance.
+
+`getTransactionsForAddress` resolves each distinct pagination/filter signature once per request
+and reuses numeric bounds on every tier and refill. A successfully missing bound remains
+unbounded; a lookup failure remains an error. Ordinary-table predicates retain their computed-key
+workaround for reverse-key ClickHouse tables. Full pages hydrate exact `(slot, slot_idx, signature)`
+keys in batches of at most 100, locally and on the primary. Only unresolved identities retry
+without `slot_idx`, under the same hydration deadline. Cache eviction falls back to the primary;
+unsupported transaction versions still produce the encoder's error.
 
 Partition-scoped interactive reads enable ClickHouse's uncompressed-block cache
 (`use_uncompressed_cache=1`) while keeping the query-result cache disabled. The cache reuses
@@ -596,6 +613,7 @@ Configuration:
 | `--disk-cache-max-bytes` | `DISK_CACHE_MAX_BYTES` | `0` | Enforced active-part byte budget for the primary cache database; `0` means unlimited. May purge the newest partition and mark the cache unready when one partition cannot fit. |
 | `--disk-cache-partition-slots` | `DISK_CACHE_PARTITION_SLOTS` | automatic | Width of local slot partitions. The automatic value targets at most 128 active partitions. |
 | `--disk-cache-query-timeout-ms` | `DISK_CACHE_QUERY_TIMEOUT_MS` | `2000` | Timeout for one local cache read. |
+| `--disk-cache-address-query-timeout-ms` | `DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` | `100` | Shared address-request cache budget in milliseconds; includes cursors, scans and full hydration. Positive integer. |
 | `--disk-cache-key-index-max-memory-bytes` | `DISK_CACHE_KEY_INDEX_MAX_MEMORY_BYTES` | `4294967296` | In-process partition membership budget, including builder buffers and metadata; minimum 64 MiB. Separate from ClickHouse and the historical block index. |
 | `--disk-cache-query-concurrency` | `DISK_CACHE_QUERY_CONCURRENCY` | `8` | Concurrent local interactive queries, range 1–64. |
 | `--disk-cache-query-max-threads` | `DISK_CACHE_QUERY_MAX_THREADS` | `2` | ClickHouse execution threads per local interactive query, range 1–16. |
@@ -975,3 +993,22 @@ run can leave those test databases for inspection. With optional cache features 
 it also exercises incomplete head-cache and disk-cache fallback, including disk slot poisoning.
 Both configurations initialize ClickHouse read cancellation and verify successful source
 metadata and projection reads before testing partial-block rejection and recovery after repair.
+
+
+## Address latency regressions
+
+The normal Rust suite checks bound deduplication, resolved SQL and unknown-partition probe limits.
+For end-to-end coverage against a disposable loopback ClickHouse (26.1.2.11), run:
+
+```bash
+DISK_CACHE_TEST_URL=http://127.0.0.1:18195 \
+cargo test -p superbank-rpc --all-features --locked address_latency_clickhouse_integration -- --ignored
+DISK_CACHE_TEST_URL=http://127.0.0.1:18195 \
+cargo test -p superbank-rpc --all-features --locked gsfa_handler_cursor_budget_and_missing_bounds -- --ignored
+```
+
+These tests create uniquely named fixture databases and drop them on success. They exercise the
+shared cursor/page budget, missing bounds, unknown edge partitions, exact batches spanning many
+slots or one slot, historical position mismatch, eviction fallback, ordering, encodings and
+unsupported versions. Failed runs can leave fixture databases for inspection. Small synthetic
+fixtures establish regression behavior, not production latency or capacity.

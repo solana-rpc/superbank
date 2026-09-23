@@ -7272,6 +7272,7 @@ async fn get_block_clickhouse_partial_payload_repair() {
                             query_max_threads: 2,
                             partition_slots: 100,
                             query_timeout: Duration::from_secs(10),
+                            address_query_timeout: Duration::from_millis(100),
                             schema_check_interval: Duration::from_secs(60),
                             memory_blocks_metadata: false,
                             memory_retain_slots: None,
