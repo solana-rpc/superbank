@@ -13,7 +13,7 @@ pub const DONE_FILE_PREFIX: &str = ".done";
 /// Bump when the manifest schema changes. A reader can compare this against
 /// the highest version it understands to detect archives written by a newer
 /// producer.
-pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+pub const MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Bump when the `report.json` schema changes.
 pub const REPORT_FORMAT_VERSION: u32 = 1;

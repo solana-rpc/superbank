@@ -378,7 +378,7 @@ to describe handler outcomes before envelope promotion.
 ## Optional gRPC head cache (`grpc-head-cache`)
 
 When compiled with `--features grpc-head-cache` and enabled at runtime, superbank-rpc subscribes to
-a Yellowstone DragonsMouth gRPC stream via `yellowstone-block-machine` and keeps a small
+a Yellowstone DragonsMouth gRPC stream of complete bank-tagged blocks and keeps a small
 in-memory cache of the most recent slots. RPC handlers can merge this "head" data with ClickHouse
 to hide the typical ingestion lag.
 
@@ -462,7 +462,9 @@ Configuration:
 | `--grpc-max-decoding-bytes` | `GRPC_MAX_DECODING_BYTES` | `67108864` | Max gRPC decoding message size. |
 
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
-The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (also AGPL-3.0).
+The optional `grpc-head-cache` feature pulls in Yellowstone gRPC client and protobuf crates
+(also AGPL-3.0). A 4.3 producer must supply bank IDs; bank replacement evicts the
+replaced slot and its cached descendants.
 
 ## Optional local ClickHouse forward cache (`disk-cache`)
 

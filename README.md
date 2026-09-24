@@ -93,6 +93,7 @@ table.
 ```bash
 cat ddl/local/transactions.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/blocks_metadata.sql | docker exec -i clickhouse clickhouse-client --multiquery
+cat ddl/local/block_footers.sql | docker exec -i clickhouse clickhouse-client --multiquery
 # Required for Superbank Fumarole/gRPC source defaults and Old Faithful / Jetstreamer PoH entry ingestion.
 cat ddl/local/entries.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/gsfa.sql | docker exec -i clickhouse clickhouse-client --multiquery
@@ -109,7 +110,7 @@ required local schemas, replays a small Old Faithful range through the Jetstream
 plugin, and prints verification queries, run:
 
 ```bash
-scripts/dev/run-jetstreamer-entries-smoke.sh
+JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh
 ```
 
 That helper also adjusts the local Docker ClickHouse `default` user so the host-side Jetstreamer
@@ -131,6 +132,7 @@ cp superbank.example.yaml superbank.yaml
 Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
+- The legacy Fumarole source also requires `fumarole-alpenglow-genesis-slot` from a trusted genesis certificate and stops after that slot. Use a bank-tagged Yellowstone gRPC producer for Alpenglow blocks.
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
   (add `rpc-skip-ingested-slots` to backfill only slots missing from ClickHouse in that range)

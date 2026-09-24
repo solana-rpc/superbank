@@ -32,6 +32,8 @@ pub struct ClickhouseIngestConfig {
     pub blocks_metadata_table: String,
     /// Base table for PoH entries.
     pub entries_table: String,
+    /// Trusted Alpenglow genesis slot; this producer can only write through it.
+    pub alpenglow_genesis_slot: Option<u64>,
     /// Max rows per ClickHouse insert batch.
     pub flush_max_rows: u64,
     /// Max bytes per ClickHouse insert batch.
@@ -67,6 +69,7 @@ impl Default for ClickhouseIngestConfig {
             transactions_table: "transactions".to_string(),
             blocks_metadata_table: "blocks_metadata".to_string(),
             entries_table: "entries".to_string(),
+            alpenglow_genesis_slot: None,
             flush_max_rows: 100_000,
             flush_max_bytes: 64 * 1024 * 1024,
             flush_interval_ms: 10_000,
@@ -98,6 +101,7 @@ impl ClickhouseIngestConfig {
 }
 
 fn apply_env_overrides(config: &mut ClickhouseIngestConfig) {
+    apply_era_env_override(config);
     if let Some(value) = env_u64("JETSTREAMER_CLICKHOUSE_FLUSH_MAX_ROWS") {
         config.flush_max_rows = value;
     }
@@ -130,6 +134,20 @@ fn apply_env_overrides(config: &mut ClickhouseIngestConfig) {
     }
     if let Some(value) = env_u64("JETSTREAMER_CLICKHOUSE_INSERT_END_TIMEOUT_MS") {
         config.insert_end_timeout_ms = value;
+    }
+}
+
+fn apply_era_env_override(config: &mut ClickhouseIngestConfig) {
+    if let Some(value) = env_u64("JETSTREAMER_ALPENGLOW_GENESIS_SLOT") {
+        config.alpenglow_genesis_slot = Some(value);
+    }
+}
+
+fn log_storage_mode(single_node: bool) {
+    if single_node {
+        log::info!("ClickHouse ingest plugin in single-node mode.");
+    } else {
+        log::info!("ClickHouse ingest plugin in clustered mode.");
     }
 }
 
@@ -170,8 +188,12 @@ fn env_bool(name: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClickhouseIngestConfig, EntryRow, apply_env_overrides};
+    use super::{
+        ClickhouseIngestConfig, ClickhouseIngestPlugin, EntryRow, apply_env_overrides,
+        versioned_message_fields,
+    };
     use jetstreamer_firehose::firehose::EntryData;
+    use solana_message::{Hash, VersionedMessage, v1};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -269,6 +291,47 @@ mod tests {
     }
 
     #[test]
+    fn legacy_backfill_requires_boundary_and_stops_after_genesis() {
+        let unbounded = ClickhouseIngestPlugin::new(ClickhouseIngestConfig::default(), 1);
+        assert!(unbounded.ensure_legacy_slot(1).is_err());
+
+        let bounded = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(bounded.ensure_legacy_slot(100).is_ok());
+        assert!(bounded.ensure_legacy_slot(101).is_err());
+    }
+
+    #[test]
+    fn v1_message_fields_preserve_lifetime_and_config() {
+        let message = VersionedMessage::V1(v1::Message {
+            lifetime_specifier: Hash::new_from_array([7; 32]),
+            config: v1::TransactionConfig {
+                priority_fee: Some(42),
+                compute_unit_limit: Some(100_000),
+                loaded_accounts_data_size_limit: Some(65_536),
+                heap_size: Some(32_768),
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            versioned_message_fields(&message),
+            (
+                Some(1),
+                [7; 32],
+                Some(42),
+                Some(100_000),
+                Some(65_536),
+                Some(32_768)
+            )
+        );
+    }
+
+    #[test]
     fn entry_rows_preserve_poh_metadata() {
         let entry = EntryData {
             slot: 42,
@@ -349,6 +412,46 @@ impl ClickhouseIngestPlugin {
             .ok_or_else(|| PluginError::new(format!("thread_id {} out of range", thread_id)))
     }
 
+    fn ensure_legacy_slot(&self, slot: u64) -> Result<(), PluginError> {
+        match self.config.alpenglow_genesis_slot {
+            Some(genesis_slot) if slot <= genesis_slot => Ok(()),
+            Some(_) => Err(PluginError::new(format!(
+                "Jetstreamer block {slot} is after the Alpenglow genesis slot; bank ID and footer provenance are unavailable"
+            ))),
+            None => Err(PluginError::new(
+                "JETSTREAMER_ALPENGLOW_GENESIS_SLOT is required to bound the legacy backfill"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn clear_skipped_slot(&self, thread_id: usize, slot: u64) -> Result<(), PluginError> {
+        let state_lock = self.thread_state(thread_id)?;
+        let mut state = state_lock.lock();
+        if state.pending_slot == Some(slot) {
+            if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
+                log::warn!(
+                    "clearing {} buffered transactions and {} buffered entries for skipped slot {}",
+                    state.pending_transactions.len(),
+                    state.pending_entries.len(),
+                    slot
+                );
+            }
+            state.pending_slot = None;
+            state.pending_transactions.clear();
+            state.pending_entries.clear();
+        } else if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
+            log::debug!(
+                "skipped slot {} leaving pending_slot={:?} pending_transactions={} pending_entries={}",
+                slot,
+                state.pending_slot,
+                state.pending_transactions.len(),
+                state.pending_entries.len()
+            );
+        }
+        Ok(())
+    }
+
     fn ensure_writer(
         &self,
         thread_id: usize,
@@ -381,6 +484,7 @@ impl Plugin for ClickhouseIngestPlugin {
     fn on_load(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         let this = self;
         async move {
+            this.ensure_legacy_slot(0)?;
             if let Some(dsn) = this
                 .config
                 .ingest_dsn
@@ -396,11 +500,7 @@ impl Plugin for ClickhouseIngestPlugin {
                 log::warn!("ClickHouse ingest plugin loaded with clickhouse disabled.");
                 return Ok(());
             }
-            if this.config.single_node {
-                log::info!("ClickHouse ingest plugin in single-node mode.");
-            } else {
-                log::info!("ClickHouse ingest plugin in clustered mode.");
-            }
+            log_storage_mode(this.config.single_node);
             Ok(())
         }
         .boxed()
@@ -497,31 +597,10 @@ impl Plugin for ClickhouseIngestPlugin {
                 return Ok(());
             };
             let slot = block.slot();
+            self.ensure_legacy_slot(slot)?;
 
             if block.was_skipped() {
-                let state_lock = self.thread_state(thread_id)?;
-                let mut state = state_lock.lock();
-                if state.pending_slot == Some(slot) {
-                    if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
-                        log::warn!(
-                            "clearing {} buffered transactions and {} buffered entries for skipped slot {}",
-                            state.pending_transactions.len(),
-                            state.pending_entries.len(),
-                            slot
-                        );
-                    }
-                    state.pending_slot = None;
-                    state.pending_transactions.clear();
-                    state.pending_entries.clear();
-                } else if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
-                    log::debug!(
-                        "skipped slot {} leaving pending_slot={:?} pending_transactions={} pending_entries={}",
-                        slot,
-                        state.pending_slot,
-                        state.pending_transactions.len(),
-                        state.pending_entries.len()
-                    );
-                }
+                self.clear_skipped_slot(thread_id, slot)?;
                 return Ok(());
             }
 
@@ -905,7 +984,7 @@ fn build_inserter<T: Row>(
         .with_period(Some(Duration::from_millis(config.flush_interval_ms.max(1))));
 
     if config.async_insert {
-        inserter = inserter.with_option("async_insert", "1").with_option(
+        inserter = inserter.with_setting("async_insert", "1").with_setting(
             "wait_for_async_insert",
             if config.wait_for_async_insert {
                 "1"
@@ -914,7 +993,7 @@ fn build_inserter<T: Row>(
             },
         );
     } else {
-        inserter = inserter.with_option("async_insert", "0");
+        inserter = inserter.with_setting("async_insert", "0");
     }
 
     let send_timeout = ms_to_duration(config.insert_send_timeout_ms);
@@ -1069,8 +1148,8 @@ impl BlocksMetadataRow {
                     rewards_lamports.push(reward.lamports);
                     rewards_post_balance.push(reward.post_balance);
                     rewards_type.push(Some(reward.reward_type.to_string()));
-                    rewards_commission.push(reward.commission);
-                    rewards_commission_bps.push(None);
+                    rewards_commission.push(None);
+                    rewards_commission_bps.push(reward.commission_bps);
                 }
 
                 let rewards_present =
@@ -1135,6 +1214,10 @@ struct TransactionRow {
     message_hash: [u8; 32],
     is_vote: u8,
     tx_version: Option<u8>,
+    tx_config_priority_fee: Option<u64>,
+    tx_config_compute_unit_limit: Option<u32>,
+    tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    tx_config_heap_size: Option<u32>,
     tx_signatures: Vec<FixedSignature>,
     tx_num_required_signatures: u8,
     tx_num_readonly_signed_accounts: u8,
@@ -1214,15 +1297,14 @@ impl TransactionRow {
             .map(|key| key.to_bytes())
             .collect::<Vec<_>>();
 
-        let tx_recent_blockhash = match message {
-            VersionedMessage::Legacy(msg) => msg.recent_blockhash.to_bytes(),
-            VersionedMessage::V0(msg) => msg.recent_blockhash.to_bytes(),
-        };
-
-        let tx_version = match message {
-            VersionedMessage::Legacy(_) => None,
-            VersionedMessage::V0(_) => Some(0),
-        };
+        let (
+            tx_version,
+            tx_recent_blockhash,
+            priority_fee,
+            compute_unit_limit,
+            loaded_accounts_data_size_limit,
+            heap_size,
+        ) = versioned_message_fields(message);
 
         let tx_instructions_program_id_index = instructions
             .iter()
@@ -1304,6 +1386,10 @@ impl TransactionRow {
             message_hash: transaction.message_hash.to_bytes(),
             is_vote: transaction.is_vote as u8,
             tx_version,
+            tx_config_priority_fee: priority_fee,
+            tx_config_compute_unit_limit: compute_unit_limit,
+            tx_config_loaded_accounts_data_size_limit: loaded_accounts_data_size_limit,
+            tx_config_heap_size: heap_size,
             tx_signatures,
             tx_num_required_signatures: header.num_required_signatures,
             tx_num_readonly_signed_accounts: header.num_readonly_signed_accounts,
@@ -1363,6 +1449,44 @@ impl TransactionRow {
             meta_compute_units_consumed: meta.compute_units_consumed,
             meta_cost_units: meta.cost_units,
         }
+    }
+}
+
+type VersionedMessageFields = (
+    Option<u8>,
+    [u8; 32],
+    Option<u64>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+);
+
+fn versioned_message_fields(message: &VersionedMessage) -> VersionedMessageFields {
+    match message {
+        VersionedMessage::Legacy(msg) => (
+            None,
+            msg.recent_blockhash.to_bytes(),
+            None,
+            None,
+            None,
+            None,
+        ),
+        VersionedMessage::V0(msg) => (
+            Some(0),
+            msg.recent_blockhash.to_bytes(),
+            None,
+            None,
+            None,
+            None,
+        ),
+        VersionedMessage::V1(msg) => (
+            Some(1),
+            msg.lifetime_specifier.to_bytes(),
+            msg.config.priority_fee,
+            msg.config.compute_unit_limit,
+            msg.config.loaded_accounts_data_size_limit,
+            msg.config.heap_size,
+        ),
     }
 }
 
@@ -1517,7 +1641,7 @@ fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> Rewa
 }
 
 fn map_return_data(
-    return_data: Option<&solana_transaction_context::TransactionReturnData>,
+    return_data: Option<&solana_transaction_context::transaction::TransactionReturnData>,
 ) -> (u8, Option<[u8; 32]>, Option<Vec<u8>>) {
     match return_data {
         Some(data) => (1, Some(data.program_id.to_bytes()), Some(data.data.clone())),

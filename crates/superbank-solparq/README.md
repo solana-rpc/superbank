@@ -24,6 +24,7 @@ type_epoch_from-slot_to-slot/
   .done.<hostname>.txt
   transactions.parquet
   blocks_metadata.parquet
+  block_footers.parquet
   entries.parquet
   gsfa.parquet
   gsfa_hot.parquet
@@ -42,6 +43,12 @@ included when they exist on the ClickHouse server and are recorded as skipped in
 `manifest.json` when absent. This lets RPC/Bigtable deployments archive cleanly
 without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
 entries for later PoH-specific tooling.
+When present, `block_footers.parquet` retains Alpenglow bank hash, producer time,
+and user agent for internal inspection and restore. The archive manifest format
+is version 3; older bundles remain readable. Footer ingestion runs on a separate
+processed stream and persists rows only after matching finalization. Archive a
+range only after its finalized `(slot, bank_id)` footer rows have arrived; a
+premature archive can omit footers that appear later.
 
 `SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
 bundle. `report.json` is a machine-readable run report: it carries a
@@ -780,6 +787,7 @@ That deletes matching slots from:
 
 - `transactions`
 - `blocks_metadata`
+- `block_footers`
 - `entries`
 - `gsfa`
 - `gsfa_hot`
@@ -803,6 +811,7 @@ Common defaults:
 - `--db-database default`
 - `--db-transactions-table-name transactions`
 - `--db-blocks-table-name blocks_metadata`
+- `--db-block-footers-table-name block_footers` (optional Alpenglow footer archive)
 - `--db-entries-table-name entries`
 - `--db-gsfa-table-name gsfa`
 - `--db-gsfa-hot-table-name gsfa_hot`

@@ -12,6 +12,7 @@ use crate::{archive::ClickHouseBounds, config::Config};
 pub struct DbTables {
     pub transactions_table: String,
     pub blocks_table: String,
+    pub block_footers_table: String,
     pub entries_table: String,
     pub gsfa_table: String,
     pub gsfa_hot_table: String,
@@ -24,6 +25,7 @@ impl DbTables {
         Self {
             transactions_table: config.transactions_table.clone(),
             blocks_table: config.blocks_table.clone(),
+            block_footers_table: config.block_footers_table.clone(),
             entries_table: config.entries_table.clone(),
             gsfa_table: config.gsfa_table.clone(),
             gsfa_hot_table: config.gsfa_hot_table.clone(),
@@ -45,6 +47,12 @@ impl DbTables {
                 self.blocks_table.clone(),
                 "slot",
                 true,
+            ),
+            ArchiveDbTable::new(
+                ArchiveTableKind::BlockFooters,
+                self.block_footers_table.clone(),
+                "slot, bank_id",
+                false,
             ),
             ArchiveDbTable::new(
                 ArchiveTableKind::Entries,
@@ -85,6 +93,7 @@ impl DbTables {
 pub enum ArchiveTableKind {
     Transactions,
     BlocksMetadata,
+    BlockFooters,
     Entries,
     Gsfa,
     GsfaHot,
@@ -94,27 +103,31 @@ pub enum ArchiveTableKind {
 
 impl ArchiveTableKind {
     pub fn as_str(self) -> &'static str {
-        match self {
-            ArchiveTableKind::Transactions => "transactions",
-            ArchiveTableKind::BlocksMetadata => "blocks_metadata",
-            ArchiveTableKind::Entries => "entries",
-            ArchiveTableKind::Gsfa => "gsfa",
-            ArchiveTableKind::GsfaHot => "gsfa_hot",
-            ArchiveTableKind::Signatures => "signatures",
-            ArchiveTableKind::TokenOwnerActivity => "token_owner_activity",
-        }
+        const NAMES: [&str; 8] = [
+            "transactions",
+            "blocks_metadata",
+            "block_footers",
+            "entries",
+            "gsfa",
+            "gsfa_hot",
+            "signatures",
+            "token_owner_activity",
+        ];
+        NAMES[self as usize]
     }
 
     pub fn file_name(self) -> &'static str {
-        match self {
-            ArchiveTableKind::Transactions => "transactions.parquet",
-            ArchiveTableKind::BlocksMetadata => "blocks_metadata.parquet",
-            ArchiveTableKind::Entries => "entries.parquet",
-            ArchiveTableKind::Gsfa => "gsfa.parquet",
-            ArchiveTableKind::GsfaHot => "gsfa_hot.parquet",
-            ArchiveTableKind::Signatures => "signatures.parquet",
-            ArchiveTableKind::TokenOwnerActivity => "token_owner_activity.parquet",
-        }
+        const FILE_NAMES: [&str; 8] = [
+            "transactions.parquet",
+            "blocks_metadata.parquet",
+            "block_footers.parquet",
+            "entries.parquet",
+            "gsfa.parquet",
+            "gsfa_hot.parquet",
+            "signatures.parquet",
+            "token_owner_activity.parquet",
+        ];
+        FILE_NAMES[self as usize]
     }
 }
 
@@ -1198,6 +1211,7 @@ mod redaction_tests {
         DbTables {
             transactions_table: "transactions".to_string(),
             blocks_table: "blocks_metadata".to_string(),
+            block_footers_table: "block_footers".to_string(),
             entries_table: "entries".to_string(),
             gsfa_table: "gsfa".to_string(),
             gsfa_hot_table: "gsfa_hot".to_string(),

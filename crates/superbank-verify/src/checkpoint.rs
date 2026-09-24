@@ -30,6 +30,8 @@ pub(crate) struct JobDescriptor {
     pub(crate) transactions_table: String,
     pub(crate) ticks_per_slot: u64,
     pub(crate) hashes_per_tick_schedule: String,
+    #[serde(default)]
+    pub(crate) alpenglow_genesis_block: Option<(u64, Hash32)>,
     /// The genesis pin is part of the job identity even after slot 0 is below
     /// the resume cursor.
     #[serde(default)]
@@ -138,6 +140,7 @@ mod tests {
             transactions_table: "default.transactions".to_string(),
             ticks_per_slot: 64,
             hashes_per_tick_schedule: "0:12500".to_string(),
+            alpenglow_genesis_block: None,
             expected_genesis_hash: Some([7; 32]),
             anchors: vec![(7, [9; 32])],
             audit_duplicate_conflicts: false,

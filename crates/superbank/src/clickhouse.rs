@@ -94,6 +94,7 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) parent_slot: u64,
     pub(crate) blockhash: Array<u8, 32>,
     pub(crate) parent_blockhash: Array<u8, 32>,
+    pub(crate) bank_id: Option<u64>,
     pub(crate) block_time: Option<i64>,
     pub(crate) block_height: Option<u64>,
     pub(crate) executed_transaction_count: u64,
@@ -106,6 +107,15 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_commission: Vec<Option<u8>>,
     pub(crate) rewards_commission_bps: Vec<Option<u16>>,
     pub(crate) rewards_num_partitions: Option<u64>,
+}
+
+#[derive(Row, Serialize)]
+pub(crate) struct BlockFooterRow {
+    pub(crate) slot: u64,
+    pub(crate) bank_id: u64,
+    pub(crate) bank_hash: Array<u8, 32>,
+    pub(crate) block_producer_time_nanos: u64,
+    pub(crate) block_user_agent: ByteBuf,
 }
 
 #[derive(Row, Serialize)]
@@ -248,6 +258,33 @@ pub(crate) struct RetryConfig {
     pub(crate) max_retries: u32,
     pub(crate) base_ms: u64,
     pub(crate) max_ms: u64,
+}
+
+pub(crate) async fn insert_footer_row(
+    client: &ClickHouseClient,
+    table: &str,
+    row: &BlockFooterRow,
+    retry: Option<&RetryConfig>,
+) -> Result<()> {
+    let mut attempt = 0u32;
+    loop {
+        match insert_rows(client, table, std::slice::from_ref(row)).await {
+            Ok(()) => return Ok(()),
+            Err(err) if retry.is_some_and(|config| attempt < config.max_retries) => {
+                let config = retry.expect("checked above");
+                attempt += 1;
+                let delay_ms = config
+                    .base_ms
+                    .saturating_mul(1u64 << (attempt - 1).min(62))
+                    .min(config.max_ms);
+                warn!(attempt, delay_ms, error = %err, "footer insert failed; retrying");
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("insert block footer into {table}"));
+            }
+        }
+    }
 }
 
 pub(crate) async fn flush_buffers_with_retry(
@@ -523,6 +560,7 @@ mod tests {
             fumarole_endpoint: None,
             fumarole_x_token: None,
             fumarole_consumer_group: None,
+            fumarole_alpenglow_genesis_slot: None,
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: 2,
@@ -588,6 +626,7 @@ mod tests {
             clickhouse_async_insert: false,
             transactions_table: "default.transactions".to_string(),
             blocks_table: "default.blocks_metadata".to_string(),
+            block_footers_table: "default.block_footers".to_string(),
             entries_table: None,
             transactions_flush_rows: 25_000,
             blocks_flush_rows: 2_000,

@@ -8,11 +8,10 @@ authors.workspace = true
 [features]
 default = []
 # Optional in-memory "head cache" fed by a Yellowstone DragonsMouth gRPC stream via
-# `yellowstone-block-machine`. This is intentionally non-default because it pulls in
-# additional deps and (notably) `yellowstone-block-machine` is AGPL-3.0 licensed.
+# Complete bank-tagged Yellowstone block updates. This remains non-default
+# because it opens a separate live gRPC subscription.
 grpc-head-cache = [
     "dep:dashmap",
-    "dep:yellowstone-block-machine",
     "dep:yellowstone-grpc-client",
     "dep:yellowstone-grpc-proto",
 ]
@@ -54,7 +53,7 @@ solana-hash = "4.3.0"
 solana-instruction = "3.1.0"
 solana-keypair = "3.1.2"
 solana-message = { version = "4.5.0", features = ["serde", "wincode"] }
-solana-signature = "3.4.0"
+solana-signature = { version = "3.4.0", features = ["rand"] }
 solana-signer = "3.0.1"
 solana-transaction = { version = "4.2.0", features = ["serde", "wincode"] }
 solana-transaction-error = { version = "3.3.1", features = ["serde", "wincode"] }
@@ -91,9 +90,8 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 dashmap = { version = "6.1.0", optional = true }
 pyroscope = { version = "0.5.8", optional = true }
 pyroscope_pprofrs = { version = "0.2.10", optional = true }
-yellowstone-block-machine = { version = "0.8.0", features = ["dragonsmouth"], optional = true }
-yellowstone-grpc-client = { version = "13.4.0", optional = true }
-yellowstone-grpc-proto = { version = "12.6.0", optional = true }
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce", optional = true }
+yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce", optional = true }
 
 [dev-dependencies]
 base64 = "0.22"

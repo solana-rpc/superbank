@@ -56,6 +56,18 @@ impl HeadCoverage {
         *self = Self::default();
     }
 
+    /// Forget a replaced bank and all later slots so a new bank can build a
+    /// fresh proof without inheriting the losing branch's tombstones or tip.
+    pub(crate) fn forget_from(&mut self, slot: u64) {
+        self.nodes.split_off(&slot);
+        for tip in &mut self.tips {
+            if tip.is_some_and(|value| value.slot >= slot) {
+                *tip = None;
+            }
+        }
+        self.highest = self.nodes.last_key_value().map_or(0, |(slot, _)| *slot);
+    }
+
     pub(crate) fn metadata(&mut self, link: Link) {
         if self
             .nodes

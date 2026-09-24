@@ -51,11 +51,20 @@ Range grammar (same as the ingestor's `--bigtable-range`): `a:b` = slots
   replica of Agave's `verify_tick_hash_count` (per-tick `num_hashes` windows
   against the era's `hashes_per_tick`), transaction-index tiling, the
   last-entry-hash == blockhash equality, and blockhash chain linkage.
+- After the Alpenglow genesis certificate slot, structural mode requires one
+  ending Alpentick and `num_hashes = 1` for every entry. Skipped slots do not
+  add ticks. Provide `--alpenglow-rpc-url` for a trusted Agave 4.3+ RPC
+  `getAgGenesisCert` response or `--alpenglow-genesis-block
+  <slot>:<base58-block-id>` for an offline run. If both are supplied, they
+  must agree. The certified genesis slot itself still uses PoH rules. The
+  certificate's consensus block ID is not treated as an RPC blockhash anchor.
 - **full**: everything above **plus** recomputing every SHA-256 hash of every
   entry, including the transaction-signature merkle mixin, and comparing
   against the recorded entry hashes and blockhash. Roughly 800k hashes per
   slot in the 12,500 hashes-per-tick era (~4M in the current 62,500 era);
   budget multiple days for a genesis-to-tip run on a large machine.
+  In Alpenglow slots this checks the low power entry hash chain; it does not
+  prove elapsed time or verify Alpenglow consensus certificates.
 
 ### Optional duplicate-conflict audit
 
@@ -161,8 +170,8 @@ golden vectors.
   `--audit-duplicate-conflicts` to report differing duplicates as
   `duplicate_conflict`; otherwise the baseline verifier does not scan for
   them.
-- Not yet handled: the Alpenglow migration (post-PoH tick rules on Agave
-  master) — revisit the era schedule when it activates on a target cluster.
+- Configure the Alpenglow genesis boundary before verifying postmigration
+  ranges. Without it the verifier applies the legacy PoH rules to every slot.
 - `getEpochSchedule` in superbank-rpc ignores mainnet's warmup epochs; this
   crate carries its own epoch math (`src/epoch.rs`) instead of sharing that
   code.

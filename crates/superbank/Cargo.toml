@@ -50,6 +50,8 @@ tracing-subscriber.workspace = true
 yellowstone-fumarole-client = "0.7.1"
 yellowstone-grpc-client = "13.4.0"
 yellowstone-grpc-proto = "12.6.0"
+yellowstone-grpc-client-43 = { package = "yellowstone-grpc-client", git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce" }
+yellowstone-grpc-proto-43 = { package = "yellowstone-grpc-proto", git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce" }
 wincode = { version = "0.2.5", features = ["derive", "solana-short-vec"] }
 wincode06 = { package = "wincode", version = "0.6.1" }
 

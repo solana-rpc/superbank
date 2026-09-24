@@ -33,10 +33,20 @@ use yellowstone_grpc_proto::prelude::{
 
 use crate::cli::{Args, FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP, FromSlotSpec};
 use crate::clickhouse::{InsertTables, build_clickhouse_client, fetch_latest_slot_from_blocks};
-use crate::commitment::parse_commitment_level;
+use crate::commitment::parse_durable_commitment;
 use crate::ingest::grpc::{BufferedRows, process_update};
 use crate::metrics;
 use crate::shutdown::spawn_shutdown_watch;
+
+// Fumarole 0.7.1 exports Yellowstone 12.6 updates. The 4.3 block mapper
+// consumes the compatible wire envelope while finalized-only Fumarole remains
+// on the legacy producer protocol. Fields unknown to 12.6 are unavailable.
+fn upgrade_update(
+    update: SubscribeUpdate,
+) -> Result<yellowstone_grpc_proto_43::prelude::SubscribeUpdate> {
+    yellowstone_grpc_proto_43::prelude::SubscribeUpdate::decode(update.encode_to_vec().as_slice())
+        .context("decode Fumarole update with Agave 4.3 Yellowstone schema")
+}
 
 pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
     let endpoint = fumarole_endpoint(args)?;
@@ -44,7 +54,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
         .fumarole_consumer_group
         .as_deref()
         .context("fumarole source requires consumer group")?;
-    let commitment = parse_commitment_level(&args.commitment)? as i32;
+    let commitment = parse_durable_commitment(&args.commitment)? as i32;
     let clickhouse = build_clickhouse_client(args);
 
     if args.fumarole_concurrent_download_limit_per_tcp != FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP
@@ -175,7 +185,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                                             observe_processed_slot(&mut last_processed_block_slot, slot);
                                         }
                                         if process_update(
-                                            update,
+                                            upgrade_update(update)?,
                                             args,
                                             &insert_tables,
                                             &clickhouse,
@@ -193,7 +203,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                                 observe_processed_slot(&mut last_processed_block_slot, slot);
                                 if let Some(update) = block_assembler.finish_slot(slot)? {
                                     if process_update(
-                                        update,
+                                        upgrade_update(update)?,
                                         args,
                                         &insert_tables,
                                         &clickhouse,

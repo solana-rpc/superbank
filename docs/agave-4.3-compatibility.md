@@ -34,10 +34,10 @@ deployed Yellowstone/Fumarole producer: record its exact version and replay
 captured payloads before qualifying a production rollout. Never infer producer
 correctness or cluster feature activation from the Agave version alone.
 
-The standalone Jetstreamer/Old Faithful workspaces remain on their historical
-Agave 3 dependency graph. They must not ingest post-v1 data until independently
-migrated. Alpenglow bank replacement, parent-reset/footer handling, and PoH
-verification are separate follow-ups. `getHealth` retains its documented
+The standalone Old Faithful workspace remains on its historical Agave 3
+dependency graph. The Jetstreamer ClickHouse plugin uses the separate upstream
+Agave 4 workspace, but its block callback does not expose bank ID or footer data;
+postmigration backfills require an independently qualified source. `getHealth` retains its documented
 ClickHouse availability semantics rather than measuring cluster-tip distance.
 
 ## Validation

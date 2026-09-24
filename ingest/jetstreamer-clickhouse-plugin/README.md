@@ -1,7 +1,9 @@
 # Jetstreamer ClickHouse Plugin
 
-High-throughput ingestion plugin for Jetstreamer that writes Solana blocks, transactions, and PoH
-entries into the `blocks_metadata`, `transactions`, and `entries` tables.
+High-throughput ingestion plugin for Jetstreamer 0.7 (Agave 4) that writes Solana blocks,
+transactions, and PoH entries into the `blocks_metadata`, `transactions`, and `entries` tables.
+Jetstreamer's block callback has no bank ID or Alpenglow footer, so this plugin stops after
+the trusted Alpenglow genesis slot. Use a qualified source for later blocks.
 
 ## Usage
 
@@ -19,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ClickhouseIngestConfig {
         single_node: false,
+        alpenglow_genesis_slot: Some(0), // replace with the trusted genesis slot
         ..Default::default()
     };
     let plugin = ClickhouseIngestPlugin::new(config, threads);
@@ -44,6 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   those entry notifications to populate the `entries` table alongside blocks and transactions.
 - The default configuration writes to `default.entries`, so apply the matching schema set under
   `../../ddl/` and include `entries.sql` before running the plugin.
+- `alpenglow_genesis_slot` or `JETSTREAMER_ALPENGLOW_GENESIS_SLOT` is required.
+  The plugin preserves v1 transaction configuration and basis-point reward commission,
+  but rejects later blocks because upstream Jetstreamer does not expose their bank/footer data.
 - The `single_node` toggle defaults to clustered mode. In single-node deployments, keep it
   enabled for clarity when using `../../ddl/local/*.sql`.
 - Backpressure tuning can be overridden with environment variables (defaults shown):
@@ -78,17 +84,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 This crate ships a minimal runner binary so you can copy just this folder and run the plugin:
 
 ```bash
-cargo run --release --bin jetstreamer-clickhouse -- 800
+JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> cargo run --release --bin jetstreamer-clickhouse -- 800
 # or a slot range:
-cargo run --release --bin jetstreamer-clickhouse -- 358560000:367631999
+JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> cargo run --release --bin jetstreamer-clickhouse -- 358560000:367631999
 ```
 
 From the Superbank repo root, you can also run the end-to-end local smoke test helper:
 
 ```bash
-scripts/dev/run-jetstreamer-entries-smoke.sh
+JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh
 # or override the default range:
-scripts/dev/run-jetstreamer-entries-smoke.sh 358560000:358560099
+JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh 358560000:358560099
 ```
 
 For the stock local Docker ClickHouse setup, that helper also updates the container's

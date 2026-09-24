@@ -158,6 +158,10 @@ struct CliArgs {
     #[arg(long, env = "FUMAROLE_CONSUMER_GROUP")]
     fumarole_consumer_group: Option<String>,
 
+    /// Trusted Alpenglow genesis slot; the legacy Fumarole stream stops after this slot
+    #[arg(long, env = "FUMAROLE_ALPENGLOW_GENESIS_SLOT")]
+    fumarole_alpenglow_genesis_slot: Option<u64>,
+
     /// Create the Fumarole consumer group before subscribing
     #[arg(
         long,
@@ -511,6 +515,14 @@ struct CliArgs {
     )]
     blocks_table: String,
 
+    /// Internal Alpenglow block footer table (gRPC source)
+    #[arg(
+        long,
+        env = "CLICKHOUSE_BLOCK_FOOTERS_TABLE",
+        default_value = "default.block_footers"
+    )]
+    block_footers_table: String,
+
     /// Optional ClickHouse PoH entries table (Fumarole/gRPC live ingest only)
     #[arg(
         long,
@@ -556,6 +568,7 @@ pub(crate) struct Args {
     pub(crate) fumarole_endpoint: Option<String>,
     pub(crate) fumarole_x_token: Option<String>,
     pub(crate) fumarole_consumer_group: Option<String>,
+    pub(crate) fumarole_alpenglow_genesis_slot: Option<u64>,
     pub(crate) fumarole_create_consumer_group: bool,
     pub(crate) fumarole_data_plane_tcp_connections: u8,
     pub(crate) fumarole_concurrent_download_limit_per_tcp: usize,
@@ -621,6 +634,7 @@ pub(crate) struct Args {
     pub(crate) clickhouse_async_insert: bool,
     pub(crate) transactions_table: String,
     pub(crate) blocks_table: String,
+    pub(crate) block_footers_table: String,
     pub(crate) entries_table: Option<String>,
     pub(crate) transactions_flush_rows: usize,
     pub(crate) blocks_flush_rows: usize,
@@ -646,6 +660,8 @@ struct FileConfig {
     fumarole_x_token: Option<String>,
     #[serde(alias = "fumarole_consumer_group")]
     fumarole_consumer_group: Option<String>,
+    #[serde(alias = "fumarole_alpenglow_genesis_slot")]
+    fumarole_alpenglow_genesis_slot: Option<u64>,
     #[serde(alias = "fumarole_create_consumer_group")]
     fumarole_create_consumer_group: Option<bool>,
     #[serde(alias = "fumarole_data_plane_tcp_connections")]
@@ -777,6 +793,8 @@ struct FileConfig {
     transactions_table: Option<String>,
     #[serde(alias = "blocks_table")]
     blocks_table: Option<String>,
+    #[serde(alias = "block_footers_table")]
+    block_footers_table: Option<String>,
     #[serde(alias = "entries_table")]
     entries_table: Option<String>,
     #[serde(alias = "transactions_flush_rows")]
@@ -827,6 +845,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "fumarole_consumer_group",
             cli.fumarole_consumer_group,
             file_config.fumarole_consumer_group,
+        ),
+        fumarole_alpenglow_genesis_slot: merge_option(
+            &matches,
+            "fumarole_alpenglow_genesis_slot",
+            cli.fumarole_alpenglow_genesis_slot,
+            file_config.fumarole_alpenglow_genesis_slot,
         ),
         fumarole_create_consumer_group: merge_value(
             &matches,
@@ -1213,6 +1237,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             cli.blocks_table,
             file_config.blocks_table,
         ),
+        block_footers_table: merge_value(
+            &matches,
+            "block_footers_table",
+            cli.block_footers_table,
+            file_config.block_footers_table,
+        ),
         entries_table: merge_option(
             &matches,
             "entries_table",
@@ -1272,53 +1302,8 @@ fn validate_args(args: &Args) -> Result<()> {
 
     match args.source {
         IngestSource::Fumarole => {
-            if args.fumarole_endpoint.as_deref().is_none_or(str::is_empty) {
-                return Err(anyhow!(
-                    "fumarole source requires --fumarole-endpoint / FUMAROLE_ENDPOINT / config fumarole_endpoint"
-                ));
-            }
-            if args
-                .fumarole_consumer_group
-                .as_deref()
-                .is_none_or(str::is_empty)
-            {
-                return Err(anyhow!(
-                    "fumarole source requires --fumarole-consumer-group / FUMAROLE_CONSUMER_GROUP / config fumarole_consumer_group"
-                ));
-            }
-            if args.grpc_max_decoding_bytes == 0 {
-                return Err(anyhow!(
-                    "fumarole max-decoding-bytes must be greater than 0"
-                ));
-            }
-            if args.grpc_idle_timeout_secs == 0 {
-                return Err(anyhow!("fumarole idle-timeout-secs must be greater than 0"));
-            }
-            if args.fumarole_data_plane_tcp_connections == 0 {
-                return Err(anyhow!(
-                    "fumarole data-plane-tcp-connections must be greater than 0"
-                ));
-            }
-            if args.fumarole_data_plane_tcp_connections > 20 {
-                return Err(anyhow!(
-                    "fumarole data-plane-tcp-connections must be less than or equal to 20"
-                ));
-            }
-            if args.fumarole_concurrent_download_limit_per_tcp == 0 {
-                return Err(anyhow!(
-                    "fumarole concurrent-download-limit-per-tcp must be greater than 0"
-                ));
-            }
-            if args.fumarole_data_channel_capacity == 0 {
-                return Err(anyhow!(
-                    "fumarole data-channel-capacity must be greater than 0"
-                ));
-            }
-            if args.fumarole_commit_interval_secs == 0 {
-                return Err(anyhow!(
-                    "fumarole commit-interval-secs must be greater than 0"
-                ));
-            }
+            require_fumarole_era_bound(args)?;
+            validate_fumarole_options(args)?;
         }
         IngestSource::Grpc => {
             if args.endpoint.is_none() {
@@ -1490,6 +1475,66 @@ fn validate_args(args: &Args) -> Result<()> {
     {
         return Err(anyhow!(
             "solparq-from-slot ({from}) must be less than or equal to solparq-to-slot ({to})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fumarole_options(args: &Args) -> Result<()> {
+    if args.fumarole_endpoint.as_deref().is_none_or(str::is_empty) {
+        return Err(anyhow!(
+            "fumarole source requires --fumarole-endpoint / FUMAROLE_ENDPOINT / config fumarole_endpoint"
+        ));
+    }
+    if args
+        .fumarole_consumer_group
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(anyhow!(
+            "fumarole source requires --fumarole-consumer-group / FUMAROLE_CONSUMER_GROUP / config fumarole_consumer_group"
+        ));
+    }
+    if args.grpc_max_decoding_bytes == 0 {
+        return Err(anyhow!(
+            "fumarole max-decoding-bytes must be greater than 0"
+        ));
+    }
+    if args.grpc_idle_timeout_secs == 0 {
+        return Err(anyhow!("fumarole idle-timeout-secs must be greater than 0"));
+    }
+    if args.fumarole_data_plane_tcp_connections == 0 {
+        return Err(anyhow!(
+            "fumarole data-plane-tcp-connections must be greater than 0"
+        ));
+    }
+    if args.fumarole_data_plane_tcp_connections > 20 {
+        return Err(anyhow!(
+            "fumarole data-plane-tcp-connections must be less than or equal to 20"
+        ));
+    }
+    if args.fumarole_concurrent_download_limit_per_tcp == 0 {
+        return Err(anyhow!(
+            "fumarole concurrent-download-limit-per-tcp must be greater than 0"
+        ));
+    }
+    if args.fumarole_data_channel_capacity == 0 {
+        return Err(anyhow!(
+            "fumarole data-channel-capacity must be greater than 0"
+        ));
+    }
+    if args.fumarole_commit_interval_secs == 0 {
+        return Err(anyhow!(
+            "fumarole commit-interval-secs must be greater than 0"
+        ));
+    }
+    Ok(())
+}
+
+fn require_fumarole_era_bound(args: &Args) -> Result<()> {
+    if args.fumarole_alpenglow_genesis_slot.is_none() {
+        return Err(anyhow!(
+            "fumarole source requires --fumarole-alpenglow-genesis-slot / FUMAROLE_ALPENGLOW_GENESIS_SLOT to bound the legacy stream"
         ));
     }
     Ok(())
@@ -2113,6 +2158,7 @@ rpc-from-slot: 456
             fumarole_endpoint: Some("https://fumarole.example:443".to_string()),
             fumarole_x_token: Some("secret".to_string()),
             fumarole_consumer_group: Some("superbank-mainnet".to_string()),
+            fumarole_alpenglow_genesis_slot: Some(1000),
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP,
@@ -2178,6 +2224,7 @@ rpc-from-slot: 456
             clickhouse_async_insert: false,
             transactions_table: "default.transactions".to_string(),
             blocks_table: "default.blocks_metadata".to_string(),
+            block_footers_table: "default.block_footers".to_string(),
             entries_table: Some("default.entries".to_string()),
             transactions_flush_rows: 25_000,
             blocks_flush_rows: 2_000,
