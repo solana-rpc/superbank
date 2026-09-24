@@ -7,9 +7,10 @@ Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
 default. The `solparq` source runs in reverse: it restores `superbank-solparq`
 Parquet archive bundles (local or S3) back into ClickHouse.
 
-The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer workspaces
-under `ingest/` remain on their upstream Agave 3 line and must not be used for post-v1 Old
-Faithful backfills until they are migrated and added to root CI.
+The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer submodule
+under `ingest/` now uses Agave 4.2, and the ClickHouse plugin supports transaction-v1 fields.
+The plugin is outside the root Cargo workspace, so validate it separately before Old Faithful
+backfills; root CI does not cover its build or live ingestion.
 
 Agave 4.2 also adds the `DeactivatedStake` reward type and changes confidential-transfer parsed
 JSON from `source`/`destination` keys to `account`; consumers of parsed RPC responses should treat
