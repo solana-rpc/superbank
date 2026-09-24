@@ -817,6 +817,39 @@ mod tests {
     use yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction;
 
     #[test]
+    fn fumarole_assembly_preserves_unknown_enum_vat_debit() {
+        let meta = SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                slot: 42,
+                rewards: Some(yellowstone_grpc_proto::prelude::Rewards {
+                    rewards: vec![yellowstone_grpc_proto::prelude::Reward {
+                        pubkey: "11111111111111111111111111111111".to_owned(),
+                        lamports: -10,
+                        post_balance: 90,
+                        reward_type: 6,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let wire = meta.encode_to_vec();
+        let decoded = SubscribeUpdate::decode(wire.as_slice()).unwrap();
+        let mut assembler = FumaroleBlockAssembler::new(false);
+        assembler.handle_update(42, decoded).unwrap();
+        let update = assembler.finish_slot(42).unwrap().unwrap();
+        let Some(UpdateOneof::Block(block)) = update.update_oneof else {
+            panic!("block")
+        };
+        let reward = &block.rewards.unwrap().rewards[0];
+        assert_eq!(reward.reward_type, 6);
+        assert_eq!(reward.lamports, -10);
+        assert_eq!(reward.post_balance, 90);
+    }
+
+    #[test]
     fn fumarole_block_assembler_builds_block_update_without_block_stream_adapter() {
         let mut assembler = FumaroleBlockAssembler::new(false);
         assembler

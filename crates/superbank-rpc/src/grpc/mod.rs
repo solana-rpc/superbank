@@ -7,11 +7,6 @@ pub(crate) mod generated {
     pub(crate) mod superbank {
         tonic::include_proto!("superbank");
     }
-
-    pub(crate) mod confirmed_block {
-        #![allow(dead_code)]
-        tonic::include_proto!("solana.storage.confirmed_block");
-    }
 }
 
 pub(crate) mod service;

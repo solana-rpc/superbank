@@ -395,30 +395,20 @@ fn parse_block_rewards(
         rewards_pubkey.push(pubkey.to_bytes());
         rewards_lamports.push(reward.lamports);
         rewards_post_balance.push(reward.post_balance);
-        rewards_type.push(
-            match yellowstone_grpc_proto::prelude::RewardType::try_from(reward.reward_type) {
-                Ok(yellowstone_grpc_proto::prelude::RewardType::Unspecified) => None,
-                Ok(yellowstone_grpc_proto::prelude::RewardType::Fee) => Some("Fee".to_string()),
-                Ok(yellowstone_grpc_proto::prelude::RewardType::Rent) => Some("Rent".to_string()),
-                Ok(yellowstone_grpc_proto::prelude::RewardType::Staking) => {
-                    Some("Staking".to_string())
-                }
-                Ok(yellowstone_grpc_proto::prelude::RewardType::Voting) => {
-                    Some("Voting".to_string())
-                }
-                Ok(yellowstone_grpc_proto::prelude::RewardType::DeactivatedStake) => {
-                    Some("DeactivatedStake".to_string())
-                }
-                Err(_) => {
+        rewards_type.push(match reward.reward_type {
+            0 => None,
+            value => match super::convert::reward_type_to_string(value) {
+                Some(name) => Some(name),
+                None => {
                     warn!(
                         slot,
-                        reward_type = reward.reward_type,
+                        reward_type = value,
                         "head cache: failed to parse reward type from BlockMeta"
                     );
                     return None;
                 }
             },
-        );
+        });
         rewards_commission.push(if reward.commission.is_empty() {
             None
         } else {
@@ -706,6 +696,43 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn block_meta_stream_preserves_vat_debit() {
+        let cache = HeadCache::new(32, 64);
+        cache.note_slot_commitment(42, CommitmentLevel::Processed);
+        let meta = yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta {
+            slot: 42,
+            blockhash: Hash::new_unique().to_string(),
+            parent_slot: 41,
+            parent_blockhash: Hash::new_unique().to_string(),
+            rewards: Some(yellowstone_grpc_proto::prelude::Rewards {
+                rewards: vec![yellowstone_grpc_proto::prelude::Reward {
+                    pubkey: Pubkey::new_unique().to_string(),
+                    lamports: -10,
+                    post_balance: 90,
+                    reward_type: 6,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_block_meta(&cache, &meta);
+        let block = cache
+            .get_block(
+                42,
+                CommitmentLevel::Processed,
+                solana_transaction_status::TransactionDetails::None,
+            )
+            .unwrap();
+        assert_eq!(
+            block.metadata().rewards_type,
+            vec![Some("VATDebit".to_owned())]
+        );
+        assert_eq!(block.metadata().rewards_lamports, vec![-10]);
+        assert_eq!(block.metadata().rewards_post_balance, vec![90]);
     }
 
     #[test]

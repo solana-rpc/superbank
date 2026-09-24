@@ -19,8 +19,8 @@ use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
-    RewardType, SubscribeRequest, SubscribeRequestFilterBlocks, SubscribeRequestFilterSlots,
-    SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateEntry, SubscribeUpdateTransactionInfo,
+    SubscribeRequest, SubscribeRequestFilterBlocks, SubscribeRequestFilterSlots, SubscribeUpdate,
+    SubscribeUpdateBlock, SubscribeUpdateEntry, SubscribeUpdateTransactionInfo,
     subscribe_update::UpdateOneof,
 };
 
@@ -1527,11 +1527,21 @@ fn convert_return_data(
 }
 
 fn reward_type_to_string(value: i32) -> Option<String> {
-    let parsed = RewardType::try_from(value).ok()?;
-    match parsed {
-        RewardType::Unspecified => None,
-        other => Some(other.as_str_name().to_string()),
-    }
+    // Agave 4.3 assigns VATDebit wire value 6. Yellowstone's published enum
+    // stops at 5, but prost preserves the raw i32, including across Fumarole.
+    const NAMES: [&str; 7] = [
+        "",
+        "Fee",
+        "Rent",
+        "Staking",
+        "Voting",
+        "DeactivatedStake",
+        "VATDebit",
+    ];
+    NAMES
+        .get(usize::try_from(value).ok()?)
+        .filter(|name| !name.is_empty())
+        .map(|name| (*name).to_owned())
 }
 
 fn parse_commission(value: &str) -> Option<u8> {
@@ -1555,7 +1565,7 @@ fn decode_transaction_error(
         return Ok((1, None));
     };
 
-    match wincode05::deserialize::<solana_transaction_error::TransactionError>(&err.err) {
+    match wincode06::deserialize::<solana_transaction_error::TransactionError>(&err.err) {
         Ok(decoded) => {
             let serialized =
                 serde_json::to_string(&decoded).unwrap_or_else(|_| format!("{decoded:?}"));
@@ -1682,6 +1692,26 @@ mod tests {
         assert_eq!(row.tx_config_compute_unit_limit, Some(1_000_000));
         assert_eq!(row.tx_config_loaded_accounts_data_size_limit, Some(65_536));
         assert_eq!(row.tx_config_heap_size, Some(32_768));
+    }
+
+    #[test]
+    fn vat_debit_survives_protobuf_round_trip_and_ingestion() {
+        use prost::Message as _;
+        let mut tx = build_test_transaction_info(None);
+        tx.meta.as_mut().unwrap().rewards = vec![Reward {
+            pubkey: "11111111111111111111111111111111".to_owned(),
+            lamports: -10,
+            post_balance: 90,
+            reward_type: 6,
+            commission: String::new(),
+            commission_bps: String::new(),
+        }];
+        let bytes = tx.encode_to_vec();
+        let decoded = SubscribeUpdateTransactionInfo::decode(bytes.as_slice()).unwrap();
+        let row = map_transaction(42, None, &decoded).unwrap();
+        assert_eq!(row.meta_reward_type, vec![Some("VATDebit".to_owned())]);
+        assert_eq!(row.meta_reward_lamports, vec![-10]);
+        assert_eq!(row.meta_reward_post_balance, vec![90]);
     }
 
     #[test]

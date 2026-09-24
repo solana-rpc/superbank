@@ -72,7 +72,7 @@ Adding `processed` commitment (in addition to `confirmed`/`finalized`) requires 
 ## Prerequisites
 
 - **ClickHouse** — 26.x or later. Docker is the fastest way to get one running.
-- **Rust** — stable toolchain specified by `rust-toolchain.toml`. Install via [rustup.rs](https://rustup.rs).
+- **Rust** — 1.97.1 toolchain (pinned in `rust-toolchain.toml`). Install via [rustup.rs](https://rustup.rs).
 - **A Dragon's Mouth gRPC endpoint or Fumarole subscription** — for live ingestion. Get one at [customers.triton.one](https://customers.triton.one). For backfill only, the JSON-RPC source works with any public endpoint.
 - Git and standard build tools (`gcc`, `pkg-config`, `libssl-dev` on Linux / Xcode Command Line Tools on macOS).
 
