@@ -7,9 +7,10 @@ Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
 default. The `solparq` source runs in reverse: it restores `superbank-solparq`
 Parquet archive bundles (local or S3) back into ClickHouse.
 
-The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer workspaces
-under `ingest/` remain on their upstream Agave 3 line and must not be used for post-v1 Old
-Faithful backfills until they are migrated and added to root CI.
+The main ingestor and RPC server target Agave 4.3 with Rust 1.97.1.
+See the [compatibility and rollout notes](../../docs/agave-4.3-compatibility.md). The standalone
+Jetstreamer plugin under `ingest/` has a separate build and qualification gate for
+Alpenglow backfills.
 
 Agave 4.2 also adds the `DeactivatedStake` reward type and changes confidential-transfer parsed
 JSON from `source`/`destination` keys to `account`; consumers of parsed RPC responses should treat
@@ -44,6 +45,7 @@ SUPERBANK_SOURCE=fumarole \
 FUMAROLE_ENDPOINT=https://your.fumarole.endpoint:443 \
 FUMAROLE_X_TOKEN=your-token \
 FUMAROLE_CONSUMER_GROUP=superbank-mainnet \
+FUMAROLE_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> \
 CLICKHOUSE_URL=http://localhost:8123 \
 CLICKHOUSE_DATABASE=default \
 CLICKHOUSE_ENTRIES_TABLE=default.entries \
@@ -257,6 +259,7 @@ clickhouse-url: "http://localhost:8123"
 clickhouse-database: "default"
 transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
+block-footers-table: "default.block_footers"
 entries-table: "default.entries"
 ```
 
@@ -284,7 +287,9 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--fumarole-no-commit[=true|false]` / `FUMAROLE_NO_COMMIT` (default: false)
 - `--endpoint` / `DRAGONSMOUTH_ENDPOINT` (required for grpc source)
 - `--x-token` / `DRAGONSMOUTH_X_TOKEN` (optional)
-- `--commitment` / `DRAGONSMOUTH_COMMITMENT` (default: `finalized`)
+- `--commitment` / `DRAGONSMOUTH_COMMITMENT` (default and required for gRPC/Fumarole
+  ClickHouse ingestion: `finalized`). Processed data is served by the RPC head cache;
+  slot-keyed ClickHouse tables must not receive competing unfinalized banks.
 - `--dragonsmouth-from-slot` / `DRAGONSMOUTH_FROM_SLOT` (optional for grpc source; use `*`
   for latest slot in `blocks_metadata`, `0` to start from earliest available slot)
 - `--fumarole-from-slot` / `FUMAROLE_FROM_SLOT` (optional for fumarole source; only used when
@@ -351,6 +356,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--clickhouse-async-insert` / `CLICKHOUSE_ASYNC_INSERT` (default: `false`)
 - `--transactions-table` / `CLICKHOUSE_TRANSACTIONS_TABLE` (default: `default.transactions`)
 - `--blocks-table` / `CLICKHOUSE_BLOCKS_TABLE` (default: `default.blocks_metadata`)
+- `--block-footers-table` / `CLICKHOUSE_BLOCK_FOOTERS_TABLE` (default: `default.block_footers`; gRPC Alpenglow footer stream)
 - `--entries-table` / `CLICKHOUSE_ENTRIES_TABLE` (default: `default.entries`; Fumarole and gRPC ingest write live PoH entries to this table)
 - `--transactions-flush-rows` / `TRANSACTIONS_FLUSH_ROWS` (default: 25000)
 - `--blocks-flush-rows` / `BLOCKS_FLUSH_ROWS` (default: 2000)
@@ -364,6 +370,8 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
+- For gRPC ingest, apply `block_footers.sql` and the updated `blocks_metadata.sql` before starting. A 4.3 Yellowstone producer must provide bank IDs. Footers arrive on a separate processed stream and are written only after that bank finalizes. Fumarole 0.7.1 still emits a legacy envelope and leaves block bank IDs empty.
+- Fumarole requires `--fumarole-alpenglow-genesis-slot` / `FUMAROLE_ALPENGLOW_GENESIS_SLOT` from a trusted genesis certificate. It accepts the genesis block and stops before the next slot; use bank-tagged gRPC for later blocks.
 - `/metrics` includes Fumarole backpressure gauges/counters such as
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
   `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
@@ -395,3 +403,17 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - Bigtable slot lists do not require `RPC_URL` because slots are explicit.
 - Superbank forces `async_insert=0` by default for ClickHouse writes; enable `--clickhouse-async-insert`
   only when your ClickHouse profile and dependent materialized views support it.
+
+## Agave 4.3 archive regression
+
+Build the production binaries and run against a disposable loopback ClickHouse
+26.1 or newer (the test creates and drops only uniquely named test databases):
+
+```sh
+cargo build -p superbank -p superbank-solparq -p superbank-rpc --all-features --locked
+DISK_CACHE_TEST_URL=http://127.0.0.1:18196 python3 scripts/test/agave43-archive-roundtrip.py
+```
+
+This exercises local bundle export, manifest discovery, ingestor restore and RPC
+hydration for VAT debits and historical commission fields. Its local produced-slot
+reference is deterministic test data; it does not qualify a live Agave producer.

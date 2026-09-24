@@ -24,6 +24,11 @@ expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 # era). Default: built-in mainnet history — only override for other clusters.
 # hashes-per-tick-schedule: "0:12500"
 
+# Trusted Agave 4.3+ RPC resolves the finalized getAgGenesisCert boundary.
+# alpenglow-rpc-url: "https://your-trusted-agave-rpc"
+# Offline alternative: the genesis certificate block slot and consensus block ID pair.
+# alpenglow-genesis-block: "<slot>:<base58-block-id>"
+
 # External trust anchors, checked against recorded blockhashes.
 # anchor:
 #   - "290000000:<base58-blockhash-from-a-trusted-rpc>"

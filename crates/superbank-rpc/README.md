@@ -3,6 +3,10 @@
 Solana-compatible JSON-RPC server backed by ClickHouse tables produced by `superbank` (or any
 writer that matches the same schemas).
 
+See the [Agave 4.3 compatibility and rollout notes](../../docs/agave-4.3-compatibility.md)
+for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries.
+Build with the pinned Rust 1.97.1 toolchain.
+
 ## Supported methods
 
 - `getSignaturesForAddress`
@@ -44,12 +48,19 @@ Notes:
   `200`, with `slot`, `currentBlockHeight`, and `rewardsCompleteBlockHeight` in `error.data`.
   Missing rewards are returned as `null` only after the address's required partition is available.
   Dedicated address, concurrency, timeout, thread, memory, and read-byte limits are enabled by
-  default.
+  default. Address-limit rejections use code `-32602` and message
+  `Too many inputs provided; max N`, where N is the configured limit. The default
+  remains 100; set `GET_INFLATION_REWARD_MAX_ADDRESSES=32` for Agave limit parity.
   Historical non-partitioned rewards do not require block height metadata. Partitioned rewards
   still require it to locate payout blocks and determine reward availability.
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
+- `getBlock` and `getTransaction` reject `base58` or `binary` with
+  `maxSupportedTransactionVersion >= 1` using code `-32602`, before cache/storage access.
+  `getTransactionsForAddress` applies the same check to its supported `base58` encoding.
+- `VATDebit` rewards preserve negative lamports; stored values also accept the producer
+  spelling `validator-admission-ticket-debit`. Inflation reward queries exclude these debits.
 - Transaction v1 (SIMD-0385) is supported. Requests must set
   `maxSupportedTransactionVersion: 1`; JSON encodings report `version: 1` and expose the inline
   `message.transactionConfig`, while binary encodings preserve the signed v1 wire bytes.
@@ -367,7 +378,7 @@ to describe handler outcomes before envelope promotion.
 ## Optional gRPC head cache (`grpc-head-cache`)
 
 When compiled with `--features grpc-head-cache` and enabled at runtime, superbank-rpc subscribes to
-a Yellowstone DragonsMouth gRPC stream via `yellowstone-block-machine` and keeps a small
+a Yellowstone DragonsMouth gRPC stream of complete bank-tagged blocks and keeps a small
 in-memory cache of the most recent slots. RPC handlers can merge this "head" data with ClickHouse
 to hide the typical ingestion lag.
 
@@ -451,7 +462,9 @@ Configuration:
 | `--grpc-max-decoding-bytes` | `GRPC_MAX_DECODING_BYTES` | `67108864` | Max gRPC decoding message size. |
 
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
-The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (also AGPL-3.0).
+The optional `grpc-head-cache` feature pulls in Yellowstone gRPC client and protobuf crates
+(also AGPL-3.0). A 4.3 producer must supply bank IDs; bank replacement evicts the
+replaced slot and its cached descendants.
 
 ## Optional local ClickHouse forward cache (`disk-cache`)
 

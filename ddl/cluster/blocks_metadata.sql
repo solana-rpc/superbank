@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS default.blocks_metadata_local ON CLUSTER '{cluster}'
     parent_slot                  UInt64,
     blockhash                    FixedString(32),
     parent_blockhash             FixedString(32),
+    bank_id                      Nullable(UInt64),
     block_time                   Nullable(Int64),
     block_height                 Nullable(UInt64),
     executed_transaction_count   UInt64,
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS default.blocks_metadata ON CLUSTER '{cluster}'
     parent_slot                  UInt64,
     blockhash                    FixedString(32),
     parent_blockhash             FixedString(32),
+    bank_id                      Nullable(UInt64),
     block_time                   Nullable(Int64),
     block_height                 Nullable(UInt64),
     executed_transaction_count   UInt64,
@@ -52,3 +54,8 @@ ALTER TABLE default.blocks_metadata_local ON CLUSTER '{cluster}'
     ADD COLUMN IF NOT EXISTS rewards_commission_bps Array(Nullable(UInt16)) AFTER rewards_commission;
 ALTER TABLE default.blocks_metadata ON CLUSTER '{cluster}'
     ADD COLUMN IF NOT EXISTS rewards_commission_bps Array(Nullable(UInt16)) AFTER rewards_commission;
+
+ALTER TABLE default.blocks_metadata_local ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS bank_id Nullable(UInt64) AFTER parent_blockhash;
+ALTER TABLE default.blocks_metadata ON CLUSTER '{cluster}'
+    ADD COLUMN IF NOT EXISTS bank_id Nullable(UInt64) AFTER parent_blockhash;

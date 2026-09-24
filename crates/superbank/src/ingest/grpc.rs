@@ -3,7 +3,11 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::{collections::HashMap, pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use clickhouse::Client as ClickHouseClient;
@@ -18,18 +22,20 @@ use tokio::{
 use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
-use yellowstone_grpc_proto::prelude::{
-    RewardType, SubscribeRequest, SubscribeRequestFilterBlocks, SubscribeRequestFilterSlots,
-    SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateEntry, SubscribeUpdateTransactionInfo,
-    subscribe_update::UpdateOneof,
+use yellowstone_grpc_client_43 as yellowstone_grpc_client;
+use yellowstone_grpc_proto_43::prelude::{
+    SlotStatus, SubscribeRequest, SubscribeRequestFilterBlockFooter, SubscribeRequestFilterBlocks,
+    SubscribeRequestFilterSlots, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateBlockFooter,
+    SubscribeUpdateEntry, SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
 };
 
-use crate::cli::{Args, FromSlotSpec};
+use crate::cli::{Args, FromSlotSpec, IngestSource};
 use crate::clickhouse::{
-    BlockMetadataRow, EntryRow, InsertTables, RetryConfig, TransactionRow, build_clickhouse_client,
-    fetch_latest_slot_from_blocks, flush_buffers, flush_buffers_with_retry,
+    BlockFooterRow, BlockMetadataRow, EntryRow, InsertTables, RetryConfig, TransactionRow,
+    build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers,
+    flush_buffers_with_retry, insert_footer_row,
 };
-use crate::commitment::parse_commitment_level;
+use crate::commitment::parse_durable_commitment;
 use crate::metrics;
 use crate::shutdown::spawn_shutdown_watch;
 use crate::utils::{bytes_to_array, decode_base58_32};
@@ -148,12 +154,115 @@ impl BufferedRows {
     }
 }
 
+const FOOTER_JOIN_WINDOW_SLOTS: u64 = 8192;
+
+#[derive(Default)]
+struct FinalizedFooterJoin {
+    pending: HashMap<(u64, u64), BlockFooterRow>,
+    finalized: HashMap<u64, u64>,
+    completed: HashSet<(u64, u64)>,
+    first_footer_slot: Option<u64>,
+    highest_slot: u64,
+}
+
+impl FinalizedFooterJoin {
+    fn observe(&mut self, update: SubscribeUpdate) -> Result<Option<BlockFooterRow>> {
+        let row = match update.update_oneof {
+            Some(UpdateOneof::BlockFooter(footer)) => self.observe_footer(&footer)?,
+            Some(UpdateOneof::Slot(slot)) => self.observe_slot(&slot)?,
+            _ => None,
+        };
+        self.prune()?;
+        Ok(row)
+    }
+
+    fn observe_footer(
+        &mut self,
+        footer: &SubscribeUpdateBlockFooter,
+    ) -> Result<Option<BlockFooterRow>> {
+        let row = map_block_footer(footer)?;
+        let key = (row.slot, row.bank_id);
+        self.highest_slot = self.highest_slot.max(row.slot);
+        self.first_footer_slot.get_or_insert(row.slot);
+        Ok(match self.finalized.get(&row.slot) {
+            Some(bank_id) if *bank_id == row.bank_id => {
+                if self.completed.insert(key) {
+                    Some(row)
+                } else {
+                    None
+                }
+            }
+            Some(_) => None,
+            None => {
+                self.pending.insert(key, row);
+                None
+            }
+        })
+    }
+
+    fn observe_slot(
+        &mut self,
+        slot: &yellowstone_grpc_proto_43::prelude::SubscribeUpdateSlot,
+    ) -> Result<Option<BlockFooterRow>> {
+        self.highest_slot = self.highest_slot.max(slot.slot);
+        let Ok(status) = SlotStatus::try_from(slot.status) else {
+            return Ok(None);
+        };
+        Ok(match status {
+            SlotStatus::SlotFinalized => {
+                let Some(bank_id) = slot.bank_id else {
+                    if self
+                        .first_footer_slot
+                        .is_some_and(|first| slot.slot >= first)
+                    {
+                        return Err(anyhow!("finalized slot {} lacks bank ID", slot.slot));
+                    }
+                    return Ok(None);
+                };
+                let key = (slot.slot, bank_id);
+                self.finalized.insert(slot.slot, key.1);
+                self.pending
+                    .retain(|(candidate, bank), _| *candidate != slot.slot || *bank == key.1);
+                let row = self.pending.remove(&key);
+                if row.is_some() {
+                    self.completed.insert(key);
+                }
+                row
+            }
+            SlotStatus::SlotDead => {
+                self.pending.retain(|(candidate, bank), _| {
+                    *candidate != slot.slot || slot.bank_id.is_some_and(|id| *bank != id)
+                });
+                None
+            }
+            _ => None,
+        })
+    }
+
+    fn prune(&mut self) -> Result<()> {
+        let oldest = self.highest_slot.saturating_sub(FOOTER_JOIN_WINDOW_SLOTS);
+        if self.finalized.iter().any(|(slot, bank_id)| {
+            *slot < oldest
+                && self.first_footer_slot.is_some_and(|first| *slot >= first)
+                && !self.completed.contains(&(*slot, *bank_id))
+        }) {
+            return Err(anyhow!(
+                "finalized slot was not matched with a footer within {FOOTER_JOIN_WINDOW_SLOTS} slots"
+            ));
+        }
+        self.pending.retain(|(slot, _), _| *slot >= oldest);
+        self.finalized.retain(|slot, _| *slot >= oldest);
+        self.completed.retain(|(slot, _)| *slot >= oldest);
+        Ok(())
+    }
+}
+
 pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     let endpoint = args
         .endpoint
         .as_ref()
         .context("grpc source requires --endpoint / DRAGONSMOUTH_ENDPOINT / config endpoint")?;
-    let commitment = parse_commitment_level(&args.commitment)? as i32;
+    let commitment = parse_durable_commitment(&args.commitment)? as i32;
     let clickhouse = build_clickhouse_client(args);
 
     info!(
@@ -193,7 +302,8 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     };
     let mut _health_watch_guard = AbortTaskGuard::default();
     if args.grpc_health_watch_enabled {
-        _health_watch_guard.set(start_grpc_health_watch(endpoint, args, health_failure_tx).await?);
+        _health_watch_guard
+            .set(start_grpc_health_watch(endpoint, args, health_failure_tx.clone()).await?);
     }
 
     let subscribe_from_slot =
@@ -202,6 +312,15 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
         initial_from_slot_mode,
         buffered_rows.last_durable_block_slot,
     );
+    let mut _footer_guard = AbortTaskGuard::default();
+    _footer_guard.set(start_footer_watch(
+        endpoint.to_string(),
+        args.clone(),
+        subscribe_from_slot,
+        subscribe_from_slot_mode,
+        clickhouse.clone(),
+        health_failure_tx.clone(),
+    ));
     let (pending_update, mut stream) = connect_grpc_stream(
         endpoint,
         args,
@@ -256,12 +375,12 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
             health_failure = health_failure_rx.recv() => {
                 let reason = health_failure
                     .unwrap_or_else(|| "gRPC health watch task stopped unexpectedly".to_string());
-                metrics::observe_source_error("grpc_health_watch", "unhealthy");
+                metrics::observe_source_error(grpc_auxiliary_source(&reason), "unhealthy");
                 warn!(
                     reason = %reason,
                     last_processed_block_slot,
                     last_durable_block_slot = buffered_rows.last_durable_block_slot,
-                    "fatal gRPC health condition; flushing pending rows before exit"
+                    "fatal gRPC auxiliary stream condition; flushing pending rows before exit"
                 );
                 flush_after_fatal_condition(
                     &clickhouse,
@@ -385,6 +504,86 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn grpc_auxiliary_source(reason: &str) -> &'static str {
+    if reason.starts_with("footer stream:") {
+        "grpc_footer_stream"
+    } else {
+        "grpc_health_watch"
+    }
+}
+
+fn start_footer_watch(
+    endpoint: String,
+    args: Args,
+    from_slot: Option<u64>,
+    mode: Option<FromSlotMode>,
+    clickhouse: ClickHouseClient,
+    failure_tx: mpsc::UnboundedSender<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = run_footer_watch(&endpoint, &args, from_slot, mode, &clickhouse).await {
+            let _ = failure_tx.send(format!("footer stream: {err:#}"));
+        }
+    })
+}
+
+async fn run_footer_watch(
+    endpoint: &str,
+    args: &Args,
+    from_slot: Option<u64>,
+    mode: Option<FromSlotMode>,
+    clickhouse: &ClickHouseClient,
+) -> Result<()> {
+    let (first, mut stream) = connect_footer_stream(endpoint, args, from_slot, mode).await?;
+    let retry = RetryConfig {
+        max_retries: args.insert_max_retries,
+        base_ms: args.insert_retry_base_ms,
+        max_ms: args.insert_retry_max_ms,
+    };
+    let mut join = FinalizedFooterJoin::default();
+    if let Some(update) = first {
+        persist_finalized_footer(
+            update,
+            &mut join,
+            clickhouse,
+            &args.block_footers_table,
+            &retry,
+        )
+        .await?;
+    }
+    loop {
+        let update = tokio::time::timeout(
+            Duration::from_secs(args.grpc_idle_timeout_secs),
+            stream.next(),
+        )
+        .await
+        .context("footer stream idle timeout")?
+        .context("footer stream ended")?
+        .context("footer stream update error")?;
+        persist_finalized_footer(
+            update,
+            &mut join,
+            clickhouse,
+            &args.block_footers_table,
+            &retry,
+        )
+        .await?;
+    }
+}
+
+async fn persist_finalized_footer(
+    update: SubscribeUpdate,
+    join: &mut FinalizedFooterJoin,
+    clickhouse: &ClickHouseClient,
+    table: &str,
+    retry: &RetryConfig,
+) -> Result<()> {
+    if let Some(row) = join.observe(update)? {
+        insert_footer_row(clickhouse, table, &row, Some(retry)).await?;
+    }
+    Ok(())
+}
+
 async fn connect_grpc_stream(
     endpoint: &str,
     args: &Args,
@@ -475,6 +674,79 @@ async fn connect_grpc_stream(
         }
     };
     Ok((pending_update, stream))
+}
+
+async fn connect_footer_stream(
+    endpoint: &str,
+    args: &Args,
+    from_slot: Option<u64>,
+    mode: Option<FromSlotMode>,
+) -> Result<(
+    Option<SubscribeUpdate>,
+    impl futures::Stream<Item = Result<SubscribeUpdate, Status>>,
+)> {
+    let mut client = build_grpc_client(endpoint, args).await?;
+    let mut stream = client
+        .subscribe_once(build_footer_request(from_slot))
+        .await?;
+    let first = first_footer_update(&mut stream, args.grpc_idle_timeout_secs)
+        .await?
+        .context("footer stream ended before first update")?;
+    let first = match first {
+        Ok(update) => Some(update),
+        Err(status) => {
+            let available_slot = footer_resume_slot(&status, mode)?;
+            stream = client
+                .subscribe_once(build_footer_request(Some(available_slot)))
+                .await?;
+            None
+        }
+    };
+    Ok((first, stream))
+}
+
+fn footer_resume_slot(status: &Status, mode: Option<FromSlotMode>) -> Result<u64> {
+    if !matches!(mode, Some(FromSlotMode::Zero | FromSlotMode::LatestDb)) {
+        return Err(anyhow!("footer stream error: {status}"));
+    }
+    parse_available_slot_from_error(status.message())
+        .map(|available| available.slot)
+        .ok_or_else(|| anyhow!("footer stream could not parse available slot: {status}"))
+}
+
+async fn first_footer_update<S>(
+    stream: &mut S,
+    idle_timeout_secs: u64,
+) -> Result<Option<Result<SubscribeUpdate, Status>>>
+where
+    S: futures::Stream<Item = Result<SubscribeUpdate, Status>> + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(idle_timeout_secs), stream.next())
+        .await
+        .context("footer stream idle before first update")
+}
+
+fn build_footer_request(from_slot: Option<u64>) -> SubscribeRequest {
+    let mut block_footer = HashMap::new();
+    block_footer.insert(
+        "block_footer".to_string(),
+        SubscribeRequestFilterBlockFooter {},
+    );
+    let mut slots = HashMap::new();
+    slots.insert(
+        "footer_finality".to_string(),
+        SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(false),
+            interslot_updates: Some(true),
+        },
+    );
+    SubscribeRequest {
+        block_footer,
+        slots,
+        commitment: Some(0),
+        from_slot,
+        ..Default::default()
+    }
 }
 
 async fn resolve_initial_from_slot(
@@ -749,37 +1021,9 @@ pub(crate) async fn process_update(
     buffered_rows: &mut BufferedRows,
     retry: Option<&RetryConfig>,
 ) -> Result<bool> {
-    let mut flushed = false;
     match update.update_oneof {
         Some(UpdateOneof::Block(block)) => {
-            {
-                let entry_rows = if args.entries_table.is_some() {
-                    Some(&mut buffered_rows.entry_rows)
-                } else {
-                    None
-                };
-                handle_block_update(
-                    block,
-                    &mut buffered_rows.transaction_rows,
-                    &mut buffered_rows.block_rows,
-                    entry_rows,
-                )?;
-            }
-            if args.flush_every_block
-                || buffered_rows.transaction_rows.len() >= args.transactions_flush_rows
-                || buffered_rows.block_rows.len() >= args.blocks_flush_rows
-                || buffered_rows.entry_rows.len() >= args.transactions_flush_rows
-            {
-                match retry {
-                    Some(r) => {
-                        buffered_rows
-                            .flush_with_retry(clickhouse, insert_tables, r)
-                            .await?
-                    }
-                    None => buffered_rows.flush(clickhouse, insert_tables).await?,
-                }
-                flushed = true;
-            }
+            process_block_update(block, args, insert_tables, clickhouse, buffered_rows, retry).await
         }
         Some(UpdateOneof::BlockMeta(meta)) => {
             if meta.executed_transaction_count > 0 {
@@ -794,11 +1038,110 @@ pub(crate) async fn process_update(
                     "received block meta update without transactions"
                 );
             }
+            Ok(false)
         }
-        Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {}
-        _ => {}
+        Some(UpdateOneof::BlockFooter(_)) => Ok(false),
+        Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => Ok(false),
+        _ => Ok(false),
     }
-    Ok(flushed)
+}
+
+async fn process_block_update(
+    block: SubscribeUpdateBlock,
+    args: &Args,
+    insert_tables: &InsertTables,
+    clickhouse: &ClickHouseClient,
+    buffered_rows: &mut BufferedRows,
+    retry: Option<&RetryConfig>,
+) -> Result<bool> {
+    validate_block_bank(&block, args.source, args.fumarole_alpenglow_genesis_slot)?;
+    let entry_rows = if args.entries_table.is_some() {
+        Some(&mut buffered_rows.entry_rows)
+    } else {
+        None
+    };
+    handle_block_update(
+        block,
+        &mut buffered_rows.transaction_rows,
+        &mut buffered_rows.block_rows,
+        entry_rows,
+    )?;
+    flush_block_if_needed(args, insert_tables, clickhouse, buffered_rows, retry).await
+}
+
+fn validate_block_bank(
+    block: &SubscribeUpdateBlock,
+    source: IngestSource,
+    fumarole_alpenglow_genesis_slot: Option<u64>,
+) -> Result<()> {
+    if source == IngestSource::Fumarole {
+        let genesis_slot = fumarole_alpenglow_genesis_slot
+            .context("Fumarole requires its Alpenglow genesis slot bound")?;
+        if block.slot > genesis_slot {
+            return Err(anyhow!(
+                "legacy Fumarole stream reached Alpenglow slot {}; use the bank-tagged gRPC source",
+                block.slot
+            ));
+        }
+    }
+    if source == IngestSource::Grpc && block.bank_id == 0 && block.slot > 0 {
+        return Err(anyhow!(
+            "gRPC block at slot {} is missing a bank ID; require an Agave 4.3 Yellowstone producer",
+            block.slot
+        ));
+    }
+    if block
+        .entries
+        .iter()
+        .any(|entry| entry.bank_id != block.bank_id)
+    {
+        return Err(anyhow!(
+            "gRPC block at slot {} contains entries from another bank",
+            block.slot
+        ));
+    }
+    Ok(())
+}
+
+async fn flush_block_if_needed(
+    args: &Args,
+    insert_tables: &InsertTables,
+    clickhouse: &ClickHouseClient,
+    buffered_rows: &mut BufferedRows,
+    retry: Option<&RetryConfig>,
+) -> Result<bool> {
+    if args.flush_every_block
+        || buffered_rows.transaction_rows.len() >= args.transactions_flush_rows
+        || buffered_rows.block_rows.len() >= args.blocks_flush_rows
+        || buffered_rows.entry_rows.len() >= args.transactions_flush_rows
+    {
+        match retry {
+            Some(r) => {
+                buffered_rows
+                    .flush_with_retry(clickhouse, insert_tables, r)
+                    .await?
+            }
+            None => buffered_rows.flush(clickhouse, insert_tables).await?,
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn map_block_footer(footer: &SubscribeUpdateBlockFooter) -> Result<BlockFooterRow> {
+    if footer.bank_id == 0 && footer.slot > 0 {
+        return Err(anyhow!(
+            "Alpenglow footer at slot {} has no bank ID",
+            footer.slot
+        ));
+    }
+    Ok(BlockFooterRow {
+        slot: footer.slot,
+        bank_id: footer.bank_id,
+        bank_hash: bytes_to_array(&footer.bank_hash).context("decode footer bank hash")?,
+        block_producer_time_nanos: footer.block_producer_time_nanos,
+        block_user_agent: ByteBuf::from(footer.block_user_agent.clone()),
+    })
 }
 
 pub(crate) fn processed_block_slot(update: &SubscribeUpdate) -> Option<u64> {
@@ -903,6 +1246,7 @@ fn map_block_metadata(block: &SubscribeUpdateBlock) -> Result<BlockMetadataRow> 
         parent_slot: block.parent_slot,
         blockhash,
         parent_blockhash,
+        bank_id: (block.bank_id != 0).then_some(block.bank_id),
         block_time,
         block_height,
         executed_transaction_count: block.executed_transaction_count,
@@ -1164,7 +1508,7 @@ fn map_transaction(
 }
 
 fn compute_message_hash(
-    message: &yellowstone_grpc_proto::prelude::Message,
+    message: &yellowstone_grpc_proto_43::prelude::Message,
 ) -> Result<Array<u8, 32>> {
     let versioned_message = create_versioned_message(message)?;
     let message_bytes = crate::message_wire::serialize_versioned_message(&versioned_message)
@@ -1179,7 +1523,7 @@ fn compute_message_hash(
 }
 
 fn create_versioned_message(
-    message: &yellowstone_grpc_proto::prelude::Message,
+    message: &yellowstone_grpc_proto_43::prelude::Message,
 ) -> Result<solana_message::VersionedMessage> {
     use solana_message::{
         Address, Hash, Message as LegacyMessage, MessageHeader, VersionedMessage,
@@ -1309,7 +1653,7 @@ type RewardsConversion = (
 );
 
 fn convert_instructions(
-    instructions: &[yellowstone_grpc_proto::prelude::CompiledInstruction],
+    instructions: &[yellowstone_grpc_proto_43::prelude::CompiledInstruction],
 ) -> Result<InstructionConversion> {
     let mut program_ids = Vec::with_capacity(instructions.len());
     let mut accounts = Vec::with_capacity(instructions.len());
@@ -1329,7 +1673,7 @@ fn convert_instructions(
 }
 
 fn convert_address_table_lookups(
-    lookups: &[yellowstone_grpc_proto::prelude::MessageAddressTableLookup],
+    lookups: &[yellowstone_grpc_proto_43::prelude::MessageAddressTableLookup],
 ) -> Result<AddressLookupConversion> {
     let mut account_keys = Vec::with_capacity(lookups.len());
     let mut writable_indexes = Vec::with_capacity(lookups.len());
@@ -1348,7 +1692,7 @@ fn convert_address_table_lookups(
 }
 
 fn convert_inner_instructions(
-    meta: &yellowstone_grpc_proto::prelude::TransactionStatusMeta,
+    meta: &yellowstone_grpc_proto_43::prelude::TransactionStatusMeta,
 ) -> Result<InnerInstructionsConversion> {
     if meta.inner_instructions_none {
         return Ok((
@@ -1402,7 +1746,7 @@ fn convert_inner_instructions(
 
 #[allow(clippy::type_complexity)]
 fn convert_token_balances(
-    balances: &[yellowstone_grpc_proto::prelude::TokenBalance],
+    balances: &[yellowstone_grpc_proto_43::prelude::TokenBalance],
 ) -> Result<(
     u8,
     Vec<u8>,
@@ -1465,7 +1809,7 @@ fn convert_token_balances(
     ))
 }
 
-fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> RewardsConversion {
+fn convert_rewards(rewards: &[yellowstone_grpc_proto_43::prelude::Reward]) -> RewardsConversion {
     let mut pubkeys = Vec::with_capacity(rewards.len());
     let mut lamports = Vec::with_capacity(rewards.len());
     let mut post_balances = Vec::with_capacity(rewards.len());
@@ -1507,7 +1851,7 @@ fn optional_pubkey(value: &str) -> Result<Option<Array<u8, 32>>> {
 }
 
 fn convert_return_data(
-    meta: &yellowstone_grpc_proto::prelude::TransactionStatusMeta,
+    meta: &yellowstone_grpc_proto_43::prelude::TransactionStatusMeta,
 ) -> Result<(u8, Option<Array<u8, 32>>, Option<ByteBuf>)> {
     if meta.return_data_none {
         return Ok((0, None, None));
@@ -1527,11 +1871,21 @@ fn convert_return_data(
 }
 
 fn reward_type_to_string(value: i32) -> Option<String> {
-    let parsed = RewardType::try_from(value).ok()?;
-    match parsed {
-        RewardType::Unspecified => None,
-        other => Some(other.as_str_name().to_string()),
-    }
+    // Agave 4.3 assigns VATDebit wire value 6. Yellowstone's published enum
+    // stops at 5, but prost preserves the raw i32, including across Fumarole.
+    const NAMES: [&str; 7] = [
+        "",
+        "Fee",
+        "Rent",
+        "Staking",
+        "Voting",
+        "DeactivatedStake",
+        "VATDebit",
+    ];
+    NAMES
+        .get(usize::try_from(value).ok()?)
+        .filter(|name| !name.is_empty())
+        .map(|name| (*name).to_owned())
 }
 
 fn parse_commission(value: &str) -> Option<u8> {
@@ -1549,13 +1903,13 @@ fn parse_commission_bps(value: &str) -> Option<u16> {
 }
 
 fn decode_transaction_error(
-    err: Option<&yellowstone_grpc_proto::prelude::TransactionError>,
+    err: Option<&yellowstone_grpc_proto_43::prelude::TransactionError>,
 ) -> Result<(u8, Option<String>)> {
     let Some(err) = err else {
         return Ok((1, None));
     };
 
-    match wincode05::deserialize::<solana_transaction_error::TransactionError>(&err.err) {
+    match wincode06::deserialize::<solana_transaction_error::TransactionError>(&err.err) {
         Ok(decoded) => {
             let serialized =
                 serde_json::to_string(&decoded).unwrap_or_else(|_| format!("{decoded:?}"));
@@ -1572,10 +1926,13 @@ fn decode_transaction_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockMetadataRow, FromSlotMode, grpc_health_status_is_serving, grpc_health_status_label,
-        grpc_status_summary, is_oversized_grpc_message, map_transaction, max_block_slot,
-        next_subscribe_from_slot, next_subscribe_from_slot_mode, parse_commission_bps,
+        BlockMetadataRow, FinalizedFooterJoin, FromSlotMode, build_footer_request,
+        build_subscribe_request, grpc_health_status_is_serving, grpc_health_status_label,
+        grpc_status_summary, is_oversized_grpc_message, map_block_footer, map_transaction,
+        max_block_slot, next_subscribe_from_slot, next_subscribe_from_slot_mode,
+        parse_commission_bps, validate_block_bank,
     };
+    use crate::cli::IngestSource;
     use serde_big_array::Array;
 
     #[test]
@@ -1587,10 +1944,149 @@ mod tests {
         assert_eq!(parse_commission_bps("65536"), None);
     }
     use tonic::Status;
-    use yellowstone_grpc_proto::prelude::{
+    use yellowstone_grpc_proto_43::prelude::{
         CompiledInstruction, Message, MessageAddressTableLookup, MessageHeader, Reward, RewardType,
-        SubscribeUpdateTransactionInfo, Transaction, TransactionConfig, TransactionStatusMeta,
+        SlotStatus, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateBlockFooter,
+        SubscribeUpdateSlot, SubscribeUpdateTransactionInfo, Transaction, TransactionConfig,
+        TransactionStatusMeta, subscribe_update::UpdateOneof,
     };
+
+    #[test]
+    fn footer_subscription_is_processed_and_receives_all_bank_statuses() {
+        let footer = build_footer_request(Some(42));
+        assert!(footer.block_footer.contains_key("block_footer"));
+        assert_eq!(footer.commitment, Some(0));
+        assert_eq!(footer.from_slot, Some(42));
+        assert_eq!(
+            footer.slots["footer_finality"].filter_by_commitment,
+            Some(false)
+        );
+        assert_eq!(
+            footer.slots["footer_finality"].interslot_updates,
+            Some(true)
+        );
+
+        let finalized = build_subscribe_request(2, Some(42), true, true);
+        assert!(finalized.block_footer.is_empty());
+        assert_eq!(finalized.commitment, Some(2));
+    }
+
+    fn footer_update(slot: u64, bank_id: u64) -> SubscribeUpdate {
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+                slot,
+                bank_id,
+                bank_hash: vec![bank_id as u8; 32],
+                block_producer_time_nanos: 123,
+                block_user_agent: b"agave".to_vec(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn slot_update(slot: u64, bank_id: u64, status: SlotStatus) -> SubscribeUpdate {
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                bank_id: Some(bank_id),
+                status: status as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn footer_persists_only_for_finalized_bank_in_either_arrival_order() {
+        let mut join = FinalizedFooterJoin::default();
+        assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
+        assert!(
+            join.observe(slot_update(42, 8, SlotStatus::SlotFinalized))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!join.pending.contains_key(&(42, 7)));
+        let row = join.observe(footer_update(42, 8)).unwrap().unwrap();
+        assert_eq!((row.slot, row.bank_id), (42, 8));
+
+        assert!(join.observe(footer_update(43, 9)).unwrap().is_none());
+        let row = join
+            .observe(slot_update(43, 9, SlotStatus::SlotFinalized))
+            .unwrap()
+            .unwrap();
+        assert_eq!((row.slot, row.bank_id), (43, 9));
+    }
+
+    #[test]
+    fn footer_join_discards_losing_banks_and_pre_activation_slots() {
+        let mut join = FinalizedFooterJoin::default();
+        assert!(
+            join.observe(slot_update(1, 1, SlotStatus::SlotFinalized))
+                .unwrap()
+                .is_none()
+        );
+        assert!(join.observe(footer_update(9_001, 3)).unwrap().is_none());
+        assert!(join.observe(footer_update(9_001, 4)).unwrap().is_none());
+        assert!(
+            join.observe(slot_update(9_001, 4, SlotStatus::SlotFinalized))
+                .unwrap()
+                .is_some()
+        );
+        assert!(join.observe(footer_update(18_000, 5)).unwrap().is_none());
+        assert!(!join.pending.contains_key(&(9_001, 3)));
+    }
+
+    #[test]
+    fn footer_join_fails_when_finalized_bank_has_no_footer() {
+        let mut join = FinalizedFooterJoin::default();
+        assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
+        assert!(
+            join.observe(slot_update(42, 8, SlotStatus::SlotFinalized))
+                .unwrap()
+                .is_none()
+        );
+        let err = join.observe(footer_update(42 + super::FOOTER_JOIN_WINDOW_SLOTS + 1, 9));
+        assert!(err.err().unwrap().to_string().contains("finalized slot"));
+    }
+
+    #[test]
+    fn footer_join_rejects_missing_bank_identity_after_activation() {
+        let mut join = FinalizedFooterJoin::default();
+        assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
+        let mut finalized = slot_update(42, 7, SlotStatus::SlotFinalized);
+        if let Some(UpdateOneof::Slot(slot)) = &mut finalized.update_oneof {
+            slot.bank_id = None;
+        }
+        assert!(join.observe(finalized).is_err());
+    }
+
+    #[test]
+    fn footer_requires_bank_identity_and_full_hash() {
+        let footer = SubscribeUpdateBlockFooter {
+            slot: 42,
+            bank_id: 7,
+            bank_hash: vec![3; 32],
+            block_producer_time_nanos: 123,
+            block_user_agent: b"agave".to_vec(),
+        };
+        let row = map_block_footer(&footer).unwrap();
+        assert_eq!(row.bank_hash.0, [3; 32]);
+        assert_eq!(row.block_user_agent.as_ref(), b"agave");
+        assert!(
+            map_block_footer(&SubscribeUpdateBlockFooter {
+                bank_hash: vec![3; 31],
+                ..footer.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            map_block_footer(&SubscribeUpdateBlockFooter {
+                bank_id: 0,
+                ..footer
+            })
+            .is_err()
+        );
+    }
 
     fn build_test_transaction_info(cost_units: Option<u64>) -> SubscribeUpdateTransactionInfo {
         SubscribeUpdateTransactionInfo {
@@ -1682,6 +2178,26 @@ mod tests {
         assert_eq!(row.tx_config_compute_unit_limit, Some(1_000_000));
         assert_eq!(row.tx_config_loaded_accounts_data_size_limit, Some(65_536));
         assert_eq!(row.tx_config_heap_size, Some(32_768));
+    }
+
+    #[test]
+    fn vat_debit_survives_protobuf_round_trip_and_ingestion() {
+        use prost::Message as _;
+        let mut tx = build_test_transaction_info(None);
+        tx.meta.as_mut().unwrap().rewards = vec![Reward {
+            pubkey: "11111111111111111111111111111111".to_owned(),
+            lamports: -10,
+            post_balance: 90,
+            reward_type: 6,
+            commission: String::new(),
+            commission_bps: String::new(),
+        }];
+        let bytes = tx.encode_to_vec();
+        let decoded = SubscribeUpdateTransactionInfo::decode(bytes.as_slice()).unwrap();
+        let row = map_transaction(42, None, &decoded).unwrap();
+        assert_eq!(row.meta_reward_type, vec![Some("VATDebit".to_owned())]);
+        assert_eq!(row.meta_reward_lamports, vec![-10]);
+        assert_eq!(row.meta_reward_post_balance, vec![90]);
     }
 
     #[test]
@@ -1827,12 +2343,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_fumarole_stops_after_genesis_and_grpc_requires_bank_id() {
+        let mut block = SubscribeUpdateBlock {
+            slot: 100,
+            ..Default::default()
+        };
+        assert!(validate_block_bank(&block, IngestSource::Fumarole, None).is_err());
+        assert!(validate_block_bank(&block, IngestSource::Fumarole, Some(100)).is_ok());
+        block.slot = 101;
+        assert!(validate_block_bank(&block, IngestSource::Fumarole, Some(100)).is_err());
+        assert!(validate_block_bank(&block, IngestSource::Grpc, None).is_err());
+        block.bank_id = 7;
+        assert!(validate_block_bank(&block, IngestSource::Grpc, None).is_ok());
+    }
+
     fn build_block_metadata_row(slot: u64) -> BlockMetadataRow {
         BlockMetadataRow {
             slot,
             parent_slot: slot.saturating_sub(1),
             blockhash: Array([1u8; 32]),
             parent_blockhash: Array([2u8; 32]),
+            bank_id: None,
             block_time: Some(1_700_000_000),
             block_height: Some(slot),
             executed_transaction_count: 1,

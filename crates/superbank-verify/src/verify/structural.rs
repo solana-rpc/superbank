@@ -22,11 +22,22 @@ pub(crate) fn expected_tick_count(slot: u64, parent_slot: u64, ticks_per_slot: u
     }
 }
 
+#[cfg(test)]
 pub(crate) fn check_structure(
     block: &BlockInfo,
     entries: &[EntryInfo],
     ticks_per_slot: u64,
     hashes_per_tick: Option<u64>,
+) -> Vec<Finding> {
+    check_structure_in_era(block, entries, ticks_per_slot, hashes_per_tick, false)
+}
+
+pub(crate) fn check_structure_in_era(
+    block: &BlockInfo,
+    entries: &[EntryInfo],
+    ticks_per_slot: u64,
+    hashes_per_tick: Option<u64>,
+    alpenglow: bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     let slot = block.slot;
@@ -69,25 +80,57 @@ pub(crate) fn check_structure(
         return findings;
     }
 
+    check_ticks(block, entries, ticks_per_slot, alpenglow, &mut findings);
+
+    check_last_entry(block, entries, &mut findings);
+
+    // Replica of Agave `verify_tick_hash_count`: the running num_hashes sum
+    // between consecutive ticks must equal hashes_per_tick exactly, and no
+    // tick may claim zero hashes. Skipped when hashes_per_tick is unknown for
+    // the era or hashing is disabled (value 0).
+    check_hash_counts(block, entries, hashes_per_tick, alpenglow, &mut findings);
+
+    // Entry transaction ranges must exactly tile [0, executed_transaction_count).
+    check_transaction_ranges(block, entries, &mut findings);
+
+    findings
+}
+
+fn check_ticks(
+    block: &BlockInfo,
+    entries: &[EntryInfo],
+    ticks_per_slot: u64,
+    alpenglow: bool,
+    findings: &mut Vec<Finding>,
+) {
+    let slot = block.slot;
     let tick_count = entries
         .iter()
         .filter(|entry| entry.transaction_count == 0)
         .count() as u64;
-    let expected_ticks = expected_tick_count(slot, block.parent_slot, ticks_per_slot);
+    let expected_ticks = if alpenglow {
+        1
+    } else {
+        expected_tick_count(slot, block.parent_slot, ticks_per_slot)
+    };
     if tick_count != expected_ticks {
-        findings.push(
-            Finding::new(
-                slot,
-                FindingCode::TickCountMismatch,
-                format!(
-                    "block covers slots {}..={slot} and must carry {expected_ticks} ticks",
-                    block.parent_slot.saturating_add(1)
-                ),
+        let description = if alpenglow {
+            "Alpenglow block must carry exactly one ending Alpentick".to_string()
+        } else {
+            format!(
+                "block covers slots {}..={slot} and must carry {expected_ticks} ticks",
+                block.parent_slot.saturating_add(1)
             )
-            .with_expected_actual(expected_ticks.to_string(), tick_count.to_string()),
+        };
+        findings.push(
+            Finding::new(slot, FindingCode::TickCountMismatch, description)
+                .with_expected_actual(expected_ticks.to_string(), tick_count.to_string()),
         );
     }
+}
 
+fn check_last_entry(block: &BlockInfo, entries: &[EntryInfo], findings: &mut Vec<Finding>) {
+    let slot = block.slot;
     if let Some(last) = entries.last() {
         if last.transaction_count != 0 {
             findings.push(
@@ -113,12 +156,29 @@ pub(crate) fn check_structure(
             );
         }
     }
+}
 
-    // Replica of Agave `verify_tick_hash_count`: the running num_hashes sum
-    // between consecutive ticks must equal hashes_per_tick exactly, and no
-    // tick may claim zero hashes. Skipped when hashes_per_tick is unknown for
-    // the era or hashing is disabled (value 0).
-    if let Some(hashes_per_tick) = hashes_per_tick.filter(|value| *value > 0) {
+fn check_hash_counts(
+    block: &BlockInfo,
+    entries: &[EntryInfo],
+    hashes_per_tick: Option<u64>,
+    alpenglow: bool,
+    findings: &mut Vec<Finding>,
+) {
+    let slot = block.slot;
+    if alpenglow {
+        if let Some(entry) = entries.iter().find(|entry| entry.num_hashes != 1) {
+            findings.push(
+                Finding::new(
+                    slot,
+                    FindingCode::TickHashCountMismatch,
+                    "Alpenglow low power entry must have num_hashes = 1",
+                )
+                .with_entry_index(entry.entry_index)
+                .with_expected_actual("1".to_string(), entry.num_hashes.to_string()),
+            );
+        }
+    } else if let Some(hashes_per_tick) = hashes_per_tick.filter(|value| *value > 0) {
         let mut tick_hash_count = 0u64;
         for entry in entries {
             tick_hash_count = tick_hash_count.saturating_add(entry.num_hashes);
@@ -142,8 +202,10 @@ pub(crate) fn check_structure(
             }
         }
     }
+}
 
-    // Entry transaction ranges must exactly tile [0, executed_transaction_count).
+fn check_transaction_ranges(block: &BlockInfo, entries: &[EntryInfo], findings: &mut Vec<Finding>) {
+    let slot = block.slot;
     let mut expected_next = 0u32;
     let mut tiling_ok = true;
     for entry in entries {
@@ -178,8 +240,6 @@ pub(crate) fn check_structure(
             ),
         );
     }
-
-    findings
 }
 
 #[cfg(test)]
@@ -224,6 +284,34 @@ mod tests {
         assert_eq!(expected_tick_count(0, 0, 64), 64);
         assert_eq!(expected_tick_count(1, 0, 64), 64);
         assert_eq!(expected_tick_count(5, 2, 64), 192);
+    }
+
+    #[test]
+    fn alpenglow_has_one_ending_tick_even_after_skipped_slots() {
+        let (block, entries, _) = build_block(9, 5, [1u8; 32], &[(1, 2), (1, 0)]);
+        assert!(check_structure_in_era(&block, &entries, 4, Some(25), true).is_empty());
+        let poh_findings = check_structure(&block, &entries, 4, Some(25));
+        assert!(
+            poh_findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickCountMismatch)
+        );
+    }
+
+    #[test]
+    fn alpenglow_rejects_extra_tick_and_high_power_entry() {
+        let (block, entries, _) = build_block(9, 8, [1u8; 32], &[(2, 0), (1, 0)]);
+        let findings = check_structure_in_era(&block, &entries, 4, Some(25), true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickCountMismatch)
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickHashCountMismatch)
+        );
     }
 
     #[test]

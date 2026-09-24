@@ -32,6 +32,7 @@ grpc-slot-notifications: true
 # fumarole-endpoint: "https://your.fumarole.endpoint:443"
 # fumarole-x-token: "your-token"
 # fumarole-consumer-group: "superbank-mainnet"
+# fumarole-alpenglow-genesis-slot: 0 # required trusted boundary; legacy Fumarole stops after this slot
 # fumarole-create-consumer-group: false
 # fumarole-from-slot: 0
 # fumarole-data-plane-tcp-connections: 4
@@ -117,6 +118,7 @@ clickhouse-password: ""
 # clickhouse-async-insert: false
 transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
+block-footers-table: "default.block_footers"
 entries-table: "default.entries"
 
 transactions-flush-rows: 25000

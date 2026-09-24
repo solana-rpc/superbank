@@ -31,16 +31,16 @@ serde_json.workspace = true
 serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["stream"] }
 solana-commitment-config = "3.0.0"
-solana-message = { version = "4.4.1", features = ["serde", "wincode"] }
-solana-rpc-client = "4.2.0"
-solana-rpc-client-api = "4.2.0"
-solana-rpc-client-types = "4.2.0"
-solana-storage-bigtable = { version = "4.2.0", features = ["agave-unstable-api"] }
+solana-message = { version = "4.5.0", features = ["serde", "wincode"] }
+solana-rpc-client = "=4.3.0"
+solana-rpc-client-api = "=4.3.0"
+solana-rpc-client-types = "=4.3.0"
+solana-storage-bigtable = { version = "=4.3.0", features = ["agave-unstable-api"] }
 solana-signature = "3.4.0"
-solana-transaction = { version = "4.1.4", features = ["serde", "wincode"] }
+solana-transaction = { version = "4.2.0", features = ["serde", "wincode"] }
 solana-transaction-error = { version = "3.3.1", features = ["serde", "wincode"] }
-solana-transaction-status = "4.2.0"
-solana-transaction-status-client-types = "4.2.0"
+solana-transaction-status = "=4.3.0"
+solana-transaction-status-client-types = "=4.3.0"
 superbank-solparq = { path = "../superbank-solparq" }
 tokio.workspace = true
 tokio-util.workspace = true
@@ -50,10 +50,13 @@ tracing-subscriber.workspace = true
 yellowstone-fumarole-client = "0.7.1"
 yellowstone-grpc-client = "13.4.0"
 yellowstone-grpc-proto = "12.6.0"
+yellowstone-grpc-client-43 = { package = "yellowstone-grpc-client", git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce" }
+yellowstone-grpc-proto-43 = { package = "yellowstone-grpc-proto", git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce" }
 wincode = { version = "0.2.5", features = ["derive", "solana-short-vec"] }
-wincode05 = { package = "wincode", version = "0.5.0" }
+wincode06 = { package = "wincode", version = "0.6.1" }
 
 [dev-dependencies]
+solana-storage-proto = { version = "=4.3.0", features = ["agave-unstable-api"] }
 solana-address = "1.1.0"
 solana-hash = "4.3.0"
 tokio = { workspace = true, features = ["test-util"] }

@@ -1020,6 +1020,7 @@ pub(crate) fn map_rpc_block_metadata(
         parent_slot: block.parent_slot,
         blockhash,
         parent_blockhash,
+        bank_id: None,
         block_time: block.block_time,
         block_height: block.block_height,
         executed_transaction_count,
@@ -1224,6 +1225,7 @@ pub(crate) fn map_bigtable_block_metadata(
         parent_slot: block.parent_slot,
         blockhash,
         parent_blockhash,
+        bank_id: None,
         block_time: block.block_time,
         block_height: block.block_height,
         executed_transaction_count,
@@ -2379,6 +2381,7 @@ mod tests {
             fumarole_endpoint: None,
             fumarole_x_token: None,
             fumarole_consumer_group: None,
+            fumarole_alpenglow_genesis_slot: None,
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: 2,
@@ -2444,6 +2447,7 @@ mod tests {
             clickhouse_async_insert: false,
             transactions_table: "default.transactions".to_string(),
             blocks_table: "default.blocks_metadata".to_string(),
+            block_footers_table: "default.block_footers".to_string(),
             entries_table: None,
             transactions_flush_rows: 25_000,
             blocks_flush_rows: 2_000,
@@ -2600,7 +2604,7 @@ mod tests {
             loaded_accounts_data_size_limit: Some(65_536),
             heap_size: Some(32_768),
         });
-        let tx_bytes = wincode05::serialize(&tx).expect("serialize v1 transaction");
+        let tx_bytes = wincode06::serialize(&tx).expect("serialize v1 transaction");
         assert_eq!(
             crate::message_wire::serialize_versioned_transaction(&tx)
                 .expect("serialize with Superbank schema"),
@@ -2637,6 +2641,63 @@ mod tests {
                 .expect("decode fixture"),
             tx_bytes
         );
+    }
+
+    #[test]
+    fn bigtable_protobuf_decoder_preserves_transaction_versions_and_signed_bytes() {
+        use prost::Message as _;
+        use solana_message::v0;
+        use solana_storage_proto::convert::generated;
+        let legacy = build_test_transaction();
+        let VersionedMessage::Legacy(message) = legacy.message.clone() else {
+            unreachable!()
+        };
+        let v0 = VersionedTransaction {
+            signatures: legacy.signatures.clone(),
+            message: VersionedMessage::V0(v0::Message {
+                header: message.header,
+                account_keys: message.account_keys,
+                recent_blockhash: message.recent_blockhash,
+                instructions: message.instructions,
+                address_table_lookups: Vec::new(),
+            }),
+        };
+        let configured = TransactionConfig {
+            priority_fee: Some(42),
+            compute_unit_limit: Some(1_000_000),
+            loaded_accounts_data_size_limit: Some(65_536),
+            heap_size: Some(32_768),
+        };
+        for tx in [
+            legacy,
+            v0,
+            build_test_v1_transaction(configured),
+            build_test_v1_transaction(TransactionConfig::empty()),
+        ] {
+            let expected = map_versioned_transaction_with_meta(42, None, 0, &tx, None, 1).unwrap();
+            let wire = generated::Transaction::from(tx.clone()).encode_to_vec();
+            let decoded: VersionedTransaction = generated::Transaction::decode(wire.as_slice())
+                .unwrap()
+                .into();
+            assert_eq!(
+                wincode06::serialize(&decoded).unwrap(),
+                wincode06::serialize(&tx).unwrap()
+            );
+            let row = map_versioned_transaction_with_meta(42, None, 0, &decoded, None, 1).unwrap();
+            assert_eq!(row.tx_version, expected.tx_version);
+            assert_eq!(row.tx_recent_blockhash, expected.tx_recent_blockhash);
+            assert_eq!(row.tx_config_priority_fee, expected.tx_config_priority_fee);
+            assert_eq!(
+                row.tx_config_compute_unit_limit,
+                expected.tx_config_compute_unit_limit
+            );
+            assert_eq!(
+                row.tx_config_loaded_accounts_data_size_limit,
+                expected.tx_config_loaded_accounts_data_size_limit
+            );
+            assert_eq!(row.tx_config_heap_size, expected.tx_config_heap_size);
+            assert_eq!(row.message_hash, expected.message_hash);
+        }
     }
 
     #[test]

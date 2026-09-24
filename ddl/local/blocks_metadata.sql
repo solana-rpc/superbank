@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS default.blocks_metadata
     parent_slot                  UInt64,
     blockhash                    FixedString(32),
     parent_blockhash             FixedString(32),
+    bank_id                      Nullable(UInt64),
     block_time                   Nullable(Int64),
     block_height                 Nullable(UInt64),
     executed_transaction_count   UInt64,
@@ -30,3 +31,6 @@ ORDER BY (slot);
 ALTER TABLE default.blocks_metadata
     ADD COLUMN IF NOT EXISTS rewards_commission_bps Array(Nullable(UInt16))
     AFTER rewards_commission;
+
+ALTER TABLE default.blocks_metadata
+    ADD COLUMN IF NOT EXISTS bank_id Nullable(UInt64) AFTER parent_blockhash;

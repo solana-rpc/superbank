@@ -59,6 +59,7 @@ pub(crate) fn b58(bytes: &[u8]) -> String {
 /// within the block) to that transaction's complete signature list; it is only
 /// consulted in full mode. Chain linkage against the parent block is checked
 /// separately by the chain walk, which owns cross-block state.
+#[cfg(test)]
 pub(crate) fn verify_block(
     mode: VerifyMode,
     block: &BlockInfo,
@@ -67,8 +68,34 @@ pub(crate) fn verify_block(
     ticks_per_slot: u64,
     hashes_per_tick: Option<u64>,
 ) -> VerifyOutcome {
+    verify_block_in_era(
+        mode,
+        block,
+        entries,
+        tx_signatures,
+        ticks_per_slot,
+        hashes_per_tick,
+        false,
+    )
+}
+
+pub(crate) fn verify_block_in_era(
+    mode: VerifyMode,
+    block: &BlockInfo,
+    entries: &[EntryInfo],
+    tx_signatures: &BTreeMap<u32, Vec<Signature64>>,
+    ticks_per_slot: u64,
+    hashes_per_tick: Option<u64>,
+    alpenglow: bool,
+) -> VerifyOutcome {
     let mut outcome = VerifyOutcome {
-        findings: structural::check_structure(block, entries, ticks_per_slot, hashes_per_tick),
+        findings: structural::check_structure_in_era(
+            block,
+            entries,
+            ticks_per_slot,
+            hashes_per_tick,
+            alpenglow,
+        ),
         ..VerifyOutcome::default()
     };
 

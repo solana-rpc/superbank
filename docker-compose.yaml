@@ -39,6 +39,7 @@ services:
         for file in \
           transactions.sql \
           blocks_metadata.sql \
+          block_footers.sql \
           entries.sql \
           gsfa.sql \
           gsfa_hot.sql \

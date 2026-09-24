@@ -10,6 +10,7 @@ Each folder contains the same file basenames:
 
 - `transactions.sql`
 - `blocks_metadata.sql`
+- `block_footers.sql`
 - `entries.sql`
 - `gsfa.sql`
 - `gsfa_nohot.sql`
@@ -27,6 +28,10 @@ not exist yet.
 `gsfa_nohot.sql` is an alternative to `gsfa.sql`; do not apply both for the same schema set.
 `entries.sql` is required for Superbank Fumarole/gRPC source defaults and for PoH entry ingestion
 from Old Faithful / Jetstreamer. RPC and Bigtable sources do not populate `entries`.
+`block_footers.sql` stores the Alpenglow bank hash, producer time, and user agent
+from an Agave 4.3 Yellowstone gRPC source. Apply it before deploying a gRPC ingestor.
+Existing block metadata tables must also receive the `bank_id` column through the
+idempotent `blocks_metadata.sql` ALTER statements.
 
 Agave 4.2 adds nullable v1 transaction-config columns. Apply `transactions.sql` before upgrading
 the RPC or ingestor binaries; old rows and Parquet archives naturally read as `NULL`. Reapply the

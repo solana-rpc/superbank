@@ -17,18 +17,18 @@ jetstreamer-firehose = { path = "../jetstreamer/jetstreamer-firehose" }
 jetstreamer-utils = { path = "../jetstreamer/jetstreamer-utils" }
 
 [dependencies]
-jetstreamer = "0.6"
-jetstreamer-plugin = "0.6"
-jetstreamer-firehose = "0.6"
-clickhouse = { version = "0.14", features = ["inserter"] }
+jetstreamer = "0.7"
+jetstreamer-plugin = "0.7"
+jetstreamer-firehose = "0.7"
+clickhouse = { version = "0.15", features = ["inserter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures-util = "0.3"
 log = "0.4"
 bs58 = "0.5"
 parking_lot = "0.12"
-solana-message = "3"
-solana-transaction-status = "3"
-solana-transaction-context = "3"
+solana-message = "4"
+solana-transaction-status = "4"
+solana-transaction-context = "4"
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
 url = "2"
