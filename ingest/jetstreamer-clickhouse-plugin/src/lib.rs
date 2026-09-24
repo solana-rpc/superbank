@@ -170,8 +170,16 @@ fn env_bool(name: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClickhouseIngestConfig, EntryRow, apply_env_overrides};
-    use jetstreamer_firehose::firehose::EntryData;
+    use super::{
+        ClickhouseIngestConfig, EntryRow, TransactionRow, apply_env_overrides, map_rewards,
+    };
+    use jetstreamer_firehose::firehose::{EntryData, TransactionData};
+    use solana_message::{
+        VersionedMessage,
+        v1::{Message, TransactionConfig},
+    };
+    use solana_transaction::versioned::VersionedTransaction;
+    use solana_transaction_status::Reward;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -287,6 +295,54 @@ mod tests {
         assert_eq!(row.transaction_count, 3);
         assert_eq!(row.num_hashes, 999);
         assert_eq!(row.hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn v1_transaction_keeps_version_and_config() {
+        let message = Message {
+            config: TransactionConfig {
+                priority_fee: Some(42),
+                compute_unit_limit: Some(250_000),
+                loaded_accounts_data_size_limit: Some(1024),
+                heap_size: Some(32_768),
+            },
+            ..Default::default()
+        };
+        let transaction = TransactionData {
+            slot: 123,
+            transaction_slot_index: 0,
+            signature: Default::default(),
+            message_hash: Default::default(),
+            is_vote: false,
+            transaction_status_meta: Default::default(),
+            transaction: VersionedTransaction {
+                signatures: Vec::new(),
+                message: VersionedMessage::V1(message),
+            },
+        };
+
+        let row = TransactionRow::from_transaction(&transaction);
+        assert_eq!(row.tx_version, Some(1));
+        assert_eq!(row.tx_config_priority_fee, Some(42));
+        assert_eq!(row.tx_config_compute_unit_limit, Some(250_000));
+        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, Some(1024));
+        assert_eq!(row.tx_config_heap_size, Some(32_768));
+    }
+
+    #[test]
+    fn transaction_rewards_keep_basis_point_commission() {
+        let rewards = vec![Reward {
+            pubkey: String::new(),
+            lamports: 1,
+            post_balance: 2,
+            reward_type: None,
+            commission: None,
+            commission_bps: Some(725),
+        }];
+
+        let (_, _, _, _, _, legacy_commission, commission_bps) = map_rewards(Some(&rewards));
+        assert_eq!(legacy_commission, vec![None]);
+        assert_eq!(commission_bps, vec![Some(725)]);
     }
 }
 
@@ -905,7 +961,7 @@ fn build_inserter<T: Row>(
         .with_period(Some(Duration::from_millis(config.flush_interval_ms.max(1))));
 
     if config.async_insert {
-        inserter = inserter.with_option("async_insert", "1").with_option(
+        inserter = inserter.with_setting("async_insert", "1").with_setting(
             "wait_for_async_insert",
             if config.wait_for_async_insert {
                 "1"
@@ -914,7 +970,7 @@ fn build_inserter<T: Row>(
             },
         );
     } else {
-        inserter = inserter.with_option("async_insert", "0");
+        inserter = inserter.with_setting("async_insert", "0");
     }
 
     let send_timeout = ms_to_duration(config.insert_send_timeout_ms);
@@ -1069,8 +1125,8 @@ impl BlocksMetadataRow {
                     rewards_lamports.push(reward.lamports);
                     rewards_post_balance.push(reward.post_balance);
                     rewards_type.push(Some(reward.reward_type.to_string()));
-                    rewards_commission.push(reward.commission);
-                    rewards_commission_bps.push(None);
+                    rewards_commission.push(None);
+                    rewards_commission_bps.push(reward.commission_bps);
                 }
 
                 let rewards_present =
@@ -1135,6 +1191,10 @@ struct TransactionRow {
     message_hash: [u8; 32],
     is_vote: u8,
     tx_version: Option<u8>,
+    tx_config_priority_fee: Option<u64>,
+    tx_config_compute_unit_limit: Option<u32>,
+    tx_config_loaded_accounts_data_size_limit: Option<u32>,
+    tx_config_heap_size: Option<u32>,
     tx_signatures: Vec<FixedSignature>,
     tx_num_required_signatures: u8,
     tx_num_readonly_signed_accounts: u8,
@@ -1214,14 +1274,26 @@ impl TransactionRow {
             .map(|key| key.to_bytes())
             .collect::<Vec<_>>();
 
-        let tx_recent_blockhash = match message {
-            VersionedMessage::Legacy(msg) => msg.recent_blockhash.to_bytes(),
-            VersionedMessage::V0(msg) => msg.recent_blockhash.to_bytes(),
-        };
+        let tx_recent_blockhash = message.recent_blockhash().to_bytes();
 
         let tx_version = match message {
             VersionedMessage::Legacy(_) => None,
             VersionedMessage::V0(_) => Some(0),
+            VersionedMessage::V1(_) => Some(1),
+        };
+        let (
+            tx_config_priority_fee,
+            tx_config_compute_unit_limit,
+            tx_config_loaded_accounts_data_size_limit,
+            tx_config_heap_size,
+        ) = match message {
+            VersionedMessage::V1(message) => (
+                message.config.priority_fee,
+                message.config.compute_unit_limit,
+                message.config.loaded_accounts_data_size_limit,
+                message.config.heap_size,
+            ),
+            _ => (None, None, None, None),
         };
 
         let tx_instructions_program_id_index = instructions
@@ -1304,6 +1376,10 @@ impl TransactionRow {
             message_hash: transaction.message_hash.to_bytes(),
             is_vote: transaction.is_vote as u8,
             tx_version,
+            tx_config_priority_fee,
+            tx_config_compute_unit_limit,
+            tx_config_loaded_accounts_data_size_limit,
+            tx_config_heap_size,
             tx_signatures,
             tx_num_required_signatures: header.num_required_signatures,
             tx_num_readonly_signed_accounts: header.num_readonly_signed_accounts,
@@ -1501,7 +1577,7 @@ fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> Rewa
             post_balance.push(reward.post_balance);
             reward_type.push(reward.reward_type.map(|t| t.to_string()));
             commission.push(reward.commission);
-            commission_bps.push(None);
+            commission_bps.push(reward.commission_bps);
         }
     }
 
@@ -1517,7 +1593,7 @@ fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> Rewa
 }
 
 fn map_return_data(
-    return_data: Option<&solana_transaction_context::TransactionReturnData>,
+    return_data: Option<&solana_transaction_context::transaction::TransactionReturnData>,
 ) -> (u8, Option<[u8; 32]>, Option<Vec<u8>>) {
     match return_data {
         Some(data) => (1, Some(data.program_id.to_bytes()), Some(data.data.clone())),

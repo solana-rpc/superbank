@@ -6,31 +6,25 @@ entries into the `blocks_metadata`, `transactions`, and `entries` tables.
 ## Usage
 
 ```rust
-use std::sync::Arc;
-
 use jetstreamer_firehose::epochs;
-use jetstreamer_plugin::PluginRunner;
+use jetstreamer::JetstreamerRunner;
 use jetstreamer_clickhouse_plugin::{ClickhouseIngestConfig, ClickhouseIngestPlugin};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let threads = 4;
-    let dsn = "http://localhost:8123";
-
     let config = ClickhouseIngestConfig {
         single_node: false,
         ..Default::default()
     };
     let plugin = ClickhouseIngestPlugin::new(config, threads);
-
-    let mut runner = PluginRunner::new(dsn, threads);
-    runner.register(Box::new(plugin));
-
     let (start, _) = epochs::epoch_to_slot_range(800);
     let (_, end_inclusive) = epochs::epoch_to_slot_range(805);
-    runner
-        .run(start..(end_inclusive + 1), true)
-        .await?;
+
+    JetstreamerRunner::default()
+        .with_threads(threads)
+        .with_slot_range(start..(end_inclusive + 1))
+        .with_plugin(Box::new(plugin))
+        .run()?;
 
     Ok(())
 }
@@ -40,6 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - Transactions and entries are buffered per slot and flushed when the corresponding `on_block`
   arrives so `block_time` is populated from the block metadata.
+- Jetstreamer 0.7 / Agave 4.2 transaction-v1 messages populate the transaction version and
+  transaction config columns. Reward commission basis points are preserved when supplied.
 - Jetstreamer already parses PoH entries while reconstructing blockhashes; this plugin consumes
   those entry notifications to populate the `entries` table alongside blocks and transactions.
 - The default configuration writes to `default.entries`, so apply the matching schema set under
