@@ -488,6 +488,24 @@ fn column_definition(column: &ColumnRow) -> String {
     definition
 }
 
+/// Seconds after its last write before a partition is merged down to one part.
+const FORCE_MERGE_AFTER_SECONDS: u64 = 600;
+
+/// Merge each partition to one part once it stops receiving writes. Every query pays CPU
+/// per part it opens, and ClickHouse otherwise leaves filled partitions at several parts
+/// indefinitely. Applied with `ALTER` rather than in the DDL: DDL settings are part of the
+/// cache fingerprint, and changing it would rebuild every existing cache. Idempotent.
+fn merge_settings_sql(table: &SourceTableSchema, config: &CacheSchemaConfig) -> Option<String> {
+    if table.kind == CacheTableKind::BlocksMetadata && config.memory_blocks_metadata {
+        return None;
+    }
+    Some(format!(
+        "ALTER TABLE {} MODIFY SETTING min_age_to_force_merge_seconds = {FORCE_MERGE_AFTER_SECONDS}, \
+         min_age_to_force_merge_on_partition_only = 1",
+        quote_table(&config.database, table.kind.local_name())
+    ))
+}
+
 fn create_cache_table_sql(
     table: &SourceTableSchema,
     config: &CacheSchemaConfig,
@@ -795,6 +813,9 @@ pub(crate) async fn initialize_cache_schema(
 
     for table in &snapshot.tables {
         execute(local, &create_cache_table_sql(table, config)?).await?;
+        if let Some(sql) = merge_settings_sql(table, config) {
+            execute(local, &sql).await?;
+        }
     }
 
     let transaction = snapshot
@@ -969,6 +990,40 @@ mod tests {
             memory_retain_slots: None,
             memory_max_bytes: None,
         }
+    }
+
+    #[test]
+    fn merge_settings_apply_to_merge_tree_tables_without_changing_fingerprint() {
+        let table = fixture_table();
+        let config = fixture_config(10_000);
+        let fingerprint = schema_fingerprint(std::slice::from_ref(&table), &config);
+        let sql = merge_settings_sql(&table, &config).expect("merge tree table");
+        assert!(sql.starts_with("ALTER TABLE "), "{sql}");
+        assert!(
+            sql.contains("min_age_to_force_merge_seconds = 600"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("min_age_to_force_merge_on_partition_only = 1"),
+            "{sql}"
+        );
+        assert!(
+            !create_cache_table_sql(&table, &config)
+                .unwrap()
+                .contains("min_age_to_force_merge")
+        );
+        assert_eq!(
+            schema_fingerprint(std::slice::from_ref(&table), &config),
+            fingerprint
+        );
+
+        let mut memory = fixture_table();
+        memory.kind = CacheTableKind::BlocksMetadata;
+        let mut memory_config = fixture_config(10_000);
+        memory_config.memory_blocks_metadata = true;
+        assert!(merge_settings_sql(&memory, &memory_config).is_none());
+        memory_config.memory_blocks_metadata = false;
+        assert!(merge_settings_sql(&memory, &memory_config).is_some());
     }
 
     #[test]

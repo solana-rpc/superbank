@@ -148,6 +148,18 @@ fn error_outcome(err: &ProcessingError) -> &'static str {
         ProcessingError::Database { context, .. } if context.contains("TIMEOUT_EXCEEDED") => {
             "timeout"
         }
+        // A cursor shares the attempt's deadline and is polled first, so a stream cut off
+        // at the deadline surfaces as the driver's own timeout rather than the attempt's.
+        ProcessingError::Database {
+            source: Some(source),
+            ..
+        } if matches!(
+            source.downcast_ref::<clickhouse::error::Error>(),
+            Some(clickhouse::error::Error::TimedOut)
+        ) =>
+        {
+            "timeout"
+        }
         _ => "error",
     }
 }
@@ -594,14 +606,23 @@ impl DiskCache {
                 partitions.len(),
             );
             // One query over every candidate: one admission and one round trip, so a
-            // short (partial) page is denied as quickly as a full page is served.
-            // Partitions are disjoint slot ranges and the query orders by slot, so this
-            // equals the former newest-first loop's concatenated pages.
-            let records = match partitions.first() {
-                None => Vec::new(),
-                Some(&newest) => {
+            // short (partial) page is denied as quickly as a full page is served. It
+            // spans one slot range from the oldest to the newest candidate: partitions
+            // inside it that were skipped are definite index negatives with no rows for
+            // this address, and a range keeps primary-key analysis on binary search.
+            // The query orders by slot, so this equals the former newest-first loop.
+            let records = match (partitions.first(), partitions.last()) {
+                (None, _) | (_, None) => Vec::new(),
+                (Some(&newest), Some(&oldest)) => {
+                    let width = self.inner.cfg.partition_slots;
                     let mut client = self.scoped_client(&base, newest, &read);
-                    client.cache_partition_set = Some(partitions.into());
+                    client.cache_slot_range = Some((
+                        oldest.saturating_mul(width),
+                        newest
+                            .saturating_add(1)
+                            .saturating_mul(width)
+                            .saturating_sub(1),
+                    ));
                     client
                         .get_signatures_for_address_with_positions(
                             &address.to_string(),
@@ -813,6 +834,19 @@ mod window_tests {
         );
         assert_eq!(
             error_outcome(&ProcessingError::database_msg("boom")),
+            "error"
+        );
+        let cursor_deadline = clickhouse::error::Error::TimedOut;
+        assert_eq!(
+            error_outcome(&ProcessingError::database(
+                cursor_deadline.to_string(),
+                cursor_deadline
+            )),
+            "timeout"
+        );
+        let other = clickhouse::error::Error::RowNotFound;
+        assert_eq!(
+            error_outcome(&ProcessingError::database(other.to_string(), other)),
             "error"
         );
     }

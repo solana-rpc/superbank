@@ -486,9 +486,13 @@ Signature and address reads use an in-process Bloom membership index to exclude 
 partitions before querying ClickHouse. This preserves whole-partition eviction without making
 key lookups search every retained partition. Signature status batches, pagination-bound signature
 lookups, regular/hot address history, and token-owner history use the same routing mechanism.
-`getSignaturesForAddress` reads every candidate partition in one local query
-(`intDiv(slot, width) IN (...)`), so a full page and a partial page that falls through to the
-source each cost one admission and one round trip. Other reads query candidate partitions in
+`getSignaturesForAddress` reads every candidate partition in one local query over a single slot
+range from the oldest to the newest candidate, so a full page and a partial page that falls
+through to the source each cost one admission and one round trip. Skipped partitions inside the
+range are definite index negatives; a range, unlike an `intDiv(slot, width) IN (...)` set, keeps
+primary-key analysis on binary search. Local tables merge each partition to one part once it has
+had no writes for 10 minutes (`min_age_to_force_merge_seconds`, applied at startup outside the
+cache fingerprint), because every local query pays CPU per part it opens. Other reads query candidate partitions in
 result order, one at a time, until the answer is complete or their deadline expires. `getSignaturesForAddress` and `getTransactionsForAddress` share one
 `DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` deadline (default 100 ms) across cursor/bound resolution,
 address scans, and full transaction hydration, including admission waiting. An address-request

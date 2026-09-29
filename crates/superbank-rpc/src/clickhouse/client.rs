@@ -321,10 +321,10 @@ pub struct ClickHouseClient {
     pub(crate) password: String,
     pub(crate) signature_slot_cache: Arc<SignatureSlotCache>,
     pub(crate) cache_partition: Option<(u64, u64)>,
-    /// Local-cache reads only: every partition a multi-partition read may touch. When
-    /// set, `cache_slot_predicate` filters on this set; `cache_partition` still supplies
-    /// the width and marks the client as a local-cache client.
-    pub(crate) cache_partition_set: Option<Arc<[u64]>>,
+    /// Local-cache reads only: inclusive slot bounds for a multi-partition read. When set,
+    /// `cache_slot_predicate` filters on this range instead of one partition;
+    /// `cache_partition` still marks the client as a local-cache client.
+    pub(crate) cache_slot_range: Option<(u64, u64)>,
     /// Local-cache reads only: the longest wait for HTTP admission before failing with
     /// [`CacheAdmissionBusy`], so a saturated cache denies quickly instead of spending
     /// the caller's budget in the queue.
@@ -739,7 +739,7 @@ impl ClickHouseClient {
             password: password.to_string(),
             signature_slot_cache: Arc::new(SignatureSlotCache::from_env()),
             cache_partition: None,
-            cache_partition_set: None,
+            cache_slot_range: None,
             cache_admission_wait: None,
             transaction_table,
             blocks_metadata_table,
@@ -1048,12 +1048,11 @@ impl ClickHouseClient {
         let Some((width, partition)) = self.cache_partition else {
             return String::new();
         };
-        match self.cache_partition_set.as_deref() {
-            Some(set) if !set.is_empty() => {
-                let list = set.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
-                format!(" AND intDiv(slot, {width}) IN ({list})")
-            }
-            _ => format!(" AND intDiv(slot, {width}) = {partition}"),
+        // A plain slot range keeps primary-key analysis on binary search; an
+        // `intDiv(slot, w) IN (...)` set forces a scan of every candidate part's index.
+        match self.cache_slot_range {
+            Some((low, high)) => format!(" AND slot BETWEEN {low} AND {high}"),
+            None => format!(" AND intDiv(slot, {width}) = {partition}"),
         }
     }
 
@@ -2695,18 +2694,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_slot_predicate_covers_partition_set() {
+    fn cache_slot_predicate_uses_range_when_set() {
         let mut client = test_client_with_hot_addresses(Vec::new());
         assert_eq!(client.cache_slot_predicate(), "");
         client.cache_partition = Some((10, 7));
         assert_eq!(client.cache_slot_predicate(), " AND intDiv(slot, 10) = 7");
-        client.cache_partition_set = Some(Arc::from(Vec::new()));
-        assert_eq!(client.cache_slot_predicate(), " AND intDiv(slot, 10) = 7");
-        client.cache_partition_set = Some(Arc::from(vec![7, 4, 2]));
-        assert_eq!(
-            client.cache_slot_predicate(),
-            " AND intDiv(slot, 10) IN (7,4,2)"
-        );
+        client.cache_slot_range = Some((20, 79));
+        assert_eq!(client.cache_slot_predicate(), " AND slot BETWEEN 20 AND 79");
     }
 
     #[tokio::test]
