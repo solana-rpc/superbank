@@ -298,35 +298,77 @@ mod tests {
     }
 
     #[test]
-    fn v1_transaction_keeps_version_and_config() {
-        let message = Message {
-            config: TransactionConfig {
-                priority_fee: Some(42),
-                compute_unit_limit: Some(250_000),
-                loaded_accounts_data_size_limit: Some(1024),
-                heap_size: Some(32_768),
-            },
-            ..Default::default()
-        };
-        let transaction = TransactionData {
-            slot: 123,
-            transaction_slot_index: 0,
-            signature: Default::default(),
-            message_hash: Default::default(),
-            is_vote: false,
-            transaction_status_meta: Default::default(),
-            transaction: VersionedTransaction {
-                signatures: Vec::new(),
-                message: VersionedMessage::V1(message),
-            },
-        };
+    fn transaction_rows_keep_version_and_config() {
+        let cases = [
+            (
+                VersionedMessage::Legacy(Default::default()),
+                None,
+                (None, None, None, None),
+            ),
+            (
+                VersionedMessage::V0(Default::default()),
+                Some(0),
+                (None, None, None, None),
+            ),
+            (
+                VersionedMessage::V1(Message::default()),
+                Some(1),
+                (None, None, None, None),
+            ),
+            (
+                VersionedMessage::V1(Message {
+                    config: TransactionConfig {
+                        priority_fee: Some(42),
+                        compute_unit_limit: Some(250_000),
+                        loaded_accounts_data_size_limit: Some(1024),
+                        heap_size: Some(32_768),
+                    },
+                    ..Default::default()
+                }),
+                Some(1),
+                (Some(42), Some(250_000), Some(1024), Some(32_768)),
+            ),
+            (
+                VersionedMessage::V1(Message {
+                    config: TransactionConfig {
+                        priority_fee: Some(u64::MAX),
+                        compute_unit_limit: None,
+                        loaded_accounts_data_size_limit: Some(0),
+                        heap_size: Some(u32::MAX),
+                    },
+                    ..Default::default()
+                }),
+                Some(1),
+                (Some(u64::MAX), None, Some(0), Some(u32::MAX)),
+            ),
+        ];
 
-        let row = TransactionRow::from_transaction(&transaction);
-        assert_eq!(row.tx_version, Some(1));
-        assert_eq!(row.tx_config_priority_fee, Some(42));
-        assert_eq!(row.tx_config_compute_unit_limit, Some(250_000));
-        assert_eq!(row.tx_config_loaded_accounts_data_size_limit, Some(1024));
-        assert_eq!(row.tx_config_heap_size, Some(32_768));
+        for (message, expected_version, expected_config) in cases {
+            let transaction = TransactionData {
+                slot: 123,
+                transaction_slot_index: 0,
+                signature: Default::default(),
+                message_hash: Default::default(),
+                is_vote: false,
+                transaction_status_meta: Default::default(),
+                transaction: VersionedTransaction {
+                    signatures: Vec::new(),
+                    message,
+                },
+            };
+
+            let row = TransactionRow::from_transaction(&transaction);
+            assert_eq!(row.tx_version, expected_version);
+            assert_eq!(
+                (
+                    row.tx_config_priority_fee,
+                    row.tx_config_compute_unit_limit,
+                    row.tx_config_loaded_accounts_data_size_limit,
+                    row.tx_config_heap_size,
+                ),
+                expected_config,
+            );
+        }
     }
 
     #[test]
@@ -1276,24 +1318,22 @@ impl TransactionRow {
 
         let tx_recent_blockhash = message.recent_blockhash().to_bytes();
 
-        let tx_version = match message {
-            VersionedMessage::Legacy(_) => None,
-            VersionedMessage::V0(_) => Some(0),
-            VersionedMessage::V1(_) => Some(1),
-        };
         let (
+            tx_version,
             tx_config_priority_fee,
             tx_config_compute_unit_limit,
             tx_config_loaded_accounts_data_size_limit,
             tx_config_heap_size,
         ) = match message {
+            VersionedMessage::Legacy(_) => (None, None, None, None, None),
+            VersionedMessage::V0(_) => (Some(0), None, None, None, None),
             VersionedMessage::V1(message) => (
+                Some(1),
                 message.config.priority_fee,
                 message.config.compute_unit_limit,
                 message.config.loaded_accounts_data_size_limit,
                 message.config.heap_size,
             ),
-            _ => (None, None, None, None),
         };
 
         let tx_instructions_program_id_index = instructions
