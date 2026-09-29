@@ -370,6 +370,67 @@ async fn assert_pagination(cache: &DiskCache) {
     }
 }
 
+/// Bounded gsfa pages over several partitions, as one local query, must equal the
+/// unbounded page filtered by the same bounds: order, limit and exclusive edges.
+async fn assert_gsfa_bounds_across_partitions(cache: &DiskCache) {
+    use crate::clickhouse::{SignatureSlot, SlotBoundary};
+    let all = cache
+        .signatures_for_address(address("address"), None, None, 1000)
+        .await
+        .unwrap()
+        .records;
+    let position = |slot| {
+        let row = all.iter().find(|row| row.slot == slot).unwrap();
+        SlotBoundary::Position(SignatureSlot {
+            slot,
+            slot_idx: row.slot_idx,
+        })
+    };
+    let key = |row: &crate::clickhouse::SignatureRecord| (row.slot, row.slot_idx);
+    let newer_than = |row, bound: Option<SlotBoundary>| match bound {
+        None => true,
+        Some(SlotBoundary::Slot(slot)) => key(row).0 > slot,
+        Some(SlotBoundary::Position(p)) => key(row) > (p.slot, p.slot_idx),
+    };
+    let older_than = |row, bound: Option<SlotBoundary>| match bound {
+        None => true,
+        Some(SlotBoundary::Slot(slot)) => key(row).0 < slot,
+        Some(SlotBoundary::Position(p)) => key(row) < (p.slot, p.slot_idx),
+    };
+    let befores = [None, Some(position(37)), Some(SlotBoundary::Slot(33))];
+    let untils = [None, Some(position(12)), Some(SlotBoundary::Slot(21))];
+    for before in befores {
+        for until in untils {
+            for limit in [1, 5, 15, 100] {
+                let expected: Vec<_> = all
+                    .iter()
+                    .filter(|row| older_than(row, before) && newer_than(row, until))
+                    .take(limit)
+                    .map(|row| (row.slot, row.slot_idx, row.signature.clone()))
+                    .collect();
+                let page = cache
+                    .signatures_for_address(address("address"), before, until, limit)
+                    .await
+                    .unwrap_or_else(|| panic!("no page for {before:?} {until:?} {limit}"));
+                let actual: Vec<_> = page
+                    .records
+                    .iter()
+                    .map(|row| (row.slot, row.slot_idx, row.signature.clone()))
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "before={before:?} until={until:?} limit={limit}"
+                );
+                // Both `until` bounds lie inside coverage, so only unbounded pages reach it.
+                assert_eq!(
+                    page.reached_floor,
+                    expected.len() < limit && until.is_none()
+                );
+            }
+        }
+    }
+}
+
 async fn assert_transaction_position_fallback(cache: &DiskCache) {
     let mut client = cache.query_client();
     client.cache_partition = Some((10, 1));
@@ -805,6 +866,7 @@ async fn key_routing_clickhouse_integration() {
         page.records.iter().map(|r| r.slot).collect::<Vec<_>>(),
         (10..50).rev().collect::<Vec<_>>()
     );
+    assert_gsfa_bounds_across_partitions(&cache).await;
     for (key, tokens) in [
         ("address", TokenAccountsFilter::None),
         ("owner", TokenAccountsFilter::All),

@@ -352,7 +352,12 @@ impl DiskCache {
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),
         );
         local.use_table_names(table_names);
-        local.read_endpoint = local.read_endpoint.with_target("cache");
+        // Serving reads are bounded server-side (see `releasing_on_abandon`); holding their
+        // few permits until an abandoned read is verified gone starved live requests.
+        local.read_endpoint = local
+            .read_endpoint
+            .with_target("cache")
+            .releasing_on_abandon();
         local.client = local
             .client
             .clone()

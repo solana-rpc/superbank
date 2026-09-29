@@ -431,6 +431,30 @@ impl EncodeLabelSetTrait for OperationOutcomeLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct OperationTargetLabels {
+    operation: String,
+    target: &'static str,
+    x_endpoint: Option<String>,
+    x_rpc_node: Option<String>,
+    x_subscription_id: Option<String>,
+    x_account_id: Option<String>,
+}
+
+impl EncodeLabelSetTrait for OperationTargetLabels {
+    fn encode(&self, mut encoder: LabelSetEncoder<'_>) -> Result<(), fmt::Error> {
+        encode_required_label(&mut encoder, "operation", self.operation.as_str())?;
+        encode_required_label(&mut encoder, "target", self.target)?;
+        encode_request_header_labels(
+            &mut encoder,
+            self.x_endpoint.as_deref(),
+            self.x_rpc_node.as_deref(),
+            self.x_subscription_id.as_deref(),
+            self.x_account_id.as_deref(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct TransportFallbackLabels {
     operation: &'static str,
     from: &'static str,
@@ -648,7 +672,7 @@ pub struct Metrics {
     clickhouse_latency_seconds: Family<MethodLabels, Histogram>,
     clickhouse_received_bytes: Family<MethodLabels, Counter>,
     clickhouse_decoded_bytes: Family<MethodLabels, Counter>,
-    clickhouse_timeouts: Family<OperationLabels, Counter>,
+    clickhouse_timeouts: Family<OperationTargetLabels, Counter>,
     clickhouse_query_cache: Family<QueryCacheLabels, Counter>,
     clickhouse_query_cache_settings: Family<QueryCacheSettingsLabels, Counter>,
     clickhouse_shard_query_aborts: Family<OperationTransportReasonLabels, Counter>,
@@ -689,6 +713,8 @@ pub struct Metrics {
     disk_cache_key_seconds: Family<DiskCacheReadLabels, Histogram>,
     #[cfg(feature = "disk-cache")]
     disk_cache_signature_membership_seconds: Family<DiskCacheReadLabels, Histogram>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_address_partitions: Family<DiskCacheReadLabels, Histogram>,
     #[cfg(feature = "disk-cache")]
     disk_cache_signature_index_partitions: Gauge,
     #[cfg(feature = "disk-cache")]
@@ -835,6 +861,9 @@ impl Metrics {
         #[cfg(feature = "disk-cache")]
         let disk_cache_signature_membership_seconds =
             Family::new_with_constructor(signature_membership_histogram as fn() -> Histogram);
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_address_partitions =
+            Family::new_with_constructor(address_partitions_histogram as fn() -> Histogram);
         #[cfg(feature = "disk-cache")]
         let disk_cache_signature_index_partitions = Gauge::default();
         #[cfg(feature = "disk-cache")]
@@ -1214,6 +1243,11 @@ impl Metrics {
                 disk_cache_key_seconds.clone(),
             );
             registry.register(
+                "disk_cache_address_partitions",
+                "Candidate partitions read per local-cache address request",
+                disk_cache_address_partitions.clone(),
+            );
+            registry.register(
                 "disk_cache_key_index_bytes",
                 "Partition routing index instrumentation",
                 disk_cache_key_index_bytes.clone(),
@@ -1389,6 +1423,8 @@ impl Metrics {
             disk_cache_key_seconds,
             #[cfg(feature = "disk-cache")]
             disk_cache_signature_membership_seconds,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_address_partitions,
             #[cfg(feature = "disk-cache")]
             disk_cache_signature_index_partitions,
             #[cfg(feature = "disk-cache")]
@@ -1611,6 +1647,7 @@ impl Metrics {
             method,
             request_labels,
             start: Instant::now(),
+            observed: false,
         }
     }
 
@@ -1622,9 +1659,26 @@ impl Metrics {
         elapsed: f64,
     ) {
         let labels = Self::method_status_labels_from_request(method, status, request_labels);
-        self.rpc_requests.get_or_create(&labels).inc();
+        self.observe_labels(&labels, elapsed);
+    }
+
+    /// A request whose future was dropped before it produced a response.
+    fn observe_abandoned(
+        &self,
+        method: &str,
+        request_labels: &RequestHeaderMetricLabels,
+        elapsed: f64,
+    ) {
+        let mut labels =
+            Self::method_status_labels_from_request(method, StatusCode::OK, request_labels);
+        labels.status = "abandoned".to_string();
+        self.observe_labels(&labels, elapsed);
+    }
+
+    fn observe_labels(&self, labels: &MethodStatusLabels, elapsed: f64) {
+        self.rpc_requests.get_or_create(labels).inc();
         self.rpc_latency_seconds
-            .get_or_create(&labels)
+            .get_or_create(labels)
             .observe(elapsed);
     }
 
@@ -1725,8 +1779,18 @@ impl Metrics {
         self.rpc_batch_rejected.get_or_create(&labels).inc();
     }
 
-    pub fn clickhouse_timeout(&self, operation: &str) {
-        let labels = Self::current_operation_labels(operation);
+    /// `target` is the ClickHouse the operation ran against: `primary`, or the local
+    /// disk cache (`cache`, `background`). Cache reads reuse primary operation names.
+    pub fn clickhouse_timeout(&self, operation: &str, target: &'static str) {
+        let request_labels = current_request_metric_labels();
+        let labels = OperationTargetLabels {
+            operation: operation.to_string(),
+            target,
+            x_endpoint: request_labels.x_endpoint,
+            x_rpc_node: request_labels.x_rpc_node,
+            x_subscription_id: request_labels.x_subscription_id,
+            x_account_id: request_labels.x_account_id,
+        };
         self.clickhouse_timeouts.get_or_create(&labels).inc();
     }
 
@@ -1957,9 +2021,14 @@ pub(crate) fn batch_rejected(reason: &str) {
     metrics.batch_rejected(reason);
 }
 
+/// Timeout of an operation against the primary cluster.
 pub(crate) fn clickhouse_timeout(operation: &str) {
+    clickhouse_timeout_for(operation, "primary");
+}
+
+pub(crate) fn clickhouse_timeout_for(operation: &str, target: &'static str) {
     let metrics = metrics();
-    metrics.clickhouse_timeout(operation);
+    metrics.clickhouse_timeout(operation, target);
 }
 
 pub(crate) fn clickhouse_query_cache_classified(operation: &str, eligible: bool) {
@@ -2323,19 +2392,30 @@ pub struct RequestTracker<'a> {
     method: String,
     request_labels: RequestHeaderMetricLabels,
     start: Instant,
+    observed: bool,
 }
 
 impl<'a> RequestTracker<'a> {
-    pub fn observe(self, status: StatusCode) {
+    pub fn observe(mut self, status: StatusCode) {
         let elapsed = self.start.elapsed().as_secs_f64();
         self.metrics
             .observe(self.method.as_str(), &self.request_labels, status, elapsed);
+        self.observed = true;
         // Gauge decrement handled in Drop
     }
 }
 
 impl Drop for RequestTracker<'_> {
     fn drop(&mut self) {
+        // Dropped unobserved: the request future was cancelled (e.g. client disconnect),
+        // so no status exists. Record it rather than losing it from latency and totals.
+        if !self.observed {
+            self.metrics.observe_abandoned(
+                self.method.as_str(),
+                &self.request_labels,
+                self.start.elapsed().as_secs_f64(),
+            );
+        }
         self.metrics
             .rpc_inflight
             .get_or_create(&Metrics::method_labels_from_request(
@@ -2387,6 +2467,25 @@ pub(crate) fn disk_cache_key_index(bytes: u64, indexed: u64, unknown: u64) {
     metrics
         .disk_cache_key_index_unknown_partitions
         .set(clamp_i64(unknown));
+}
+
+#[cfg(feature = "disk-cache")]
+fn address_partitions_histogram() -> Histogram {
+    Histogram::new([0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0])
+}
+
+/// Candidate partitions one local-cache address read covered. Signature pages read them all
+/// in one query; transaction pages still issue at least one query per candidate.
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_address_partitions(operation: &'static str, partitions: usize) {
+    let metrics = metrics();
+    metrics
+        .disk_cache_address_partitions
+        .get_or_create(&DiskCacheReadLabels {
+            operation: operation.into(),
+            outcome: "candidates".into(),
+        })
+        .observe(partitions as f64);
 }
 
 #[cfg(feature = "disk-cache")]
@@ -2462,6 +2561,12 @@ mod tests {
         drop(cancelled);
         assert_eq!(metrics.rpc_inflight.get_or_create(&labels).get(), 0);
         assert_eq!(metrics.rpc_requests.get_or_create(&status_labels).get(), 1);
+        let mut abandoned_labels = status_labels.clone();
+        abandoned_labels.status = "abandoned".to_string();
+        assert_eq!(
+            metrics.rpc_requests.get_or_create(&abandoned_labels).get(),
+            1
+        );
 
         let exported = String::from_utf8(metrics.export().expect("metrics export"))
             .expect("metrics are UTF-8");
@@ -2469,5 +2574,13 @@ mod tests {
         assert!(
             exported.contains("superbank_rpc_requests_total{method=\"getSlot\",status=\"200\"} 1")
         );
+        assert!(
+            exported.contains(
+                "superbank_rpc_requests_total{method=\"getSlot\",status=\"abandoned\"} 1"
+            )
+        );
+        assert!(exported.contains(
+            "superbank_rpc_response_time_seconds_count{method=\"getSlot\",status=\"abandoned\"} 1"
+        ));
     }
 }

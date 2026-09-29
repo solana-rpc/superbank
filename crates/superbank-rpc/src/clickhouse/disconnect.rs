@@ -93,6 +93,7 @@ pub(crate) struct DisconnectGuard {
     operation: &'static str,
     target: &'static str,
     submitted: bool,
+    retain_until_verified: bool,
     additional: Vec<OwnedSemaphorePermit>,
     workflow: Vec<Arc<OwnedSemaphorePermit>>,
 }
@@ -140,6 +141,7 @@ impl DisconnectVerifier {
             operation: "signature_statuses",
             target: "primary",
             submitted: true,
+            retain_until_verified: true,
             additional: Vec::new(),
             workflow: Vec::new(),
         })
@@ -178,6 +180,7 @@ impl DisconnectVerifier {
             operation,
             target,
             submitted: false,
+            retain_until_verified: true,
             additional: Vec::new(),
             workflow: Vec::new(),
         })
@@ -245,6 +248,11 @@ impl DisconnectGuard {
     pub(crate) fn submitted(&mut self) {
         self.submitted = true;
     }
+    /// Release admission when the response is closed instead of holding it until
+    /// termination is observed. Only for reads that ClickHouse bounds on its own.
+    pub(crate) fn release_on_abandon(&mut self) {
+        self.retain_until_verified = false;
+    }
     #[cfg(any(test, feature = "disk-cache"))]
     pub(crate) fn set_query_id(&mut self, id: String) {
         self.query_id = id;
@@ -266,6 +274,17 @@ impl Drop for DisconnectGuard {
 
 fn enqueue_abandoned(guard: &mut DisconnectGuard) {
     if !guard.submitted {
+        return;
+    }
+    if !guard.retain_until_verified {
+        // Permits drop with the guard, after the owning cursor closed the response.
+        if guard.permit.take().is_some() {
+            crate::metrics::read_disconnect_verification(
+                guard.operation,
+                guard.target,
+                "released_unverified",
+            );
+        }
         return;
     }
     let Some(permit) = guard.permit.take() else {
@@ -819,6 +838,7 @@ mod tests {
             operation: "signature_statuses",
             target: "primary",
             submitted: true,
+            retain_until_verified: true,
             additional: Vec::new(),
             workflow: Vec::new(),
         };
@@ -840,6 +860,7 @@ mod tests {
             operation: "signature_statuses",
             target: "primary",
             submitted: true,
+            retain_until_verified: true,
             additional: Vec::new(),
             workflow: Vec::new(),
         };

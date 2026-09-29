@@ -133,7 +133,12 @@ before releasing admission. A valid first row does not hide a later stream or de
 error. Successful EOF generates no verification probes and permits connection reuse.
 Dropping a query before submission releases its admission immediately. Once submitted,
 abandonment closes the data response before scheduling verification and retains its read
-and associated workflow permits until termination is confirmed.
+and associated workflow permits until termination is confirmed. The local disk cache's
+interactive reads are the exception: they release admission as soon as the response is closed,
+recorded as `released_unverified`, because every local read carries
+`cancel_http_readonly_queries_on_client_close` and partition-scoped reads also carry a
+`max_execution_time` of their remaining budget. Holding their few permits for verification (at least two 250 ms polls) starved live
+requests. Disk-cache background scans still wait for verification.
 
 One verifier is shared by clones of each endpoint and uses its separate control pool.
 It probes pending IDs in batches of at most **128**, with one probe in flight per verifier.
@@ -185,7 +190,7 @@ Shared metrics have bounded `operation` and `target` labels, never query IDs:
 | Metric | Meaning |
 | --- | --- |
 | `superbank_clickhouse_read_disconnect_pending{operation,target}` | Abandoned HTTP reads retaining admission. |
-| `superbank_clickhouse_read_disconnect_verification_total{operation,target,outcome}` | `confirmed_absent` and `unconfirmed` outcomes; the latter is recorded once per abandoned read. |
+| `superbank_clickhouse_read_disconnect_verification_total{operation,target,outcome}` | `confirmed_absent` and `unconfirmed` outcomes; the latter is recorded once per abandoned read. `released_unverified` counts abandoned local-cache reads that released admission without verification. |
 | `superbank_clickhouse_read_disconnect_probe_seconds{target,outcome}` | Control-probe latency histogram; targets are `cluster` or `local`, outcomes `success` or `error`. |
 
 Pending/verification target classes are `primary`, `cache`, `shard`, and `background`.
@@ -481,10 +486,14 @@ Signature and address reads use an in-process Bloom membership index to exclude 
 partitions before querying ClickHouse. This preserves whole-partition eviction without making
 key lookups search every retained partition. Signature status batches, pagination-bound signature
 lookups, regular/hot address history, and token-owner history use the same routing mechanism.
-Candidate partitions are queried in result order, one at a time, until the answer is complete or
-their deadline expires. `getSignaturesForAddress` and `getTransactionsForAddress` share one
+`getSignaturesForAddress` reads every candidate partition in one local query
+(`intDiv(slot, width) IN (...)`), so a full page and a partial page that falls through to the
+source each cost one admission and one round trip. Other reads query candidate partitions in
+result order, one at a time, until the answer is complete or their deadline expires. `getSignaturesForAddress` and `getTransactionsForAddress` share one
 `DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` deadline (default 100 ms) across cursor/bound resolution,
-address scans, and full transaction hydration, including admission waiting. This is separate from
+address scans, and full transaction hydration, including admission waiting. An address-request
+read waits for local admission at most one tenth of its remaining budget; a saturated cache then
+reports `busy` and the source answers at once instead of after the full deadline. This is separate from
 `DISK_CACHE_QUERY_TIMEOUT_MS` (default 2000 ms), which still governs other reads and index work.
 The 100 ms default leaves room above the observed roughly 3 ms mean cache hit while limiting the
 historical 2-second timeout penalty; it is a latency policy, not a measured tail-latency guarantee.
@@ -572,7 +581,11 @@ errors, invalidation, and slots first covered during the lookup fall back to the
 An index entry whose payload is unavailable also falls back. Cache format and retention
 are unchanged.
 
-The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors, and timeouts.
+The `superbank_disk_cache_reads_total` outcomes distinguish misses, query errors, and timeouts;
+address reads also report `busy` (bounded admission wait expired) and `probe_budget` (a third
+unknown partition was required). `superbank_disk_cache_key_seconds{operation="admission"}`
+records `acquired` and `busy` waits, and `superbank_disk_cache_address_partitions` is the number
+of candidate partitions each address read covered.
 `superbank_disk_cache_key_seconds` records complete attempts, admission waits, and index builds;
 `superbank_disk_cache_key_index_bytes` reports reserved index memory, and
 `superbank_disk_cache_key_index_partitions` / `superbank_disk_cache_key_index_unknown_partitions`
@@ -928,7 +941,7 @@ Route normalization metric:
   - `source`: `clickhouse|head_cache|disk_cache|response_cache|none` (primary source used for the returned response).
   - `head_cache_read`: `true|false` (whether handler read from head cache on that request).
   - `disk_cache_read`: `true|false` (whether the handler read from the local ClickHouse disk cache on that request).
-  - `outcome`: `success|not_found|invalid_params|rpc_error|backend_error|timeout`.
+  - `outcome`: `success|not_found|invalid_params|rpc_error|backend_error|timeout|abandoned`. `abandoned` means the handler future was dropped before returning and before its own request timeout: the client disconnected, or a batch envelope timed out while the item was still running.
   - `x_endpoint`: omitted when capture is disabled; otherwise `missing|<value>` (`<value>` is the raw `X-Endpoint` header value).
   - `x_rpc_node`: omitted when capture is disabled; otherwise `missing|<value>`.
   - `x_subscription_id`: omitted when capture is disabled; otherwise `missing|<value>` (`<value>` is the raw `X-Subscription-ID` header value).
@@ -938,6 +951,8 @@ Request-scoped metric families:
 
 - `rpc_requests`, `rpc_response_time_seconds`, `rpc_inflight_requests`, `rpc_timeouts`, `rpc_response_overhead_seconds`, `rpc_blocks_slots_returned`, `rpc_batch_requests`, `rpc_batch_items`, `rpc_batch_size`, `rpc_batch_rejected_total`, `rpc_backend_errors`, `rpc_clickhouse_duration_seconds`, `rpc_clickhouse_received_bytes`, `rpc_clickhouse_decoded_bytes`, `rpc_clickhouse_timeouts`, `rpc_clickhouse_query_cache_total`, `rpc_clickhouse_query_cache_settings_total` can include `x_endpoint`, `x_rpc_node`, `x_subscription_id`, and `x_account_id` when each capture option is enabled.
 - For those labels, values are `missing|<raw-value>` for enabled capture; disabled capture omits the label.
+- `rpc_requests` and `rpc_response_time_seconds` use `status="abandoned"` for requests dropped before a response existed, so cancelled requests keep their latency.
+- `rpc_clickhouse_timeouts` carries `target`: `primary`, or `cache`/`background` for the local disk cache, which reuses primary operation names.
 
 `getBlock` response-cache metrics:
 

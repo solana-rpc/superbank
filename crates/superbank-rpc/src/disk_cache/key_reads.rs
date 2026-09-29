@@ -8,8 +8,8 @@ use super::{
     lower_bound_reaches_floor, upper_bound_reaches_tip,
 };
 use crate::clickhouse::{
-    ClickHouseClient, NumericFilter, PaginationToken, SignatureRecord, SignatureSlot, SlotBoundary,
-    SortOrder, TokenAccountsFilter, TransactionsForAddressQuery,
+    CacheAdmissionBusy, ClickHouseClient, NumericFilter, PaginationToken, SignatureRecord,
+    SignatureSlot, SlotBoundary, SortOrder, TokenAccountsFilter, TransactionsForAddressQuery,
 };
 use crate::processing::{ProcessingError, ProcessingResult};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -100,6 +100,15 @@ impl AddressRows {
     }
 }
 
+/// Address requests may wait for local admission for at most this fraction of their
+/// remaining budget; past that the cache is busy and the primary answers instead.
+const ADDRESS_ADMISSION_WAIT_DIVISOR: u32 = 10;
+
+/// Source of the error when a read meets more unindexed partitions than it may probe.
+#[derive(Debug, thiserror::Error)]
+#[error("disk cache unknown partition probe budget exhausted")]
+struct ProbeBudgetExhausted;
+
 // Two unknown partitions allow both intentionally unindexed retention edges.
 // A third needs source fallback: skipping it could silently truncate a page.
 struct ProbeBudget(usize);
@@ -108,10 +117,38 @@ impl ProbeBudget {
         if let Some(present) = membership {
             return Ok(present);
         }
-        self.0 = self.0.checked_sub(1).ok_or_else(|| {
-            ProcessingError::timeout_msg("disk cache unknown partition probe budget exhausted")
-        })?;
+        // Still a timeout to callers (fall back to source), but distinguishable in metrics.
+        self.0 = self
+            .0
+            .checked_sub(1)
+            .ok_or_else(|| ProcessingError::Timeout {
+                context: ProbeBudgetExhausted.to_string(),
+                source: Some(Box::new(ProbeBudgetExhausted)),
+            })?;
         Ok(true)
+    }
+}
+
+fn is_probe_budget_exhausted(err: &ProcessingError) -> bool {
+    matches!(err, ProcessingError::Timeout { source: Some(source), .. } if source.is::<ProbeBudgetExhausted>())
+}
+
+/// Metric outcome for a failed cache attempt.
+fn error_outcome(err: &ProcessingError) -> &'static str {
+    match err {
+        ProcessingError::Timeout {
+            source: Some(source),
+            ..
+        } if source.is::<CacheAdmissionBusy>() => "busy",
+        ProcessingError::Timeout {
+            source: Some(source),
+            ..
+        } if source.is::<ProbeBudgetExhausted>() => "probe_budget",
+        ProcessingError::Timeout { .. } => "timeout",
+        ProcessingError::Database { context, .. } if context.contains("TIMEOUT_EXCEEDED") => {
+            "timeout"
+        }
+        _ => "error",
     }
 }
 
@@ -119,6 +156,8 @@ struct Read {
     deadline: Instant,
     epoch: u64,
     unknown_probe_limit: usize,
+    /// Part of an interactive address request: admission waits are bounded.
+    address_request: bool,
 }
 impl Read {
     fn candidate(
@@ -135,6 +174,14 @@ impl Read {
         }
         Ok(())
     }
+}
+/// Scope a local-cache client to what remains of the read's budget.
+fn apply_budget(client: &mut ClickHouseClient, read: &Read) {
+    let remaining = read.deadline.saturating_duration_since(Instant::now());
+    client.query_timeout = remaining;
+    client.cache_admission_wait = read
+        .address_request
+        .then(|| remaining / ADDRESS_ADMISSION_WAIT_DIVISOR);
 }
 fn transaction_outcome(
     result: Result<ProcessingResult<DiskTransactionResult>, tokio::time::error::Elapsed>,
@@ -167,6 +214,7 @@ impl DiskCache {
             deadline: Instant::now() + self.inner.cfg.query_timeout,
             epoch: self.inner.key_index.epoch(),
             unknown_probe_limit: usize::MAX,
+            address_request: false,
         })
     }
     /// One absolute deadline shared by every cache stage of an address request.
@@ -177,6 +225,7 @@ impl DiskCache {
         let mut read = self.read()?;
         read.deadline = read.deadline.min(deadline);
         read.unknown_probe_limit = 2;
+        read.address_request = true;
         read.check().ok()?;
         Some(read)
     }
@@ -191,8 +240,30 @@ impl DiskCache {
     ) -> ClickHouseClient {
         let mut client = base.clone();
         client.cache_partition = Some((self.inner.cfg.partition_slots, partition));
-        client.query_timeout = read.deadline.saturating_duration_since(Instant::now());
+        apply_budget(&mut client, read);
         client
+    }
+    /// Newest-first candidate partitions for an address read. Stops where the former
+    /// per-partition loop would have exhausted its probe budget and returns that error
+    /// beside the prefix: the loop raised it only when the prefix left the page short.
+    fn address_candidates(
+        &self,
+        (floor, tip): (u64, u64),
+        families: &[Family],
+        key: &[u8],
+        read: &Read,
+    ) -> ProcessingResult<(Vec<u64>, Option<ProcessingError>)> {
+        let mut budget = ProbeBudget(read.unknown_probe_limit);
+        let mut partitions = Vec::new();
+        for partition in self.partitions(floor, tip, SortOrder::Desc) {
+            match self.candidate(partition, families, key, &mut budget, read) {
+                Ok(true) => partitions.push(partition),
+                Ok(false) => {}
+                Err(err) if is_probe_budget_exhausted(&err) => return Ok((partitions, Some(err))),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok((partitions, None))
     }
     pub(super) fn key_span(&self) -> Option<(u64, u64)> {
         self.inner
@@ -266,13 +337,7 @@ impl DiskCache {
         let (value, outcome) = match result {
             Ok(Ok(Some(value))) if self.valid_read(read) => (Some(value), "hit"),
             Ok(Ok(_)) => (None, "miss"),
-            Ok(Err(ProcessingError::Timeout { .. })) => (None, "timeout"),
-            Ok(Err(ProcessingError::Database { context, .. }))
-                if context.contains("TIMEOUT_EXCEEDED") =>
-            {
-                (None, "timeout")
-            }
-            Ok(Err(_)) => (None, "error"),
+            Ok(Err(err)) => (None, error_outcome(&err)),
             Err(_) => (None, "timeout"),
         };
         crate::metrics::disk_cache_read(operation, outcome);
@@ -518,26 +583,40 @@ impl DiskCache {
         let base = self.query_client_for_address(&address, TokenAccountsFilter::None)?;
         let families = self.address_families(&address, TokenAccountsFilter::None);
         self.attempt("signatures_for_address", &read, async {
-            let mut records = Vec::new();
-            let mut budget = ProbeBudget(read.unknown_probe_limit);
-            let (scan_floor, scan_tip) = gsfa_window((floor, tip), before, until);
-            for partition in self.partitions(scan_floor, scan_tip, SortOrder::Desc) {
-                if records.len() >= limit {
-                    break;
+            let window = gsfa_window((floor, tip), before, until);
+            let (partitions, exhausted) = if limit == 0 {
+                (Vec::new(), None)
+            } else {
+                self.address_candidates(window, &families, address.as_ref(), &read)?
+            };
+            crate::metrics::disk_cache_address_partitions(
+                "signatures_for_address",
+                partitions.len(),
+            );
+            // One query over every candidate: one admission and one round trip, so a
+            // short (partial) page is denied as quickly as a full page is served.
+            // Partitions are disjoint slot ranges and the query orders by slot, so this
+            // equals the former newest-first loop's concatenated pages.
+            let records = match partitions.first() {
+                None => Vec::new(),
+                Some(&newest) => {
+                    let mut client = self.scoped_client(&base, newest, &read);
+                    client.cache_partition_set = Some(partitions.into());
+                    client
+                        .get_signatures_for_address_with_positions(
+                            &address.to_string(),
+                            limit as u64,
+                            before,
+                            until,
+                        )
+                        .await?
+                        .0
                 }
-                if !self.candidate(partition, &families, address.as_ref(), &mut budget, &read)? {
-                    continue;
-                }
-                let client = self.scoped_client(&base, partition, &read);
-                let (page, _) = client
-                    .get_signatures_for_address_with_positions(
-                        &address.to_string(),
-                        (limit - records.len()) as u64,
-                        before,
-                        until,
-                    )
-                    .await?;
-                records.extend(page);
+            };
+            if records.len() < limit
+                && let Some(err) = exhausted
+            {
+                return Err(err);
             }
             let reached_floor = records.len() < limit && floor_effective;
             Ok(self.address_page(records, floor, tip, reached_floor, false))
@@ -633,7 +712,7 @@ impl DiskCache {
             read.check()?;
             query.limit = (limit - rows.records.len()) as u64;
             let mut client = client.clone();
-            client.query_timeout = read.deadline.saturating_duration_since(Instant::now());
+            apply_budget(&mut client, read);
             let (page, _) = client
                 .get_transactions_for_address_signatures(query)
                 .await?;
@@ -704,11 +783,38 @@ mod window_tests {
             deadline: Instant::now(),
             epoch: 0,
             unknown_probe_limit: 2,
+            address_request: true,
         };
         let mut budget = ProbeBudget(read.unknown_probe_limit);
         assert!(read.candidate(&mut budget, Some(true)).is_err());
         assert!(read.candidate(&mut budget, None).is_err());
         assert_eq!(budget.0, 2);
+    }
+
+    #[test]
+    fn failed_attempt_outcomes_separate_busy_and_probe_budget_from_timeouts() {
+        let exhausted = ProbeBudget(0).candidate(None).unwrap_err();
+        assert!(is_probe_budget_exhausted(&exhausted));
+        assert_eq!(error_outcome(&exhausted), "probe_budget");
+        let busy = ProcessingError::Timeout {
+            context: "busy".into(),
+            source: Some(Box::new(CacheAdmissionBusy)),
+        };
+        assert!(!is_probe_budget_exhausted(&busy));
+        assert_eq!(error_outcome(&busy), "busy");
+        let deadline = ProcessingError::timeout_msg("disk cache deadline exceeded");
+        assert!(!is_probe_budget_exhausted(&deadline));
+        assert_eq!(error_outcome(&deadline), "timeout");
+        assert_eq!(
+            error_outcome(&ProcessingError::database_msg(
+                "Code: 159. TIMEOUT_EXCEEDED"
+            )),
+            "timeout"
+        );
+        assert_eq!(
+            error_outcome(&ProcessingError::database_msg("boom")),
+            "error"
+        );
     }
 
     #[test]

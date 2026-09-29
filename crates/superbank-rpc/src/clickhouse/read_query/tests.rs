@@ -372,3 +372,26 @@ async fn background_capacity_is_independent_and_extended_deadline_is_preserved()
     assert_eq!(background.admission.available_permits(), 1);
     drop(held);
 }
+
+#[cfg(feature = "disk-cache")]
+#[tokio::test]
+async fn releasing_endpoint_frees_capacity_on_abandon_without_verification() {
+    let fixture = Fixture::initialized().await;
+    fixture.state.mode.store(STREAMING, Ordering::SeqCst);
+    let endpoint = fixture.endpoint.releasing_on_abandon();
+    let probes_before = fixture.probe_count();
+    let mut cursor = endpoint
+        .query(&fixture.client, "SELECT 42", "test")
+        .await
+        .unwrap()
+        .fetch::<u64>()
+        .unwrap();
+    assert_eq!(cursor.next().await.unwrap(), Some(42));
+    assert_eq!(endpoint.admission.available_permits(), 0);
+    drop(cursor);
+    // Source work is still active, yet admission returns at once and nothing is probed.
+    assert_eq!(endpoint.admission.available_permits(), 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fixture.probe_count(), probes_before);
+    assert!(endpoint.background(1).retain_until_verified);
+}

@@ -22,6 +22,7 @@ pub(crate) struct ReadEndpoint {
     admission: Arc<Semaphore>,
     timeout: Duration,
     target: &'static str,
+    retain_until_verified: bool,
 }
 
 impl ReadEndpoint {
@@ -34,6 +35,20 @@ impl ReadEndpoint {
     pub(crate) fn with_target(&self, target: &'static str) -> Self {
         Self {
             target,
+            ..self.clone()
+        }
+    }
+
+    /// Abandoned reads release admission once their response is closed, without
+    /// waiting for termination verification. Use only where ClickHouse bounds the
+    /// abandoned query itself: every read carries
+    /// `cancel_http_readonly_queries_on_client_close`, and partition-scoped local-cache
+    /// reads also carry a `max_execution_time` of their remaining budget. The shared primary
+    /// keeps verification so abandoned work cannot exceed its admission limit.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn releasing_on_abandon(&self) -> Self {
+        Self {
+            retain_until_verified: false,
             ..self.clone()
         }
     }
@@ -50,7 +65,13 @@ impl ReadEndpoint {
             admission: Arc::new(Semaphore::new(capacity.max(1))),
             timeout,
             target,
+            retain_until_verified: true,
         }
+    }
+
+    /// Which ClickHouse this endpoint reads: `primary`, `cache` or `background`.
+    pub(crate) fn target(&self) -> &'static str {
+        self.target
     }
 
     pub(crate) fn with_timeout(&self, timeout: Duration) -> Self {
@@ -69,6 +90,8 @@ impl ReadEndpoint {
         Self {
             admission: Arc::new(Semaphore::new(capacity.max(1))),
             target: "background",
+            // Background scans run far past any request budget; keep verifying them.
+            retain_until_verified: true,
             ..self.clone()
         }
     }
@@ -152,6 +175,9 @@ impl ReadEndpoint {
             .verifier
             .arm_ready(id.clone(), permit, operation, self.target)?;
         guard.retain_workflow(admission::current());
+        if !self.retain_until_verified {
+            guard.release_on_abandon();
+        }
         Ok(ReadQuery {
             query: client.query(sql).with_setting("query_id", id),
             guard: Some(guard),

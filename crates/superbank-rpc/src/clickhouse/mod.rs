@@ -20,7 +20,7 @@ mod util;
 pub mod verification;
 
 #[cfg(feature = "disk-cache")]
-pub(crate) use client::ClickHouseTableNames;
+pub(crate) use client::{CacheAdmissionBusy, ClickHouseTableNames};
 pub use client::{ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits};
 #[cfg(feature = "disk-cache")]
 pub(crate) use rows::BlockTimeRangeRow;
