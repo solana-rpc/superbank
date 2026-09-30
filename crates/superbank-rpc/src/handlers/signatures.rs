@@ -738,7 +738,7 @@ async fn inline_cursor_page(
             Option<SignatureSlot>,
         )>,
     >,
-    Response,
+    Box<Response>,
 > {
     if before.1.is_none() && until.1.is_none() {
         return Ok(None);
@@ -774,10 +774,10 @@ async fn inline_cursor_page(
                 GsfaMissingCursor::Until => options.until.as_deref(),
             };
             route.rpc_error();
-            Err(json_rpc_filter_transaction_not_found_response(
+            Err(Box::new(json_rpc_filter_transaction_not_found_response(
                 id.clone(),
                 signature.unwrap_or_default(),
-            ))
+            )))
         }
         Err(err) => Ok(Some(Err(err))),
     }
@@ -1299,7 +1299,7 @@ pub(crate) async fn handle_get_signatures_for_address(
             }
             Ok(Some(Err(err))) => Some(Err(err)),
             Ok(None) => None,
-            Err(response) => return Ok(response),
+            Err(response) => return Ok(*response),
         };
 
         // Empty-address watermarks apply only to a request without any cursor.
@@ -1676,7 +1676,7 @@ pub(crate) async fn handle_get_signatures_for_address(
     .await
     {
         Ok(page) => page.map(|result| result.map(|(records, timings, _, _)| (records, timings))),
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
 
     // A complete local page replaces the primary; see the head-cache path above.
