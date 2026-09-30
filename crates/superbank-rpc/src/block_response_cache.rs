@@ -20,9 +20,18 @@ pub(crate) struct BlockResponseCacheKey {
     pub(crate) max_supported_transaction_version: Option<u8>,
 }
 
+/// Bound on remembered `UnsupportedTransactionVersion` results. Entries hold only
+/// the key and the version byte, so this is a few MiB at most.
+const UNSUPPORTED_VERSION_MAX_ENTRIES: u64 = 65_536;
+
 #[derive(Clone)]
 pub(crate) struct BlockResponseCache {
     inner: Option<Cache<BlockResponseCacheKey, Bytes>>,
+    /// Deterministic `-32015` results for finalized slots, keyed like `inner`.
+    /// Only this error is remembered: it depends solely on the (immutable,
+    /// count-validated) block and the request's shaping options. Misses and
+    /// backend failures are never stored.
+    unsupported_versions: Option<Cache<BlockResponseCacheKey, u8>>,
     max_bytes: u64,
 }
 
@@ -36,9 +45,27 @@ impl BlockResponseCache {
                 })
                 .build()
         });
-        let cache = Self { inner, max_bytes };
+        let unsupported_versions = (max_bytes > 0).then(|| {
+            Cache::builder()
+                .max_capacity(UNSUPPORTED_VERSION_MAX_ENTRIES)
+                .build()
+        });
+        let cache = Self {
+            inner,
+            unsupported_versions,
+            max_bytes,
+        };
         cache.publish_metrics();
         cache
+    }
+
+    /// `GET_BLOCK_RESPONSE_CACHE_UNSUPPORTED_VERSION=false`: never remember `-32015`, so
+    /// every such request fetches and hydrates the block again, as before the error cache.
+    pub(crate) fn with_unsupported_version_cache(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.unsupported_versions = None;
+        }
+        self
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -59,6 +86,33 @@ impl BlockResponseCache {
         });
         self.publish_metrics();
         value
+    }
+
+    pub(crate) async fn get_unsupported_transaction_version(
+        &self,
+        key: &BlockResponseCacheKey,
+    ) -> Option<u8> {
+        let cache = self.unsupported_versions.as_ref()?;
+        let version = cache.get(key).await;
+        if version.is_some() {
+            crate::metrics::get_block_response_cache_access("error_hit");
+        }
+        version
+    }
+
+    pub(crate) async fn insert_unsupported_transaction_version(
+        &self,
+        key: BlockResponseCacheKey,
+        version: u8,
+    ) {
+        let Some(cache) = self.unsupported_versions.as_ref() else {
+            return;
+        };
+        if key.commitment != solana_commitment_config::CommitmentLevel::Finalized {
+            return;
+        }
+        cache.insert(key, version).await;
+        crate::metrics::get_block_response_cache_access("error_insert");
     }
 
     pub(crate) async fn get_or_try_insert_with<F, E>(
@@ -110,7 +164,7 @@ impl BlockResponseCache {
         );
     }
 
-    #[cfg(all(test, feature = "grpc-head-cache"))]
+    #[cfg(test)]
     pub(crate) async fn run_pending_tasks(&self) {
         if let Some(cache) = self.inner.as_ref() {
             cache.run_pending_tasks().await;
@@ -219,6 +273,69 @@ mod tests {
         }
         assert_eq!(evaluations.load(Ordering::Relaxed), 1);
         assert_eq!(evaluated_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_version_is_remembered_only_for_finalized_keys() {
+        let cache = BlockResponseCache::new(1024);
+        assert_eq!(
+            cache.get_unsupported_transaction_version(&key(4)).await,
+            None
+        );
+        cache
+            .insert_unsupported_transaction_version(key(4), 1)
+            .await;
+        assert_eq!(
+            cache.get_unsupported_transaction_version(&key(4)).await,
+            Some(1)
+        );
+        // Shaping options are part of the key: another max version is unaffected.
+        let other_version = BlockResponseCacheKey {
+            max_supported_transaction_version: Some(1),
+            ..key(4)
+        };
+        assert_eq!(
+            cache
+                .get_unsupported_transaction_version(&other_version)
+                .await,
+            None
+        );
+        // The error never masquerades as a cached success.
+        assert!(cache.get(&key(4)).await.is_none());
+
+        let confirmed = BlockResponseCacheKey {
+            commitment: solana_commitment_config::CommitmentLevel::Confirmed,
+            ..key(5)
+        };
+        cache
+            .insert_unsupported_transaction_version(confirmed.clone(), 1)
+            .await;
+        assert_eq!(
+            cache.get_unsupported_transaction_version(&confirmed).await,
+            None
+        );
+
+        let disabled = BlockResponseCache::new(0);
+        disabled
+            .insert_unsupported_transaction_version(key(4), 1)
+            .await;
+        assert_eq!(
+            disabled.get_unsupported_transaction_version(&key(4)).await,
+            None
+        );
+
+        // The kill switch keeps the success cache but never remembers the error.
+        let switched_off = BlockResponseCache::new(1024).with_unsupported_version_cache(false);
+        assert!(switched_off.enabled());
+        switched_off
+            .insert_unsupported_transaction_version(key(4), 1)
+            .await;
+        assert_eq!(
+            switched_off
+                .get_unsupported_transaction_version(&key(4))
+                .await,
+            None
+        );
     }
 
     #[tokio::test]

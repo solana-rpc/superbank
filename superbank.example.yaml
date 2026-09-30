@@ -5,6 +5,10 @@
 # DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS=100 bounds all cache stages of one
 # getSignaturesForAddress/getTransactionsForAddress request; expiry uses primary fallback.
 # It is independent of DISK_CACHE_QUERY_TIMEOUT_MS=2000 for other reads/index work.
+# DISK_CACHE_GET_TX_TIMEOUT_MS=1000 bounds one local getTransaction attempt before
+# primary fallback (capped at DISK_CACHE_QUERY_TIMEOUT_MS).
+# DISK_CACHE_GET_TX_UNKNOWN_TIMEOUT_MS=150 replaces it while the signature index is
+# being rebuilt (more than 4 unknown partitions, e.g. after a restart).
 #
 # Optional superbank-rpc exact request filters. Pass this same file to
 # superbank-rpc with --config / SUPERBANK_CONFIG. Each entry contains the

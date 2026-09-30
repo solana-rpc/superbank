@@ -111,6 +111,15 @@ fn reply_rows(sql: &str, slots: &[u64]) -> Vec<u8> {
 
 #[cfg(feature = "grpc-head-cache")]
 pub(super) fn seed_head(cache: &HeadCache, slots: &[u64], commitment: CommitmentLevel) {
+    seed_head_at(cache, slots, commitment, std::time::Instant::now());
+}
+#[cfg(feature = "grpc-head-cache")]
+fn seed_head_at(
+    cache: &HeadCache,
+    slots: &[u64],
+    commitment: CommitmentLevel,
+    observed: std::time::Instant,
+) {
     use crate::head_cache::coverage::Link;
     let mut proof = cache.coverage.write().unwrap();
     proof.connect();
@@ -122,7 +131,7 @@ pub(super) fn seed_head(cache: &HeadCache, slots: &[u64], commitment: Commitment
             hash: [slot as u8; 32],
             parent_hash: [parent as u8; 32],
         });
-        proof.observe(slot, commitment, std::time::Instant::now());
+        proof.observe(slot, commitment, observed);
         proof.publish(slot, commitment);
         parent = slot;
     }
@@ -133,6 +142,14 @@ fn with_head(backend: &mut Backend, slots: &[u64], commitment: CommitmentLevel) 
     seed_head(&cache, slots, commitment);
     Arc::get_mut(&mut backend.state).unwrap().head_cache = Some(cache.clone());
     cache
+}
+/// A head whose tip is too old to trust: explicit ends keep reading above it.
+#[cfg(feature = "grpc-head-cache")]
+fn with_stale_head(backend: &mut Backend, slots: &[u64]) {
+    let cache = Arc::new(HeadCache::new(32, 1024));
+    let old = std::time::Instant::now() - Duration::from_secs(2);
+    seed_head_at(&cache, slots, CommitmentLevel::Finalized, old);
+    Arc::get_mut(&mut backend.state).unwrap().head_cache = Some(cache);
 }
 #[cfg(feature = "disk-cache")]
 fn with_disk(backend: &mut Backend, index: Option<(u64, u64, &[u64])>, intervals: &[(u64, u64)]) {
@@ -336,7 +353,7 @@ async fn get_blocks_with_limit_preserves_skipped_slot_window() {
 #[tokio::test]
 async fn get_blocks_both_primary_gaps_merge_with_local_slots() {
     let mut backend = Backend::new(vec![1, 5, 15, 20], false).await;
-    with_head(&mut backend, &[10, 12], CommitmentLevel::Finalized);
+    with_stale_head(&mut backend, &[10, 12]);
     assert_eq!(
         backend.request(vec![json!(1), json!(20)]).await.result,
         Some(json!([1, 5, 10, 12, 15, 20]))
@@ -368,7 +385,7 @@ async fn get_blocks_disabled_head_uses_primary_latest_cache() {
 #[tokio::test]
 async fn get_blocks_second_gap_failure_cannot_return_partial_success() {
     let mut backend = Backend::with_options(vec![1, 20], Some(1), Duration::ZERO).await;
-    with_head(&mut backend, &[10, 12], CommitmentLevel::Finalized);
+    with_stale_head(&mut backend, &[10, 12]);
     let response = backend.request(vec![json!(1), json!(20)]).await;
     assert!(response.result.is_none());
     assert_eq!(response.error.unwrap().code, -32603);
@@ -413,4 +430,116 @@ async fn conflicting_index_and_head_invalidate_the_whole_chain() {
     let queries = backend.queries();
     assert_eq!(queries.len(), 1);
     assert!(queries[0].contains("slot BETWEEN 10 AND 12"));
+}
+
+#[cfg(feature = "grpc-head-cache")]
+async fn with_limit(backend: &Backend, params: Vec<Value>) -> super::JsonRpcResponse {
+    let response = handle_get_blocks_with_limit(backend.state.clone(), json!(1), Some(params))
+        .await
+        .unwrap();
+    parse_json_rpc_response(response).await
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn explicit_end_above_trusted_tip_clamps_without_primary() {
+    let mut backend = Backend::new(vec![], true).await;
+    with_head(&mut backend, &[10, 12, 15], CommitmentLevel::Finalized);
+    assert_eq!(
+        backend.request(vec![json!(10), json!(40)]).await.result,
+        Some(json!([10, 12, 15]))
+    );
+    assert_eq!(
+        with_limit(&backend, vec![json!(12), json!(100)])
+            .await
+            .result,
+        Some(json!([12, 15]))
+    );
+    assert!(backend.queries().is_empty());
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn explicit_end_above_stale_tip_still_reads_primary() {
+    let mut backend = Backend::new(vec![13, 20], false).await;
+    with_stale_head(&mut backend, &[10, 12]);
+    assert_eq!(
+        backend.request(vec![json!(10), json!(20)]).await.result,
+        Some(json!([10, 12, 13, 20]))
+    );
+    let queries = backend.queries();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("slot BETWEEN 13 AND 20"));
+}
+
+/// GET_BLOCKS_CLAMP_TO_HEAD_TIP=false: an explicit end above a trusted tip is kept and the
+/// primary is asked for the slots above the tip, as before the clamp.
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn explicit_end_clamp_switch_off_reads_primary_above_trusted_tip() {
+    let mut backend = Backend::new(vec![13, 20], false).await;
+    let cache = Arc::new(HeadCache::new(32, 1024).with_explicit_end_clamp(false));
+    seed_head(&cache, &[10, 12], CommitmentLevel::Finalized);
+    Arc::get_mut(&mut backend.state).unwrap().head_cache = Some(cache);
+    assert_eq!(
+        backend.request(vec![json!(10), json!(20)]).await.result,
+        Some(json!([10, 12, 13, 20]))
+    );
+    let queries = backend.queries();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("slot BETWEEN 13 AND 20"));
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn start_above_trusted_tip_is_empty_not_invalid() {
+    let mut backend = Backend::new(vec![], true).await;
+    with_head(&mut backend, &[10, 12], CommitmentLevel::Finalized);
+    let response = backend.request(vec![json!(15), json!(20)]).await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(response.result, Some(json!([])));
+    // getBlocksWithLimit must not panic or read the primary for a window above the tip.
+    let response = with_limit(&backend, vec![json!(15), json!(5)]).await;
+    assert!(response.error.is_none());
+    assert_eq!(response.result, Some(json!([])));
+    assert!(backend.queries().is_empty());
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn raw_end_checks_precede_the_clamp() {
+    let mut backend = Backend::new(vec![], true).await;
+    with_head(&mut backend, &[10, 12], CommitmentLevel::Finalized);
+    // Raw end below start stays invalid even though the tip could clamp both.
+    let error = backend
+        .request(vec![json!(20), json!(15)])
+        .await
+        .error
+        .unwrap();
+    assert_eq!(error.code, -32602);
+    // The range cap applies to the raw end, not the clamped one.
+    let error = backend
+        .request(vec![
+            json!(10),
+            json!(10 + crate::handlers::types::MAX_GET_BLOCKS_RANGE + 1),
+        ])
+        .await
+        .error
+        .unwrap();
+    assert_eq!(error.code, -32602);
+    assert!(backend.queries().is_empty());
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn hole_below_trusted_tip_is_still_queried() {
+    let mut backend = Backend::new(vec![6, 30], false).await;
+    with_head(&mut backend, &[10, 12], CommitmentLevel::Finalized);
+    assert_eq!(
+        backend.request(vec![json!(5), json!(40)]).await.result,
+        Some(json!([6, 10, 12]))
+    );
+    let queries = backend.queries();
+    assert_eq!(queries.len(), 1);
+    assert!(queries[0].contains("slot BETWEEN 5 AND 9"));
 }

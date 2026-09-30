@@ -120,6 +120,8 @@ impl SlotRange {
 struct ClaimableWindow {
     floor: u64,
     tip: u64,
+    /// Unlagged source tip, the next iteration's latest-slot hint.
+    source_tip: u64,
 }
 
 pub(crate) async fn run(
@@ -146,6 +148,7 @@ pub(crate) async fn run(
         cfg.max_slots_per_sec,
     );
     let mut last_schema_check = Instant::now();
+    let mut last_source_tip = None;
 
     loop {
         if last_schema_check.elapsed() >= cache.inner.cfg.schema_check_interval {
@@ -174,12 +177,13 @@ pub(crate) async fn run(
             continue;
         }
 
-        let Some(window) = claimable_window(&source, &cfg).await else {
+        let Some(window) = claimable_window(&source, &cfg, last_source_tip).await else {
             if wait_or_shutdown(&mut shutdown, cfg.repair_interval).await {
                 break;
             }
             continue;
         };
+        last_source_tip = Some(window.source_tip);
         attempts.retain(|slot, _| *slot >= window.floor);
         given_up.retain(|slot| *slot >= window.floor);
 
@@ -366,15 +370,17 @@ async fn fill_ranges_concurrently(
 async fn claimable_window(
     source: &ClickHouseClient,
     cfg: &FillerConfig,
+    hint: Option<u64>,
 ) -> Option<ClaimableWindow> {
-    let tip = match source.get_latest_finalized_slot().await {
-        Ok(Some(tip)) => tip.saturating_sub(cfg.repair_min_lag_slots),
+    let source_tip = match source.get_latest_finalized_slot_since(hint).await {
+        Ok(Some(tip)) => tip,
         Ok(None) => return None,
         Err(err) => {
             warn!("disk cache: cannot resolve source finalized tip: {err}");
             return None;
         }
     };
+    let tip = source_tip.saturating_sub(cfg.repair_min_lag_slots);
     if tip == 0 {
         return None;
     }
@@ -382,7 +388,11 @@ async fn claimable_window(
     // current cache floor prevents a warm or partially filled cache from ever
     // expanding backward when retention increases.
     let floor = retention_floor(tip, cfg.retain_slots);
-    Some(ClaimableWindow { floor, tip })
+    Some(ClaimableWindow {
+        floor,
+        tip,
+        source_tip,
+    })
 }
 
 fn retention_floor(tip: u64, retain_slots: u64) -> u64 {

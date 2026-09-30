@@ -35,6 +35,18 @@ fn latency_histogram() -> Histogram {
     Histogram::new(LATENCY_BUCKETS)
 }
 
+/// `LATENCY_BUCKETS` plus 0.15, 0.2, 0.3, 0.4 and 0.75 s, for finer p90/p99 resolution. Every
+/// original boundary is kept so existing queries over these histograms keep working.
+const SERVING_LATENCY_BUCKETS: [f64; 18] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5,
+    5.0, 10.0,
+];
+
+/// Request, primary ClickHouse and local-cache key latency, which judge p90/p99.
+fn serving_latency_histogram() -> Histogram {
+    Histogram::new(SERVING_LATENCY_BUCKETS)
+}
+
 const BATCH_SIZE_BUCKETS: [f64; 8] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
 
 fn batch_size_histogram() -> Histogram {
@@ -59,6 +71,18 @@ struct DisconnectOutcomeLabels {
 struct ReadDisconnectLabels {
     operation: &'static str,
     target: &'static str,
+}
+
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DiskCacheBootstrapLabels {
+    outcome: &'static str,
+}
+
+#[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DiskCacheGetTxReasonLabels {
+    reason: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -656,14 +680,21 @@ pub struct Metrics {
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
     rpc_blocks_range_seconds: Family<BlockRangeLabels, Histogram>,
     get_block_response_cache_access: Family<OperationOutcomeLabels, Counter>,
+    transactions_for_address_cursor_cache_access: Family<OperationOutcomeLabels, Counter>,
+    signature_status_history_cache: Family<OperationOutcomeLabels, Counter>,
     get_block_response_cache_entries: Gauge,
     get_block_response_cache_weighted_bytes: Gauge,
     get_block_response_cache_max_bytes: Gauge,
+    get_transaction_primary_cache_access: Family<OperationOutcomeLabels, Counter>,
+    get_transaction_primary_cache_entries: Gauge,
+    get_transaction_primary_cache_weighted_bytes: Gauge,
+    get_transaction_primary_cache_max_bytes: Gauge,
     get_block_phase_seconds: Family<OperationLabels, Histogram>,
 
     backend_errors: Family<OperationLabels, Counter>,
     inflation_reward_rejections: Family<BatchRejectLabels, Counter>,
     inflation_reward_lookups: Family<OperationOutcomeLabels, Counter>,
+    inflation_reward_epoch_cache: Family<OperationOutcomeLabels, Counter>,
     inflation_reward_selected_blocks: Histogram,
 
     route_total: Family<RouteLabels, Counter>,
@@ -730,6 +761,8 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_reads_total: Family<DiskCacheReadLabels, Counter>,
     #[cfg(feature = "disk-cache")]
+    disk_cache_tip_gap_total: Family<DiskCacheReadLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
     disk_cache_covered_min_slot: Gauge,
     #[cfg(feature = "disk-cache")]
     disk_cache_covered_max_slot: Gauge,
@@ -758,6 +791,10 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_wipes_total: Counter,
     #[cfg(feature = "disk-cache")]
+    disk_cache_bootstraps_total: Family<DiskCacheBootstrapLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    disk_cache_get_tx_reason_total: Family<DiskCacheGetTxReasonLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
     block_index_active: Gauge,
     #[cfg(feature = "disk-cache")]
     block_index_floor_slot: Gauge,
@@ -769,13 +806,15 @@ pub struct Metrics {
     block_index_errors_total: Family<OperationLabels, Counter>,
     #[cfg(feature = "disk-cache")]
     block_index_lookup_seconds: Family<BlockIndexLookupLabels, Histogram>,
+    get_transaction_primary_slot_age: Histogram,
+    get_transaction_primary_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
 }
 
 impl Metrics {
     fn new() -> Self {
         let rpc_requests = Family::default();
         let rpc_latency_seconds =
-            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
 
         let rpc_inflight = Family::default();
         let rpc_timeouts = Family::default();
@@ -800,22 +839,29 @@ impl Metrics {
         let rpc_blocks_range_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let get_block_response_cache_access = Family::default();
+        let transactions_for_address_cursor_cache_access = Family::default();
+        let signature_status_history_cache = Family::default();
         let get_block_response_cache_entries = Gauge::default();
         let get_block_response_cache_weighted_bytes = Gauge::default();
         let get_block_response_cache_max_bytes = Gauge::default();
+        let get_transaction_primary_cache_access = Family::default();
+        let get_transaction_primary_cache_entries = Gauge::default();
+        let get_transaction_primary_cache_weighted_bytes = Gauge::default();
+        let get_transaction_primary_cache_max_bytes = Gauge::default();
         let get_block_phase_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
 
         let backend_errors = Family::default();
         let inflation_reward_rejections = Family::default();
         let inflation_reward_lookups = Family::default();
+        let inflation_reward_epoch_cache = Family::default();
         let inflation_reward_selected_blocks = block_slot_count_histogram();
 
         let route_total = Family::default();
         let slot_source = Family::default();
 
         let clickhouse_latency_seconds =
-            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
         let clickhouse_received_bytes = Family::default();
         let clickhouse_decoded_bytes = Family::default();
         let clickhouse_timeouts = Family::default();
@@ -857,7 +903,7 @@ impl Metrics {
 
         #[cfg(feature = "disk-cache")]
         let disk_cache_key_seconds =
-            Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
         #[cfg(feature = "disk-cache")]
         let disk_cache_signature_membership_seconds =
             Family::new_with_constructor(signature_membership_histogram as fn() -> Histogram);
@@ -878,6 +924,8 @@ impl Metrics {
         let disk_cache_active = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_reads_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_tip_gap_total = Family::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_covered_min_slot = Gauge::default();
         #[cfg(feature = "disk-cache")]
@@ -906,6 +954,11 @@ impl Metrics {
         let disk_cache_poisoned_slots_total = Counter::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_wipes_total = Counter::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_bootstraps_total = Family::<DiskCacheBootstrapLabels, Counter>::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_get_tx_reason_total =
+            Family::<DiskCacheGetTxReasonLabels, Counter>::default();
         #[cfg(feature = "disk-cache")]
         let block_index_active = Gauge::default();
         #[cfg(feature = "disk-cache")]
@@ -1013,9 +1066,19 @@ impl Metrics {
             rpc_blocks_slots_returned.clone(),
         );
         registry.register(
+            "rpc_signature_status_history_cache",
+            "getSignatureStatuses history-search absence cache outcomes (per signature)",
+            signature_status_history_cache.clone(),
+        );
+        registry.register(
             "get_block_response_cache_access",
             "getBlock serialized-response cache access outcomes",
             get_block_response_cache_access.clone(),
+        );
+        registry.register(
+            "transactions_for_address_cursor_cache_access",
+            "getTransactionsForAddress cursor cache outcomes (hit, miss, insert)",
+            transactions_for_address_cursor_cache_access.clone(),
         );
         registry.register(
             "get_block_response_cache_entries",
@@ -1031,6 +1094,26 @@ impl Metrics {
             "get_block_response_cache_max_bytes",
             "Configured serialized getBlock response cache byte budget",
             get_block_response_cache_max_bytes.clone(),
+        );
+        registry.register(
+            "get_transaction_primary_cache_access",
+            "Primary-served getTransaction record cache access outcomes",
+            get_transaction_primary_cache_access.clone(),
+        );
+        registry.register(
+            "get_transaction_primary_cache_entries",
+            "Approximate number of primary-served getTransaction records cached",
+            get_transaction_primary_cache_entries.clone(),
+        );
+        registry.register(
+            "get_transaction_primary_cache_weighted_bytes",
+            "Approximate bytes of primary-served getTransaction records cached",
+            get_transaction_primary_cache_weighted_bytes.clone(),
+        );
+        registry.register(
+            "get_transaction_primary_cache_max_bytes",
+            "Configured primary-served getTransaction record cache byte budget",
+            get_transaction_primary_cache_max_bytes.clone(),
         );
         registry.register(
             "get_block_phase_seconds",
@@ -1051,6 +1134,11 @@ impl Metrics {
             "rpc_inflation_reward_lookups_total",
             "getInflationReward lookup outcomes by lookup path",
             inflation_reward_lookups.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_epoch_cache_total",
+            "getInflationReward epoch metadata cache outcomes by cached item",
+            inflation_reward_epoch_cache.clone(),
         );
         registry.register(
             "rpc_inflation_reward_selected_blocks",
@@ -1273,6 +1361,11 @@ impl Metrics {
                 disk_cache_reads_total.clone(),
             );
             registry.register(
+                "disk_cache_tip_gap",
+                "Local newest-first address pages owing rows above the disk-cache tip, by whether a merged head cache covers them",
+                disk_cache_tip_gap_total.clone(),
+            );
+            registry.register(
                 "disk_cache_covered_min_slot",
                 "Oldest slot covered by the disk cache",
                 disk_cache_covered_min_slot.clone(),
@@ -1342,7 +1435,31 @@ impl Metrics {
                 "Times the disk cache database was destroyed and rebuilt",
                 disk_cache_wipes_total.clone(),
             );
+            registry.register(
+                "disk_cache_bootstraps",
+                "Disk cache startups by schema outcome (reused, created, rebuilt, coverage_reset)",
+                disk_cache_bootstraps_total.clone(),
+            );
+            registry.register(
+                "disk_cache_get_tx_reason",
+                "Local getTransaction attempts by bounded reason; one per get_tx read",
+                disk_cache_get_tx_reason_total.clone(),
+            );
         }
+
+        let get_transaction_primary_slot_age = Histogram::new(PRIMARY_SLOT_AGE_BUCKETS);
+        registry.register(
+            "rpc_get_transaction_primary_slot_age_slots",
+            "Finalized tip minus slot of getTransaction results served by primary ClickHouse",
+            get_transaction_primary_slot_age.clone(),
+        );
+        let get_transaction_primary_slot_age_skipped_total =
+            Family::<SlotAgeSkipLabels, Counter>::default();
+        registry.register(
+            "rpc_get_transaction_primary_slot_age_skipped",
+            "Primary getTransaction results not recorded in the slot-age histogram, by reason",
+            get_transaction_primary_slot_age_skipped_total.clone(),
+        );
 
         // Register process metrics to expose basic runtime health info (CPU, memory).
         if let Err(err) =
@@ -1372,13 +1489,20 @@ impl Metrics {
             rpc_blocks_slots_returned,
             rpc_blocks_range_seconds,
             get_block_response_cache_access,
+            transactions_for_address_cursor_cache_access,
+            signature_status_history_cache,
             get_block_response_cache_entries,
             get_block_response_cache_weighted_bytes,
             get_block_response_cache_max_bytes,
+            get_transaction_primary_cache_access,
+            get_transaction_primary_cache_entries,
+            get_transaction_primary_cache_weighted_bytes,
+            get_transaction_primary_cache_max_bytes,
             get_block_phase_seconds,
             backend_errors,
             inflation_reward_rejections,
             inflation_reward_lookups,
+            inflation_reward_epoch_cache,
             inflation_reward_selected_blocks,
             route_total,
             slot_source,
@@ -1440,6 +1564,8 @@ impl Metrics {
             #[cfg(feature = "disk-cache")]
             disk_cache_reads_total,
             #[cfg(feature = "disk-cache")]
+            disk_cache_tip_gap_total,
+            #[cfg(feature = "disk-cache")]
             disk_cache_covered_min_slot,
             #[cfg(feature = "disk-cache")]
             disk_cache_covered_max_slot,
@@ -1468,6 +1594,10 @@ impl Metrics {
             #[cfg(feature = "disk-cache")]
             disk_cache_wipes_total,
             #[cfg(feature = "disk-cache")]
+            disk_cache_bootstraps_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_get_tx_reason_total,
+            #[cfg(feature = "disk-cache")]
             block_index_active,
             #[cfg(feature = "disk-cache")]
             block_index_floor_slot,
@@ -1479,6 +1609,8 @@ impl Metrics {
             block_index_errors_total,
             #[cfg(feature = "disk-cache")]
             block_index_lookup_seconds,
+            get_transaction_primary_slot_age,
+            get_transaction_primary_slot_age_skipped_total,
         }
     }
 
@@ -1716,9 +1848,28 @@ impl Metrics {
             .observe(slots as f64);
     }
 
+    #[cfg_attr(
+        not(all(feature = "disk-cache", feature = "grpc-head-cache")),
+        allow(dead_code)
+    )]
+    pub fn signature_status_history_cache(&self, outcome: &'static str, count: u64) {
+        let labels = Self::current_operation_outcome_labels("get_signature_statuses", outcome);
+        self.signature_status_history_cache
+            .get_or_create(&labels)
+            .inc_by(count);
+    }
+
     pub fn get_block_response_cache_access(&self, outcome: &'static str) {
         let labels = Self::current_operation_outcome_labels("get_block", outcome);
         self.get_block_response_cache_access
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    pub fn transactions_for_address_cursor_cache_access(&self, outcome: &'static str) {
+        let labels =
+            Self::current_operation_outcome_labels("get_transactions_for_address", outcome);
+        self.transactions_for_address_cursor_cache_access
             .get_or_create(&labels)
             .inc();
     }
@@ -1729,6 +1880,22 @@ impl Metrics {
         self.get_block_response_cache_weighted_bytes
             .set(clamp_i64(bytes));
         self.get_block_response_cache_max_bytes
+            .set(clamp_i64(max_bytes));
+    }
+
+    pub fn get_transaction_primary_cache_access(&self, outcome: &'static str) {
+        let labels = Self::current_operation_outcome_labels("get_transaction", outcome);
+        self.get_transaction_primary_cache_access
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    pub fn get_transaction_primary_cache_state(&self, entries: u64, bytes: u64, max_bytes: u64) {
+        self.get_transaction_primary_cache_entries
+            .set(clamp_i64(entries));
+        self.get_transaction_primary_cache_weighted_bytes
+            .set(clamp_i64(bytes));
+        self.get_transaction_primary_cache_max_bytes
             .set(clamp_i64(max_bytes));
     }
 
@@ -1754,6 +1921,13 @@ impl Metrics {
     pub fn inflation_reward_lookup(&self, path: &'static str, outcome: &'static str) {
         let labels = Self::current_operation_outcome_labels(path, outcome);
         self.inflation_reward_lookups.get_or_create(&labels).inc();
+    }
+
+    pub fn inflation_reward_epoch_cache(&self, item: &'static str, outcome: &'static str) {
+        let labels = Self::current_operation_outcome_labels(item, outcome);
+        self.inflation_reward_epoch_cache
+            .get_or_create(&labels)
+            .inc();
     }
 
     pub fn inflation_reward_selected_blocks(&self, blocks: usize) {
@@ -2001,6 +2175,11 @@ pub(crate) fn inflation_reward_lookup(path: &'static str, outcome: &'static str)
     metrics.inflation_reward_lookup(path, outcome);
 }
 
+pub(crate) fn inflation_reward_epoch_cache(item: &'static str, outcome: &'static str) {
+    let metrics = metrics();
+    metrics.inflation_reward_epoch_cache(item, outcome);
+}
+
 pub(crate) fn inflation_reward_selected_blocks(blocks: usize) {
     let metrics = metrics();
     metrics.inflation_reward_selected_blocks(blocks);
@@ -2100,14 +2279,48 @@ pub(crate) fn blocks_slots_returned(method: &str, slots: usize) {
     metrics.blocks_slots_returned(method, slots);
 }
 
+#[cfg_attr(
+    not(all(feature = "disk-cache", feature = "grpc-head-cache")),
+    allow(dead_code)
+)]
+pub(crate) fn signature_status_history_cache(outcome: &'static str, count: u64) {
+    if count > 0 {
+        metrics().signature_status_history_cache(outcome, count);
+    }
+}
+
 pub(crate) fn get_block_response_cache_access(outcome: &'static str) {
     let metrics = metrics();
     metrics.get_block_response_cache_access(outcome);
 }
 
+pub(crate) fn transactions_for_address_cursor_cache_access(outcome: &'static str) {
+    let metrics = metrics();
+    metrics.transactions_for_address_cursor_cache_access(outcome);
+}
+
 pub(crate) fn get_block_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
     let metrics = metrics();
     metrics.get_block_response_cache_state(entries, bytes, max_bytes);
+}
+
+pub(crate) fn get_transaction_primary_cache_access(outcome: &'static str) {
+    let metrics = metrics();
+    metrics.get_transaction_primary_cache_access(outcome);
+}
+
+#[cfg(test)]
+pub(crate) fn get_transaction_primary_cache_access_count_for_tests(outcome: &'static str) -> u64 {
+    let labels = Metrics::current_operation_outcome_labels("get_transaction", outcome);
+    metrics()
+        .get_transaction_primary_cache_access
+        .get_or_create(&labels)
+        .get()
+}
+
+pub(crate) fn get_transaction_primary_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
+    let metrics = metrics();
+    metrics.get_transaction_primary_cache_state(entries, bytes, max_bytes);
 }
 
 pub(crate) fn get_block_phase(phase: &str, elapsed_seconds: f64) {
@@ -2259,6 +2472,19 @@ pub(crate) fn disk_cache_read_count(operation: &'static str, outcome: &'static s
         .inc_by(count);
 }
 
+/// A local newest-first address page owed rows above the disk-cache tip; `outcome` is
+/// `head` when a merged head cache covers them, else `primary`. Not a read outcome.
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_tip_gap(operation: &'static str, outcome: &'static str) {
+    metrics()
+        .disk_cache_tip_gap_total
+        .get_or_create(&DiskCacheReadLabels {
+            operation: operation.to_string(),
+            outcome: outcome.to_string(),
+        })
+        .inc();
+}
+
 #[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_coverage(min_covered: u64, max_covered: u64, contiguous_floor: u64) {
     let metrics = metrics();
@@ -2345,6 +2571,24 @@ pub(crate) fn disk_cache_poisoned_slot() {
 pub(crate) fn disk_cache_wipe() {
     let metrics = metrics();
     metrics.disk_cache_wipes_total.inc();
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_bootstrap(outcome: &'static str) {
+    metrics()
+        .disk_cache_bootstraps_total
+        .get_or_create(&DiskCacheBootstrapLabels { outcome })
+        .inc();
+}
+
+/// One per local getTransaction attempt, in its own family so sums over
+/// `disk_cache_reads_total` count each attempt once (as `operation="get_tx"`).
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_get_tx_reason(reason: &'static str) {
+    metrics()
+        .disk_cache_get_tx_reason_total
+        .get_or_create(&DiskCacheGetTxReasonLabels { reason })
+        .inc();
 }
 
 #[cfg(feature = "disk-cache")]
@@ -2537,9 +2781,116 @@ pub(crate) fn blocks_range_observation(
         .observe(seconds);
 }
 
+/// Slot-age buckets in epochs (432,000 slots): 0.5, 1, 2, 3, 4, 5, 10 and 50 epochs. They
+/// bracket disk-cache retention windows of a few epochs.
+const PRIMARY_SLOT_AGE_BUCKETS: [f64; 8] = [
+    216_000.0,
+    432_000.0,
+    864_000.0,
+    1_296_000.0,
+    1_728_000.0,
+    2_160_000.0,
+    4_320_000.0,
+    21_600_000.0,
+];
+
+/// Records how far behind the finalized tip a getTransaction result served by primary
+/// ClickHouse is, in slots.
+pub(crate) fn get_transaction_primary_slot_age(slots: u64) {
+    metrics()
+        .get_transaction_primary_slot_age
+        .observe(slots as f64);
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SlotAgeSkipLabels {
+    reason: &'static str,
+}
+
+/// Counts a primary getTransaction result left out of the slot-age histogram because no usable
+/// finalized tip was cached (`no_tip`, `stale_tip`).
+pub(crate) fn get_transaction_primary_slot_age_skipped(reason: &'static str) {
+    metrics()
+        .get_transaction_primary_slot_age_skipped_total
+        .get_or_create(&SlotAgeSkipLabels { reason })
+        .inc();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finite `le` bounds exported for `name`, which must have exactly one label set.
+    fn exported_buckets(exported: &str, name: &str) -> Vec<f64> {
+        let prefix = format!("{name}_bucket{{");
+        let bounds: Vec<f64> = exported
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .filter_map(|line| {
+                let le = line.split("le=\"").nth(1)?.split('"').next()?;
+                (le != "+Inf").then(|| le.parse::<f64>().expect("numeric le"))
+            })
+            .collect();
+        assert!(!bounds.is_empty(), "{name} has no exported buckets");
+        bounds
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn get_tx_reasons_have_their_own_counter_family() {
+        disk_cache_get_tx_reason("found_revalidated");
+        let exported = String::from_utf8(metrics().export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        assert!(
+            exported.lines().any(|line| line.starts_with(
+                "superbank_disk_cache_get_tx_reason_total{reason=\"found_revalidated\"}"
+            )),
+            "{exported}"
+        );
+        // Not an operation of disk_cache_reads_total or disk_cache_key_seconds.
+        assert!(!exported.contains("\"get_tx_reason\""), "{exported}");
+    }
+
+    #[test]
+    fn serving_histograms_add_tail_buckets_and_keep_existing_bounds() {
+        let metrics = Metrics::new();
+        metrics.track_request("getSlot").observe(StatusCode::OK);
+        metrics.observe_clickhouse("getSlot", 5, 0, 0);
+        metrics.get_block_phase("fetch", 0.01);
+        #[cfg(feature = "disk-cache")]
+        metrics
+            .disk_cache_key_seconds
+            .get_or_create(&DiskCacheReadLabels {
+                operation: "get_tx".into(),
+                outcome: "hit".into(),
+            })
+            .observe(0.01);
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+
+        let mut serving = vec![
+            "superbank_rpc_response_time_seconds",
+            "superbank_rpc_clickhouse_duration_seconds",
+        ];
+        if cfg!(feature = "disk-cache") {
+            serving.push("superbank_disk_cache_key_seconds");
+        }
+        for name in serving {
+            let bounds = exported_buckets(&exported, name);
+            assert_eq!(bounds, SERVING_LATENCY_BUCKETS, "{name}");
+            for old in LATENCY_BUCKETS {
+                assert!(bounds.contains(&old), "{name} lost bound {old}");
+            }
+            for added in [0.15, 0.2, 0.3, 0.4, 0.75] {
+                assert!(bounds.contains(&added), "{name} lacks bound {added}");
+            }
+        }
+        // Other latency histograms keep the original, coarser buckets.
+        assert_eq!(
+            exported_buckets(&exported, "superbank_get_block_phase_seconds"),
+            LATENCY_BUCKETS
+        );
+    }
 
     #[test]
     fn request_tracker_records_completion_and_releases_inflight_on_drop() {
@@ -2582,5 +2933,27 @@ mod tests {
         assert!(exported.contains(
             "superbank_rpc_response_time_seconds_count{method=\"getSlot\",status=\"abandoned\"} 1"
         ));
+    }
+
+    #[test]
+    fn get_transaction_primary_slot_age_uses_epoch_buckets() {
+        let metrics = Metrics::new();
+        metrics.get_transaction_primary_slot_age.observe(500_000.0);
+        metrics
+            .get_transaction_primary_slot_age
+            .observe(3_000_000.0);
+
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        let bucket = |le: &str, count: u64| {
+            format!(
+                "superbank_rpc_get_transaction_primary_slot_age_slots_bucket{{le=\"{le}\"}} {count}"
+            )
+        };
+        assert!(exported.contains(&bucket("432000.0", 0)), "{exported}");
+        assert!(exported.contains(&bucket("864000.0", 1)), "{exported}");
+        assert!(exported.contains(&bucket("2160000.0", 1)), "{exported}");
+        assert!(exported.contains(&bucket("4320000.0", 2)), "{exported}");
+        assert!(exported.contains("superbank_rpc_get_transaction_primary_slot_age_slots_count 2"));
     }
 }

@@ -14,9 +14,15 @@ use crate::processing::{ProcessingError, ProcessingResult};
 
 use super::QueryFreshnessClass;
 use super::cache::{CacheStart, SignatureBytes};
-use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
+use super::client::{ClickHouseClient, execute_shard_tcp_query_block, split_table_reference};
+use super::owner_shard::{
+    LayoutVerdict, OwnerShardSource, check_owner_shard_layout, owner_shard_status_filter,
+    same_cluster_layout, signature_literal, signatures_storage, with_owner_shard_settings,
+};
 use super::read_query::admission;
-use super::sharding::ShardTopology;
+use super::sharding::{
+    ClusterRow, ShardTopology, derive_local_table_name, escape_clickhouse_string,
+};
 use super::types::{QueryTimings, SignatureSlot, SignatureStatusRecord};
 use super::util::{
     append_max_execution_time_setting, build_select_settings_clause, parse_err_json,
@@ -98,6 +104,210 @@ fn primary_signature_status_settings(
 }
 
 impl ClickHouseClient {
+    /// Enables owner-shard routing for primary signature lookups
+    /// (`CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING`). `local_table_override` is
+    /// `CLICKHOUSE_SIGNATURES_LOCAL_TABLE`; without it the local table is
+    /// `CLICKHOUSE_SIGNATURE_STATUSES_TABLE` + `_local`. `create_tables` verifies the source.
+    pub(crate) fn set_signatures_owner_shard_routing(
+        &mut self,
+        enabled: bool,
+        cluster: &str,
+        local_table_override: Option<&str>,
+    ) -> ProcessingResult<()> {
+        if !enabled {
+            self.signatures_owner_shard_source = None;
+            return Ok(());
+        }
+        let local_table = derive_local_table_name(
+            &self.signature_statuses_table,
+            local_table_override.map(str::to_string),
+        )
+        .ok_or_else(|| {
+            ProcessingError::database_msg(
+                "CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING requires a signatures local table",
+            )
+        })?;
+        self.signatures_owner_shard_source = Some(OwnerShardSource::new(cluster, &local_table)?);
+        Ok(())
+    }
+
+    /// The table (or table function) primary signature lookups read.
+    pub(crate) fn signature_lookup_source(&self) -> &str {
+        match &self.signatures_owner_shard_source {
+            Some(routing) if self.signatures_owner_shard_routed() => &routing.source,
+            _ => &self.signature_statuses_table,
+        }
+    }
+
+    /// Owner-shard routing needs query SETTINGS to request pruning, and never applies to
+    /// local-cache clients.
+    pub(crate) fn signatures_owner_shard_routed(&self) -> bool {
+        self.cache_partition.is_none()
+            && self.allow_query_settings
+            && self.signatures_owner_shard_source.is_some()
+    }
+
+    /// Startup check for owner-shard routing. Without query SETTINGS the reads could not ask
+    /// for shard pruning, so routing is turned off with a warning. Otherwise, on the host that
+    /// answers:
+    /// 1. the layout check ([`Self::verify_signatures_owner_shard_layout`]) proves the routed
+    ///    source reads the view's local table, sharding key and cluster layout;
+    /// 2. one lookup of an all-zero signature (same literal shape as real lookups) runs with
+    ///    `force_optimize_skip_unused_shards=1`: it fails unless the cluster name, grants
+    ///    (`REMOTE`), local table and shard pruning all work.
+    ///
+    /// Neither proves that every stored row sits on its owner shard (see the README).
+    pub(crate) async fn verify_signatures_owner_shard_routing(&mut self) -> ProcessingResult<()> {
+        let Some(routing) = self.signatures_owner_shard_source.clone() else {
+            return Ok(());
+        };
+        if self.cache_partition.is_some() {
+            return Ok(());
+        }
+        if !self.allow_query_settings {
+            tracing::warn!(
+                "CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING disabled: query SETTINGS are unavailable, so shard pruning cannot be requested; signature lookups read {}",
+                self.signature_statuses_table
+            );
+            self.signatures_owner_shard_source = None;
+            return Ok(());
+        }
+        self.with_http_query_timeout(
+            "startup_signatures_owner_shard_layout",
+            self.verify_signatures_owner_shard_layout(&routing),
+        )
+        .await
+        .map_err(|e| {
+            ProcessingError::database_msg(format!(
+                "CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING layout check failed for {}: {e}; routed lookups could miss rows, unset the flag to read {}",
+                routing.source, self.signature_statuses_table
+            ))
+        })?;
+        let source = routing.source;
+        let zero = [0u8; 64];
+        let sig_bucket = cityhash64(&zero) % self.signatures_bucket_modulus();
+        let query = format!(
+            "SELECT count() FROM {source} PREWHERE sig_bucket = {sig_bucket} AND signature = {} SETTINGS optimize_skip_unused_shards=1, force_optimize_skip_unused_shards=1",
+            signature_literal(&zero)
+        );
+        self.with_http_query_timeout("startup_signatures_owner_shard", async {
+            self.read_one::<u64>(&query, "create_tables")
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    ProcessingError::database(
+                        format!(
+                            "CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING startup check failed for {source}: the cluster name, REMOTE grant, local table or shard pruning is unavailable; unset the flag to read {}",
+                            self.signature_statuses_table
+                        ),
+                        e,
+                    )
+                })
+        })
+        .await?;
+        tracing::info!("Primary signature lookups use owner-shard routing via {source}");
+        Ok(())
+    }
+
+    /// Proves, on the answering host, that `cluster('<CLICKHOUSE_CLUSTER>', <local table>,
+    /// cityHash64(signature))` is the same `Distributed` read as the view's storage: same local
+    /// table, same sharding key, and the same cluster, or a differently named cluster whose
+    /// `system.clusters` rows (shard order, weights, replicas, hosts, ports) are identical. A
+    /// cluster with the same hosts in another order would otherwise pass the probe and silently
+    /// miss rows.
+    async fn verify_signatures_owner_shard_layout(
+        &self,
+        routing: &OwnerShardSource,
+    ) -> ProcessingResult<()> {
+        #[derive(Deserialize, clickhouse::Row)]
+        struct StorageRow {
+            engine: String,
+            create_table_query: String,
+            engine_full: String,
+        }
+        #[derive(Deserialize, clickhouse::Row)]
+        struct MacroRow {
+            #[serde(rename = "macro")]
+            name: String,
+            substitution: String,
+        }
+        let err = |message: String| ProcessingError::database_msg(message);
+        let query_err = |e: clickhouse::error::Error| {
+            ProcessingError::database(format!("layout query failed: {e}"), e)
+        };
+        let (view_database, view_table) =
+            split_table_reference(&self.database, &self.signature_statuses_table);
+        let rows = self
+            .read_all::<StorageRow>(
+                &format!(
+                    "SELECT engine, create_table_query, engine_full FROM system.tables WHERE database = '{}' AND name = '{}' LIMIT 1",
+                    escape_clickhouse_string(view_database),
+                    escape_clickhouse_string(view_table)
+                ),
+                "create_tables",
+            )
+            .await
+            .map_err(query_err)?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            err(format!(
+                "{} is not in system.tables",
+                self.signature_statuses_table
+            ))
+        })?;
+        let storage = signatures_storage(&row.engine, &row.create_table_query, &row.engine_full)
+            .map_err(|e| err(format!("{}: {e}", self.signature_statuses_table)))?;
+        let macros = self
+            .read_all::<MacroRow>(
+                "SELECT macro, substitution FROM system.macros",
+                "create_tables",
+            )
+            .await
+            .map_err(query_err)?
+            .into_iter()
+            .map(|row| (row.name, row.substitution))
+            .collect::<Vec<_>>();
+        let (local_database, local_table) =
+            split_table_reference(&self.database, &routing.local_table);
+        let verdict = check_owner_shard_layout(
+            &storage,
+            &routing.cluster,
+            local_database,
+            local_table,
+            &macros,
+        )
+        .map_err(err)?;
+        let LayoutVerdict::CompareClusters {
+            configured,
+            storage: storage_cluster,
+        } = verdict
+        else {
+            return Ok(());
+        };
+        let cluster_rows = |cluster: String| async move {
+            self.read_all::<ClusterRow>(
+                &format!(
+                    "SELECT shard_num, shard_weight, replica_num, host_name, host_address, port, is_local FROM system.clusters WHERE cluster = '{}' ORDER BY shard_num, replica_num",
+                    escape_clickhouse_string(&cluster)
+                ),
+                "create_tables",
+            )
+            .await
+            .map_err(query_err)
+        };
+        let configured_rows = cluster_rows(configured.clone()).await?;
+        let storage_rows = cluster_rows(storage_cluster.clone()).await?;
+        if !same_cluster_layout(&configured_rows, &storage_rows) {
+            return Err(err(format!(
+                "CLICKHOUSE_CLUSTER {:?} expands to cluster {configured:?} ({} rows in system.clusters), but the view's Distributed storage uses cluster {:?} = {storage_cluster:?} ({} rows) with a different shard layout",
+                routing.cluster,
+                configured_rows.len(),
+                storage.cluster,
+                storage_rows.len()
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn get_signature_slot(
         &self,
         signature: &str,
@@ -127,8 +337,7 @@ impl ClickHouseClient {
     ) -> ProcessingResult<(Option<SignatureSlot>, QueryTimings)> {
         let signature_hash = cityhash64(signature_bytes.as_ref());
         let sig_bucket = signature_hash % self.signatures_bucket_modulus();
-        let signature_hex = hex::encode(signature_bytes.as_ref()).to_uppercase();
-        let signature_literal = format!("toFixedString(unhex('{signature_hex}'), 64)");
+        let signature_literal = signature_literal(signature_bytes.as_ref());
 
         if self.cache_partition.is_some() {
             return self
@@ -258,9 +467,12 @@ impl ClickHouseClient {
                 }
             }
 
-            let signature_statuses_table = &self.signature_statuses_table;
-            let settings_clause =
+            let signature_statuses_table = self.signature_lookup_source();
+            let mut settings_clause =
                 self.select_settings_clause("get_signature_slot", QueryFreshnessClass::Historical);
+            if self.signatures_owner_shard_routed() {
+                settings_clause = with_owner_shard_settings(&settings_clause);
+            }
             let query = format!(
                 "SELECT
                     slot,
@@ -359,7 +571,7 @@ impl ClickHouseClient {
             }
 
             let signature_filter = self.signature_status_filter(signatures)?;
-            let signature_statuses_table = &self.signature_statuses_table;
+            let signature_statuses_table = self.signature_lookup_source();
             let query = format!(
                 "SELECT
                     signature,
@@ -484,16 +696,26 @@ impl ClickHouseClient {
                 )));
             }
             let bucket = cityhash64(&signature_bytes) % self.signatures_bucket_modulus();
-            let signature_hex = hex::encode(signature_bytes).to_uppercase();
             bucketed_signatures
                 .entry(bucket)
                 .or_default()
-                .push(format!("toFixedString(unhex('{signature_hex}'), 64)"));
+                .push(signature_literal(&signature_bytes));
         }
         if self.cache_partition.is_some() {
             Ok(build_signature_filter(
                 bucketed_signatures,
                 self.in_clause_chunk,
+            ))
+        } else if self.signatures_owner_shard_routed() {
+            let literals = bucketed_signatures
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>();
+            let literals = literals.iter().map(String::as_str).collect::<Vec<_>>();
+            Ok(owner_shard_status_filter(
+                &build_primary_signature_filter(bucketed_signatures.clone()),
+                &literals,
             ))
         } else {
             Ok(build_primary_signature_filter(bucketed_signatures))
@@ -523,7 +745,13 @@ impl ClickHouseClient {
             false,
             "get_signature_statuses",
         );
-        primary_signature_status_settings(&base, self.signature_status_max_threads, remaining)
+        let settings =
+            primary_signature_status_settings(&base, self.signature_status_max_threads, remaining)?;
+        Ok(if self.signatures_owner_shard_routed() {
+            with_owner_shard_settings(&settings)
+        } else {
+            settings
+        })
     }
 
     async fn try_signature_slot_by_signature_tcp(

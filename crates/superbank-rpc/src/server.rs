@@ -31,12 +31,14 @@ use crate::clickhouse::{
 };
 use crate::config::{ClickHouseScope, ClickHouseTransport, RpcConfig};
 use crate::genesis;
+use crate::get_transaction_primary_cache::PrimaryTransactionCache;
 use crate::handlers::handle_json_rpc_with_headers;
 use crate::metrics;
 use crate::metrics::metrics_handler;
 use crate::processing::ProcessingError;
 use crate::request_filter::RpcParameterFilterSet;
 use crate::state::{AppState, LatestBlockHeightCache, LatestSlotCache, MetricsHeaderCaptureConfig};
+use crate::status_history_cache::StatusHistoryCache;
 
 #[cfg(feature = "grpc-streaming")]
 use crate::grpc::service::{self as superbank_grpc, SuperbankGrpcConfig};
@@ -101,7 +103,10 @@ fn ignored_distributed_shard_settings(args: &RpcConfig) -> Vec<&'static str> {
     if has_nonempty_setting(args.clickhouse_gsfa_local_table.as_deref()) {
         ignored.push("CLICKHOUSE_GSFA_LOCAL_TABLE");
     }
-    if has_nonempty_setting(args.clickhouse_signatures_local_table.as_deref()) {
+    // Owner-shard routing reads the local signatures table through `cluster()`.
+    if has_nonempty_setting(args.clickhouse_signatures_local_table.as_deref())
+        && !args.clickhouse_signatures_owner_shard_routing
+    {
         ignored.push("CLICKHOUSE_SIGNATURES_LOCAL_TABLE");
     }
     if has_nonempty_setting(args.clickhouse_token_owner_activity_local_table.as_deref()) {
@@ -330,8 +335,28 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             max_threads: args.get_inflation_reward_max_threads,
             max_memory_bytes: args.get_inflation_reward_max_memory_bytes,
             max_bytes_to_read: args.get_inflation_reward_max_bytes_to_read,
+            epoch_cache_max_bytes: args.get_inflation_reward_epoch_cache_max_bytes,
         }),
     );
+
+    clickhouse
+        .set_get_transaction_single_round_trip(args.clickhouse_get_transaction_single_round_trip);
+    clickhouse.set_latest_slot_hint(args.clickhouse_latest_slot_hint);
+    clickhouse.set_transactions_for_address_position_tokens(
+        args.clickhouse_transactions_for_address_position_tokens,
+    );
+    clickhouse.set_transactions_for_address_cursor_cache(
+        args.clickhouse_transactions_for_address_cursor_cache,
+    );
+    clickhouse.set_transactions_for_address_union_pushdown(
+        args.clickhouse_transactions_for_address_union_pushdown,
+    );
+    clickhouse.set_gsfa_inline_cursor(args.clickhouse_gsfa_inline_cursor);
+    clickhouse.set_signatures_owner_shard_routing(
+        args.clickhouse_signatures_owner_shard_routing,
+        &args.clickhouse_cluster,
+        args.clickhouse_signatures_local_table.as_deref(),
+    )?;
 
     // Verify ClickHouse connection
     clickhouse.create_tables().await?;
@@ -375,7 +400,10 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             let retain_slots = args.head_cache_retain_slots.max(1);
             let max_per_address = args.max_signatures_limit as usize;
 
-            let cache = Arc::new(HeadCache::new(retain_slots, max_per_address));
+            let cache = Arc::new(
+                HeadCache::new(retain_slots, max_per_address)
+                    .with_explicit_end_clamp(args.get_blocks_clamp_to_head_tip),
+            );
 
             let cfg = DragonsmouthHeadCacheConfig {
                 endpoint: endpoint.to_string(),
@@ -398,6 +426,21 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     };
     #[cfg(not(feature = "grpc-head-cache"))]
     let head_cache_task: Option<JoinHandle<()>> = None;
+
+    #[cfg(all(feature = "disk-cache", feature = "grpc-head-cache"))]
+    let status_history_tiers = Some((
+        head_cache.is_some(),
+        disk_runtime.is_some(),
+        args.head_cache_retain_slots,
+    ));
+    #[cfg(not(all(feature = "disk-cache", feature = "grpc-head-cache")))]
+    let status_history_tiers = None;
+    if let Some(reason) = inert_status_history_cache(
+        args.signature_status_history_cache_entries,
+        status_history_tiers,
+    ) {
+        warn!("SIGNATURE_STATUS_HISTORY_CACHE_ENTRIES > 0 but {reason}");
+    }
 
     let state = Arc::new(AppState {
         clickhouse,
@@ -426,7 +469,19 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         hydration_sem: Arc::new(tokio::sync::Semaphore::new(
             args.hydration_cpu_concurrency.max(1),
         )),
-        block_response_cache: BlockResponseCache::new(args.get_block_response_cache_max_bytes),
+        get_block_hydration_parallelism: args.get_block_hydration_parallelism.max(1),
+        block_response_cache: BlockResponseCache::new(args.get_block_response_cache_max_bytes)
+            .with_unsupported_version_cache(args.get_block_response_cache_unsupported_version),
+        get_transaction_primary_cache: PrimaryTransactionCache::new(
+            args.get_transaction_primary_cache_max_bytes,
+            Duration::from_secs(args.get_transaction_primary_cache_ttl_secs),
+        ),
+        get_block_response_cache_share_confirmed: args.get_block_response_cache_share_confirmed,
+        status_history_cache: StatusHistoryCache::new(
+            args.signature_status_history_cache_entries,
+            args.signature_status_history_cache_max_bytes,
+            Duration::from_secs(args.signature_status_history_cache_ttl_secs),
+        ),
         #[cfg(feature = "grpc-head-cache")]
         head_cache,
         #[cfg(feature = "disk-cache")]
@@ -557,6 +612,31 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 struct DiskCacheRuntime {
     cache: Arc<tokio::sync::OnceCell<Arc<DiskCache>>>,
     supervisor_task: JoinHandle<()>,
+}
+
+/// Head retention below this cannot bridge a disk cache trailing the finalized tip, so
+/// the status history cache would only ever bypass.
+const STATUS_HISTORY_MIN_HEAD_RETAIN_SLOTS: u64 = 256;
+
+/// Why an enabled status history cache can never skip the primary, if it cannot.
+/// `tiers` is (head cache running, disk cache enabled, head retained slots), or `None`
+/// when the build lacks either tier.
+fn inert_status_history_cache(
+    entries: u64,
+    tiers: Option<(bool, bool, u64)>,
+) -> Option<&'static str> {
+    if entries == 0 {
+        return None;
+    }
+    match tiers {
+        None => Some("this build lacks grpc-head-cache or disk-cache; the cache has no effect"),
+        Some((false, _, _)) => Some("the head cache is not running; the cache has no effect"),
+        Some((_, false, _)) => Some("the disk cache is not enabled; the cache has no effect"),
+        Some((_, _, retain)) if retain < STATUS_HISTORY_MIN_HEAD_RETAIN_SLOTS => Some(
+            "HEAD_CACHE_RETAIN_SLOTS is below 256; the head chain likely cannot reach the disk tip and lookups will bypass",
+        ),
+        Some(_) => None,
+    }
 }
 
 #[cfg(feature = "disk-cache")]
@@ -696,6 +776,29 @@ async fn start_disk_cache(
     let retain_slots = args.disk_cache_retain_slots.ok_or_else(|| {
         RpcError::Config("DISK_CACHE_ENABLED=true requires DISK_CACHE_RETAIN_SLOTS".to_string())
     })?;
+    if args.disk_cache_get_tx_timeout_ms > args.disk_cache_query_timeout_ms {
+        warn!(
+            disk_cache_get_tx_timeout_ms = args.disk_cache_get_tx_timeout_ms,
+            disk_cache_query_timeout_ms = args.disk_cache_query_timeout_ms,
+            "DISK_CACHE_GET_TX_TIMEOUT_MS exceeds DISK_CACHE_QUERY_TIMEOUT_MS; capping it"
+        );
+    }
+    if args.disk_cache_compact_transactions_parts && args.disk_cache_max_bytes > 0 {
+        warn!(
+            disk_cache_max_bytes = args.disk_cache_max_bytes,
+            "DISK_CACHE_COMPACT_TRANSACTIONS_PARTS=true: Compact transactions parts are about 13.5% \
+             larger on disk, so a DISK_CACHE_MAX_BYTES sized for Wide parts evicts retained slots \
+             and makes the forwarder refill them repeatedly; raise the cap with this flag \
+             by the same proportion"
+        );
+    }
+    if args.disk_cache_get_tx_unknown_timeout_ms > args.disk_cache_get_tx_timeout_ms {
+        warn!(
+            disk_cache_get_tx_unknown_timeout_ms = args.disk_cache_get_tx_unknown_timeout_ms,
+            disk_cache_get_tx_timeout_ms = args.disk_cache_get_tx_timeout_ms,
+            "DISK_CACHE_GET_TX_UNKNOWN_TIMEOUT_MS exceeds DISK_CACHE_GET_TX_TIMEOUT_MS; capping it"
+        );
+    }
     let memory_blocks_metadata = args
         .disk_cache_memory_tables
         .iter()
@@ -710,12 +813,25 @@ async fn start_disk_cache(
         max_bytes: args.disk_cache_max_bytes,
         key_index_max_memory_bytes: args.disk_cache_key_index_max_memory_bytes,
         query_concurrency: args.disk_cache_query_concurrency as usize,
+        background_query_concurrency: args.disk_cache_background_query_concurrency() as usize,
         query_max_threads: args.disk_cache_query_max_threads,
         partition_slots: args
             .disk_cache_partition_slots
             .unwrap_or_else(|| automatic_partition_slots(retain_slots)),
         query_timeout: Duration::from_millis(args.disk_cache_query_timeout_ms),
+        get_tx_timeout: Duration::from_millis(args.disk_cache_get_tx_timeout_ms),
+        fused_get_tx: args.disk_cache_fused_get_tx,
+        get_tx_span_check: args.disk_cache_get_tx_span_check,
+        eviction_safe_hits: args.disk_cache_eviction_safe_hits,
+        status_span_query: args.disk_cache_status_span_query,
+        compact_transactions_parts: args.disk_cache_compact_transactions_parts,
+        gsfa_race_primary: args.gsfa_race_primary,
+        get_tx_unknown_timeout: Duration::from_millis(args.disk_cache_get_tx_unknown_timeout_ms),
         address_query_timeout: Duration::from_millis(args.disk_cache_address_query_timeout_ms),
+        gsfa_empty_watermark_ttl: Duration::from_secs(
+            args.disk_cache_gsfa_empty_watermark_ttl_secs,
+        ),
+        gsfa_empty_watermark_max_entries: args.disk_cache_gsfa_empty_watermark_max_entries as usize,
         schema_check_interval: Duration::from_secs(args.disk_cache_schema_check_interval_secs),
         memory_blocks_metadata,
         memory_retain_slots: args.disk_cache_memory_retain_slots,
@@ -738,7 +854,15 @@ async fn start_disk_cache(
         retain_slots = disk_cfg.retain_slots,
         partition_slots = disk_cfg.partition_slots,
         max_bytes = disk_cfg.max_bytes,
+        query_concurrency = disk_cfg.query_concurrency,
+        background_query_concurrency = disk_cfg.background_query_concurrency,
         backfill_enabled = args.disk_cache_backfill_enabled,
+        fused_get_tx = disk_cfg.fused_get_tx,
+        get_tx_span_check = disk_cfg.get_tx_span_check,
+        eviction_safe_hits = disk_cfg.eviction_safe_hits,
+        status_span_query = disk_cfg.status_span_query,
+        compact_transactions_parts = disk_cfg.compact_transactions_parts,
+        gsfa_race_primary = disk_cfg.gsfa_race_primary,
         "disk cache: starting"
     );
 
@@ -911,6 +1035,20 @@ mod tests {
     use solana_epoch_schedule::EpochSchedule;
     use std::convert::Infallible;
     use tower::{ServiceBuilder, ServiceExt, service_fn};
+
+    #[test]
+    fn inert_status_history_cache_is_reported() {
+        use super::inert_status_history_cache as inert;
+        assert_eq!(inert(0, None), None, "disabled");
+        assert!(inert(1, None).is_some(), "tiers compiled out");
+        assert!(inert(1, Some((false, true, 600))).is_some(), "no head");
+        assert!(inert(1, Some((true, false, 600))).is_some(), "no disk");
+        assert!(
+            inert(1, Some((true, true, 32))).is_some(),
+            "short head window"
+        );
+        assert_eq!(inert(1, Some((true, true, 256))), None);
+    }
 
     #[tokio::test]
     async fn response_compression_negotiates_gzip_for_large_json() {

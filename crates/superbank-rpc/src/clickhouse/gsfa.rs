@@ -17,11 +17,12 @@ use tokio::task::JoinSet;
 use crate::processing::{ProcessingError, ProcessingResult};
 
 use super::QueryFreshnessClass;
+use super::cache::SignatureBytes;
 use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
 use super::queries::{build_hot_position_pagination_clauses, build_pagination_clauses};
 use super::read_query::admission;
 use super::sharding::{ShardTarget, ShardTopology};
-use super::types::{QueryTimings, SignatureRecord, SlotBoundary};
+use super::types::{QueryTimings, SignatureRecord, SignatureSlot, SlotBoundary};
 use super::util::{
     GsfaFallbackMode, append_max_execution_time_setting, format_gsfa_memo, gsfa_fallback_mode,
     parse_err_json, pubkey_literal, transient_shard_local_error_reason,
@@ -87,6 +88,233 @@ struct GsfaSignatureQueryRow {
     err: Option<String>,
     memo: Option<String>,
     block_time: Option<i64>,
+}
+
+/// Scalar value of an inline cursor whose signature has no `signatures` row. The page
+/// predicate excludes every row for it, and the marker row reports it.
+const INLINE_CURSOR_MISSING_SLOT: u64 = u64::MAX;
+
+/// A getSignaturesForAddress `before`/`until` bound for [`ClickHouseClient::get_signatures_for_address_inline_cursor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GsfaCursor {
+    /// Already resolved (a slot bound, a position, or no bound).
+    Resolved(Option<SlotBoundary>),
+    /// A signature the page query resolves to its newest `signatures` `(slot, slot_idx)`.
+    Signature(SignatureBytes),
+}
+
+/// Which inline cursor had no `signatures` row. `before` wins when both miss, like the
+/// sequential lookups, which resolve `before` first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GsfaMissingCursor {
+    Before,
+    Until,
+}
+
+/// The page and the positions its inline cursors resolved to (`None` for a cursor that was
+/// not inline), so the caller can bound other tiers by them.
+#[derive(Debug)]
+pub(crate) enum InlineGsfaPage {
+    Page {
+        records: Vec<SignatureRecord>,
+        timings: QueryTimings,
+        before: Option<SignatureSlot>,
+        until: Option<SignatureSlot>,
+    },
+    Missing(GsfaMissingCursor),
+}
+
+fn inline_cursor_scalar(
+    signatures_table: &str,
+    signatures_bucket_modulus: u64,
+    signature: &SignatureBytes,
+    alias: &str,
+) -> String {
+    let sig_bucket = cityhash64(signature.as_ref()) % signatures_bucket_modulus;
+    let signature_hex = hex::encode(signature.as_ref()).to_uppercase();
+    format!(
+        "(SELECT if(count() = 0, (toUInt64({missing}), toUInt32(0)), max((slot, slot_idx))) \
+         FROM {signatures_table} \
+         PREWHERE sig_bucket = {sig_bucket} AND signature = toFixedString(unhex('{signature_hex}'), 64)) AS {alias}",
+        missing = INLINE_CURSOR_MISSING_SLOT,
+    )
+}
+
+/// The request's page with any unresolved cursor resolved by an aggregate scalar subquery.
+///
+/// The scalar has the shape of the primary getTransaction single round trip: an aggregate
+/// without `GROUP BY` always returns one row, so a missing signature never raises error 125,
+/// and `max((slot, slot_idx))` equals the separate lookup's `ORDER BY slot DESC, slot_idx DESC
+/// LIMIT 1`. The bound keeps `build_pagination_clauses`' two-clause shape. A missing cursor
+/// matches no page row. Each inline cursor adds one `UNION ALL` cursor row: an empty signature
+/// (a real row never has an empty `base58Encode(signature)`), the resolved `(slot, slot_idx)`
+/// (`u64::MAX` when missing) and `memo` `before` or `until`.
+#[allow(clippy::too_many_arguments)]
+fn build_gsfa_inline_cursor_query(
+    gsfa_table: &str,
+    signatures_table: &str,
+    signatures_bucket_modulus: u64,
+    addr_bucket: u64,
+    address_literal: &str,
+    before: GsfaCursor,
+    until: GsfaCursor,
+    limit: u64,
+    settings_clause: &str,
+) -> String {
+    let missing = INLINE_CURSOR_MISSING_SLOT;
+    let mut scalars = Vec::new();
+    let mut conditions = Vec::new();
+    let mut markers = Vec::new();
+
+    let before_alias = match before {
+        GsfaCursor::Resolved(bound) => {
+            let (_, clause) = build_pagination_clauses(bound, None);
+            conditions.push(clause);
+            None
+        }
+        GsfaCursor::Signature(signature) => {
+            scalars.push(inline_cursor_scalar(
+                signatures_table,
+                signatures_bucket_modulus,
+                &signature,
+                "before_pos",
+            ));
+            conditions.push(format!(
+                "tupleElement(before_pos, 1) != {missing} AND (slot < tupleElement(before_pos, 1) \
+                 OR (slot = tupleElement(before_pos, 1) AND slot_idx < tupleElement(before_pos, 2)))"
+            ));
+            markers.push("before_pos");
+            Some(signature)
+        }
+    };
+    match until {
+        GsfaCursor::Resolved(bound) => {
+            let (_, clause) = build_pagination_clauses(None, bound);
+            conditions.push(clause);
+        }
+        GsfaCursor::Signature(signature) => {
+            // `until == before` reuses the `before` scalar, like the sequential path.
+            let alias = if before_alias == Some(signature) {
+                "before_pos"
+            } else {
+                scalars.push(inline_cursor_scalar(
+                    signatures_table,
+                    signatures_bucket_modulus,
+                    &signature,
+                    "until_pos",
+                ));
+                markers.push("until_pos");
+                "until_pos"
+            };
+            conditions.push(format!(
+                "tupleElement({alias}, 1) != {missing} AND (slot > tupleElement({alias}, 1) \
+                 OR (slot = tupleElement({alias}, 1) AND slot_idx > tupleElement({alias}, 2)))"
+            ));
+        }
+    }
+
+    // One cursor row per inline scalar: the resolved position, `u64::MAX` when missing.
+    let cursor_rows: String = markers
+        .iter()
+        .map(|alias| {
+            let name = alias.trim_end_matches("_pos");
+            format!(
+                " UNION ALL SELECT '' AS signature, \
+                 toUInt64(assumeNotNull(tupleElement({alias}, 1))) AS slot, \
+                 toUInt32(assumeNotNull(tupleElement({alias}, 2))) AS slot_idx, \
+                 CAST(NULL, 'Nullable(String)') AS err, \
+                 CAST('{name}', 'Nullable(String)') AS memo, \
+                 CAST(NULL, 'Nullable(Int64)') AS block_time"
+            )
+        })
+        .collect();
+    let where_clause = conditions
+        .iter()
+        .map(|condition| format!("({condition})"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    format!(
+        "WITH {scalars}
+         SELECT signature, slot, slot_idx, err, memo, block_time
+         FROM
+         (
+             SELECT
+                 base58Encode(signature) AS signature,
+                 slot,
+                 slot_idx,
+                 err,
+                 memo,
+                 block_time
+             FROM
+             (
+                 SELECT
+                     signature,
+                     slot,
+                     slot_idx,
+                     err,
+                     memo,
+                     block_time
+                 FROM {gsfa_table}
+                 PREWHERE
+                     addr_bucket = {addr_bucket}
+                     AND address = {address_literal}
+                 WHERE {where_clause}
+                 ORDER BY slot DESC, slot_idx DESC, signature
+                 LIMIT {limit}
+             ){cursor_rows}
+         )
+         {settings_clause}",
+        scalars = scalars.join(", "),
+    )
+}
+
+/// Resolved inline cursors, or the missing cursor (`before` first, as sequential lookups).
+#[derive(Debug, PartialEq, Eq)]
+struct InlineCursors {
+    before: Option<SignatureSlot>,
+    until: Option<SignatureSlot>,
+}
+
+/// Split an inline-cursor result into page rows and the cursor rows' positions.
+fn inline_cursor_outcome(
+    rows: Vec<GsfaSignatureQueryRow>,
+) -> Result<(Vec<SignatureRecord>, InlineCursors), GsfaMissingCursor> {
+    let mut cursors = InlineCursors {
+        before: None,
+        until: None,
+    };
+    let mut before_missing = false;
+    let mut until_missing = false;
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !row.signature.is_empty() {
+            records.push(map_gsfa_signature_row(row));
+            continue;
+        }
+        let missing = row.slot == INLINE_CURSOR_MISSING_SLOT;
+        let position = (!missing).then_some(SignatureSlot {
+            slot: row.slot,
+            slot_idx: row.slot_idx,
+        });
+        match row.memo.as_deref() {
+            Some("until") => {
+                until_missing = missing;
+                cursors.until = position;
+            }
+            _ => {
+                before_missing = missing;
+                cursors.before = position;
+            }
+        }
+    }
+    if before_missing {
+        return Err(GsfaMissingCursor::Before);
+    }
+    if until_missing {
+        return Err(GsfaMissingCursor::Until);
+    }
+    Ok((records, cursors))
 }
 
 struct HotGsfaQuerySpec {
@@ -816,6 +1044,100 @@ impl ClickHouseClient {
         .await
     }
 
+    /// Whether [`Self::get_signatures_for_address_inline_cursor`] applies
+    /// (`CLICKHOUSE_GSFA_INLINE_CURSOR`). Shard-direct keeps its local-table routing, local-cache
+    /// clients resolve cursors themselves, and the transaction-table fallback needs resolved bounds,
+    /// so all three keep the separate lookup.
+    pub(crate) fn gsfa_inline_cursor_enabled(&self) -> bool {
+        self.gsfa_inline_cursor
+            && self.cache_partition.is_none()
+            && !self.scope_shard_direct()
+            && matches!(gsfa_fallback_mode(), GsfaFallbackMode::Disabled)
+    }
+
+    /// Enables the inline gSFA cursor (`CLICKHOUSE_GSFA_INLINE_CURSOR`).
+    pub(crate) fn set_gsfa_inline_cursor(&mut self, enabled: bool) {
+        self.gsfa_inline_cursor = enabled;
+    }
+
+    /// The signature-slot cache's current answer for `signature` without starting a lookup:
+    /// `Some(Some(pos))` found, `Some(None)` a cached miss, `None` unknown.
+    pub(crate) async fn cached_signature_slot(
+        &self,
+        signature: &SignatureBytes,
+    ) -> Option<Option<super::types::SignatureSlot>> {
+        self.signature_slot_cache.peek(signature).await
+    }
+
+    /// The distributed getSignaturesForAddress page with unresolved cursors resolved inside the
+    /// same query (see [`build_gsfa_inline_cursor_query`]). Callers check
+    /// [`Self::gsfa_inline_cursor_enabled`].
+    pub(crate) async fn get_signatures_for_address_inline_cursor(
+        &self,
+        address: &str,
+        limit: u64,
+        before: GsfaCursor,
+        until: GsfaCursor,
+    ) -> ProcessingResult<InlineGsfaPage> {
+        self.with_http_query_timeout("get_signatures_for_address_inline_cursor", async {
+            let pubkey = Pubkey::from_str(address)
+                .map_err(|e| ProcessingError::deserialization("Invalid address", e))?;
+            let address_literal = pubkey_literal(&pubkey);
+            let addr_bucket =
+                cityhash64(pubkey.as_ref()) % self.gsfa_bucket_modulus_for_address(&pubkey);
+            let settings_clause = self.select_settings_clause(
+                "get_signatures_for_address_inline_cursor",
+                QueryFreshnessClass::Historical,
+            );
+            let query = build_gsfa_inline_cursor_query(
+                self.gsfa_table_for_address(&pubkey),
+                &self.signature_statuses_table,
+                self.signatures_bucket_modulus(),
+                addr_bucket,
+                &address_literal,
+                before,
+                until,
+                limit,
+                &settings_clause,
+            );
+
+            let start = Instant::now();
+            let mut cursor = self
+                .read::<GsfaSignatureQueryRow>(&query, "gsfa_signatures_inline_cursor")
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+            let mut rows = Vec::new();
+            while let Some(row) = cursor
+                .next()
+                .await
+                .map_err(|e| ProcessingError::database(e.to_string(), e))?
+            {
+                rows.push(row);
+            }
+            let mut timings = QueryTimings {
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                received_bytes: cursor.received_bytes(),
+                decoded_bytes: cursor.decoded_bytes(),
+                rows_read: Some(0),
+                rows_read_unknown: true,
+                rows_returned: 0,
+            };
+            Ok(match inline_cursor_outcome(rows) {
+                Ok((records, cursors)) => {
+                    timings.rows_returned = records.len() as u64;
+                    InlineGsfaPage::Page {
+                        records,
+                        timings,
+                        before: cursors.before,
+                        until: cursors.until,
+                    }
+                }
+                Err(missing) => InlineGsfaPage::Missing(missing),
+            })
+        })
+        .await
+    }
+
     async fn get_signatures_for_address_fallback(
         &self,
         address: &str,
@@ -1351,5 +1673,183 @@ mod tests {
 
         assert_eq!(client.gsfa_table_for_address(&cold_pubkey), "default.gsfa");
         assert!(client.should_use_gsfa_shard_routing(&cold_pubkey));
+    }
+
+    fn inline_sql(before: GsfaCursor, until: GsfaCursor) -> String {
+        normalize_sql(&build_gsfa_inline_cursor_query(
+            "default.gsfa",
+            "default.signatures",
+            8,
+            3,
+            "toFixedString(unhex('ABCD'), 32)",
+            before,
+            until,
+            25,
+            "SETTINGS optimize_skip_unused_shards=1",
+        ))
+    }
+
+    fn scalar(signature: &SignatureBytes, alias: &str) -> String {
+        normalize_sql(&inline_cursor_scalar(
+            "default.signatures",
+            8,
+            signature,
+            alias,
+        ))
+    }
+
+    #[test]
+    fn inline_cursor_query_resolves_before_with_an_aggregate_scalar() {
+        let before = [7u8; 64];
+        let sql = inline_sql(GsfaCursor::Signature(before), GsfaCursor::Resolved(None));
+        let bucket = cityhash64(before.as_ref()) % 8;
+        let hex = "07".repeat(64);
+        assert!(sql.starts_with(&format!(
+            "WITH (SELECT if(count() = 0, (toUInt64(18446744073709551615), toUInt32(0)), max((slot, slot_idx))) FROM default.signatures PREWHERE sig_bucket = {bucket} AND signature = toFixedString(unhex('{hex}'), 64)) AS before_pos SELECT signature, slot, slot_idx, err, memo, block_time FROM"
+        )), "{sql}");
+        assert!(sql.contains(
+            "FROM default.gsfa PREWHERE addr_bucket = 3 AND address = toFixedString(unhex('ABCD'), 32) WHERE (tupleElement(before_pos, 1) != 18446744073709551615 AND (slot < tupleElement(before_pos, 1) OR (slot = tupleElement(before_pos, 1) AND slot_idx < tupleElement(before_pos, 2)))) AND (1) ORDER BY slot DESC, slot_idx DESC, signature LIMIT 25 )"
+        ), "{sql}");
+        assert!(sql.contains(
+            "LIMIT 25 ) UNION ALL SELECT '' AS signature, toUInt64(assumeNotNull(tupleElement(before_pos, 1))) AS slot, toUInt32(assumeNotNull(tupleElement(before_pos, 2))) AS slot_idx, CAST(NULL, 'Nullable(String)') AS err, CAST('before', 'Nullable(String)') AS memo, CAST(NULL, 'Nullable(Int64)') AS block_time ) SETTINGS optimize_skip_unused_shards=1"
+        ), "{sql}");
+        assert!(!sql.contains("until_pos"));
+    }
+
+    #[test]
+    fn inline_cursor_query_orders_before_marker_ahead_of_until() {
+        let (before, until) = ([1u8; 64], [2u8; 64]);
+        let sql = inline_sql(GsfaCursor::Signature(before), GsfaCursor::Signature(until));
+        assert!(sql.contains(&format!(
+            "{}, {}",
+            scalar(&before, "before_pos"),
+            scalar(&until, "until_pos")
+        )));
+        assert!(sql.contains(
+            "AND (tupleElement(until_pos, 1) != 18446744073709551615 AND (slot > tupleElement(until_pos, 1) OR (slot = tupleElement(until_pos, 1) AND slot_idx > tupleElement(until_pos, 2))))"
+        ), "{sql}");
+        assert!(sql.contains(
+            "toUInt32(assumeNotNull(tupleElement(before_pos, 2))) AS slot_idx, CAST(NULL, 'Nullable(String)') AS err, CAST('before', 'Nullable(String)') AS memo, CAST(NULL, 'Nullable(Int64)') AS block_time UNION ALL SELECT '' AS signature, toUInt64(assumeNotNull(tupleElement(until_pos, 1))) AS slot, toUInt32(assumeNotNull(tupleElement(until_pos, 2))) AS slot_idx, CAST(NULL, 'Nullable(String)') AS err, CAST('until', 'Nullable(String)') AS memo"
+        ), "{sql}");
+    }
+
+    #[test]
+    fn inline_cursor_query_reuses_before_scalar_when_until_is_the_same_signature() {
+        let signature = [3u8; 64];
+        let sql = inline_sql(
+            GsfaCursor::Signature(signature),
+            GsfaCursor::Signature(signature),
+        );
+        assert!(!sql.contains("until_pos"), "{sql}");
+        assert_eq!(sql.matches("FROM default.signatures").count(), 1);
+        assert!(sql.contains("AND (tupleElement(before_pos, 1) != 18446744073709551615 AND (slot > tupleElement(before_pos, 1)"));
+    }
+
+    #[test]
+    fn inline_cursor_query_keeps_resolved_bounds_in_pagination_shape() {
+        let sql = inline_sql(
+            GsfaCursor::Resolved(Some(SlotBoundary::Position(SignatureSlot {
+                slot: 220584742,
+                slot_idx: 286,
+            }))),
+            GsfaCursor::Signature([4u8; 64]),
+        );
+        assert!(sql.contains(
+            "WHERE ((slot < 220584742 OR (slot = 220584742 AND slot_idx < 286))) AND (tupleElement(until_pos, 1) != 18446744073709551615"
+        ), "{sql}");
+        assert!(
+            sql.contains("toUInt64(assumeNotNull(tupleElement(until_pos, 1))) AS slot"),
+            "{sql}"
+        );
+        assert_eq!(sql.matches("UNION ALL").count(), 1);
+        assert!(!sql.contains("before_pos"));
+
+        let sql = inline_sql(
+            GsfaCursor::Resolved(Some(SlotBoundary::Slot(10))),
+            GsfaCursor::Signature([4u8; 64]),
+        );
+        assert!(
+            sql.contains("WHERE (slot < 10) AND (tupleElement(until_pos, 1)"),
+            "{sql}"
+        );
+    }
+
+    fn row(signature: &str, slot: u64, memo: Option<&str>) -> GsfaSignatureQueryRow {
+        GsfaSignatureQueryRow {
+            signature: signature.to_string(),
+            slot,
+            slot_idx: 3,
+            err: None,
+            memo: memo.map(str::to_string),
+            block_time: None,
+        }
+    }
+
+    #[test]
+    fn inline_cursor_rows_map_to_positions_or_the_missing_cursor() {
+        let missing = INLINE_CURSOR_MISSING_SLOT;
+        let found = |slot| Some(SignatureSlot { slot, slot_idx: 3 });
+        let (records, cursors) = inline_cursor_outcome(vec![
+            row("sigA", 9, None),
+            row("", 20, Some("before")),
+            row("sigB", 8, Some("user memo")),
+            row("", 5, Some("until")),
+        ])
+        .unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.slot).collect::<Vec<_>>(),
+            vec![9, 8]
+        );
+        assert_eq!(
+            cursors,
+            InlineCursors {
+                before: found(20),
+                until: found(5)
+            }
+        );
+        assert_eq!(
+            inline_cursor_outcome(vec![row("", missing, Some("before"))]).unwrap_err(),
+            GsfaMissingCursor::Before
+        );
+        assert_eq!(
+            inline_cursor_outcome(vec![
+                row("", 20, Some("before")),
+                row("", missing, Some("until"))
+            ])
+            .unwrap_err(),
+            GsfaMissingCursor::Until
+        );
+        assert_eq!(
+            inline_cursor_outcome(vec![
+                row("", missing, Some("until")),
+                row("", missing, Some("before"))
+            ])
+            .unwrap_err(),
+            GsfaMissingCursor::Before,
+            "before wins regardless of row order"
+        );
+        let (records, cursors) = inline_cursor_outcome(Vec::new()).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(
+            cursors,
+            InlineCursors {
+                before: None,
+                until: None
+            }
+        );
+    }
+
+    #[test]
+    fn inline_cursor_applies_only_to_distributed_primary_reads() {
+        let mut client = test_client_with_scope(RoutingScope::Distributed);
+        assert!(!client.gsfa_inline_cursor_enabled(), "default off");
+        client.set_gsfa_inline_cursor(true);
+        assert!(client.gsfa_inline_cursor_enabled());
+        client.cache_partition = Some((10, 1));
+        assert!(!client.gsfa_inline_cursor_enabled(), "local cache clients");
+
+        let mut shard = test_client_with_scope(RoutingScope::ShardDirect);
+        shard.set_gsfa_inline_cursor(true);
+        assert!(!shard.gsfa_inline_cursor_enabled(), "shard-direct");
     }
 }

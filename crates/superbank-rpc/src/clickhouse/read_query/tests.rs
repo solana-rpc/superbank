@@ -395,3 +395,82 @@ async fn releasing_endpoint_frees_capacity_on_abandon_without_verification() {
     assert_eq!(fixture.probe_count(), probes_before);
     assert!(endpoint.background(1).retain_until_verified);
 }
+
+#[test]
+fn background_lane_has_its_own_capacity() {
+    let serving = ReadEndpoint::new(
+        Client::default(),
+        None,
+        Default::default(),
+        16,
+        Duration::from_secs(1),
+        "cache",
+    );
+    let background = serving.background(8);
+    assert_eq!(serving.available_permits(), 16);
+    assert_eq!(background.available_permits(), 8);
+    assert_eq!(background.target(), "background");
+    assert_eq!(serving.background(0).available_permits(), 1);
+}
+
+#[tokio::test]
+async fn primary_reads_send_their_execution_limit_and_background_reads_do_not() {
+    let fixture = Fixture::initialized().await;
+    let primary = fixture.endpoint.with_timeout(Duration::from_millis(2_500));
+    assert_eq!(
+        primary
+            .query(&fixture.client, "SELECT 42", "primary")
+            .await
+            .unwrap()
+            .fetch_one::<u64>()
+            .await
+            .unwrap(),
+        42
+    );
+    let background = primary.background(1).with_timeout(Duration::from_secs(60));
+    assert_eq!(
+        background
+            .query(&fixture.client, "SELECT 42", "background")
+            .await
+            .unwrap()
+            .fetch_one::<u64>()
+            .await
+            .unwrap(),
+        42
+    );
+    let requests = fixture.requests();
+    assert_eq!(requests[2].params["max_execution_time"], "3");
+    // Bounds an initiator waiting on a hung leaf, which never checks its time limit.
+    assert_eq!(requests[2].params["receive_timeout"], "3");
+    assert!(!requests[3].params.contains_key("max_execution_time"));
+    assert!(!requests[3].params.contains_key("receive_timeout"));
+}
+
+#[tokio::test]
+async fn abandoned_primary_read_still_observed_releases_after_its_execution_limit() {
+    let fixture = Fixture::initialized().await;
+    fixture.state.mode.store(STREAMING, Ordering::SeqCst);
+    let endpoint = fixture.endpoint.with_timeout(Duration::from_millis(500));
+    let mut cursor = endpoint
+        .query(&fixture.client, "SELECT 42", "test")
+        .await
+        .unwrap()
+        .fetch::<u64>()
+        .unwrap();
+    assert_eq!(cursor.next().await.unwrap(), Some(42));
+    let abandoned = Instant::now();
+    drop(cursor);
+    // The probe keeps reporting the query as running: absence is never confirmed.
+    fixture.wait_until(|| fixture.probe_count() >= 3).await;
+    assert_eq!(endpoint.admission.available_permits(), 0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while endpoint.admission.available_permits() != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("admission released after max_execution_time + margin");
+    // 500 ms rounds up to a one-second server limit, plus the five-second margin.
+    assert!(abandoned.elapsed() >= Duration::from_secs(6));
+    assert!(fixture.state.active.load(Ordering::SeqCst));
+}

@@ -62,6 +62,9 @@ pub(crate) struct CacheSchemaConfig {
     pub(crate) memory_blocks_metadata: bool,
     pub(crate) memory_retain_slots: Option<u64>,
     pub(crate) memory_max_bytes: Option<u64>,
+    /// Compact `transactions` parts (`DISK_CACHE_COMPACT_TRANSACTIONS_PARTS`). Applied with
+    /// `ALTER` and deliberately excluded from `schema_fingerprint`: toggling it never rebuilds.
+    pub(crate) compact_transactions_parts: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Row)]
@@ -506,6 +509,117 @@ fn merge_settings_sql(table: &SourceTableSchema, config: &CacheSchemaConfig) -> 
     ))
 }
 
+/// `min_bytes_for_wide_part` large enough that every transactions part stays Compact.
+const COMPACT_PART_MAX_BYTES: u64 = 1 << 40;
+
+/// Write new `transactions` parts as Compact. A payload point lookup reads one granule of
+/// every column: a Wide part costs one file and one read per column stream (~150), a
+/// Compact part a few reads of one file. Dropping substream marks roughly halves marks
+/// memory. Existing Wide parts stay readable; a merge that includes one stays Wide, so
+/// they age out with retention instead of being rewritten. Applied with `ALTER` outside
+/// the cache fingerprint, like `merge_settings_sql`, and limited to the settings the local
+/// server reports; `None` when no setting applies.
+///
+/// With `compact_transactions_parts` off the same settings are reset instead, so turning the
+/// flag off returns new parts to the server default layout (Compact parts already written
+/// stay readable and age out with retention). Resetting a setting the table never set is a
+/// no-op, so this runs on every open.
+fn layout_settings_sql(
+    table: &SourceTableSchema,
+    config: &CacheSchemaConfig,
+    supported: &[String],
+) -> Option<String> {
+    if table.kind != CacheTableKind::Transactions {
+        return None;
+    }
+    let supports = |name: &str| supported.iter().any(|supported| supported == name);
+    let target = quote_table(&config.database, table.kind.local_name());
+    if !config.compact_transactions_parts {
+        let reset = LAYOUT_SETTINGS
+            .into_iter()
+            .filter(|(name, _)| supports(name))
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        return (!reset.is_empty())
+            .then(|| format!("ALTER TABLE {target} RESET SETTING {}", reset.join(", ")));
+    }
+    // Substream marks alone change nothing while parts are still Wide.
+    if !supports("min_bytes_for_wide_part") {
+        return None;
+    }
+    let settings = LAYOUT_SETTINGS
+        .into_iter()
+        .filter(|(name, _)| supports(name))
+        .map(|(name, value)| format!("{name} = {value}"))
+        .collect::<Vec<_>>();
+    Some(format!(
+        "ALTER TABLE {target} MODIFY SETTING {}",
+        settings.join(", ")
+    ))
+}
+
+/// Part-layout settings `layout_settings_sql` applies (flag on) or resets (flag off).
+const LAYOUT_SETTINGS: [(&str, u64); 2] = [
+    ("min_bytes_for_wide_part", COMPACT_PART_MAX_BYTES),
+    ("write_marks_for_substreams_in_compact_parts", 0),
+];
+
+/// Names of the part-layout MergeTree settings this local server knows.
+async fn supported_layout_settings(local: &ClickHouseClient) -> Result<Vec<String>, SchemaError> {
+    local
+        .read_all::<NameRow>(
+            "SELECT name FROM system.merge_tree_settings \
+             WHERE name IN ('min_bytes_for_wide_part', 'write_marks_for_substreams_in_compact_parts')",
+            "disk_cache_schema_merge_tree_settings",
+        )
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.name).collect())
+        .map_err(|err| SchemaError::Query(err.to_string()))
+}
+
+/// Part layout is an optimization: a server that rejects it keeps serving Wide parts.
+pub(super) async fn apply_layout_settings(
+    local: &ClickHouseClient,
+    snapshot: &SourceSchemaSnapshot,
+    config: &CacheSchemaConfig,
+) {
+    let supported = match supported_layout_settings(local).await {
+        Ok(supported) => supported,
+        Err(err) => {
+            tracing::warn!("disk cache: part layout settings skipped: {err}");
+            return;
+        }
+    };
+    for table in &snapshot.tables {
+        let Some(sql) = layout_settings_sql(table, config, &supported) else {
+            continue;
+        };
+        match (
+            execute(local, &sql).await,
+            config.compact_transactions_parts,
+        ) {
+            (Ok(()), true) => tracing::info!(
+                table = table.kind.local_name(),
+                settings = ?supported,
+                "disk cache: compact part layout applied"
+            ),
+            (Ok(()), false) => tracing::info!(
+                table = table.kind.local_name(),
+                settings = ?supported,
+                "disk cache: part layout settings reset; new parts use the server default layout"
+            ),
+            (Err(err), true) => tracing::warn!(
+                table = table.kind.local_name(),
+                "disk cache: compact part layout skipped: {err}"
+            ),
+            (Err(err), false) => tracing::warn!(
+                table = table.kind.local_name(),
+                "disk cache: part layout settings reset skipped: {err}"
+            ),
+        }
+    }
+}
+
 fn create_cache_table_sql(
     table: &SourceTableSchema,
     config: &CacheSchemaConfig,
@@ -764,11 +878,40 @@ async fn rebuild_owned_tables(
     Ok(())
 }
 
+/// What schema initialization did to the existing cache contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaBootstrap {
+    /// Owned tables matched the fingerprint and were kept.
+    Reused,
+    /// The cache database had no tables, e.g. fresh or reset storage.
+    Created,
+    /// Format or fingerprint changed; owned tables were dropped and recreated.
+    Rebuilt,
+    /// Tables were kept but Memory-table coverage was reset after a server restart.
+    CoverageReset,
+}
+
+impl SchemaBootstrap {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::Created => "created",
+            Self::Rebuilt => "rebuilt",
+            Self::CoverageReset => "coverage_reset",
+        }
+    }
+
+    /// Existing cached data was discarded.
+    pub(crate) fn wiped(self) -> bool {
+        matches!(self, Self::Rebuilt | Self::CoverageReset)
+    }
+}
+
 pub(crate) async fn initialize_cache_schema(
     local: &ClickHouseClient,
     snapshot: &SourceSchemaSnapshot,
     config: &CacheSchemaConfig,
-) -> Result<bool, SchemaError> {
+) -> Result<SchemaBootstrap, SchemaError> {
     validate_identifier(&config.database, "cache database")?;
     let mut rebuilt = false;
     let existing = database_tables(local, &config.database).await?;
@@ -809,7 +952,7 @@ pub(crate) async fn initialize_cache_schema(
     )
     .await?;
     create_control_tables(local, config).await?;
-    rebuilt |= reset_coverage_after_memory_restart(local, config).await?;
+    let coverage_reset = reset_coverage_after_memory_restart(local, config).await?;
 
     for table in &snapshot.tables {
         execute(local, &create_cache_table_sql(table, config)?).await?;
@@ -817,6 +960,7 @@ pub(crate) async fn initialize_cache_schema(
             execute(local, &sql).await?;
         }
     }
+    apply_layout_settings(local, snapshot, config).await;
 
     let transaction = snapshot
         .table(CacheTableKind::Transactions)
@@ -833,7 +977,15 @@ pub(crate) async fn initialize_cache_schema(
         .await?;
     }
     write_meta(local, snapshot, config).await?;
-    Ok(rebuilt)
+    Ok(if existing.is_empty() {
+        SchemaBootstrap::Created
+    } else if rebuilt {
+        SchemaBootstrap::Rebuilt
+    } else if coverage_reset {
+        SchemaBootstrap::CoverageReset
+    } else {
+        SchemaBootstrap::Reused
+    })
 }
 
 /// Extract top-level `INDEX ...` entries from a CREATE TABLE column list.
@@ -989,6 +1141,7 @@ mod tests {
             memory_blocks_metadata: false,
             memory_retain_slots: None,
             memory_max_bytes: None,
+            compact_transactions_parts: true,
         }
     }
 
@@ -1024,6 +1177,95 @@ mod tests {
         assert!(merge_settings_sql(&memory, &memory_config).is_none());
         memory_config.memory_blocks_metadata = false;
         assert!(merge_settings_sql(&memory, &memory_config).is_some());
+    }
+
+    #[test]
+    fn layout_settings_make_transactions_compact_without_changing_fingerprint() {
+        let mut table = fixture_table();
+        table.kind = CacheTableKind::Transactions;
+        let config = fixture_config(10_000);
+        let fingerprint = schema_fingerprint(std::slice::from_ref(&table), &config);
+        let supported = [
+            "min_bytes_for_wide_part".to_string(),
+            "write_marks_for_substreams_in_compact_parts".to_string(),
+        ];
+        let sql = layout_settings_sql(&table, &config, &supported).expect("transactions");
+        assert_eq!(
+            sql,
+            "ALTER TABLE `cache`.`transactions` MODIFY SETTING \
+             min_bytes_for_wide_part = 1099511627776, \
+             write_marks_for_substreams_in_compact_parts = 0"
+        );
+        let ddl = create_cache_table_sql(&table, &config).unwrap();
+        assert!(!ddl.contains("min_bytes_for_wide_part"), "{ddl}");
+        assert!(!ddl.contains("write_marks_for_substreams"), "{ddl}");
+        assert_eq!(
+            schema_fingerprint(std::slice::from_ref(&table), &config),
+            fingerprint
+        );
+
+        // Older servers without substream marks still get Compact parts.
+        assert_eq!(
+            layout_settings_sql(&table, &config, &supported[..1]).unwrap(),
+            "ALTER TABLE `cache`.`transactions` MODIFY SETTING \
+             min_bytes_for_wide_part = 1099511627776"
+        );
+        assert!(layout_settings_sql(&table, &config, &supported[1..]).is_none());
+        assert!(layout_settings_sql(&table, &config, &[]).is_none());
+
+        // Flag off: reset exactly the settings the server reports, never rebuild.
+        let mut off = config.clone();
+        off.compact_transactions_parts = false;
+        assert_eq!(
+            layout_settings_sql(&table, &off, &supported).unwrap(),
+            "ALTER TABLE `cache`.`transactions` RESET SETTING \
+             min_bytes_for_wide_part, write_marks_for_substreams_in_compact_parts"
+        );
+        assert_eq!(
+            layout_settings_sql(&table, &off, &supported[..1]).unwrap(),
+            "ALTER TABLE `cache`.`transactions` RESET SETTING min_bytes_for_wide_part"
+        );
+        assert_eq!(
+            layout_settings_sql(&table, &off, &supported[1..]).unwrap(),
+            "ALTER TABLE `cache`.`transactions` RESET SETTING \
+             write_marks_for_substreams_in_compact_parts"
+        );
+        assert!(layout_settings_sql(&table, &off, &[]).is_none());
+        assert_eq!(create_cache_table_sql(&table, &off).unwrap(), ddl);
+        assert_eq!(
+            schema_fingerprint(std::slice::from_ref(&table), &off),
+            fingerprint
+        );
+
+        for kind in [
+            CacheTableKind::BlocksMetadata,
+            CacheTableKind::Signatures,
+            CacheTableKind::Gsfa,
+            CacheTableKind::GsfaHot,
+            CacheTableKind::TokenOwnerActivity,
+        ] {
+            table.kind = kind;
+            assert!(layout_settings_sql(&table, &config, &supported).is_none());
+            assert!(layout_settings_sql(&table, &off, &supported).is_none());
+        }
+    }
+
+    #[test]
+    fn bootstrap_outcomes_count_only_discarded_data_as_wipes() {
+        let outcomes = [
+            SchemaBootstrap::Reused,
+            SchemaBootstrap::Created,
+            SchemaBootstrap::Rebuilt,
+            SchemaBootstrap::CoverageReset,
+        ];
+        assert_eq!(
+            outcomes.map(SchemaBootstrap::as_str),
+            ["reused", "created", "rebuilt", "coverage_reset"]
+        );
+        assert_eq!(
+            outcomes.map(SchemaBootstrap::wiped),
+            [false, false, true, true]
+        );
     }
 
     #[test]

@@ -74,11 +74,40 @@ pub(super) async fn resolve_range(
     if let Some(cache) = state.head_cache.as_ref() {
         route.head_cache_read();
         let authoritative_head_tip = end.is_none();
-        let (end, head) = cache
-            .coverage
-            .read()
-            .expect("head coverage lock")
-            .snapshot(start, end, commitment.commitment, Instant::now())?;
+        let (end, head, clamped) = {
+            let coverage = cache.coverage.read().expect("head coverage lock");
+            let now = Instant::now();
+            match end {
+                None => {
+                    let (end, head) = coverage.snapshot(start, None, commitment.commitment, now)?;
+                    (end, head, false)
+                }
+                // Slots above a trusted tip are not at the requested commitment yet; do not
+                // ask the primary to prove their absence (Agave clamps to its bank slot).
+                Some(end) if cache.clamps_explicit_end() => {
+                    coverage.snapshot_clamped(start, end, commitment.commitment, now)
+                }
+                // GET_BLOCKS_CLAMP_TO_HEAD_TIP=false: the requested end, as before the clamp.
+                Some(end) => {
+                    let (end, head) =
+                        coverage.snapshot(start, Some(end), commitment.commitment, now)?;
+                    (end, head, false)
+                }
+            }
+        };
+        if clamped {
+            // Counted apart from `observation.reason` so a remaining below-tip
+            // `coverage_gap` stays visible.
+            let operation = match route.method() {
+                "getBlocksWithLimit" => "get_blocks_with_limit_end",
+                _ => "get_blocks_end",
+            };
+            metrics::slot_source(
+                operation,
+                "head_clamped",
+                crate::state::commitment_label(commitment.commitment),
+            );
+        }
         return Ok(BlockRange {
             start,
             end,

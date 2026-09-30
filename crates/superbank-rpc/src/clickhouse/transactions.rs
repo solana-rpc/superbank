@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 use crate::processing::{ProcessingError, ProcessingResult};
 
 use super::QueryFreshnessClass;
+use super::cache::{CacheStart, SignatureBytes};
 use super::client::{ClickHouseClient, execute_shard_tcp_query_block};
 use super::constants::SLOT_SHARD_DIVISOR;
 use super::queries::{
@@ -117,6 +118,10 @@ fn compare_transactions_for_address_records(
 
 const TRANSACTIONS_FOR_ADDRESS_MIN_BATCH_SIZE: u64 = 64;
 const TRANSACTIONS_FOR_ADDRESS_MAX_BATCH_SIZE: u64 = 2_000;
+/// One entry per served page (~150 B); matches the signature-slot cache's bound and TTL.
+const TRANSACTIONS_FOR_ADDRESS_CURSOR_CAPACITY: u64 = 50_000;
+const TRANSACTIONS_FOR_ADDRESS_CURSOR_TTL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
 
 fn transactions_for_address_batch_size(remaining: u64) -> u64 {
     remaining.saturating_mul(2).clamp(
@@ -163,10 +168,7 @@ fn decode_transaction_signature(signature: &str) -> ProcessingResult<([u8; 64], 
         )));
     }
 
-    let signature_literal = format!(
-        "toFixedString(unhex('{}'), 64)",
-        hex::encode(&signature_bytes).to_uppercase()
-    );
+    let signature_literal = super::owner_shard::signature_literal(&signature_bytes);
     let signature_bytes = signature_bytes.as_slice().try_into().map_err(|_| {
         ProcessingError::deserialization_msg("Invalid signature length".to_string())
     })?;
@@ -217,7 +219,134 @@ fn build_get_transaction_by_signature_query(
     }
 }
 
+const SINGLE_ROUND_TRIP_OPERATION: &str = "get_transaction_single_rt";
+
+/// Position the single-round-trip scalar yields for an unknown signature. No transaction lives at
+/// this slot, and the outer `WHERE` rejects it before any shard is read.
+const SINGLE_ROUND_TRIP_MISSING_SLOT: u64 = u64::MAX;
+
+/// Resolves the latest `(slot, slot_idx)` for a signature and reads its payload in one query.
+///
+/// The scalar is an aggregate without `GROUP BY`, so it returns exactly one row even for an
+/// unknown signature (an empty non-Nullable scalar is error 125); `max((slot, slot_idx))` matches
+/// the two-query path's `ORDER BY slot DESC, slot_idx DESC LIMIT 1`. With the analyzer
+/// (`enable_analyzer=1`; verified locally on 26.8.11.7) ClickHouse folds the scalar to a constant
+/// before `optimize_skip_unused_shards`, so the outer read goes to the one shard owning the epoch,
+/// and not at all for the sentinel.
+///
+/// The outer read keys on the full `(slot, slot_idx, signature)` so it selects one granule like
+/// the exact two-query read. It has no legacy fallback: a payload row whose `slot_idx` differs
+/// from its `signatures` row is not found, where the two-query path would retry without
+/// `slot_idx`.
+fn build_get_transaction_single_round_trip_query(
+    transaction_table: &str,
+    signatures_table: &str,
+    sig_bucket: u64,
+    signature_literal: &str,
+    settings_clause: &str,
+) -> String {
+    format!(
+        "WITH (
+            SELECT if(count() = 0, (toUInt64({missing_slot}), toUInt32(0)), max((slot, slot_idx)))
+            FROM {signatures_table}
+            PREWHERE sig_bucket = {sig_bucket} AND signature = {signature_literal}
+         ) AS pos
+         SELECT
+            {columns}
+         FROM {transaction_table}
+         PREWHERE slot = tupleElement(pos, 1)
+            AND slot_idx = tupleElement(pos, 2)
+            AND signature = {signature_literal}
+         WHERE tupleElement(pos, 1) != {missing_slot}
+         LIMIT 1
+         {settings_clause}",
+        missing_slot = SINGLE_ROUND_TRIP_MISSING_SLOT,
+        columns = TRANSACTION_SELECT_COLUMNS
+    )
+}
+
 impl ClickHouseClient {
+    /// Enables the one-query primary getTransaction fallback
+    /// (`CLICKHOUSE_GET_TRANSACTION_SINGLE_ROUND_TRIP`).
+    pub(crate) fn set_get_transaction_single_round_trip(&mut self, enabled: bool) {
+        self.get_transaction_single_round_trip = enabled;
+    }
+
+    pub(crate) fn set_transactions_for_address_union_pushdown(&mut self, enabled: bool) {
+        self.transactions_for_address_union_pushdown = enabled;
+    }
+
+    pub(crate) fn set_transactions_for_address_position_tokens(&mut self, enabled: bool) {
+        self.transactions_for_address_position_tokens = enabled;
+    }
+
+    pub(crate) fn transactions_for_address_position_tokens(&self) -> bool {
+        self.transactions_for_address_position_tokens
+    }
+
+    pub(crate) fn set_transactions_for_address_cursor_cache(&mut self, enabled: bool) {
+        self.transactions_for_address_cursors = enabled.then(|| {
+            moka::future::Cache::builder()
+                .max_capacity(TRANSACTIONS_FOR_ADDRESS_CURSOR_CAPACITY)
+                .time_to_live(TRANSACTIONS_FOR_ADDRESS_CURSOR_TTL)
+                .build()
+        });
+    }
+
+    /// Position of a previously served ClickHouse page's last row, if remembered.
+    pub(crate) async fn transactions_for_address_cursor(
+        &self,
+        signature: &str,
+    ) -> Option<SignatureSlot> {
+        let position = self
+            .transactions_for_address_cursors
+            .as_ref()?
+            .get(signature)
+            .await;
+        crate::metrics::transactions_for_address_cursor_cache_access(if position.is_some() {
+            "hit"
+        } else {
+            "miss"
+        });
+        position
+    }
+
+    pub(crate) async fn remember_transactions_for_address_cursor(
+        &self,
+        signature: &str,
+        position: SignatureSlot,
+    ) {
+        if let Some(cursors) = &self.transactions_for_address_cursors {
+            cursors.insert(signature.to_owned(), position).await;
+            crate::metrics::transactions_for_address_cursor_cache_access("insert");
+        }
+    }
+
+    // Shard-direct keeps its local-table routing, and local-cache clients never use the
+    // signature-slot cache, so both stay on the two-query path.
+    fn get_transaction_single_round_trip_enabled(&self) -> bool {
+        self.get_transaction_single_round_trip
+            && self.cache_partition.is_none()
+            && !self.scope_shard_direct()
+    }
+
+    // Each fused query is unique per signature, so the query cache would only take writes.
+    fn single_round_trip_settings_clause(&self) -> String {
+        crate::metrics::clickhouse_query_cache_classified(SINGLE_ROUND_TRIP_OPERATION, false);
+        if !self.allow_query_settings {
+            return String::new();
+        }
+        let settings = append_max_execution_time_setting(
+            "SETTINGS optimize_skip_unused_shards=1, use_query_cache=0",
+            self.query_timeout,
+        );
+        if self.signatures_owner_shard_routed() {
+            super::owner_shard::with_owner_shard_settings(&settings)
+        } else {
+            settings
+        }
+    }
+
     pub async fn get_transactions_for_address_signatures(
         &self,
         query: &TransactionsForAddressQuery,
@@ -375,6 +504,7 @@ impl ClickHouseClient {
             token_owner_bucket_modulus: self.token_owner_bucket_modulus(),
             signatures_table: &self.signature_statuses_table,
             signature_bucket_modulus: self.signatures_bucket_modulus(),
+            union_pushdown: self.transactions_for_address_union_pushdown,
         };
         let query = build_transactions_for_address_query(&tables, query, &settings_clause)?;
 
@@ -556,6 +686,11 @@ impl ClickHouseClient {
     ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
         self.with_operation_timeout("get_transaction_by_signature", async {
             let (signature_bytes, signature_literal) = decode_transaction_signature(signature)?;
+            if self.get_transaction_single_round_trip_enabled() {
+                return self
+                    .get_transaction_single_round_trip(signature_bytes, &signature_literal)
+                    .await;
+            }
             let (slot_opt, mut timings) = self
                 .get_signature_slot_by_signature_bytes(signature_bytes)
                 .await?;
@@ -571,6 +706,118 @@ impl ClickHouseClient {
             Ok((record, timings))
         })
         .await
+    }
+
+    /// [`Self::get_transaction_by_signature`] with one query per signature-slot cache miss.
+    ///
+    /// The signature-slot cache and its singleflight are kept: a cached position reads the
+    /// payload only, a cached miss returns `None`, and the leader runs the fused query under one
+    /// HTTP permit. The leader caches the returned row's position, or a miss when no row comes
+    /// back. A signature with a `signatures` row but no payload row at that exact position
+    /// therefore caches a miss (1 s TTL by default) instead of its position, and the address
+    /// history `before`/`until` cursors see that miss too. getTransaction returns `null` for it,
+    /// including a payload at another `slot_idx` that the two-query legacy fallback would find.
+    async fn get_transaction_single_round_trip(
+        &self,
+        signature_bytes: SignatureBytes,
+        signature_literal: &str,
+    ) -> ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)> {
+        let call_start = Instant::now();
+        let mut waited = false;
+
+        loop {
+            match self
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await
+            {
+                CacheStart::Hit(value) => {
+                    let mut timings = if waited {
+                        QueryTimings {
+                            elapsed_ms: call_start.elapsed().as_millis() as u64,
+                            received_bytes: 0,
+                            decoded_bytes: 0,
+                            rows_read: Some(0),
+                            rows_read_unknown: true,
+                            rows_returned: 0,
+                        }
+                    } else {
+                        QueryTimings::zero()
+                    };
+                    let Some(position) = value else {
+                        return Ok((None, timings));
+                    };
+                    let _http_permit = self.acquire_http_query_permit().await?;
+                    let (record, payload_timings) = self
+                        .fetch_transaction_at_position(signature_literal, position)
+                        .await?;
+                    timings.add(payload_timings);
+                    return Ok((record, timings));
+                }
+                CacheStart::Wait(wait) => {
+                    waited = true;
+                    wait.await;
+                }
+                CacheStart::Leader(leader) => {
+                    let result = async {
+                        let _http_permit = self.acquire_http_query_permit().await?;
+                        self.fetch_transaction_single_round_trip(signature_bytes, signature_literal)
+                            .await
+                    }
+                    .await;
+
+                    match result {
+                        Ok((row_opt, timings)) => {
+                            let position = row_opt.as_ref().map(|row| SignatureSlot {
+                                slot: row.slot,
+                                slot_idx: row.slot_idx,
+                            });
+                            leader.finish(position).await;
+                            return Ok((row_opt.map(map_transaction_row), timings));
+                        }
+                        Err(err) => {
+                            leader.fail().await;
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The caller owns HTTP admission and the operation deadline.
+    async fn fetch_transaction_single_round_trip(
+        &self,
+        signature_bytes: SignatureBytes,
+        signature_literal: &str,
+    ) -> ProcessingResult<(Option<TransactionRow>, QueryTimings)> {
+        let sig_bucket = cityhash64(signature_bytes.as_ref()) % self.signatures_bucket_modulus();
+        let query = build_get_transaction_single_round_trip_query(
+            &self.transaction_table,
+            self.signature_lookup_source(),
+            sig_bucket,
+            signature_literal,
+            &self.single_round_trip_settings_clause(),
+        );
+        let start = Instant::now();
+        let mut cursor = self
+            .read_endpoint
+            .fetch::<TransactionRow>(&self.client, &query, SINGLE_ROUND_TRIP_OPERATION)
+            .await
+            .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+        let row_opt = cursor
+            .next_optional()
+            .await
+            .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+        let timings = QueryTimings {
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            received_bytes: cursor.received_bytes(),
+            decoded_bytes: cursor.decoded_bytes(),
+            rows_read: Some(0),
+            rows_read_unknown: true,
+            rows_returned: u64::from(row_opt.is_some()),
+        };
+        Ok((row_opt, timings))
     }
 
     /// Read an already resolved position without another signature lookup.
@@ -823,6 +1070,7 @@ impl ClickHouseClient {
             token_owner_bucket_modulus: self.token_owner_bucket_modulus(),
             signatures_table: &self.signature_statuses_table,
             signature_bucket_modulus: self.signatures_bucket_modulus(),
+            union_pushdown: self.transactions_for_address_union_pushdown,
         };
         let query_sql = build_transactions_for_address_query(&tables, query, &settings_clause)?;
 
@@ -1069,6 +1317,7 @@ impl ClickHouseClient {
             token_owner_bucket_modulus: self.token_owner_bucket_modulus(),
             signatures_table: &self.signature_statuses_table,
             signature_bucket_modulus: self.signatures_bucket_modulus(),
+            union_pushdown: self.transactions_for_address_union_pushdown,
         };
         let query_sql = build_transactions_for_address_query(&tables, query, &settings_clause)?;
 
@@ -1417,6 +1666,7 @@ impl ClickHouseClient {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cache::SignatureSlotCacheLeader;
     use super::*;
 
     #[test]
@@ -1549,6 +1799,377 @@ mod tests {
             "PREWHERE slot = 42 AND slot_idx = 7 AND signature = toFixedString(unhex('AB'), 64)"
         ));
         assert!(!query.contains("ORDER BY slot_idx DESC"));
+    }
+
+    fn single_round_trip_test_client(url: &str, database: &str, enabled: bool) -> ClickHouseClient {
+        let mut client = ClickHouseClient::new(
+            url,
+            "default",
+            "default",
+            "",
+            super::super::ClickHouseClientOptions::new(
+                super::super::RoutingPolicy {
+                    transport: super::super::RoutingTransport::Http,
+                    scope: super::super::RoutingScope::Distributed,
+                },
+                None,
+                Vec::new(),
+                format!("{database}.gsfa_hot"),
+                format!("{database}.gsfa_hot_local"),
+            ),
+        );
+        client.transaction_table = format!("{database}.transactions");
+        client.signature_statuses_table = format!("{database}.signatures");
+        client.set_get_transaction_single_round_trip(enabled);
+        client
+    }
+
+    #[test]
+    fn single_round_trip_query_resolves_position_and_payload_in_one_statement() {
+        let signature = bs58::encode([7u8; 64]).into_string();
+        let (_, literal) = decode_transaction_signature(&signature).unwrap();
+        let sql = build_get_transaction_single_round_trip_query(
+            "default.transactions",
+            "default.signatures",
+            5,
+            &literal,
+            "SETTINGS optimize_skip_unused_shards=1, use_query_cache=0",
+        );
+
+        // One aggregate row even for an unknown signature, with an unreachable sentinel slot.
+        assert!(sql.contains(
+            "SELECT if(count() = 0, (toUInt64(18446744073709551615), toUInt32(0)), max((slot, slot_idx)))"
+        ));
+        assert!(sql.contains(&format!(
+            "FROM default.signatures\n            PREWHERE sig_bucket = 5 AND signature = {literal}"
+        )));
+        // The full primary key, so the payload read selects one granule.
+        assert!(sql.contains(&format!(
+            "FROM default.transactions\n         PREWHERE slot = tupleElement(pos, 1)\n            AND slot_idx = tupleElement(pos, 2)\n            AND signature = {literal}"
+        )));
+        assert!(sql.contains("WHERE tupleElement(pos, 1) != 18446744073709551615"));
+        assert!(!sql.contains("ORDER BY"));
+        assert!(sql.contains("LIMIT 1"));
+        assert!(sql.contains(TRANSACTION_SELECT_COLUMNS));
+        assert!(sql.trim_end().ends_with("use_query_cache=0"));
+    }
+
+    #[test]
+    fn single_round_trip_settings_disable_query_cache() {
+        let mut client = single_round_trip_test_client("http://127.0.0.1:1", "default", true);
+        client.query_cache = super::super::util::QueryCacheConfig::new(true, 30, false, false)
+            .with_get_transaction_overrides(300, 2);
+        client.allow_query_settings = true;
+        let settings = client.single_round_trip_settings_clause();
+        assert!(settings.starts_with("SETTINGS optimize_skip_unused_shards=1, use_query_cache=0"));
+        assert!(settings.contains("max_execution_time="));
+        assert!(!settings.contains("use_query_cache=1"));
+        assert!(!settings.contains("enable_writes_to_query_cache"));
+
+        client.allow_query_settings = false;
+        assert_eq!(client.single_round_trip_settings_clause(), "");
+    }
+
+    #[test]
+    fn single_round_trip_reads_owner_shard_source_when_routed() {
+        let mut client = single_round_trip_test_client("http://127.0.0.1:1", "default", true);
+        client.allow_query_settings = true;
+        assert!(
+            !client
+                .single_round_trip_settings_clause()
+                .contains("force_optimize_skip_unused_shards")
+        );
+        assert_eq!(client.signature_lookup_source(), "default.signatures");
+        client
+            .set_signatures_owner_shard_routing(true, "my_cluster", None)
+            .unwrap();
+        assert_eq!(
+            client.signature_lookup_source(),
+            "cluster('my_cluster', default.signatures_local, cityHash64(signature))"
+        );
+        let settings = client.single_round_trip_settings_clause();
+        assert!(settings.starts_with("SETTINGS optimize_skip_unused_shards=1, use_query_cache=0"));
+        assert!(settings.ends_with(", force_optimize_skip_unused_shards=0"));
+        assert_eq!(settings.matches("optimize_skip_unused_shards=1").count(), 1);
+    }
+
+    #[test]
+    fn single_round_trip_applies_only_to_distributed_primary_reads() {
+        let mut client = single_round_trip_test_client("http://127.0.0.1:1", "default", false);
+        assert!(!client.get_transaction_single_round_trip_enabled());
+        client.set_get_transaction_single_round_trip(true);
+        assert!(client.get_transaction_single_round_trip_enabled());
+        client.cache_partition = Some((100, 1));
+        assert!(!client.get_transaction_single_round_trip_enabled());
+    }
+
+    #[tokio::test]
+    async fn single_round_trip_cached_miss_returns_none_without_query() {
+        // Port 1 refuses connections, so any query would fail the call.
+        let client = single_round_trip_test_client("http://127.0.0.1:1", "default", true);
+        let signature_bytes = [9u8; 64];
+        client
+            .signature_slot_cache
+            .prime_for_tests(signature_bytes, None)
+            .await;
+        let (record, timings) = client
+            .get_transaction_by_signature(&bs58::encode(signature_bytes).into_string())
+            .await
+            .expect("cached miss");
+        assert!(record.is_none());
+        assert_eq!(timings.rows_returned, 0);
+    }
+
+    #[tokio::test]
+    async fn single_round_trip_query_error_releases_singleflight() {
+        let client = single_round_trip_test_client("http://127.0.0.1:1", "default", true);
+        let signature_bytes = [10u8; 64];
+        let signature = bs58::encode(signature_bytes).into_string();
+        assert!(
+            client
+                .get_transaction_by_signature(&signature)
+                .await
+                .is_err()
+        );
+        // A failed leader leaves no entry, so the next caller leads again instead of waiting.
+        assert!(matches!(
+            client
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await,
+            CacheStart::Leader(_)
+        ));
+    }
+
+    /// Spawns a flag-on getTransaction for `signature_bytes` while the test holds the cache
+    /// leader, and returns once the call is waiting on that leader.
+    async fn spawn_single_round_trip_waiter(
+        client: &Arc<ClickHouseClient>,
+        signature_bytes: SignatureBytes,
+    ) -> tokio::task::JoinHandle<ProcessingResult<(Option<StoredTransactionRecord>, QueryTimings)>>
+    {
+        let spawned = client.clone();
+        let signature = bs58::encode(signature_bytes).into_string();
+        let handle =
+            tokio::spawn(async move { spawned.get_transaction_by_signature(&signature).await });
+        for _ in 0..1_000 {
+            if client
+                .signature_slot_cache
+                .in_flight_waiters_for_tests(signature_bytes)
+                .await
+                == 1
+            {
+                return handle;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("getTransaction never waited on the cache leader");
+    }
+
+    fn expect_leader(start: CacheStart<Option<SignatureSlot>>) -> SignatureSlotCacheLeader {
+        match start {
+            CacheStart::Leader(leader) => leader,
+            other => panic!("expected cache leader, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_round_trip_waiter_uses_leader_miss_without_query() {
+        // Port 1 refuses connections, so any query would fail the call.
+        let client = Arc::new(single_round_trip_test_client(
+            "http://127.0.0.1:1",
+            "default",
+            true,
+        ));
+        let signature_bytes = [11u8; 64];
+        let leader = expect_leader(
+            client
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await,
+        );
+        let waiter = spawn_single_round_trip_waiter(&client, signature_bytes).await;
+
+        leader.finish(None).await;
+        let (record, timings) = waiter.await.expect("join").expect("leader miss");
+        assert!(record.is_none());
+        // Waited timings, not the zero timings of an immediate cache hit.
+        assert!(timings.rows_read_unknown);
+        assert_eq!(timings.rows_returned, 0);
+    }
+
+    #[tokio::test]
+    async fn single_round_trip_waiter_reads_payload_at_leader_position() {
+        let client = Arc::new(single_round_trip_test_client(
+            "http://127.0.0.1:1",
+            "default",
+            true,
+        ));
+        let signature_bytes = [12u8; 64];
+        let leader = expect_leader(
+            client
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await,
+        );
+        let waiter = spawn_single_round_trip_waiter(&client, signature_bytes).await;
+
+        leader
+            .finish(Some(SignatureSlot {
+                slot: 42,
+                slot_idx: 7,
+            }))
+            .await;
+        // The payload read at the leader's position reaches the refused port.
+        assert!(waiter.await.expect("join").is_err());
+        // The position stays cached; the failed payload read does not evict it.
+        assert!(matches!(
+            client
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await,
+            CacheStart::Hit(Some(SignatureSlot {
+                slot: 42,
+                slot_idx: 7
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn single_round_trip_waiter_leads_after_leader_failure() {
+        let client = Arc::new(single_round_trip_test_client(
+            "http://127.0.0.1:1",
+            "default",
+            true,
+        ));
+        let signature_bytes = [13u8; 64];
+        let leader = expect_leader(
+            client
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await,
+        );
+        let waiter = spawn_single_round_trip_waiter(&client, signature_bytes).await;
+
+        leader.fail().await;
+        // The waiter leads its own fused query, which fails against the refused port and releases
+        // the entry again.
+        assert!(waiter.await.expect("join").is_err());
+        expect_leader(
+            client
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await,
+        );
+    }
+
+    /// Compares the one-query path with the two-query path on a dedicated database of an
+    /// explicitly supplied local ClickHouse: found, legacy `slot_idx`, orphan and unknown. The
+    /// paths agree except for the legacy row, which only the two-query fallback finds.
+    #[tokio::test]
+    #[ignore = "requires SUPERBANK_SINGLE_RT_CLICKHOUSE_TEST_URL pointing to local ClickHouse"]
+    async fn single_round_trip_matches_two_query_path_clickhouse() {
+        let url = std::env::var("SUPERBANK_SINGLE_RT_CLICKHOUSE_TEST_URL")
+            .expect("set SUPERBANK_SINGLE_RT_CLICKHOUSE_TEST_URL");
+        let http = reqwest::Client::new();
+        let database = format!(
+            "single_rt_{}_{}",
+            std::process::id(),
+            crate::util::current_time_millis()
+        );
+        async fn execute(http: &reqwest::Client, url: &str, sql: String) {
+            let response = http.post(url).body(sql).send().await.expect("request");
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(status.is_success(), "ClickHouse {status}: {body}");
+        }
+        execute(&http, &url, format!("CREATE DATABASE {database}")).await;
+        for ddl in [
+            include_str!("../../../../ddl/local/transactions.sql"),
+            include_str!("../../../../ddl/local/signatures.sql"),
+        ] {
+            for statement in ddl
+                .replace("default.", &format!("{database}."))
+                .split(";\n")
+            {
+                if !statement.trim().is_empty() {
+                    execute(&http, &url, statement.to_string()).await;
+                }
+            }
+        }
+        let insert_transaction = |fill: char, slot: u64, slot_idx: u32| {
+            format!(
+                "INSERT INTO {database}.transactions (signature, slot, slot_idx, tx_signatures, tx_num_required_signatures, tx_account_keys, tx_recent_blockhash, meta_status_ok, meta_pre_balances, meta_post_balances) VALUES (repeat('{fill}', 64), {slot}, {slot_idx}, [repeat('{fill}', 64)], 1, [repeat('k', 32)], repeat('h', 32), 1, [10], [10])"
+            )
+        };
+        // Found: the view writes the matching signatures row.
+        execute(&http, &url, insert_transaction('a', 700, 3)).await;
+        // Legacy: signatures points at slot_idx 9, the payload lives at slot_idx 5.
+        execute(&http, &url, insert_transaction('l', 701, 5)).await;
+        execute(&http, &url, format!("INSERT INTO {database}.signatures (signature, slot, slot_idx, err) VALUES (repeat('l', 64), 701, 9, NULL)")).await;
+        // Orphan: a signatures row without a payload row.
+        execute(&http, &url, format!("INSERT INTO {database}.signatures (signature, slot, slot_idx, err) VALUES (repeat('o', 64), 702, 1, NULL)")).await;
+
+        let two_query = single_round_trip_test_client(&url, &database, false);
+        let one_query = single_round_trip_test_client(&url, &database, true);
+        for client in [&two_query, &one_query] {
+            client
+                .initialize_read_cancellation()
+                .await
+                .expect("cancellation preflight");
+        }
+        let key = |record: &Option<StoredTransactionRecord>| {
+            record
+                .as_ref()
+                .map(|record| (record.signature, record.slot, record.slot_idx))
+        };
+        for (fill, two_query_expected, expected) in [
+            (b'a', Some((700, 3)), Some((700, 3))),
+            (b'l', Some((701, 5)), None),
+            (b'o', None, None),
+            (b'u', None, None),
+        ] {
+            let signature_bytes = [fill; 64];
+            let signature = bs58::encode(signature_bytes).into_string();
+            let (before, _) = two_query
+                .get_transaction_by_signature(&signature)
+                .await
+                .expect("two-query read");
+            let (after, timings) = one_query
+                .get_transaction_by_signature(&signature)
+                .await
+                .expect("one-query read");
+            let position = |record: &Option<StoredTransactionRecord>| {
+                key(record).map(|(_, slot, slot_idx)| (slot, slot_idx))
+            };
+            assert_eq!(
+                position(&before),
+                two_query_expected,
+                "signature {}",
+                fill as char
+            );
+            assert_eq!(position(&after), expected, "signature {}", fill as char);
+            assert_eq!(timings.rows_returned, u64::from(expected.is_some()));
+
+            // The leader cached the served position, or a miss.
+            let cached = match one_query
+                .signature_slot_cache
+                .get_or_start(signature_bytes)
+                .await
+            {
+                CacheStart::Hit(value) => value.map(|pos| (pos.slot, pos.slot_idx)),
+                _ => panic!("signature {} not cached", fill as char),
+            };
+            assert_eq!(cached, expected, "signature {}", fill as char);
+
+            // A second read takes the cached path and returns the same result.
+            let (again, _) = one_query
+                .get_transaction_by_signature(&signature)
+                .await
+                .expect("cached read");
+            assert_eq!(key(&again), key(&after), "signature {}", fill as char);
+        }
+        execute(&http, &url, format!("DROP DATABASE {database}")).await;
     }
 }
 

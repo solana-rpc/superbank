@@ -58,6 +58,37 @@ async fn sample(cache: &DiskCache, state: &str, slot: u64, pinned: bool) -> Valu
         "membership_ms":membership_ms,"elapsed_ms":elapsed_ms})
 }
 
+/// Ready-membership hits arriving at a fixed rate, independent of completions, so
+/// admission waits queue as they do under open-loop client arrivals. The fixture lane has
+/// `query_concurrency` permits; rates are chosen to load it partially.
+async fn open_loop_hits(cache: &DiskCache) -> Value {
+    let mut runs = Vec::new();
+    for rate in [100u64, 200, 260] {
+        let count = rate * 3;
+        let mut ticks = tokio::time::interval(Duration::from_micros(1_000_000 / rate));
+        let mut tasks = tokio::task::JoinSet::new();
+        let started = std::time::Instant::now();
+        for i in 0..count {
+            ticks.tick().await;
+            let cache = cache.clone();
+            let slot = if i % 2 == 0 { 15 } else { 25 };
+            tasks.spawn(async move {
+                let start = std::time::Instant::now();
+                let result = Box::pin(cache.get_tx(signature(slot), None)).await;
+                assert!(matches!(result, DiskTransactionResult::Found(_)));
+                start.elapsed().as_secs_f64() * 1000.0
+            });
+        }
+        let mut elapsed = Vec::new();
+        while let Some(ms) = tasks.join_next().await {
+            elapsed.push(ms.unwrap());
+        }
+        runs.push(json!({"rate_per_s":rate,"reads":count,
+            "wall_ms":started.elapsed().as_secs_f64()*1000.0,"elapsed_ms":elapsed}));
+    }
+    json!(runs)
+}
+
 async fn run(client: &clickhouse::Client, cache: &DiskCache, source: &ClickHouseClient) -> Value {
     assert!(cache.ready());
     assert!(!cache.signature_indexes_ready());
@@ -102,6 +133,7 @@ async fn run(client: &clickhouse::Client, cache: &DiskCache, source: &ClickHouse
             assert_eq!(actual, expected);
         }
     }
+    let open_loop = open_loop_hits(cache).await;
     assert_transaction_position_fallback(cache).await;
     assert_transaction_invalidation(cache).await;
     let db = &cache.inner.cfg.database;
@@ -125,7 +157,7 @@ async fn run(client: &clickhouse::Client, cache: &DiskCache, source: &ClickHouse
         .fetch_one::<String>()
         .await
         .unwrap();
-    json!({"clickhouse_version":version,"samples":samples,"phases":phases,"handler_samples":handlers,
+    json!({"clickhouse_version":version,"samples":samples,"phases":phases,"handler_samples":handlers,"open_loop":open_loop,
         "checks":{"legacy_v0_parity":true,"stale_position":true,"invalidated_read":true,"unavailable_fallback":true}})
 }
 
