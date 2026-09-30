@@ -1426,7 +1426,7 @@ impl Metrics {
             );
             registry.register(
                 "disk_cache_given_up_slots",
-                "Incomplete slots inside the retention window the forwarder has given up on until their retry",
+                "Incomplete slots inside the retention window the forwarder has given up on",
                 disk_cache_given_up_slots.clone(),
             );
             registry.register(

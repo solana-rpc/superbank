@@ -883,7 +883,7 @@ Configuration:
 
 The forwarder admits all concurrent ranges through one slots-per-second token bucket. Each range streams and validates independently. Coverage is published only for a range that completes both base-table writes and transaction-count validation. For a fast initial fill on capable source and local ClickHouse instances, increase concurrency and the rate limit first, then increase slots per query if fixed query overhead dominates. Watch `superbank_disk_cache_backfill_inflight_ranges`, write latency, fill errors, and source-cluster load while tuning.
 
-`superbank_disk_cache_backfill_slots_remaining` counts every hole in the retention window, including slots the forwarder has given up on. `superbank_disk_cache_given_up_slots` counts only the given-up slots that are waiting for their retry; reads for them fall back to the source.
+`superbank_disk_cache_backfill_slots_remaining` counts every hole in the retention window, including slots the forwarder has given up on. `superbank_disk_cache_given_up_slots` counts only the given-up slots, which the forwarder skips until their retry (or for good when `DISK_CACHE_GIVEN_UP_RETRY_SECS` is `0`); reads for them fall back to the source.
 
 The removed RocksDB settings `DISK_CACHE_PATH`, `DISK_CACHE_BLOCK_CACHE_BYTES`, `DISK_CACHE_WRITE_QUEUE_SLOTS`, and `DISK_CACHE_READ_CONCURRENCY` produce a configuration error instead of being ignored.
 
