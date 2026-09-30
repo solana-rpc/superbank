@@ -8,7 +8,10 @@ mod errors;
 mod meta;
 mod transaction;
 
-pub(crate) use block::hydrate_block_payload;
+pub(crate) use block::{
+    BlockBuildError, SplitBlockPayload, assemble_block_chunks, block_hydration_chunk_count,
+    hydrate_block_payload, hydrate_serialize_block_chunk, split_block_payload,
+};
 pub(crate) use errors::{BlockHydrationError, TransactionHydrationError};
 #[cfg(any(test, feature = "grpc-streaming"))]
 pub(crate) use meta::build_transaction_status_meta;

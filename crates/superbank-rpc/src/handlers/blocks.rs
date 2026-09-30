@@ -37,7 +37,11 @@ use crate::handlers::{
         reject_unknown_fields,
     },
 };
-use crate::hydration::{BlockHydrationError, hydrate_block_payload};
+use crate::hydration::{
+    BlockBuildError, BlockHydrationError, SplitBlockPayload, assemble_block_chunks,
+    block_hydration_chunk_count, hydrate_block_payload, hydrate_serialize_block_chunk,
+    split_block_payload,
+};
 use crate::metrics;
 use crate::rpc::{
     json_rpc_error_response, json_rpc_internal_error_response, json_rpc_node_unhealthy_response,
@@ -1192,6 +1196,148 @@ pub(crate) async fn handle_is_blockhash_valid(
     Ok(resp)
 }
 
+fn block_result_build_error(err: BlockHydrationError) -> BlockResultBuildError {
+    match err {
+        BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(version)) => {
+            BlockResultBuildError::UnsupportedTransactionVersion(version)
+        }
+        other => BlockResultBuildError::Failed(other.to_string()),
+    }
+}
+
+fn encode_block_result(
+    payload: StoredBlockPayload,
+    fetch_plan: GetBlockFetchPlan,
+) -> Result<Bytes, BlockResultBuildError> {
+    let encoded_block = hydrate_block_payload(
+        payload,
+        fetch_plan.encoding,
+        fetch_plan.transaction_details,
+        fetch_plan.show_rewards,
+        fetch_plan.max_supported_transaction_version,
+    )
+    .map_err(block_result_build_error)?;
+    serde_json::to_vec(&encoded_block)
+        .map(Bytes::from)
+        .map_err(|err| BlockResultBuildError::Failed(err.to_string()))
+}
+
+fn join_error(err: tokio::task::JoinError) -> BlockResultBuildError {
+    BlockResultBuildError::Failed(err.to_string())
+}
+
+/// Hydrates and serializes on the blocking pool. Large full/accounts blocks
+/// are split into contiguous chunks, one hydration permit each; extra permits
+/// are taken only when immediately free, so the total never exceeds
+/// `HYDRATION_CPU_CONCURRENCY` and a busy pool degrades to one thread.
+async fn build_block_result_blocking(
+    state: &AppState,
+    payload: StoredBlockPayload,
+    fetch_plan: GetBlockFetchPlan,
+) -> Result<Bytes, BlockResultBuildError> {
+    let closed = |_| BlockResultBuildError::Failed("hydration semaphore closed".to_string());
+    let semaphore = state.hydration_sem.clone();
+    let mut permits = vec![semaphore.clone().acquire_owned().await.map_err(closed)?];
+
+    let wanted = match fetch_plan.transaction_details {
+        TransactionDetails::Full | TransactionDetails::Accounts => block_hydration_chunk_count(
+            payload.observed_transaction_count().unwrap_or(0),
+            state.get_block_hydration_parallelism,
+        ),
+        TransactionDetails::Signatures | TransactionDetails::None => 1,
+    };
+    while permits.len() < wanted {
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permits.push(permit),
+            Err(_) => break,
+        }
+    }
+
+    let payload = if permits.len() > 1 {
+        match split_block_payload(payload, fetch_plan.transaction_details, permits.len()) {
+            Ok(split) => return build_block_result_chunked(split, permits, fetch_plan).await,
+            Err(payload) => *payload,
+        }
+    } else {
+        payload
+    };
+    permits.truncate(1);
+    tokio::task::spawn_blocking(move || {
+        let _permits = permits;
+        encode_block_result(payload, fetch_plan)
+    })
+    .await
+    .map_err(join_error)?
+}
+
+async fn build_block_result_chunked(
+    split: SplitBlockPayload,
+    permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+    fetch_plan: GetBlockFetchPlan,
+) -> Result<Bytes, BlockResultBuildError> {
+    let SplitBlockPayload { metadata, chunks } = split;
+    debug_assert_eq!(chunks.len(), permits.len());
+    let GetBlockFetchPlan {
+        encoding,
+        transaction_details,
+        show_rewards,
+        max_supported_transaction_version,
+    } = fetch_plan;
+    let run_chunk = move |chunk| {
+        hydrate_serialize_block_chunk(
+            chunk,
+            encoding,
+            show_rewards,
+            max_supported_transaction_version,
+        )
+    };
+
+    let mut permits = permits.into_iter();
+    let mut chunks = chunks.into_iter();
+    let (Some(lead_permit), Some(first_chunk)) = (permits.next(), chunks.next()) else {
+        return Err(BlockResultBuildError::Failed(
+            "empty hydration chunk plan".to_string(),
+        ));
+    };
+    // The first chunk's permit is handed back to run the final assembly.
+    let first = tokio::task::spawn_blocking(move || (run_chunk(first_chunk), lead_permit));
+    let rest = chunks
+        .zip(permits)
+        .map(|(chunk, permit)| {
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                run_chunk(chunk)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let (first_output, lead_permit) = first.await.map_err(join_error)?;
+    let mut outputs = Vec::with_capacity(rest.len() + 1);
+    outputs.push(first_output);
+    for handle in rest {
+        outputs.push(handle.await.map_err(join_error)?);
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = lead_permit;
+        assemble_block_chunks(
+            metadata,
+            encoding,
+            transaction_details,
+            show_rewards,
+            max_supported_transaction_version,
+            outputs,
+        )
+    })
+    .await
+    .map_err(join_error)?
+    .map(Bytes::from)
+    .map_err(|err| match err {
+        BlockBuildError::Hydration(err) => block_result_build_error(err),
+        BlockBuildError::Serialize(err) => BlockResultBuildError::Failed(err.to_string()),
+    })
+}
+
 /// Hydrate a block payload and build the JSON-RPC response; shared by the
 /// head-cache, disk-cache, and ClickHouse branches of getBlock.
 async fn respond_with_hydrated_block(
@@ -1229,47 +1375,16 @@ async fn respond_with_hydrated_block(
 
     let build_result = async move {
         let started = Instant::now();
-        let encode = move || {
-            let encoded_block = hydrate_block_payload(
-                payload,
-                fetch_plan.encoding,
-                fetch_plan.transaction_details,
-                fetch_plan.show_rewards,
-                fetch_plan.max_supported_transaction_version,
-            )
-            .map_err(|err| match err {
-                BlockHydrationError::Encode(EncodeError::UnsupportedTransactionVersion(
-                    version,
-                )) => BlockResultBuildError::UnsupportedTransactionVersion(version),
-                other => BlockResultBuildError::Failed(other.to_string()),
-            })?;
-            serde_json::to_vec(&encoded_block)
-                .map(Bytes::from)
-                .map_err(|err| BlockResultBuildError::Failed(err.to_string()))
-        };
-
         let result = if fetch_plan.needs_blocking_hydration() {
-            let permit = state
-                .hydration_sem
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| {
-                    BlockResultBuildError::Failed("hydration semaphore closed".to_string())
-                })?;
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                encode()
-            })
-            .await
-            .map_err(|err| BlockResultBuildError::Failed(err.to_string()))?
+            build_block_result_blocking(state, payload, fetch_plan).await
         } else {
-            encode()
+            encode_block_result(payload, fetch_plan)
         };
         metrics::get_block_phase("hydrate_serialize", started.elapsed().as_secs_f64());
         result
     };
 
+    let cache_key_for_errors = cache_key.clone();
     let built = match cache_key {
         Some(key) => state
             .block_response_cache
@@ -1300,6 +1415,14 @@ async fn respond_with_hydrated_block(
             let BlockResultBuildError::UnsupportedTransactionVersion(version) = err.as_ref() else {
                 unreachable!()
             };
+            // The payload passed the transaction-count check above, so for a
+            // finalized slot (the only keys issued) the error is immutable.
+            if let Some(key) = cache_key_for_errors {
+                state
+                    .block_response_cache
+                    .insert_unsupported_transaction_version(key, *version)
+                    .await;
+            }
             route.rpc_error();
             let code = JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32;
             let mut resp = json_rpc_error_response(
@@ -1396,18 +1519,35 @@ pub(crate) async fn handle_get_block(
         ));
     }
 
-    let response_cache_key = (commitment.commitment == CommitmentLevel::Finalized)
-        .then(|| fetch_plan.cache_key(slot, commitment.commitment));
-    if let Some(response_cache_key) = response_cache_key.as_ref()
-        && state.block_response_cache.enabled()
-    {
+    // Entries are only ever built from finalized data (see the per-tier keys
+    // below), so an entry proves the slot is finalized. A confirmed request for
+    // a finalized slot returns that same block, so both commitments share the
+    // finalized key.
+    let response_cache_key = fetch_plan.cache_key(slot, CommitmentLevel::Finalized);
+    let requested_finalized = commitment.commitment == CommitmentLevel::Finalized;
+    let uses_response_cache = requested_finalized || state.get_block_response_cache_share_confirmed;
+    if uses_response_cache && state.block_response_cache.enabled() {
         route.response_cache_read();
-        if let Some(result_bytes) = state.block_response_cache.get(response_cache_key).await {
+        if let Some(result_bytes) = state.block_response_cache.get(&response_cache_key).await {
             route.source_response_cache();
             route.success();
             return Ok(json_rpc_success_response_from_result_bytes(
                 id,
                 result_bytes,
+            ));
+        }
+        if let Some(version) = state
+            .block_response_cache
+            .get_unsupported_transaction_version(&response_cache_key)
+            .await
+        {
+            route.source_response_cache();
+            route.rpc_error();
+            return Ok(json_rpc_error_response(
+                id,
+                JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32,
+                unsupported_transaction_version_message(version),
+                None,
             ));
         }
     }
@@ -1436,7 +1576,8 @@ pub(crate) async fn handle_get_block(
                     payload,
                     fetch_plan,
                     BlockResponseOptions {
-                        cache_key: response_cache_key.clone(),
+                        // A confirmed head-cache block may not be finalized yet.
+                        cache_key: requested_finalized.then(|| response_cache_key.clone()),
                         timings: None,
                     },
                 )
@@ -1470,7 +1611,8 @@ pub(crate) async fn handle_get_block(
                     *payload,
                     fetch_plan,
                     BlockResponseOptions {
-                        cache_key: response_cache_key.clone(),
+                        // Disk-cache data is finalized for either commitment.
+                        cache_key: uses_response_cache.then(|| response_cache_key.clone()),
                         timings: None,
                     },
                 )
@@ -1613,7 +1755,9 @@ pub(crate) async fn handle_get_block(
         block_payload,
         fetch_plan,
         BlockResponseOptions {
-            cache_key: response_cache_key,
+            // Source ClickHouse is read identically for both commitments, so
+            // these bytes are exactly what a finalized request would insert.
+            cache_key: uses_response_cache.then_some(response_cache_key),
             timings: Some(timings),
         },
     )
@@ -1801,7 +1945,6 @@ pub(crate) async fn handle_get_blocks(
     };
 
     let mut end_slot_opt = None;
-    let mut end_from_param = false;
     let mut config_value_opt: Option<Value> = None;
 
     if let Some(value) = params.first() {
@@ -1825,7 +1968,6 @@ pub(crate) async fn handle_get_blocks(
                 }
             };
             end_slot_opt = Some(end_slot);
-            end_from_param = true;
             if let Some(config_value) = params.get(1) {
                 config_value_opt = Some(config_value.clone());
             }
@@ -1863,6 +2005,24 @@ pub(crate) async fn handle_get_blocks(
         rows_read_unknown: false,
         rows_returned: 0,
     };
+    // Validate an explicit end on the raw parameter: a head-tip clamp must not turn a valid
+    // request into an error or admit a range this server rejects today.
+    if let Some(end_slot) = end_slot_opt {
+        if end_slot < start_slot {
+            route.invalid_params();
+            return Ok(json_rpc_error_response(
+                id,
+                -32602,
+                "Invalid params: end_slot must be greater than or equal to start_slot",
+                None,
+            ));
+        }
+        if end_slot - start_slot > MAX_GET_BLOCKS_RANGE {
+            route.invalid_params();
+            return Ok(get_blocks_range_too_large(id));
+        }
+    }
+
     let mut observation = RangeObservation::new(route.method());
     let range = match resolve_range(
         &state,
@@ -1885,35 +2045,21 @@ pub(crate) async fn handle_get_blocks(
     };
     let end_slot = range.end;
 
+    // An omitted end below start, or an explicit end clamped below start by the trusted
+    // head tip: nothing at this commitment yet (Agave returns an empty list).
     if end_slot < start_slot {
-        if end_from_param {
-            route.invalid_params();
-            return Ok(json_rpc_error_response(
-                id,
-                -32602,
-                "Invalid params: end_slot must be greater than or equal to start_slot",
-                None,
-            ));
-        }
-
-        route.success();
-        observation.success();
-        let mut resp = json_rpc_success_response(id, Vec::<u64>::new());
-        add_downstream_header(&mut resp, &timings);
-        return Ok(resp);
+        return Ok(empty_block_range_response(
+            &mut route,
+            &mut observation,
+            id,
+            &timings,
+        ));
     }
 
+    // Only reachable for an omitted end; explicit ends were checked on the raw value.
     if end_slot.saturating_sub(start_slot) > MAX_GET_BLOCKS_RANGE {
         route.invalid_params();
-        return Ok(json_rpc_error_response(
-            id,
-            -32602,
-            format!(
-                "Invalid params: end_slot must be no more than {} blocks higher than start_slot",
-                MAX_GET_BLOCKS_RANGE
-            ),
-            None,
-        ));
+        return Ok(get_blocks_range_too_large(id));
     }
 
     get_block_slots_response_for_range(&state, &mut route, id, range, timings, &mut observation)
@@ -2022,7 +2168,7 @@ pub(crate) async fn handle_get_blocks_with_limit(
 
     let mut observation = RangeObservation::new(route.method());
     let mut timings = timings;
-    let range = resolve_range(
+    let range = match resolve_range(
         &state,
         &mut route,
         start_slot,
@@ -2032,9 +2178,51 @@ pub(crate) async fn handle_get_blocks_with_limit(
         &mut observation,
     )
     .await
-    .expect("explicit range does not resolve a tip");
+    {
+        Ok(range) => range,
+        Err(reason) => {
+            observation.reason = reason;
+            let mut response = json_rpc_internal_error_response(id);
+            add_downstream_header(&mut response, &timings);
+            return Ok(response);
+        }
+    };
+    // The trusted head tip may clamp the window below start.
+    if range.end < start_slot {
+        return Ok(empty_block_range_response(
+            &mut route,
+            &mut observation,
+            id,
+            &timings,
+        ));
+    }
     get_block_slots_response_for_range(&state, &mut route, id, range, timings, &mut observation)
         .await
+}
+
+fn get_blocks_range_too_large(id: Value) -> Response {
+    json_rpc_error_response(
+        id,
+        -32602,
+        format!(
+            "Invalid params: end_slot must be no more than {} blocks higher than start_slot",
+            MAX_GET_BLOCKS_RANGE
+        ),
+        None,
+    )
+}
+
+fn empty_block_range_response(
+    route: &mut RouteMetric,
+    observation: &mut RangeObservation,
+    id: Value,
+    timings: &QueryTimings,
+) -> Response {
+    route.success();
+    observation.success();
+    let mut response = json_rpc_success_response(id, Vec::<u64>::new());
+    add_downstream_header(&mut response, timings);
+    response
 }
 
 fn inflation_reward_address_limit_exceeded(
@@ -2415,7 +2603,15 @@ pub(crate) async fn handle_get_health(
     }
 
     route.source_clickhouse();
-    match state.clickhouse.get_latest_finalized_slot().await {
+    // The latest-slot cache's last value bounds the scan; the answer is unchanged either way.
+    let hint = Some(
+        state
+            .latest_slot_cache
+            .value
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .filter(|slot| *slot > 0);
+    match state.clickhouse.get_latest_finalized_slot_since(hint).await {
         Ok(Some(_slot)) => {
             route.success();
             Ok(json_rpc_success_response(id, "ok"))
@@ -2520,6 +2716,199 @@ mod tests {
                     .map(|tx| bs58::encode(tx.signature).into_string())
                     .collect(),
             },
+        }
+    }
+
+    /// Local benchmark for the `hydrate_serialize` phase on a large synthetic
+    /// block: `cargo test ... get_block_hydration_benchmark -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn get_block_hydration_benchmark() {
+        use super::*;
+
+        let transactions: usize = std::env::var("GET_BLOCK_BENCH_TRANSACTIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_290);
+        let iterations = 15;
+        let realistic = std::env::var("GET_BLOCK_BENCH_SIMPLE").is_err();
+        for (details, encoding) in [
+            (TransactionDetails::Full, UiTransactionEncoding::Json),
+            (TransactionDetails::Full, UiTransactionEncoding::JsonParsed),
+            (TransactionDetails::Full, UiTransactionEncoding::Base64),
+            (TransactionDetails::Accounts, UiTransactionEncoding::Json),
+        ] {
+            let mut reference: Option<Bytes> = None;
+            for parallelism in [1, 2, 4, 8] {
+                let mut state = crate::tests::test_state();
+                Arc::get_mut(&mut state)
+                    .unwrap()
+                    .get_block_hydration_parallelism = parallelism;
+                let plan = GetBlockFetchPlan::new(&RpcBlockConfig {
+                    encoding: Some(encoding),
+                    transaction_details: Some(details),
+                    max_supported_transaction_version: Some(1),
+                    ..Default::default()
+                });
+                let block = if realistic {
+                    crate::tests::realistic_synthetic_block_record(transactions)
+                } else {
+                    crate::tests::large_synthetic_block_record(transactions, true)
+                };
+                let mut samples = Vec::with_capacity(iterations);
+                let mut last = Bytes::new();
+                for _ in 0..iterations {
+                    let payload = crate::clickhouse::StoredBlockPayload::Full(block.clone());
+                    let started = Instant::now();
+                    let response = respond_with_hydrated_block(
+                        &state,
+                        json!(1),
+                        &mut RouteMetric::for_state("getBlock", &state),
+                        4_242,
+                        payload,
+                        plan,
+                        BlockResponseOptions {
+                            cache_key: None,
+                            timings: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+                    last = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                }
+                match reference.as_ref() {
+                    Some(reference) => assert!(*reference == last),
+                    None => reference = Some(last.clone()),
+                }
+                samples.sort_by(f64::total_cmp);
+                if parallelism > 1 {
+                    // Contention-free critical path: time each chunk and the
+                    // assembly on this thread; with free cores the latency is
+                    // max(chunk) + assembly instead of their sum.
+                    let mut model = Vec::with_capacity(iterations);
+                    for _ in 0..iterations {
+                        let payload = crate::clickhouse::StoredBlockPayload::Full(block.clone());
+                        let started = Instant::now();
+                        let split = split_block_payload(
+                            payload,
+                            details,
+                            block_hydration_chunk_count(transactions, parallelism),
+                        )
+                        .expect("splits");
+                        let split_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                        let mut chunk_ms = Vec::new();
+                        let mut outputs = Vec::new();
+                        for chunk in split.chunks {
+                            let started = Instant::now();
+                            outputs.push(hydrate_serialize_block_chunk(
+                                chunk,
+                                encoding,
+                                plan.show_rewards,
+                                plan.max_supported_transaction_version,
+                            ));
+                            chunk_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                        }
+                        let started = Instant::now();
+                        let bytes = assemble_block_chunks(
+                            split.metadata,
+                            encoding,
+                            details,
+                            plan.show_rewards,
+                            plan.max_supported_transaction_version,
+                            outputs,
+                        )
+                        .expect("assembles");
+                        let assemble_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                        // `last` is the full JSON-RPC envelope around these bytes.
+                        assert!(last.len() - bytes.len() < 64);
+                        let sum: f64 = chunk_ms.iter().sum();
+                        let max = chunk_ms.iter().copied().fold(0.0, f64::max);
+                        model.push((split_ms + max + assemble_ms, split_ms + sum + assemble_ms));
+                    }
+                    model.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
+                    let (critical, serial) = model[model.len() / 2];
+                    println!(
+                        "model details={details:?} encoding={encoding:?} txs={transactions} parallelism={parallelism} critical_path_ms={critical:.2} serial_sum_ms={serial:.2}"
+                    );
+                }
+                println!(
+                    "bench realistic={realistic} details={details:?} encoding={encoding:?} txs={transactions} parallelism={parallelism} bytes={} p50_ms={:.2} min_ms={:.2} max_ms={:.2}",
+                    last.len(),
+                    samples[samples.len() / 2],
+                    samples[0],
+                    samples[samples.len() - 1],
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_block_parallel_hydration_response_matches_sequential_bytes() {
+        use super::*;
+
+        async fn body(
+            parallelism: usize,
+            permits: usize,
+            details: TransactionDetails,
+            encoding: UiTransactionEncoding,
+        ) -> Bytes {
+            let mut state = crate::tests::test_state();
+            {
+                let state = Arc::get_mut(&mut state).unwrap();
+                state.get_block_hydration_parallelism = parallelism;
+                state.hydration_sem = Arc::new(tokio::sync::Semaphore::new(permits));
+            }
+            let plan = GetBlockFetchPlan::new(&RpcBlockConfig {
+                encoding: Some(encoding),
+                transaction_details: Some(details),
+                max_supported_transaction_version: Some(1),
+                ..Default::default()
+            });
+            let payload = crate::clickhouse::StoredBlockPayload::Full(
+                crate::tests::large_synthetic_block_record(1_290, true),
+            );
+            let response = respond_with_hydrated_block(
+                &state,
+                json!("same-id"),
+                &mut RouteMetric::for_state("getBlock", &state),
+                4_242,
+                payload,
+                plan,
+                BlockResponseOptions {
+                    cache_key: None,
+                    timings: None,
+                },
+            )
+            .await
+            .unwrap();
+            // Every permit is released once the response is built.
+            assert_eq!(state.hydration_sem.available_permits(), permits);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        }
+
+        for (details, encoding) in [
+            (TransactionDetails::Full, UiTransactionEncoding::Json),
+            (TransactionDetails::Full, UiTransactionEncoding::Base64),
+            (TransactionDetails::Accounts, UiTransactionEncoding::Json),
+        ] {
+            let sequential = body(1, 8, details, encoding).await;
+            let parsed: Value = serde_json::from_slice(&sequential).unwrap();
+            assert_eq!(
+                parsed["result"]["transactions"].as_array().unwrap().len(),
+                1_290
+            );
+            for (parallelism, permits) in [(4, 8), (8, 8), (4, 2), (4, 1)] {
+                let parallel = body(parallelism, permits, details, encoding).await;
+                assert!(
+                    parallel == sequential,
+                    "{details:?}/{encoding:?} parallelism={parallelism} permits={permits}"
+                );
+            }
         }
     }
 

@@ -450,6 +450,19 @@ impl DiskCache {
         }
     }
 
+    /// Unknown-membership signature partitions in the current key span. Every
+    /// signature is a candidate in each of them, so this is the unknown count of
+    /// `signature_candidates` for any signature at this instant.
+    pub(in crate::disk_cache) fn unknown_signature_partitions(&self) -> u64 {
+        let width = self.inner.cfg.partition_slots;
+        self.key_span().map_or(0, |(floor, tip)| {
+            self.inner
+                .key_index
+                .signature_completeness(floor / width, tip / width)
+                .1
+        })
+    }
+
     pub(in crate::disk_cache) fn publish_signature_index_metrics(&self) {
         if let Some((floor, tip)) = self.key_span() {
             let width = self.inner.cfg.partition_slots;

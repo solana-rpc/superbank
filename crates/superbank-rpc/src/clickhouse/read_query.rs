@@ -12,8 +12,8 @@ use tokio::time::Instant;
 
 pub(crate) mod admission;
 
-use super::disconnect::{DisconnectGuard, DisconnectVerifier};
-use super::util::next_required_query_id;
+use super::disconnect::{DisconnectGuard, DisconnectVerifier, PendingBudget};
+use super::util::{max_execution_time_secs, next_required_query_id};
 use crate::processing::{ProcessingError, ProcessingResult};
 
 #[derive(Clone)]
@@ -29,6 +29,11 @@ impl ReadEndpoint {
     #[cfg(test)]
     pub(crate) fn verification_timeouts(&self) -> super::verification::VerificationTimeouts {
         self.verifier.timeouts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self) -> usize {
+        self.admission.available_permits()
     }
 
     #[cfg(feature = "disk-cache")]
@@ -60,8 +65,31 @@ impl ReadEndpoint {
         timeout: Duration,
         target: &'static str,
     ) -> Self {
+        let capacity = capacity.max(1);
+        Self::with_pending_budget(
+            control,
+            cluster,
+            verification_timeouts,
+            capacity,
+            timeout,
+            target,
+            PendingBudget::for_admission(capacity),
+        )
+    }
+
+    /// Like [`Self::new`], but abandoned bounded reads count against `budget`,
+    /// shared with every endpoint whose reads hold the same workflow permits.
+    pub(crate) fn with_pending_budget(
+        control: Client,
+        cluster: Option<String>,
+        verification_timeouts: super::verification::VerificationTimeouts,
+        capacity: usize,
+        timeout: Duration,
+        target: &'static str,
+        budget: Arc<PendingBudget>,
+    ) -> Self {
         Self {
-            verifier: DisconnectVerifier::new(control, cluster, verification_timeouts),
+            verifier: DisconnectVerifier::new(control, cluster, verification_timeouts, budget),
             admission: Arc::new(Semaphore::new(capacity.max(1))),
             timeout,
             target,
@@ -69,9 +97,21 @@ impl ReadEndpoint {
         }
     }
 
+    pub(crate) fn pending_budget(&self) -> Arc<PendingBudget> {
+        self.verifier.pending_budget()
+    }
+
     /// Which ClickHouse this endpoint reads: `primary`, `cache` or `background`.
     pub(crate) fn target(&self) -> &'static str {
         self.target
+    }
+
+    /// Interactive primary-cluster reads carry a server-side `max_execution_time`
+    /// equal to their deadline, so abandoned ones release admission after it
+    /// passes even when termination cannot be verified. Local-cache reads keep
+    /// their own policy and background scans keep verifying without a bound.
+    fn bounds_abandoned_retention(&self) -> bool {
+        matches!(self.target, "primary" | "shard")
     }
 
     pub(crate) fn with_timeout(&self, timeout: Duration) -> Self {
@@ -171,15 +211,29 @@ impl ReadEndpoint {
             .map_err(|e| ProcessingError::timeout("ClickHouse read admission", e))?
             .map_err(|_| ProcessingError::database_msg("ClickHouse read admission closed"))?;
         let id = id.unwrap_or_else(|| next_required_query_id(operation));
-        let mut guard = self
-            .verifier
-            .arm_ready(id.clone(), permit, operation, self.target)?;
+        let max_execution = self.bounds_abandoned_retention().then_some(self.timeout);
+        let mut guard =
+            self.verifier
+                .arm_ready(id.clone(), permit, operation, self.target, max_execution)?;
         guard.retain_workflow(admission::current());
         if !self.retain_until_verified {
             guard.release_on_abandon();
         }
+        let mut query = client.query(sql).with_setting("query_id", id);
+        if let Some(limit) = max_execution {
+            let limit_secs = max_execution_time_secs(limit).to_string();
+            // Default for statements without their own limit (optional SQL settings
+            // disabled, metadata reads). A SQL `SETTINGS max_execution_time`, which
+            // callers derive from the same or a shorter budget, takes precedence.
+            query = query.with_setting("max_execution_time", limit_secs.clone());
+            // An initiator blocked on a hung leaf never checks `max_execution_time`;
+            // it waits for `receive_timeout` (300 s by default). This is an idle gap
+            // between leaf packets, and working leaves send progress every
+            // `interactive_delay`, so a gap this long has already missed the deadline.
+            query = query.with_setting("receive_timeout", limit_secs);
+        }
         Ok(ReadQuery {
-            query: client.query(sql).with_setting("query_id", id),
+            query,
             guard: Some(guard),
             deadline,
         })

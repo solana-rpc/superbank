@@ -159,6 +159,32 @@ impl HeadCoverage {
         })
     }
 
+    /// The trusted newest tip at `commitment` and its verified chain: a connected
+    /// subscription, a tip advanced within [`TIP_MAX_AGE`], and at least one verified parent
+    /// edge (or the genesis root). This is the single definition of a trusted tip.
+    fn trusted_chain(
+        &self,
+        commitment: CommitmentLevel,
+        now: Instant,
+    ) -> Result<(u64, Vec<Link>), &'static str> {
+        if !self.connected {
+            return Err("untrusted_tip");
+        }
+        let Some(tip) = self.tips[rank(commitment)] else {
+            return Err("commitment_unavailable");
+        };
+        if now.saturating_duration_since(tip.advanced) > TIP_MAX_AGE {
+            return Err("untrusted_tip");
+        }
+        let chain = self.chain(tip.slot, commitment);
+        // A trusted latest bound requires at least one verified parent edge.
+        let rooted = chain.first().is_some_and(|link| link.slot == 0);
+        if chain.len() < 2 && !rooted {
+            return Err("untrusted_tip");
+        }
+        Ok((tip.slot, chain))
+    }
+
     pub(crate) fn snapshot(
         &self,
         start: u64,
@@ -166,29 +192,49 @@ impl HeadCoverage {
         commitment: CommitmentLevel,
         now: Instant,
     ) -> Result<(u64, SlotCoverage), &'static str> {
-        let unavailable = || {
-            end.map(|end| (end, SlotCoverage::default()))
-                .ok_or("untrusted_tip")
+        let Some(end) = end else {
+            let (tip, chain) = self.trusted_chain(commitment, now)?;
+            return Ok((tip, chain_coverage(&chain, start, tip)));
         };
+        Ok((end, self.historical_coverage(start, end, commitment)))
+    }
+
+    /// Coverage for an explicit end: historical proof stays usable while connected, even
+    /// when tip discovery is stale.
+    fn historical_coverage(
+        &self,
+        start: u64,
+        end: u64,
+        commitment: CommitmentLevel,
+    ) -> SlotCoverage {
         if !self.connected {
-            return unavailable();
+            return SlotCoverage::default();
         }
         let Some(tip) = self.tips[rank(commitment)] else {
-            return end
-                .map(|end| (end, SlotCoverage::default()))
-                .ok_or("commitment_unavailable");
+            return SlotCoverage::default();
         };
-        if end.is_none() && now.saturating_duration_since(tip.advanced) > TIP_MAX_AGE {
-            return Err("untrusted_tip");
+        chain_coverage(&self.chain(tip.slot, commitment), start, end)
+    }
+
+    /// Explicit-end snapshot that clamps `end` to the trusted tip, as Agave clamps to its
+    /// bank slot. Slots above a trusted tip are not yet at `commitment`, so no source can
+    /// list them. Without a trusted tip the explicit end is kept unchanged (never an error).
+    /// Returns `(end, coverage, clamped)`; the clamped end may be below `start`.
+    pub(crate) fn snapshot_clamped(
+        &self,
+        start: u64,
+        end: u64,
+        commitment: CommitmentLevel,
+        now: Instant,
+    ) -> (u64, SlotCoverage, bool) {
+        match self.trusted_chain(commitment, now) {
+            Ok((tip, chain)) => {
+                let clamped = tip < end;
+                let end = end.min(tip);
+                (end, chain_coverage(&chain, start, end), clamped)
+            }
+            Err(_) => (end, self.historical_coverage(start, end, commitment), false),
         }
-        let chain = self.chain(tip.slot, commitment);
-        // A trusted latest bound requires at least one verified parent edge.
-        let rooted = chain.first().is_some_and(|link| link.slot == 0);
-        if end.is_none() && chain.len() < 2 && !rooted {
-            return Err("untrusted_tip");
-        }
-        let end = end.unwrap_or(tip.slot);
-        Ok((end, chain_coverage(&chain, start, end)))
     }
 }
 
@@ -409,5 +455,46 @@ mod tests {
                 .snapshot(10, None, CommitmentLevel::Finalized, now)
                 .is_err()
         );
+    }
+    #[test]
+    fn explicit_end_clamps_only_to_the_trusted_tip() {
+        let now = Instant::now();
+        let finalized = CommitmentLevel::Finalized;
+        let mut state = HeadCoverage::default();
+        state.connect();
+        add(&mut state, 10, 9, now);
+        add(&mut state, 12, 10, now);
+        // Trusted: the clamp matches the omitted-end tip and its proof.
+        let (tip, trusted) = state.snapshot(5, None, finalized, now).unwrap();
+        let (end, proof, clamped) = state.snapshot_clamped(5, 20, finalized, now);
+        assert_eq!((end, clamped), (tip, true));
+        assert_eq!(proof.slots, trusted.slots);
+        assert_eq!(proof.gaps(5, end), vec![(5, 9)]);
+        // An end at or below the tip is unchanged.
+        let (end, proof, clamped) = state.snapshot_clamped(10, 12, finalized, now);
+        assert_eq!((end, clamped), (12, false));
+        assert!(proof.gaps(10, 12).is_empty());
+        // Start above the tip clamps below start: an empty range, not an error.
+        let (end, proof, clamped) = state.snapshot_clamped(15, 20, finalized, now);
+        assert_eq!((end, clamped), (12, true));
+        assert!(proof.slots.is_empty());
+        // Stale tip: keep the raw end and the historical proof.
+        let later = now + TIP_MAX_AGE + Duration::from_nanos(1);
+        assert!(state.snapshot(5, None, finalized, later).is_err());
+        let (end, proof, clamped) = state.snapshot_clamped(10, 20, finalized, later);
+        assert_eq!((end, clamped), (20, false));
+        assert_eq!(proof.gaps(10, 20), vec![(13, 20)]);
+        // No tip yet after a reconnect: raw end.
+        state.connect();
+        assert_eq!(state.snapshot_clamped(10, 20, finalized, now).0, 20);
+        // Unverified single-link chain: raw end.
+        add(&mut state, 30, 29, now);
+        assert!(state.snapshot(30, None, finalized, now).is_err());
+        assert_eq!(state.snapshot_clamped(30, 40, finalized, now).0, 40);
+        // Disconnected: raw end, no proof.
+        state.disconnect();
+        let (end, proof, clamped) = state.snapshot_clamped(10, 20, finalized, now);
+        assert_eq!((end, clamped), (20, false));
+        assert!(proof.intervals.is_empty());
     }
 }

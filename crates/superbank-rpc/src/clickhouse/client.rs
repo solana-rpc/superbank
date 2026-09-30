@@ -37,7 +37,7 @@ use super::sharding::{
     detect_bucket_modulus_on_shards, escape_clickhouse_string, load_clickhouse_topology_config,
     resolve_host, validate_table_schema_on_shards,
 };
-use super::types::QueryTimings;
+use super::types::{QueryTimings, SignatureSlot};
 use super::util::{
     QueryCacheConfig, QueryFreshnessClass, annotate_tcp_query, append_max_execution_time_setting,
     build_select_settings_clause, build_select_settings_clause_with_overrides, env_truthy,
@@ -329,6 +329,21 @@ pub struct ClickHouseClient {
     /// [`CacheAdmissionBusy`], so a saturated cache denies quickly instead of spending
     /// the caller's budget in the queue.
     pub(crate) cache_admission_wait: Option<Duration>,
+    /// Primary distributed getTransaction: resolve the position and read the payload in one
+    /// query when the signature-slot cache misses.
+    pub(crate) get_transaction_single_round_trip: bool,
+    /// Bound latest-slot queries by the caller's previous answer (`CLICKHOUSE_LATEST_SLOT_HINT`).
+    pub(crate) latest_slot_hint: bool,
+    /// getTransactionsForAddress: emit `slot:idx` paginationTokens for ClickHouse rows.
+    pub(crate) transactions_for_address_position_tokens: bool,
+    /// getTransactionsForAddress token-accounts UNION pushdown
+    /// (`CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN`).
+    pub(crate) transactions_for_address_union_pushdown: bool,
+    /// getTransactionsForAddress: last-row positions of served ClickHouse pages, by signature.
+    pub(crate) transactions_for_address_cursors: Option<moka::future::Cache<String, SignatureSlot>>,
+    /// Primary distributed getSignaturesForAddress: resolve a `before`/`until` cursor that
+    /// the head and local tiers missed inside the page query instead of a separate lookup.
+    pub(crate) gsfa_inline_cursor: bool,
     pub(crate) transaction_table: String,
     pub(crate) blocks_metadata_table: String,
     pub(crate) gsfa_table: String,
@@ -337,6 +352,11 @@ pub struct ClickHouseClient {
     pub(crate) gsfa_hot_addresses: Vec<String>,
     pub(crate) gsfa_hot_pubkeys: HashSet<Pubkey>,
     pub(crate) signature_statuses_table: String,
+    /// Primary only: the owner-shard-prunable source for signature lookups
+    /// (`CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING`), e.g.
+    /// `cluster('{cluster}', default.signatures_local, cityHash64(signature))`.
+    /// `None` reads `signature_statuses_table`.
+    pub(crate) signatures_owner_shard_source: Option<super::owner_shard::OwnerShardSource>,
     pub(crate) token_owner_activity_table: String,
     pub(crate) signatures_local_table: Option<String>,
     pub(crate) token_owner_activity_local_table: Option<String>,
@@ -358,6 +378,7 @@ pub struct ClickHouseClient {
     #[cfg(any(test, feature = "disk-cache"))]
     query_cleanup_cluster: Option<String>,
     pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
+    pub(crate) inflation_epoch_cache: super::inflation_cache::InflationEpochCache,
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) replica_health_check_interval: Duration,
     pub(crate) http_connect_timeout: Duration,
@@ -434,6 +455,8 @@ pub struct InflationRewardQueryLimits {
     pub max_threads: usize,
     pub max_memory_bytes: u64,
     pub max_bytes_to_read: u64,
+    /// Byte budget for validated epoch boundary/partition metadata; zero disables the cache.
+    pub epoch_cache_max_bytes: u64,
 }
 
 impl Default for InflationRewardQueryLimits {
@@ -443,6 +466,7 @@ impl Default for InflationRewardQueryLimits {
             max_threads: 2,
             max_memory_bytes: 536_870_912,
             max_bytes_to_read: 536_870_912,
+            epoch_cache_max_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -615,6 +639,13 @@ impl ClickHouseClientOptions {
     }
 }
 
+#[cfg(test)]
+impl ClickHouseClient {
+    pub(crate) fn disable_inflation_epoch_cache(&mut self) {
+        self.inflation_epoch_cache = super::inflation_cache::InflationEpochCache::new(0);
+    }
+}
+
 impl ClickHouseClient {
     pub fn new(
         url: &str,
@@ -741,6 +772,12 @@ impl ClickHouseClient {
             cache_partition: None,
             cache_slot_range: None,
             cache_admission_wait: None,
+            get_transaction_single_round_trip: false,
+            latest_slot_hint: true,
+            transactions_for_address_position_tokens: false,
+            transactions_for_address_union_pushdown: true,
+            transactions_for_address_cursors: None,
+            gsfa_inline_cursor: false,
             transaction_table,
             blocks_metadata_table,
             gsfa_table,
@@ -749,6 +786,7 @@ impl ClickHouseClient {
             gsfa_hot_addresses,
             gsfa_hot_pubkeys: HashSet::new(),
             signature_statuses_table,
+            signatures_owner_shard_source: None,
             token_owner_activity_table,
             signatures_local_table,
             token_owner_activity_local_table,
@@ -773,6 +811,9 @@ impl ClickHouseClient {
             query_cleanup_cluster,
             read_endpoint,
             inflation_reward_limits,
+            inflation_epoch_cache: super::inflation_cache::InflationEpochCache::new(
+                inflation_reward_limits.epoch_cache_max_bytes,
+            ),
             tcp_access_check_timeout,
             replica_health_check_interval,
             http_connect_timeout,
@@ -875,6 +916,7 @@ impl ClickHouseClient {
         self.gsfa_hot_table = names.gsfa_hot.clone();
         self.gsfa_hot_local_table = names.gsfa_hot;
         self.signature_statuses_table = names.signatures;
+        self.signatures_owner_shard_source = None;
         self.token_owner_activity_table = names.token_owner_activity;
         self.signatures_local_table = None;
         self.token_owner_activity_local_table = None;
@@ -1775,6 +1817,10 @@ impl ClickHouseClient {
             }
         }
 
+        // Boxed: the layout check's futures would otherwise sit in every create_tables frame,
+        // which debug-build tests await on the default 2 MiB test-thread stack.
+        Box::pin(self.verify_signatures_owner_shard_routing()).await?;
+
         if self.scope_shard_direct() && self.shard_routing.is_none() {
             return Err(ProcessingError::database_msg(
                 "CLICKHOUSE_SCOPE=shard-direct requires shard routing configuration",
@@ -1943,13 +1989,16 @@ impl ClickHouseClient {
             shard_num,
             tcp_pool,
             http_client: self.build_http_client(shard_url.as_str()),
-            read_endpoint: super::read_query::ReadEndpoint::new(
+            // Pending shard reads keep leases on the client's HTTP semaphore, so every
+            // replica shares the primary endpoint's abandoned-read budget.
+            read_endpoint: super::read_query::ReadEndpoint::with_pending_budget(
                 self.build_http_client(shard_url.as_str()),
                 None,
                 self.verification_timeouts,
                 self.http_query_sem.available_permits().max(1),
                 self.query_timeout,
                 "shard",
+                self.read_endpoint.pending_budget(),
             ),
             host,
             tcp_port,
@@ -2441,7 +2490,10 @@ fn validate_gsfa_shard_layout_query(
     Ok(())
 }
 
-fn split_table_reference<'a>(default_database: &'a str, table: &'a str) -> (&'a str, &'a str) {
+pub(crate) fn split_table_reference<'a>(
+    default_database: &'a str,
+    table: &'a str,
+) -> (&'a str, &'a str) {
     match table.rsplit_once('.') {
         Some((database, table_name)) if !database.is_empty() && !table_name.is_empty() => {
             (database.trim_matches('`'), table_name.trim_matches('`'))
@@ -3111,6 +3163,7 @@ mod tests {
                 max_threads: 3,
                 max_memory_bytes: 123_456,
                 max_bytes_to_read: 654_321,
+                epoch_cache_max_bytes: 0,
             },
             ..client
         };

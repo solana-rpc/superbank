@@ -83,6 +83,10 @@ struct State {
     signatures: BTreeMap<u64, signatures::SignatureEntry>,
     serial: u64,
     epoch: u64,
+    /// Bumped only by events that can change or remove rows at covered slots
+    /// (poison, repair, schema rebuild); `epoch` is bumped by those and by eviction
+    /// floor moves and routing-membership changes, which can only stale negatives.
+    data_epoch: u64,
     untracked_writers: usize,
 }
 
@@ -156,8 +160,25 @@ impl KeyIndex {
             id: Some(id),
         }
     }
+    /// Rows at covered slots may change: every in-flight read is invalid.
     pub(super) fn invalidate_reads(&self) {
+        let mut state = self.state.lock().expect("key index lock");
+        state.epoch += 1;
+        state.data_epoch += 1;
+    }
+    /// Only rows below a new retention floor go away. In-flight negatives are
+    /// invalid; a found row whose slot is still covered at completion is not.
+    pub(super) fn invalidate_negative_reads(&self) {
         self.state.lock().expect("key index lock").epoch += 1;
+    }
+    /// Eviction's invalidation. `DISK_CACHE_EVICTION_SAFE_HITS=false` restores the
+    /// behaviour before eviction-safe hits: every in-flight read, found rows included.
+    pub(super) fn invalidate_for_eviction(&self, eviction_safe_hits: bool) {
+        if eviction_safe_hits {
+            self.invalidate_negative_reads();
+        } else {
+            self.invalidate_reads();
+        }
     }
     // Reject an overlapping writer even when its invalidation predates this read.
     pub(super) fn range_read_token(&self, start: u64, end: u64) -> Option<(u64, u64)> {
@@ -172,6 +193,11 @@ impl KeyIndex {
 
     pub(super) fn epoch(&self) -> u64 {
         self.state.lock().expect("key index lock").epoch
+    }
+    /// `(epoch, data_epoch)` read under one lock.
+    pub(super) fn epochs(&self) -> (u64, u64) {
+        let state = self.state.lock().expect("key index lock");
+        (state.epoch, state.data_epoch)
     }
     #[cfg(test)]
     pub(super) fn may_contain(&self, partition: u64, families: &[Family], key: &[u8]) -> bool {
@@ -478,6 +504,18 @@ async fn read_keys<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn eviction_invalidates_found_reads_only_with_the_switch_off() {
+        let cfg = super::super::key_tests::config(String::new(), String::new());
+        let index = KeyIndex::new(&cfg);
+        let (epoch, data) = index.epochs();
+        // On: negatives only; a found row survives while its slot stays covered.
+        index.invalidate_for_eviction(true);
+        assert_eq!(index.epochs(), (epoch + 1, data));
+        // Off: the data epoch moves too, so every in-flight read is rejected.
+        index.invalidate_for_eviction(false);
+        assert_eq!(index.epochs(), (epoch + 2, data + 1));
+    }
     #[test]
     fn mutation_metadata_is_bounded_under_overload() {
         let index = Arc::new(KeyIndex {

@@ -254,6 +254,10 @@ pub(crate) struct TransactionsForAddressTables<'a> {
     pub(crate) token_owner_bucket_modulus: u64,
     pub(crate) signatures_table: &'a str,
     pub(crate) signature_bucket_modulus: u64,
+    /// Token-accounts UNION: push the filter, ORDER BY and LIMIT into each branch
+    /// (`CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN`); `false` keeps the filter
+    /// outside the union, as before.
+    pub(crate) union_pushdown: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -746,40 +750,12 @@ pub(crate) fn build_transactions_for_address_query(
             format!(" AND intDiv(slot, {width}) = {partition}")
         });
 
-    let gsfa_subquery = format!(
-        "SELECT signature, slot, slot_idx, err, memo, block_time
-         FROM {gsfa_table}
-         PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}{slot_scope}",
-        gsfa_table = tables.gsfa_table,
-        addr_bucket = gsfa_addr_bucket,
-        address_literal = address_literal
-    );
-
-    let mut union_parts = vec![gsfa_subquery];
-    if query.token_accounts != TokenAccountsFilter::None {
-        let balance_clause = if query.token_accounts == TokenAccountsFilter::BalanceChanged {
-            " WHERE balance_changed = 1"
-        } else {
-            ""
-        };
-        let token_subquery = format!(
-            "SELECT signature, slot, slot_idx, err, memo, block_time
-             FROM {token_owner_table}
-             PREWHERE owner_bucket = {addr_bucket} AND owner = {address_literal}{slot_scope}{balance_clause}",
-            token_owner_table = tables.token_owner_table,
-            addr_bucket = token_owner_bucket,
-            address_literal = address_literal,
-            balance_clause = balance_clause
-        );
-        union_parts.push(token_subquery);
-    }
-
     let order_dir = match query.sort_order {
         SortOrder::Asc => "ASC",
         SortOrder::Desc => "DESC",
     };
 
-    let select = if union_parts.len() == 1 {
+    let select = if query.token_accounts == TokenAccountsFilter::None {
         format!(
             "{with_clause}SELECT
             base58Encode(signature) AS signature,
@@ -798,8 +774,46 @@ pub(crate) fn build_transactions_for_address_query(
             where_clause = where_clause,
         )
     } else {
-        format!(
-            "{with_clause}SELECT
+        let balance_condition = if query.token_accounts == TokenAccountsFilter::BalanceChanged {
+            "balance_changed = 1 AND "
+        } else {
+            ""
+        };
+        let gsfa_branch = format!(
+            "SELECT signature, slot, slot_idx, err, memo, block_time
+             FROM {gsfa_table}
+             PREWHERE addr_bucket = {addr_bucket} AND address = {address_literal}{slot_scope}",
+            gsfa_table = tables.gsfa_table,
+            addr_bucket = gsfa_addr_bucket,
+            address_literal = address_literal
+        );
+        let token_branch = format!(
+            "SELECT signature, slot, slot_idx, err, memo, block_time
+             FROM {token_owner_table}
+             PREWHERE owner_bucket = {addr_bucket} AND owner = {address_literal}{slot_scope}",
+            token_owner_table = tables.token_owner_table,
+            addr_bucket = token_owner_bucket,
+            address_literal = address_literal
+        );
+        if with_parts.is_empty() && tables.union_pushdown {
+            // Every bound is a literal, so each branch can apply the filter and
+            // its own top-`limit` before the union. The outer ORDER BY/LIMIT
+            // below still picks the global top-`limit`, which lies within the
+            // union of each branch's top-`limit`. Branches order by the same
+            // key as the outer query (base58 tiebreak, which the outer alias
+            // `signature` resolves to), so ties at a branch boundary resolve
+            // identically. That alias resolution needs the server default
+            // prefer_column_name_to_alias=0; with 1 the outer query would sort
+            // raw bytes and distinct signatures tied on (slot, slot_idx) across
+            // a branch LIMIT could differ. Without the pushdown every matching
+            // branch row is shipped from each shard to the initiator.
+            let branch_order = format!(
+                "ORDER BY slot {order_dir}, slot_idx {order_dir}, base58Encode(signature) {order_dir}
+             LIMIT {limit}",
+                limit = query.limit
+            );
+            format!(
+                "SELECT
                 base58Encode(signature) AS signature,
                 slot,
                 slot_idx,
@@ -807,13 +821,39 @@ pub(crate) fn build_transactions_for_address_query(
                 memo,
                 block_time
              FROM (
-                {union_sql}
+                {gsfa_branch}
+             WHERE {where_clause}
+             {branch_order}
+                UNION ALL
+                {token_branch}
+             WHERE {balance_condition}({where_clause})
+             {branch_order}
+             )"
+            )
+        } else {
+            // Unresolved signature bounds are WITH scalar subqueries; keep the
+            // filter outside the union so the aliases stay in scope.
+            let balance_clause = if balance_condition.is_empty() {
+                ""
+            } else {
+                " WHERE balance_changed = 1"
+            };
+            format!(
+                "{with_clause}SELECT
+                base58Encode(signature) AS signature,
+                slot,
+                slot_idx,
+                err,
+                memo,
+                block_time
+             FROM (
+                {gsfa_branch}
+UNION ALL
+                {token_branch}{balance_clause}
              )
-             WHERE {where_clause}",
-            with_clause = with_clause,
-            union_sql = union_parts.join("\nUNION ALL\n"),
-            where_clause = where_clause,
-        )
+             WHERE {where_clause}"
+            )
+        }
     };
 
     Ok(format!(
@@ -1035,6 +1075,7 @@ mod tests {
             token_owner_bucket_modulus: 32,
             signatures_table: "default.signatures",
             signature_bucket_modulus: 64,
+            union_pushdown: true,
         };
 
         let sql = build_transactions_for_address_query(&tables, &query, "").expect("query");
@@ -1054,6 +1095,180 @@ mod tests {
                 "slot > sig_gte_slot OR (slot = sig_gte_slot AND slot_idx >= sig_gte_idx)"
             )
         );
+    }
+
+    fn token_union_query(
+        token_accounts: TokenAccountsFilter,
+        signature_filter: Option<SignatureFilter>,
+        resolved_signature_filter: Option<ResolvedSignatureFilter>,
+    ) -> String {
+        token_union_query_with(
+            true,
+            token_accounts,
+            signature_filter,
+            resolved_signature_filter,
+        )
+    }
+
+    fn token_union_query_with(
+        union_pushdown: bool,
+        token_accounts: TokenAccountsFilter,
+        signature_filter: Option<SignatureFilter>,
+        resolved_signature_filter: Option<ResolvedSignatureFilter>,
+    ) -> String {
+        let query = TransactionsForAddressQuery {
+            address: bs58::encode([9_u8; 32]).into_string(),
+            limit: 40,
+            sort_order: SortOrder::Asc,
+            pagination: None,
+            resolved_pagination: None,
+            slot_filter: Some(NumericFilter {
+                gte: Some(100),
+                ..NumericFilter::default()
+            }),
+            block_time_filter: None,
+            signature_filter,
+            resolved_signature_filter,
+            status: TransactionStatusFilter::Failed,
+            token_accounts,
+        };
+        let tables = TransactionsForAddressTables {
+            cache_partition: None,
+            gsfa_table: "default.gsfa",
+            gsfa_bucket_modulus: 128,
+            token_owner_table: "default.token_owner_activity",
+            token_owner_bucket_modulus: 32,
+            signatures_table: "default.signatures",
+            signature_bucket_modulus: 64,
+            union_pushdown,
+        };
+        normalize_sql(&build_transactions_for_address_query(&tables, &query, "").expect("query"))
+    }
+
+    #[test]
+    fn token_accounts_union_pushdown_switch_off_keeps_the_outer_filter() {
+        // CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN=false: literal bounds get the
+        // pre-pushdown shape, filter outside the union and no per-branch ORDER BY/LIMIT.
+        let resolved = || {
+            Some(ResolvedSignatureFilter {
+                lt: Some(SignatureSlot {
+                    slot: 500,
+                    slot_idx: 7,
+                }),
+                ..ResolvedSignatureFilter::default()
+            })
+        };
+        let signature_filter = || {
+            Some(SignatureFilter {
+                lt: Some("unused".into()),
+                ..SignatureFilter::default()
+            })
+        };
+        let sql = token_union_query_with(
+            false,
+            TokenAccountsFilter::BalanceChanged,
+            signature_filter(),
+            resolved(),
+        );
+        assert!(!sql.starts_with("WITH"), "{sql}");
+        assert!(!sql.contains("base58Encode(signature) ASC LIMIT"), "{sql}");
+        assert!(
+            sql.contains("AS FixedString(32)) WHERE balance_changed = 1 ) WHERE err IS NOT NULL"),
+            "{sql}"
+        );
+        assert_eq!(
+            sql.matches("(slot < 500 OR (slot = 500 AND slot_idx < 7))")
+                .count(),
+            1,
+            "{sql}"
+        );
+        assert!(sql.ends_with("ORDER BY slot ASC, slot_idx ASC, signature ASC LIMIT 40"));
+        // The switch changes nothing for unresolved bounds (already the outer shape)
+        // or for single-table requests.
+        let signature = bs58::encode([7_u8; 64]).into_string();
+        let unresolved = |pushdown| {
+            token_union_query_with(
+                pushdown,
+                TokenAccountsFilter::All,
+                Some(SignatureFilter {
+                    gte: Some(signature.clone()),
+                    ..SignatureFilter::default()
+                }),
+                None,
+            )
+        };
+        assert_eq!(unresolved(false), unresolved(true));
+        assert_eq!(
+            token_union_query_with(false, TokenAccountsFilter::None, None, None),
+            token_union_query_with(true, TokenAccountsFilter::None, None, None)
+        );
+    }
+
+    #[test]
+    fn token_accounts_union_pushes_filter_order_and_limit_into_each_branch() {
+        let branch_tail = "ORDER BY slot ASC, slot_idx ASC, base58Encode(signature) ASC LIMIT 40";
+        let sql = token_union_query(TokenAccountsFilter::BalanceChanged, None, None);
+
+        assert!(sql.contains(&format!(
+            "AS FixedString(32)) WHERE err IS NOT NULL AND slot >= 100 {branch_tail} UNION ALL"
+        )));
+        assert!(sql.contains(&format!(
+            "WHERE balance_changed = 1 AND (err IS NOT NULL AND slot >= 100) {branch_tail} )"
+        )));
+        // The outer query still picks the global top-n from both branches.
+        assert!(sql.ends_with(") ORDER BY slot ASC, slot_idx ASC, signature ASC LIMIT 40"));
+        assert!(!sql.starts_with("WITH"));
+
+        let sql = token_union_query(TokenAccountsFilter::All, None, None);
+        assert!(sql.contains(&format!(
+            "WHERE (err IS NOT NULL AND slot >= 100) {branch_tail} )"
+        )));
+        assert!(!sql.contains("balance_changed"));
+        assert_eq!(sql.matches(branch_tail).count(), 2);
+
+        // Resolved signature bounds are literals and push down too.
+        let sql = token_union_query(
+            TokenAccountsFilter::All,
+            Some(SignatureFilter {
+                lt: Some("unused".into()),
+                ..SignatureFilter::default()
+            }),
+            Some(ResolvedSignatureFilter {
+                lt: Some(SignatureSlot {
+                    slot: 500,
+                    slot_idx: 7,
+                }),
+                ..ResolvedSignatureFilter::default()
+            }),
+        );
+        assert_eq!(sql.matches(branch_tail).count(), 2);
+        assert_eq!(
+            sql.matches("(slot < 500 OR (slot = 500 AND slot_idx < 7))")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn token_accounts_union_keeps_outer_filter_for_unresolved_signature_bounds() {
+        let signature = bs58::encode([7_u8; 64]).into_string();
+        let sql = token_union_query(
+            TokenAccountsFilter::BalanceChanged,
+            Some(SignatureFilter {
+                gte: Some(signature),
+                ..SignatureFilter::default()
+            }),
+            None,
+        );
+
+        assert!(sql.starts_with("WITH "));
+        assert!(!sql.contains("base58Encode(signature) ASC LIMIT"));
+        assert!(sql.contains("AND owner = CAST(base58Decode('"));
+        assert!(
+            sql.contains("AS FixedString(32)) WHERE balance_changed = 1 ) WHERE err IS NOT NULL")
+        );
+        assert!(sql.contains("slot > sig_gte_slot OR"));
+        assert!(sql.ends_with("ORDER BY slot ASC, slot_idx ASC, signature ASC LIMIT 40"));
     }
 
     #[test]
@@ -1103,6 +1318,7 @@ mod tests {
             token_owner_bucket_modulus: 32,
             signatures_table: "default.signatures",
             signature_bucket_modulus: 32,
+            union_pushdown: true,
         };
 
         let sql = build_transactions_for_address_query(&tables, &query, "").expect("query");
@@ -1143,6 +1359,7 @@ mod tests {
             token_owner_bucket_modulus: 32,
             signatures_table: "default.signatures",
             signature_bucket_modulus: 32,
+            union_pushdown: true,
         };
 
         let sql = normalize_sql(
@@ -1196,6 +1413,7 @@ mod tests {
             token_owner_bucket_modulus: 32,
             signatures_table: "default.signatures",
             signature_bucket_modulus: 32,
+            union_pushdown: true,
         };
         for sort_order in [SortOrder::Asc, SortOrder::Desc] {
             query.sort_order = sort_order;
@@ -1242,6 +1460,7 @@ mod tests {
             token_owner_bucket_modulus: 32,
             signatures_table: "cache.signatures",
             signature_bucket_modulus: 32,
+            union_pushdown: true,
         };
 
         let sql = normalize_sql(
@@ -1283,6 +1502,7 @@ mod tests {
             token_owner_bucket_modulus: 32,
             signatures_table: "default.signatures",
             signature_bucket_modulus: 32,
+            union_pushdown: true,
         };
 
         let sql = normalize_sql(

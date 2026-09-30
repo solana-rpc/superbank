@@ -204,10 +204,15 @@ pub(crate) fn append_max_execution_time_setting(
         return settings_clause.to_string();
     }
 
-    let timeout_secs = (timeout.as_millis().saturating_add(999) / 1000).max(1);
-    let timeout_secs = timeout_secs.min(u128::from(u64::MAX)) as u64;
-
+    let timeout_secs = max_execution_time_secs(timeout);
     format!("{settings_clause}, max_execution_time={timeout_secs}")
+}
+
+/// Whole-second `max_execution_time` for a read budget: rounded up, at least one
+/// second (zero would disable the server-side limit).
+pub(crate) fn max_execution_time_secs(timeout: Duration) -> u64 {
+    let timeout_secs = (timeout.as_millis().saturating_add(999) / 1000).max(1);
+    timeout_secs.min(u128::from(u64::MAX)) as u64
 }
 
 pub(crate) fn build_select_settings_clause(

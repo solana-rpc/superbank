@@ -17,6 +17,7 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::client::ClickHouseClient;
 use super::constants::SLOT_SHARD_DIVISOR;
+use super::inflation_cache::{InflationBoundary, complete_partition_slots};
 #[cfg(feature = "grpc-streaming")]
 use super::queries::build_transactions_by_slot_range_query;
 use super::queries::{
@@ -118,7 +119,36 @@ fn build_inflation_boundary_query(
     )
 }
 
+/// Reads every partition block (`first_block_height ..= last_block_height`) of the payout epoch so
+/// a complete height -> slot map can be cached. It scans the same payout-epoch slot range as an
+/// exact-height lookup and returns at most one row per declared partition.
 fn build_inflation_partition_slots_query(
+    table: &str,
+    boundary_slot: u64,
+    end_slot_exclusive: u64,
+    first_block_height: u64,
+    last_block_height: u64,
+    settings_clause: &str,
+) -> String {
+    let payout_epoch = boundary_slot / SLOT_SHARD_DIVISOR;
+    format!(
+        "SELECT slot, block_height
+         FROM {table}
+         PREWHERE
+            intDiv(slot, {slot_shard_divisor}) = {payout_epoch}
+            AND slot > {boundary_slot}
+            AND slot < {end_slot_exclusive}
+         WHERE block_height >= {first_block_height} AND block_height <= {last_block_height}
+         ORDER BY block_height ASC, slot ASC
+         {settings_clause}",
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+    )
+}
+
+/// Reads only the partition heights one request needs (`block_height IN (...)`). This is the
+/// query from before the epoch cache; with the cache off (`GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES=0`)
+/// nothing could use a complete map, so the cold path sends it instead of the range read.
+fn build_inflation_required_partition_slots_query(
     table: &str,
     boundary_slot: u64,
     end_slot_exclusive: u64,
@@ -173,6 +203,52 @@ fn build_inflation_rewards_query(
     selection: InflationRewardSelection,
     settings_clause: &str,
 ) -> String {
+    build_inflation_rewards_query_with(
+        table,
+        addresses,
+        slots,
+        selection.sql_predicate(),
+        "pubkey",
+        settings_clause,
+    )
+}
+
+/// Reads boundary vote rewards and partition stake rewards in one query when the complete
+/// partition slot map is known. Rows are grouped per `(pubkey, slot)` so the caller can apply the
+/// sequential lookup's boundary-first and per-partition rules without the query mixing slots.
+fn build_inflation_folded_rewards_query(
+    table: &str,
+    addresses: &[[u8; 32]],
+    boundary_slot: u64,
+    partition_slots: &[u64],
+    settings_clause: &str,
+) -> String {
+    let mut slots = Vec::with_capacity(partition_slots.len().saturating_add(1));
+    slots.push(boundary_slot);
+    slots.extend_from_slice(partition_slots);
+    let predicate = format!(
+        "((slot = {boundary_slot} AND {vote}) OR (slot != {boundary_slot} AND {stake}))",
+        vote = InflationRewardSelection::VoteOnly.sql_predicate(),
+        stake = InflationRewardSelection::StakeOnly.sql_predicate(),
+    );
+    build_inflation_rewards_query_with(
+        table,
+        addresses,
+        &slots,
+        &predicate,
+        "pubkey, slot",
+        settings_clause,
+    )
+}
+
+fn build_inflation_rewards_query_with(
+    table: &str,
+    addresses: &[[u8; 32]],
+    slots: &[u64],
+    reward_type_predicate: &str,
+    group_by: &str,
+    settings_clause: &str,
+) -> String {
     let address_literals = addresses
         .iter()
         .map(|address| {
@@ -188,7 +264,6 @@ fn build_inflation_rewards_query(
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    let reward_type_predicate = selection.sql_predicate();
 
     format!(
         "WITH [{address_literals}] AS target_pubkeys
@@ -229,7 +304,7 @@ fn build_inflation_rewards_query(
                 rewards_commission_bps
             ) AS reward
             WHERE has(target_pubkeys, reward.1) AND {reward_type_predicate}
-            GROUP BY pubkey
+            GROUP BY {group_by}
          )
          {settings_clause}"
     )
@@ -276,6 +351,99 @@ fn inflation_rewards_period_is_active(
     rewards_complete_block_height: u64,
 ) -> bool {
     current_block_height < rewards_complete_block_height
+}
+
+struct FoldedInflationRewards {
+    rewards_by_pubkey: HashMap<[u8; 32], InflationRewardRecord>,
+    /// Distinct partition slots the sequential lookup would have read (0 when every address
+    /// resolved at the boundary).
+    selected_partition_slots: usize,
+}
+
+/// Applies the sequential lookup's rules to `(pubkey, slot)` rows from the folded query:
+/// boundary vote rewards resolve an address first; each remaining address takes the latest stake
+/// reward among the partition slots of the remaining addresses, which must be its own partition
+/// slot. Rows for addresses resolved at the boundary, or at slots the sequential lookup would not
+/// have read, are ignored exactly as that lookup would never have seen them.
+fn resolve_folded_inflation_rewards(
+    rows: Vec<InflationRewardRecord>,
+    deduped_addresses: &[[u8; 32]],
+    boundary_slot: u64,
+    expected_slot_by_pubkey: &HashMap<[u8; 32], u64>,
+) -> Result<FoldedInflationRewards, String> {
+    let requested = deduped_addresses.iter().copied().collect::<HashSet<_>>();
+    let partition_slot_set = expected_slot_by_pubkey
+        .values()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut rewards_by_pubkey = HashMap::with_capacity(deduped_addresses.len());
+    let mut partition_rows = HashMap::<[u8; 32], Vec<InflationRewardRecord>>::new();
+    for row in rows {
+        if !requested.contains(&row.pubkey) {
+            return Err("folded reward query returned an unrequested address".to_string());
+        }
+        if row.effective_slot == boundary_slot {
+            if rewards_by_pubkey.insert(row.pubkey, row).is_some() {
+                return Err("boundary reward query returned a duplicate address".to_string());
+            }
+        } else if partition_slot_set.contains(&row.effective_slot) {
+            partition_rows.entry(row.pubkey).or_default().push(row);
+        } else {
+            return Err(format!(
+                "folded reward query returned unexpected slot {}",
+                row.effective_slot
+            ));
+        }
+    }
+
+    let unresolved = deduped_addresses
+        .iter()
+        .copied()
+        .filter(|address| !rewards_by_pubkey.contains_key(address))
+        .collect::<Vec<_>>();
+    let mut selected_slots = HashSet::with_capacity(unresolved.len());
+    for address in &unresolved {
+        let expected_slot = expected_slot_by_pubkey.get(address).ok_or_else(|| {
+            "folded reward lookup has no partition slot for an address".to_string()
+        })?;
+        selected_slots.insert(*expected_slot);
+    }
+    for address in &unresolved {
+        let expected_slot = expected_slot_by_pubkey[address];
+        let Some(rows) = partition_rows.remove(address) else {
+            continue;
+        };
+        let mut seen_slots = HashSet::with_capacity(rows.len());
+        let mut latest: Option<InflationRewardRecord> = None;
+        for row in rows {
+            if !selected_slots.contains(&row.effective_slot) {
+                continue;
+            }
+            if !seen_slots.insert(row.effective_slot) {
+                return Err("partition reward query returned a duplicate address".to_string());
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|latest| row.effective_slot > latest.effective_slot)
+            {
+                latest = Some(row);
+            }
+        }
+        if let Some(row) = latest {
+            if row.effective_slot != expected_slot {
+                return Err(format!(
+                    "partition reward for requested address came from slot {}, expected {}",
+                    row.effective_slot, expected_slot
+                ));
+            }
+            rewards_by_pubkey.insert(*address, row);
+        }
+    }
+
+    Ok(FoldedInflationRewards {
+        rewards_by_pubkey,
+        selected_partition_slots: selected_slots.len(),
+    })
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -847,8 +1015,30 @@ async fn fetch_block_full_projection(
     Ok((records, timings))
 }
 
+/// Slots below a caller's last observed latest slot that a hinted latest-slot query still
+/// reads (~45 minutes at 3.7 slots/s). Any floor inside the current epoch prunes
+/// `blocks_metadata` (partitioned by `intDiv(slot, 432000)`) to one or two partitions.
+pub(crate) const LATEST_SLOT_HINT_MARGIN: u64 = 10_000;
+
 impl ClickHouseClient {
-    pub async fn get_latest_finalized_slot(&self) -> ProcessingResult<Option<u64>> {
+    /// `CLICKHOUSE_LATEST_SLOT_HINT`: `false` ignores every caller's hint, so each
+    /// latest-slot query is the unbounded one.
+    pub(crate) fn set_latest_slot_hint(&mut self, enabled: bool) {
+        self.latest_slot_hint = enabled;
+    }
+
+    /// Latest finalized slot, reading only partitions at or above `hint - LATEST_SLOT_HINT_MARGIN`
+    /// when a previously observed slot is supplied. The unbounded query plans every
+    /// `blocks_metadata` part on each shard; the bounded one prunes to the newest partitions.
+    ///
+    /// The answer is exact either way: a bounded row means the global maximum is at or above
+    /// the floor and therefore inside the bounded set, and an empty bounded result (hint above
+    /// the source maximum, a lagging replica, truncation) falls back to the unbounded query.
+    /// A hint whose floor is 0 prunes nothing and sends the unbounded query directly.
+    pub async fn get_latest_finalized_slot_since(
+        &self,
+        hint: Option<u64>,
+    ) -> ProcessingResult<Option<u64>> {
         #[cfg(test)]
         if let Some(latest_slot) = self.latest_finalized_slot_for_tests {
             return Ok(latest_slot);
@@ -865,6 +1055,29 @@ impl ClickHouseClient {
                 "get_latest_finalized_slot",
                 QueryFreshnessClass::TipSensitive,
             );
+            let floor = hint
+                .filter(|_| self.latest_slot_hint)
+                .unwrap_or(0)
+                .saturating_sub(LATEST_SLOT_HINT_MARGIN);
+            if floor > 0 {
+                let query = format!(
+                    "SELECT slot FROM {blocks_metadata_table} WHERE slot >= {floor} ORDER BY slot DESC LIMIT 1 {settings_clause}",
+                );
+                let row = self
+                    .read_optional::<LatestSlotRow>(&query, "get_latest_finalized_slot")
+                    .await
+                    .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+                if let Some(row) = row {
+                    crate::metrics::slot_source("get_latest_finalized_slot", "hinted", "finalized");
+                    return Ok(Some(row.slot));
+                }
+                crate::metrics::slot_source(
+                    "get_latest_finalized_slot",
+                    "hint_fallback",
+                    "finalized",
+                );
+            }
+
             let query = format!(
                 "SELECT slot FROM {blocks_metadata_table} ORDER BY slot DESC LIMIT 1 {settings_clause}",
                 blocks_metadata_table = blocks_metadata_table,
@@ -1196,6 +1409,8 @@ impl ClickHouseClient {
         };
         let query_timeout = self.inflation_reward_limits.query_timeout;
         let read_endpoint = read_endpoint.with_timeout(query_timeout);
+        let epoch_cache_key = (start_slot, end_slot_exclusive);
+        let cached_epoch = self.inflation_epoch_cache.get(epoch_cache_key).await;
         let workflow_started = Instant::now();
         let deadline = tokio::time::Instant::now() + query_timeout;
 
@@ -1218,77 +1433,219 @@ impl ClickHouseClient {
         let execute = async {
             let mut timings = QueryTimings::zero();
 
-            let boundary_query = build_inflation_boundary_query(
-                &blocks_metadata_table,
-                start_slot,
-                end_slot_exclusive,
-                &settings_clause,
-            );
-            let boundary_started = Instant::now();
-            let mut boundary_cursor = read_endpoint
-                .fetch::<InflationBoundaryRow>(
-                    &query_client,
-                    &boundary_query,
-                    "get_inflation_reward_boundary",
-                )
-                .await
-                .map_err(|e| ProcessingError::database(e.to_string(), e))?;
-            let boundary = match boundary_cursor.next_optional().await {
-                Ok(row) => row,
-                Err(err) => {
-                    return Err(ProcessingError::database(err.to_string(), err));
-                }
-            };
-            timings.add(QueryTimings {
-                elapsed_ms: boundary_started.elapsed().as_millis() as u64,
-                received_bytes: boundary_cursor.received_bytes(),
-                decoded_bytes: boundary_cursor.decoded_bytes(),
-                rows_read: Some(0),
-                rows_read_unknown: true,
-                rows_returned: u64::from(boundary.is_some()),
-            });
-
-            let Some(boundary) = boundary else {
-                crate::metrics::inflation_reward_lookup("unknown", "boundary_missing");
-                return Ok((
-                    InflationRewardLookupOutcome::BoundaryUnavailable { slot: start_slot },
-                    timings,
-                ));
-            };
-            if boundary.parent_slot >= start_slot {
-                crate::metrics::inflation_reward_lookup("unknown", "invalid_boundary");
-                return Err(ProcessingError::database_msg(format!(
-                    "slot {} is not a valid epoch boundary for inflation epoch {epoch}",
-                    boundary.slot
-                )));
-            }
-
-            let num_partitions = match boundary.rewards_num_partitions {
-                Some(num_partitions) => {
-                    let num_partitions = usize::try_from(num_partitions).map_err(|_| {
-                        ProcessingError::database_msg(format!(
-                            "inflation epoch {epoch} declares too many reward partitions"
-                        ))
-                    })?;
-                    if num_partitions == 0 || num_partitions > MAX_INFLATION_REWARD_PARTITIONS {
-                        crate::metrics::inflation_reward_lookup(
-                            "partitioned",
-                            "invalid_partitions",
-                        );
-                        return Err(ProcessingError::database_msg(format!(
-                            "inflation epoch {epoch} declares unsupported reward partition count {num_partitions}"
-                        )));
+            let boundary = if let Some(cached) = &cached_epoch {
+                cached.boundary.clone()
+            } else {
+                let boundary_query = build_inflation_boundary_query(
+                    &blocks_metadata_table,
+                    start_slot,
+                    end_slot_exclusive,
+                    &settings_clause,
+                );
+                let boundary_started = Instant::now();
+                let mut boundary_cursor = read_endpoint
+                    .fetch::<InflationBoundaryRow>(
+                        &query_client,
+                        &boundary_query,
+                        "get_inflation_reward_boundary",
+                    )
+                    .await
+                    .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+                let boundary = match boundary_cursor.next_optional().await {
+                    Ok(row) => row,
+                    Err(err) => {
+                        return Err(ProcessingError::database(err.to_string(), err));
                     }
-                    Some(num_partitions)
+                };
+                timings.add(QueryTimings {
+                    elapsed_ms: boundary_started.elapsed().as_millis() as u64,
+                    received_bytes: boundary_cursor.received_bytes(),
+                    decoded_bytes: boundary_cursor.decoded_bytes(),
+                    rows_read: Some(0),
+                    rows_read_unknown: true,
+                    rows_returned: u64::from(boundary.is_some()),
+                });
+
+                let Some(boundary) = boundary else {
+                    crate::metrics::inflation_reward_lookup("unknown", "boundary_missing");
+                    return Ok((
+                        InflationRewardLookupOutcome::BoundaryUnavailable { slot: start_slot },
+                        timings,
+                    ));
+                };
+                if boundary.parent_slot >= start_slot {
+                    crate::metrics::inflation_reward_lookup("unknown", "invalid_boundary");
+                    return Err(ProcessingError::database_msg(format!(
+                        "slot {} is not a valid epoch boundary for inflation epoch {epoch}",
+                        boundary.slot
+                    )));
                 }
-                None => None,
+
+                let num_partitions = match boundary.rewards_num_partitions {
+                    Some(num_partitions) => {
+                        let num_partitions = usize::try_from(num_partitions).map_err(|_| {
+                            ProcessingError::database_msg(format!(
+                                "inflation epoch {epoch} declares too many reward partitions"
+                            ))
+                        })?;
+                        if num_partitions == 0 || num_partitions > MAX_INFLATION_REWARD_PARTITIONS {
+                            crate::metrics::inflation_reward_lookup(
+                                "partitioned",
+                                "invalid_partitions",
+                            );
+                            return Err(ProcessingError::database_msg(format!(
+                                "inflation epoch {epoch} declares unsupported reward partition count {num_partitions}"
+                            )));
+                        }
+                        Some(num_partitions)
+                    }
+                    None => None,
+                };
+                let boundary = InflationBoundary {
+                    slot: boundary.slot,
+                    parent_blockhash: boundary.parent_blockhash.0,
+                    block_height: boundary.block_height,
+                    num_partitions,
+                };
+                // A partitioned boundary without a block height cannot serve partition lookups and
+                // may be repaired on the primary, so only fully usable boundaries are cached.
+                if boundary.num_partitions.is_none() || boundary.block_height.is_some() {
+                    self.inflation_epoch_cache
+                        .insert_boundary(epoch_cache_key, boundary.clone())
+                        .await;
+                }
+                boundary
             };
+            let num_partitions = boundary.num_partitions;
             let partitioned = num_partitions.is_some();
             let boundary_selection = if partitioned {
                 InflationRewardSelection::VoteOnly
             } else {
                 InflationRewardSelection::VoteAndStake
             };
+
+            // With the complete partition slot map cached, read boundary vote rewards and every
+            // candidate partition's stake rewards in one round trip, then apply the sequential
+            // lookup's rules client side.
+            if let (Some(num_partitions), Some(boundary_block_height), Some(partition_slots)) = (
+                num_partitions,
+                boundary.block_height,
+                cached_epoch
+                    .as_ref()
+                    .and_then(|cached| cached.partition_slots.clone()),
+            ) && partition_slots.len() == num_partitions
+            {
+                let plan = plan_inflation_reward_partitions(
+                    &deduped_addresses,
+                    num_partitions,
+                    &boundary.parent_blockhash,
+                    boundary_block_height,
+                )
+                .ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "inflation epoch {epoch} partition block height overflowed"
+                    ))
+                })?;
+                let mut expected_slot_by_pubkey = HashMap::with_capacity(deduped_addresses.len());
+                for (address, block_height) in &plan.block_height_by_pubkey {
+                    let slot = block_height
+                        .checked_sub(boundary_block_height)
+                        .and_then(|offset| offset.checked_sub(1))
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .and_then(|offset| partition_slots.get(offset))
+                        .copied()
+                        .ok_or_else(|| {
+                            ProcessingError::database_msg(format!(
+                                "inflation epoch {epoch} partition block height {block_height} is outside the cached partition map"
+                            ))
+                        })?;
+                    expected_slot_by_pubkey.insert(*address, slot);
+                }
+                let mut candidate_slots = expected_slot_by_pubkey
+                    .values()
+                    .copied()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                candidate_slots.sort_unstable();
+
+                let folded_query = build_inflation_folded_rewards_query(
+                    &blocks_metadata_table,
+                    &deduped_addresses,
+                    boundary.slot,
+                    &candidate_slots,
+                    &settings_clause,
+                );
+                let folded_started = Instant::now();
+                let mut folded_cursor = read_endpoint
+                    .fetch::<InflationRewardRow>(
+                        &query_client,
+                        &folded_query,
+                        "get_inflation_reward_cached_rewards",
+                    )
+                    .await
+                    .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+                let mut rows = Vec::new();
+                loop {
+                    let next = match folded_cursor.next().await {
+                        Ok(next) => next,
+                        Err(err) => {
+                            return Err(ProcessingError::database(err.to_string(), err));
+                        }
+                    };
+                    let Some(row) = next else {
+                        break;
+                    };
+                    rows.push(InflationRewardRecord {
+                        pubkey: row.pubkey.0,
+                        effective_slot: row.effective_slot,
+                        lamports: row.lamports,
+                        post_balance: row.post_balance,
+                        commission: row.commission,
+                        commission_bps: row.commission_bps,
+                    });
+                }
+                let rows_returned = rows.len() as u64;
+                timings.add(QueryTimings {
+                    elapsed_ms: folded_started.elapsed().as_millis() as u64,
+                    received_bytes: folded_cursor.received_bytes(),
+                    decoded_bytes: folded_cursor.decoded_bytes(),
+                    rows_read: Some(0),
+                    rows_read_unknown: true,
+                    rows_returned,
+                });
+                let folded = resolve_folded_inflation_rewards(
+                    rows,
+                    &deduped_addresses,
+                    boundary.slot,
+                    &expected_slot_by_pubkey,
+                )
+                .map_err(ProcessingError::database_msg)?;
+
+                let selected_block_count = folded.selected_partition_slots.saturating_add(1);
+                crate::metrics::inflation_reward_selected_blocks(selected_block_count);
+                crate::metrics::inflation_reward_lookup("partitioned", "success");
+                tracing::info!(
+                    epoch,
+                    input_addresses = addresses.len(),
+                    unique_addresses = deduped_addresses.len(),
+                    declared_partitions = num_partitions,
+                    selected_blocks = selected_block_count,
+                    boundary_block_height = boundary.block_height,
+                    elapsed_ms = workflow_started.elapsed().as_millis() as u64,
+                    received_bytes = timings.received_bytes,
+                    query_scope,
+                    epoch_cache = "hit",
+                    "Completed targeted getInflationReward lookup"
+                );
+                return Ok((
+                    InflationRewardLookupOutcome::Complete(
+                        folded.rewards_by_pubkey.into_values().collect(),
+                    ),
+                    timings,
+                ));
+            }
+
             let boundary_rewards_query = build_inflation_rewards_query(
                 &blocks_metadata_table,
                 &deduped_addresses,
@@ -1426,7 +1783,7 @@ impl ClickHouseClient {
             let partition_plan = plan_inflation_reward_partitions(
                 &unresolved_addresses,
                 num_partitions,
-                &boundary.parent_blockhash.0,
+                &boundary.parent_blockhash,
                 boundary_block_height,
             )
             .ok_or_else(|| {
@@ -1440,13 +1797,33 @@ impl ClickHouseClient {
                 .copied()
                 .collect::<HashSet<_>>();
 
-            let partition_slots_query = build_inflation_partition_slots_query(
-                &blocks_metadata_table,
-                boundary.slot,
-                end_slot_exclusive,
-                &partition_plan.required_block_heights,
-                &settings_clause,
-            );
+            let first_partition_block_height =
+                boundary_block_height.checked_add(1).ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "inflation epoch {epoch} partition block height overflowed"
+                    ))
+                })?;
+            let last_partition_block_height = rewards_complete_block_height - 1;
+            // The whole declared range only feeds the epoch cache; with the cache off this
+            // is the pre-cache exact-height query.
+            let partition_slots_query = if self.inflation_epoch_cache.enabled() {
+                build_inflation_partition_slots_query(
+                    &blocks_metadata_table,
+                    boundary.slot,
+                    end_slot_exclusive,
+                    first_partition_block_height,
+                    last_partition_block_height,
+                    &settings_clause,
+                )
+            } else {
+                build_inflation_required_partition_slots_query(
+                    &blocks_metadata_table,
+                    boundary.slot,
+                    end_slot_exclusive,
+                    &partition_plan.required_block_heights,
+                    &settings_clause,
+                )
+            };
             let partition_slots_started = Instant::now();
             let mut partition_slots_cursor = read_endpoint
                 .fetch::<InflationSlotRow>(
@@ -1461,6 +1838,7 @@ impl ClickHouseClient {
             let mut block_height_by_slot =
                 HashMap::with_capacity(partition_plan.required_block_heights.len());
             let mut partition_slot_rows = 0u64;
+            let mut partition_map_rows = Vec::new();
             loop {
                 let next = match partition_slots_cursor.next().await {
                     Ok(next) => next,
@@ -1478,7 +1856,9 @@ impl ClickHouseClient {
                         row.slot
                     ))
                 })?;
-                if !required_block_height_set.contains(&block_height) {
+                if block_height < first_partition_block_height
+                    || block_height > last_partition_block_height
+                {
                     return Err(ProcessingError::database_msg(format!(
                         "partition lookup returned unexpected block height {block_height}"
                     )));
@@ -1488,6 +1868,12 @@ impl ClickHouseClient {
                         "partition lookup returned unexpected slot {}",
                         row.slot
                     )));
+                }
+                partition_map_rows.push((block_height, row.slot));
+                // Only heights this request needs are validated as strictly as before; the rest
+                // only decide whether the complete map may be cached.
+                if !required_block_height_set.contains(&block_height) {
+                    continue;
                 }
                 if let Some(previous_slot) = slot_by_block_height.insert(block_height, row.slot)
                     && previous_slot != row.slot
@@ -1520,6 +1906,19 @@ impl ClickHouseClient {
                 .copied()
                 .filter(|block_height| !slot_by_block_height.contains_key(block_height))
                 .collect::<Vec<_>>();
+            if missing_block_heights.is_empty()
+                && let Some(partition_slots) = complete_partition_slots(
+                    &partition_map_rows,
+                    boundary.slot,
+                    end_slot_exclusive,
+                    boundary_block_height,
+                    num_partitions,
+                )
+            {
+                self.inflation_epoch_cache
+                    .insert_complete(epoch_cache_key, boundary.clone(), partition_slots)
+                    .await;
+            }
             if !missing_block_heights.is_empty() {
                 let progress_query = build_inflation_progress_query(
                     &blocks_metadata_table,
@@ -2634,14 +3033,18 @@ mod tests {
     use super::build_block_time_range_query;
     use solana_epoch_schedule::EpochSchedule;
 
+    use super::super::inflation_cache::InflationEpochCache;
     use super::{
-        BlockTransactionProjection, InflationRewardSelection, SLOT_SHARD_DIVISOR,
+        BlockTransactionProjection, ClickHouseClient, InflationRewardLookupOutcome,
+        InflationRewardRecord, InflationRewardSelection, SLOT_SHARD_DIVISOR,
         build_block_metadata_query, build_block_time_query, build_block_transactions_query,
         build_blockhash_valid_query, build_inflation_boundary_query,
-        build_inflation_partition_slots_query, build_inflation_progress_query,
+        build_inflation_folded_rewards_query, build_inflation_partition_slots_query,
+        build_inflation_progress_query, build_inflation_required_partition_slots_query,
         build_inflation_rewards_query, build_transaction_count_query, inflation_epoch_slot_bounds,
         inflation_reward_partition, inflation_rewards_period_is_active, normalize_slots,
-        plan_inflation_reward_partitions, shard_indices_for_slot_range,
+        plan_inflation_reward_partitions, resolve_folded_inflation_rewards,
+        shard_indices_for_slot_range,
     };
     #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use super::{
@@ -2788,22 +3191,176 @@ mod tests {
     }
 
     #[test]
-    fn inflation_partition_slots_query_targets_exact_block_heights() {
+    fn inflation_partition_slots_query_reads_the_declared_partition_range() {
         let query = build_inflation_partition_slots_query(
             "default.blocks_metadata",
             121_392_000,
             121_824_000,
-            &[270_000_001, 270_000_017],
+            270_000_001,
+            270_000_293,
             "",
         );
 
         assert!(query.contains("SELECT slot, block_height"));
+        assert!(query.contains("intDiv(slot, 432000) = 281"));
         assert!(query.contains("slot > 121392000"));
         assert!(query.contains("slot < 121824000"));
-        assert!(query.contains("WHERE block_height IN (270000001, 270000017)"));
+        assert!(query.contains("WHERE block_height >= 270000001 AND block_height <= 270000293"));
         assert!(query.contains("ORDER BY block_height ASC, slot ASC"));
-        assert!(!query.contains("LIMIT 1 BY slot"));
-        assert!(!query.contains("LIMIT 293"));
+        assert!(!query.contains("LIMIT"));
+    }
+
+    #[test]
+    fn inflation_partition_slots_query_without_the_epoch_cache_reads_required_heights_only() {
+        // GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES=0 sends the pre-cache query.
+        let query = build_inflation_required_partition_slots_query(
+            "default.blocks_metadata",
+            121_392_000,
+            121_824_000,
+            &[270_000_007, 270_000_042],
+            "",
+        );
+        let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            normalized,
+            "SELECT slot, block_height FROM default.blocks_metadata PREWHERE \
+             intDiv(slot, 432000) = 281 AND slot > 121392000 AND slot < 121824000 \
+             WHERE block_height IN (270000007, 270000042) ORDER BY block_height ASC, slot ASC"
+        );
+        assert!(!InflationEpochCache::new(0).enabled());
+        assert!(InflationEpochCache::new(1024).enabled());
+    }
+
+    #[test]
+    fn inflation_folded_rewards_query_groups_per_slot_with_per_slot_types() {
+        let query = build_inflation_folded_rewards_query(
+            "default.blocks_metadata",
+            &[[1u8; 32], [2u8; 32]],
+            121_392_000,
+            &[121_392_003, 121_392_017],
+            "SETTINGS max_threads=2",
+        );
+
+        assert!(query.contains("PREWHERE slot IN (121392000, 121392003, 121392017)"));
+        assert!(query.contains(
+            "((slot = 121392000 AND lowerUTF8(ifNull(reward.4, '')) = 'voting') OR (slot != 121392000 AND lowerUTF8(ifNull(reward.4, '')) = 'staking'))"
+        ));
+        assert!(query.contains("GROUP BY pubkey, slot"));
+        assert!(query.contains("tupleElement(latest, 1) AS effective_slot"));
+        assert!(query.contains("SETTINGS max_threads=2"));
+
+        let sequential = build_inflation_rewards_query(
+            "default.blocks_metadata",
+            &[[1u8; 32]],
+            &[121_392_000],
+            InflationRewardSelection::VoteOnly,
+            "",
+        );
+        assert!(sequential.contains("GROUP BY pubkey\n"));
+        assert!(!sequential.contains("GROUP BY pubkey, slot"));
+    }
+
+    fn folded_record(pubkey: u8, slot: u64, lamports: i64) -> InflationRewardRecord {
+        InflationRewardRecord {
+            pubkey: [pubkey; 32],
+            effective_slot: slot,
+            lamports,
+            post_balance: 1_000,
+            commission: None,
+            commission_bps: None,
+        }
+    }
+
+    #[test]
+    fn folded_rewards_resolve_boundary_first_then_own_partition() {
+        let addresses = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let expected = HashMap::from([
+            ([1u8; 32], 20),
+            ([2u8; 32], 21),
+            ([3u8; 32], 22),
+            ([4u8; 32], 23),
+        ]);
+        let rows = vec![
+            // Vote account: boundary reward wins; its partition row is ignored.
+            folded_record(1, 10, 5),
+            folded_record(1, 20, 99),
+            // Stake account paid in its own partition.
+            folded_record(2, 21, 7),
+            // Address 3 has no reward anywhere; address 4 only in its partition.
+            folded_record(4, 23, 9),
+        ];
+        let folded =
+            resolve_folded_inflation_rewards(rows, &addresses, 10, &expected).expect("resolved");
+        assert_eq!(folded.rewards_by_pubkey.len(), 3);
+        assert_eq!(folded.rewards_by_pubkey[&[1u8; 32]].lamports, 5);
+        assert_eq!(folded.rewards_by_pubkey[&[2u8; 32]].effective_slot, 21);
+        assert!(!folded.rewards_by_pubkey.contains_key(&[3u8; 32]));
+        assert_eq!(folded.rewards_by_pubkey[&[4u8; 32]].lamports, 9);
+        // Partition slots of the unresolved addresses 2, 3 and 4.
+        assert_eq!(folded.selected_partition_slots, 3);
+    }
+
+    #[test]
+    fn folded_rewards_ignore_slots_the_sequential_lookup_would_not_read() {
+        // Address 2 has a stake row at address 1's partition slot (20). Address 1 resolved at the
+        // boundary, so the sequential lookup would not read slot 20 and must not fail.
+        let addresses = [[1u8; 32], [2u8; 32]];
+        let expected = HashMap::from([([1u8; 32], 20), ([2u8; 32], 21)]);
+        let rows = vec![
+            folded_record(1, 10, 5),
+            folded_record(2, 20, 1),
+            folded_record(2, 21, 7),
+        ];
+        let folded =
+            resolve_folded_inflation_rewards(rows, &addresses, 10, &expected).expect("resolved");
+        assert_eq!(folded.rewards_by_pubkey[&[2u8; 32]].effective_slot, 21);
+        assert_eq!(folded.selected_partition_slots, 1);
+    }
+
+    #[test]
+    fn folded_rewards_keep_sequential_integrity_errors() {
+        let addresses = [[1u8; 32], [2u8; 32]];
+        let expected = HashMap::from([([1u8; 32], 20), ([2u8; 32], 21)]);
+        // Latest stake reward among read partition slots is not the address's own partition.
+        let err = resolve_folded_inflation_rewards(
+            vec![folded_record(2, 21, 7), folded_record(1, 21, 1)],
+            &addresses,
+            10,
+            &expected,
+        )
+        .err()
+        .expect("wrong partition");
+        assert!(err.contains("came from slot 21, expected 20"), "{err}");
+        // Unrequested address.
+        assert!(
+            resolve_folded_inflation_rewards(
+                vec![folded_record(9, 10, 1)],
+                &addresses,
+                10,
+                &expected
+            )
+            .is_err()
+        );
+        // Slot outside the boundary and candidate partitions.
+        assert!(
+            resolve_folded_inflation_rewards(
+                vec![folded_record(1, 30, 1)],
+                &addresses,
+                10,
+                &expected
+            )
+            .is_err()
+        );
+        // Duplicate boundary rows.
+        assert!(
+            resolve_folded_inflation_rewards(
+                vec![folded_record(1, 10, 1), folded_record(1, 10, 2)],
+                &addresses,
+                10,
+                &expected
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3072,5 +3629,305 @@ mod tests {
         assert!(!query.contains("\n                slot,"));
         assert!(!query.contains("\n                block_time,"));
         assert!(query.contains("meta_reward_pubkey"));
+    }
+
+    fn inflation_integration_client(url: &str, database: &str, cached: bool) -> ClickHouseClient {
+        let mut client = ClickHouseClient::new(
+            url,
+            "default",
+            "default",
+            "",
+            crate::clickhouse::ClickHouseClientOptions::new(
+                crate::clickhouse::RoutingPolicy {
+                    transport: crate::clickhouse::RoutingTransport::Http,
+                    scope: crate::clickhouse::RoutingScope::Distributed,
+                },
+                None,
+                Vec::new(),
+                format!("{database}.gsfa_hot"),
+                format!("{database}.gsfa_hot_local"),
+            ),
+        );
+        client.blocks_metadata_table = format!("{database}.blocks_metadata");
+        if !cached {
+            client.inflation_epoch_cache = InflationEpochCache::new(0);
+        }
+        client
+    }
+
+    fn outcome_key(outcome: &InflationRewardLookupOutcome) -> String {
+        match outcome {
+            InflationRewardLookupOutcome::Complete(rows) => {
+                let mut rows = rows
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{}:{}:{}:{}:{:?}:{:?}",
+                            hex::encode(row.pubkey),
+                            row.effective_slot,
+                            row.lamports,
+                            row.post_balance,
+                            row.commission,
+                            row.commission_bps
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort();
+                format!("complete {rows:?}")
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Compares cached and uncached lookups on a disposable loopback ClickHouse for a
+    /// non-partitioned epoch, a completed partitioned epoch, and an active partitioned epoch,
+    /// and counts the queries each lookup sends through `system.query_log`.
+    #[tokio::test]
+    #[ignore = "requires SUPERBANK_INFLATION_CLICKHOUSE_TEST_URL pointing to local ClickHouse"]
+    async fn inflation_epoch_cache_matches_uncached_lookup_clickhouse() {
+        let url = std::env::var("SUPERBANK_INFLATION_CLICKHOUSE_TEST_URL")
+            .expect("set SUPERBANK_INFLATION_CLICKHOUSE_TEST_URL");
+        let http = reqwest::Client::new();
+        let database = format!(
+            "inflation_{}_{}",
+            std::process::id(),
+            crate::util::current_time_millis()
+        );
+        async fn execute(http: &reqwest::Client, url: &str, sql: String) -> String {
+            let response = http.post(url).body(sql).send().await.expect("request");
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert!(status.is_success(), "ClickHouse {status}: {body}");
+            body
+        }
+        execute(&http, &url, format!("CREATE DATABASE {database}")).await;
+        for statement in include_str!("../../../../ddl/local/blocks_metadata.sql")
+            .replace("default.", &format!("{database}."))
+            .split(";\n")
+        {
+            if !statement.trim().is_empty() {
+                execute(&http, &url, statement.to_string()).await;
+            }
+        }
+
+        let hash = |value: u8| hex::encode_upper([value; 32]);
+        let block = |slot: u64,
+                     parent_slot: u64,
+                     height: Option<u64>,
+                     partitions: Option<u64>,
+                     rewards: &[([u8; 32], i64, &str, Option<u16>)]| {
+            let fixed = |bytes: &[u8; 32]| {
+                format!("toFixedString(unhex('{}'), 32)", hex::encode_upper(bytes))
+            };
+            let join = |items: Vec<String>| items.join(", ");
+            format!(
+                "({slot}, {parent_slot}, toFixedString(unhex('{}'), 32), toFixedString(unhex('{}'), 32), NULL, {}, 0, 0, {}, [{}], [{}], [{}], [{}], [{}], [{}], {})",
+                hash(9),
+                hash(1),
+                height.map_or("NULL".to_string(), |height| height.to_string()),
+                u8::from(!rewards.is_empty()),
+                join(rewards.iter().map(|reward| fixed(&reward.0)).collect()),
+                join(rewards.iter().map(|reward| reward.1.to_string()).collect()),
+                join(
+                    rewards
+                        .iter()
+                        .map(|reward| (reward.1 as u64 * 10).to_string())
+                        .collect()
+                ),
+                join(
+                    rewards
+                        .iter()
+                        .map(|reward| format!("'{}'", reward.2))
+                        .collect()
+                ),
+                join(rewards.iter().map(|_| "NULL".to_string()).collect()),
+                join(
+                    rewards
+                        .iter()
+                        .map(|reward| reward.3.map_or("NULL".to_string(), |bps| bps.to_string()))
+                        .collect()
+                ),
+                partitions.map_or("NULL".to_string(), |partitions| partitions.to_string()),
+            )
+        };
+
+        let schedule = EpochSchedule::without_warmup();
+        let seed = [1u8; 32];
+        let vote = [10u8; 32];
+        let stakes = (20u8..44).map(|value| [value; 32]).collect::<Vec<_>>();
+        let mut rows = Vec::new();
+
+        // Epoch 42 (payout epoch 43): non-partitioned, no block heights.
+        let (start, _) = inflation_epoch_slot_bounds(42, &schedule).unwrap();
+        rows.push(block(
+            start + 2,
+            start - 1,
+            None,
+            None,
+            &[
+                (vote, 11, "Voting", Some(500)),
+                (stakes[0], 12, "Staking", None),
+                (stakes[1], 13, "Fee", None),
+            ],
+        ));
+        rows.push(block(
+            start + 3,
+            start + 2,
+            None,
+            None,
+            &[(stakes[2], 99, "Staking", None)],
+        ));
+
+        // Epoch 43 (payout epoch 44): 8 partitions, all landed, with skipped slots between them.
+        const PARTITIONS: u64 = 8;
+        let (start, _) = inflation_epoch_slot_bounds(43, &schedule).unwrap();
+        rows.push(block(
+            start,
+            start - 1,
+            Some(1_000),
+            Some(PARTITIONS),
+            &[(vote, 21, "Voting", Some(700)), (stakes[3], 1, "Fee", None)],
+        ));
+        let mut parent = start;
+        for partition in 0..PARTITIONS {
+            let slot = start + 1 + partition * 2;
+            let mut rewards = stakes
+                .iter()
+                .filter(|stake| {
+                    inflation_reward_partition(stake, PARTITIONS as usize, &seed) as u64
+                        == partition
+                })
+                .map(|stake| {
+                    (
+                        *stake,
+                        i64::from(stake[0]) * 100 + partition as i64,
+                        "Staking",
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>();
+            // The vote account also shows up as a fee payee in every partition block.
+            rewards.push((vote, 1, "Fee", None));
+            rows.push(block(slot, parent, Some(1_001 + partition), None, &rewards));
+            parent = slot;
+        }
+        rows.push(block(
+            parent + 1,
+            parent,
+            Some(1_001 + PARTITIONS),
+            None,
+            &[],
+        ));
+
+        // Epoch 44 (payout epoch 45): 4 partitions, only the first landed.
+        let (start, _) = inflation_epoch_slot_bounds(44, &schedule).unwrap();
+        rows.push(block(
+            start,
+            start - 1,
+            Some(2_000),
+            Some(4),
+            &[(vote, 31, "Voting", None)],
+        ));
+        let first_partition_stakes = stakes
+            .iter()
+            .filter(|stake| inflation_reward_partition(stake, 4, &seed) == 0)
+            .map(|stake| (*stake, 5, "Staking", None))
+            .collect::<Vec<_>>();
+        rows.push(block(
+            start + 1,
+            start,
+            Some(2_001),
+            None,
+            &first_partition_stakes,
+        ));
+
+        execute(
+            &http,
+            &url,
+            format!(
+                "INSERT INTO {database}.blocks_metadata (slot, parent_slot, blockhash, parent_blockhash, block_time, block_height, executed_transaction_count, entry_count, rewards_present, rewards_pubkey, rewards_lamports, rewards_post_balance, rewards_type, rewards_commission, rewards_commission_bps, rewards_num_partitions) VALUES {}",
+                rows.join(", ")
+            ),
+        )
+        .await;
+
+        let uncached = inflation_integration_client(&url, &database, false);
+        let cached = inflation_integration_client(&url, &database, true);
+        for client in [&uncached, &cached] {
+            client
+                .initialize_read_cancellation()
+                .await
+                .expect("cancellation preflight");
+        }
+        let query_count = || {
+            let http = http.clone();
+            let url = url.clone();
+            let database = database.clone();
+            async move {
+                execute(&http, &url, "SYSTEM FLUSH LOGS".to_string()).await;
+                execute(
+                    &http,
+                    &url,
+                    format!(
+                        "SELECT count() FROM system.query_log WHERE event_date >= yesterday() AND type = 'QueryFinish' AND query_kind = 'Select' AND has(databases, '{database}')"
+                    ),
+                )
+                .await
+                .trim()
+                .parse::<u64>()
+                .expect("count")
+            }
+        };
+
+        let mut all = vec![vote];
+        all.extend(stakes.iter().copied());
+        let active_other_partition = stakes
+            .iter()
+            .copied()
+            .find(|stake| inflation_reward_partition(stake, 4, &seed) != 0)
+            .expect("an address outside partition 0");
+        let active_first_partition = stakes
+            .iter()
+            .copied()
+            .find(|stake| inflation_reward_partition(stake, 4, &seed) == 0)
+            .expect("an address in partition 0");
+        let cases: Vec<(&str, u64, Vec<[u8; 32]>)> = vec![
+            ("non_partitioned", 42, all.clone()),
+            ("partitioned_all", 43, all.clone()),
+            ("partitioned_vote_only", 43, vec![vote]),
+            (
+                "partitioned_subset",
+                43,
+                vec![stakes[5], vote, stakes[5], [99; 32]],
+            ),
+            ("active_vote_only", 44, vec![vote]),
+            ("active_first_partition", 44, vec![active_first_partition]),
+            ("active_pending", 44, vec![vote, active_other_partition]),
+            ("boundary_unavailable", 45, vec![vote]),
+        ];
+        for (name, epoch, addresses) in cases {
+            let before = query_count().await;
+            let (expected, _) = uncached
+                .get_inflation_rewards_for_epoch(&addresses, epoch, &schedule)
+                .await
+                .expect("uncached lookup");
+            let uncached_queries = query_count().await - before;
+            let mut cached_queries = Vec::new();
+            for _ in 0..3 {
+                let before = query_count().await;
+                let (actual, _) = cached
+                    .get_inflation_rewards_for_epoch(&addresses, epoch, &schedule)
+                    .await
+                    .expect("cached lookup");
+                cached_queries.push(query_count().await - before);
+                assert_eq!(outcome_key(&actual), outcome_key(&expected), "{name}");
+            }
+            println!(
+                "{name}: {} | uncached queries {uncached_queries}, cached queries {cached_queries:?}",
+                outcome_key(&expected).chars().take(160).collect::<String>()
+            );
+        }
+
+        execute(&http, &url, format!("DROP DATABASE {database} SYNC")).await;
     }
 }

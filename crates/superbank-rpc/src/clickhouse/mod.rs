@@ -9,6 +9,10 @@ mod client;
 mod constants;
 mod disconnect;
 mod gsfa;
+mod inflation_cache;
+#[cfg(feature = "disk-cache")]
+mod local_transaction;
+mod owner_shard;
 mod queries;
 pub(crate) mod read_query;
 mod rows;
@@ -38,6 +42,7 @@ pub(crate) use types::{
     SlotBoundary,
 };
 
+pub(crate) use gsfa::{GsfaCursor, GsfaMissingCursor, InlineGsfaPage};
 pub(crate) use sharding::{RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig};
 pub(crate) use util::{QueryCacheConfig, QueryFreshnessClass};
 
@@ -49,5 +54,7 @@ pub(crate) use util::extract_memo;
 #[cfg(feature = "disk-cache")]
 pub(crate) use util::parse_err_json;
 
+#[cfg(all(test, feature = "disk-cache"))]
+pub(crate) use local_transaction::build_fused_transaction_query;
 #[cfg(all(test, feature = "disk-cache"))]
 pub(crate) use transactions::diagnostics::{measure_layout_sample, measure_position_reads};
