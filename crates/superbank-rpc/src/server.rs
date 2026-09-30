@@ -877,6 +877,7 @@ async fn start_disk_cache(
             query_timeout: Duration::from_millis(args.disk_cache_backfill_query_timeout_ms),
             repair_interval: Duration::from_millis(args.disk_cache_repair_interval_ms),
             repair_min_lag_slots: args.disk_cache_repair_min_lag_slots,
+            given_up_retry: Duration::from_secs(args.disk_cache_given_up_retry_secs),
             ..Default::default()
         });
 
