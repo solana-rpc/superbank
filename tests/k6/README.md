@@ -1159,11 +1159,6 @@ omitted/0/1 maximum supported versions, pinned/mismatched slots, and null/string
 request IDs. Existing disk-cache integration tests cover unavailable reads, invalidation,
 concurrent coverage publication, absent signatures, skipped slots, and stale positions.
 
-The former Docker SQL benchmark runner was removed with its shared ClickHouse
-protocol harness. Its [archived findings](../../GETTRANSACTION_BENCHMARKS.md) and
-[machine-readable results](../../docs/benchmarks/gettransaction-2026-09-11.json) remain
-available for reference.
-
 ### Agave 4.3 request parity
 
 The standard runner always runs the Agave 4.3 request-contract scenario. Set
