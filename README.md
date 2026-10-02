@@ -429,7 +429,9 @@ scripts/dev/run-local-rpc.sh
 ### Nix (flakes)
 
 This repo includes a Nix flake with a dev shell that provides `tilt`, `docker`, `kubectl`, `kind`,
-Rust tooling, `k6`, and common CLI utilities.
+Rust tooling, `k6`, and common CLI utilities. The locked `rust-overlay` reads
+`rust-toolchain.toml`, including `rustfmt` and `clippy`, so the shell uses the same
+exact compiler as non-Nix builds rather than the compiler bundled with nixpkgs.
 
 Enable flakes (if needed):
 
@@ -442,6 +444,7 @@ Enter the dev shell:
 
 ```bash
 nix develop
+nix develop -c rustc --version # must match rust-toolchain.toml
 ```
 
 If you don't want to change global Nix config, you can also run:
