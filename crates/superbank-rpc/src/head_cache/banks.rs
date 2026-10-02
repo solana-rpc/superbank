@@ -18,6 +18,7 @@ type BankKey = (u64, u64); // (slot, node-local bank ID), within BankState::sess
 pub(super) struct BankState {
     session: u64,
     highest: u64,
+    minimum_commitment: u8,
     banks: HashMap<BankKey, Bank>,
     selected: HashMap<u64, u64>,
     canonical: HashMap<u64, u64>,
@@ -51,7 +52,7 @@ fn rank(commitment: CommitmentLevel) -> u8 {
 }
 
 impl HeadCache {
-    pub(super) fn start_bank_session(&self) -> u64 {
+    pub(super) fn start_bank_session(&self, minimum: CommitmentLevel) -> u64 {
         let mut state = self.banks.write().expect("head bank lock");
         let session = state.session.checked_add(1).expect("head session overflow");
         // Even an identical node-local ID can name a different bank after reconnecting.
@@ -67,6 +68,7 @@ impl HeadCache {
         self.address_truncated_slot.clear();
         *state = BankState {
             session,
+            minimum_commitment: rank(minimum),
             ..Default::default()
         };
         self.coverage.write().expect("head coverage lock").connect();
@@ -274,6 +276,12 @@ impl HeadCache {
             return;
         };
         let commitment = decode_commitment(bank.commitment.load(Ordering::Acquire));
+        // BlockStream emits FrozenBlock before SlotCommitmentUpdate. A default
+        // Processed token is not sufficient for a Confirmed/Finalized session,
+        // even while concurrent readers query Processed commitment.
+        if rank(commitment) < state.minimum_commitment {
+            return;
+        }
         let current = state.selected.get(&key.0).copied();
         if current.is_some_and(|id| id != key.1) && commitment == CommitmentLevel::Processed {
             return;

@@ -64,7 +64,7 @@ fn stage_entry(cache: &HeadCache, session: u64, slot: u64, bank_id: u64, count: 
 #[test]
 fn winning_bank_replaces_all_loser_indexes_and_never_promotes_old_results() {
     let cache = HeadCache::new(32, 64);
-    let session = cache.start_bank_session();
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
     freeze(&cache, session, 42, 1, 1);
     let old_meta = cache
         .get_meta(&Signature::from([1; 64]), CommitmentLevel::Processed)
@@ -118,7 +118,7 @@ fn winning_bank_replaces_all_loser_indexes_and_never_promotes_old_results() {
 #[test]
 fn late_loser_metadata_status_and_freeze_cannot_replace_the_winner() {
     let cache = HeadCache::new(32, 64);
-    let session = cache.start_bank_session();
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
     freeze(&cache, session, 42, 1, 1);
     freeze(&cache, session, 42, 2, 2);
     cache.commit_bank(session, 42, 2, CommitmentLevel::Finalized, Some(41));
@@ -141,7 +141,7 @@ fn late_loser_metadata_status_and_freeze_cannot_replace_the_winner() {
 #[test]
 fn pruning_one_bank_preserves_its_sibling_and_other_slots() {
     let cache = HeadCache::new(32, 64);
-    let session = cache.start_bank_session();
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
     freeze(&cache, session, 42, 1, 1);
     freeze(&cache, session, 42, 2, 2);
     freeze(&cache, session, 43, 3, 3);
@@ -162,9 +162,9 @@ fn pruning_one_bank_preserves_its_sibling_and_other_slots() {
 #[test]
 fn reconnect_reusing_bank_ids_cannot_promote_old_transactions_or_accept_old_events() {
     let cache = HeadCache::new(32, 64);
-    let first = cache.start_bank_session();
+    let first = cache.start_bank_session(CommitmentLevel::Processed);
     freeze(&cache, first, 42, 7, 1);
-    let second = cache.start_bank_session();
+    let second = cache.start_bank_session(CommitmentLevel::Processed);
     cache.commit_bank(second, 42, 7, CommitmentLevel::Finalized, Some(41));
     assert!(
         cache
@@ -190,7 +190,7 @@ fn reconnect_reusing_bank_ids_cannot_promote_old_transactions_or_accept_old_even
 #[test]
 fn status_before_sealing_selects_only_that_bank_and_retention_removes_bank_buffers() {
     let cache = HeadCache::new(2, 64);
-    let session = cache.start_bank_session();
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
     cache.commit_bank(session, 42, 2, CommitmentLevel::Confirmed, Some(41));
     freeze(&cache, session, 42, 1, 1);
     freeze(&cache, session, 42, 2, 2);
@@ -219,7 +219,7 @@ fn status_before_sealing_selects_only_that_bank_and_retention_removes_bank_buffe
 #[test]
 fn metadata_with_an_unmatched_sealed_hash_cannot_publish_transactions() {
     let cache = HeadCache::new(32, 64);
-    let session = cache.start_bank_session();
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
     cache.stage_bank_metadata(session, 7, metadata(42, 1));
     cache.freeze_bank(session, 42, 7, [2; 32], vec![transaction(2)]);
     cache.commit_bank(session, 42, 7, CommitmentLevel::Finalized, Some(41));
@@ -233,7 +233,7 @@ fn metadata_with_an_unmatched_sealed_hash_cannot_publish_transactions() {
 #[test]
 fn winner_status_removes_a_visible_loser_before_winner_content_and_blocks_old_tip_fallback() {
     let cache = HeadCache::new(32, 64);
-    let session = cache.start_bank_session();
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
     freeze(&cache, session, 42, 1, 1);
     cache.commit_bank(session, 42, 2, CommitmentLevel::Confirmed, Some(41));
     assert!(
@@ -274,7 +274,7 @@ fn winner_status_removes_a_visible_loser_before_winner_content_and_blocks_old_ti
 #[test]
 fn incomplete_competing_bank_cannot_publish_or_borrow_winner_commitment() {
     let cache = HeadCache::new(32, 64);
-    let session = cache.start_bank_session();
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
     freeze(&cache, session, 42, 1, 1);
     let loser = cache
         .get_meta(&Signature::from([1; 64]), CommitmentLevel::Processed)
@@ -320,7 +320,7 @@ fn incomplete_competing_bank_cannot_publish_or_borrow_winner_commitment() {
 fn duplicate_indices_signatures_and_malformed_transactions_cannot_seal_a_bank() {
     for corrupt in 0..3 {
         let cache = HeadCache::new(32, 64);
-        let session = cache.start_bank_session();
+        let session = cache.start_bank_session(CommitmentLevel::Processed);
         let mut meta = metadata(42, 2);
         meta.executed_transaction_count = 2;
         cache.stage_bank_metadata(session, 2, meta);
@@ -356,7 +356,7 @@ fn entry_count_indices_ranges_and_hashes_must_be_complete_before_publication() {
     use yellowstone_grpc_proto::prelude::SubscribeUpdateEntry;
     for corrupt in 0..4 {
         let cache = HeadCache::new(32, 64);
-        let session = cache.start_bank_session();
+        let session = cache.start_bank_session(CommitmentLevel::Processed);
         let mut meta = metadata(42, 2);
         meta.entry_count = 2;
         cache.stage_bank_metadata(session, 2, meta);
@@ -407,5 +407,74 @@ fn entry_count_indices_ranges_and_hashes_must_be_complete_before_publication() {
                 )
                 .is_none()
         );
+    }
+}
+
+#[test]
+fn frozen_bank_cannot_expose_processed_data_below_session_minimum_to_concurrent_readers() {
+    for minimum in [CommitmentLevel::Confirmed, CommitmentLevel::Finalized] {
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = cache.start_bank_session(minimum);
+        freeze(&cache, session, 42, 7, 1);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let cache = &cache;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        assert!(
+                            cache
+                                .get_tx(&Signature::from([1; 64]), CommitmentLevel::Processed)
+                                .is_none()
+                        );
+                        assert!(
+                            cache
+                                .get_meta(&Signature::from([1; 64]), CommitmentLevel::Processed)
+                                .is_none()
+                        );
+                        assert!(
+                            cache
+                                .get_block(
+                                    42,
+                                    CommitmentLevel::Processed,
+                                    solana_transaction_status::TransactionDetails::Full
+                                )
+                                .is_none()
+                        );
+                        assert!(
+                            cache
+                                .signatures_for_address(
+                                    &Pubkey::from([1; 32]),
+                                    None,
+                                    None,
+                                    10,
+                                    CommitmentLevel::Processed
+                                )
+                                .is_empty()
+                        );
+                        assert_eq!(cache.latest_slot(), 0);
+                    }
+                });
+            }
+        });
+        if minimum == CommitmentLevel::Finalized {
+            cache.commit_bank(session, 42, 7, CommitmentLevel::Confirmed, Some(41));
+            assert!(
+                cache
+                    .get_tx(&Signature::from([1; 64]), CommitmentLevel::Processed)
+                    .is_none()
+            );
+        }
+        cache.commit_bank(session, 42, 7, minimum, Some(41));
+        let metadata = cache
+            .get_meta(&Signature::from([1; 64]), CommitmentLevel::Processed)
+            .unwrap();
+        assert_eq!(
+            cache.confirmation_status_string(&metadata),
+            match minimum {
+                CommitmentLevel::Confirmed => "confirmed",
+                _ => "finalized",
+            }
+        );
+        assert!(cache.get_tx(&Signature::from([1; 64]), minimum).is_some());
     }
 }

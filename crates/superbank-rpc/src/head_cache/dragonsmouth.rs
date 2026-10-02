@@ -47,7 +47,7 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
     let max_backoff = Duration::from_secs(5);
 
     loop {
-        let session = CoverageSession::new(cache.clone());
+        let session = CoverageSession::new(cache.clone(), cfg.min_commitment);
         match connect_and_subscribe(&cfg, cache.clone(), session.id).await {
             Ok(mut stream) => {
                 info!(
@@ -444,8 +444,8 @@ struct CoverageSession {
     id: u64,
 }
 impl CoverageSession {
-    fn new(cache: Arc<HeadCache>) -> Self {
-        let id = cache.start_bank_session();
+    fn new(cache: Arc<HeadCache>, minimum: CommitmentLevel) -> Self {
+        let id = cache.start_bank_session(minimum);
         Self { cache, id }
     }
 }
@@ -563,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn block_machine_subscription_publishes_matching_range_proofs() {
         let cache = Arc::new(HeadCache::new(32, 64));
-        let session = CoverageSession::new(cache.clone());
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
         let events = coverage_events(10, 9)
             .into_iter()
             .chain(coverage_events(12, 10));
@@ -685,7 +685,7 @@ mod tests {
             SlotStatus, SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
         };
         let cache = Arc::new(HeadCache::new(32, 64));
-        let session = CoverageSession::new(cache.clone());
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
         let make_bank = |bank_id: u64, marker: u8| {
             let mut events = coverage_events(42, 41);
             events.retain(|event| !matches!(event.update_oneof.as_ref(), Some(UpdateOneof::Slot(slot)) if slot.status == SlotStatus::SlotConfirmed as i32 || slot.status == SlotStatus::SlotFinalized as i32));
@@ -780,7 +780,7 @@ mod tests {
     async fn legacy_pre_alpenglow_bank_blind_stream_keeps_finalized_blocks() {
         use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
         let cache = Arc::new(HeadCache::new(32, 64));
-        let session = CoverageSession::new(cache.clone());
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
         let events = coverage_events(42, 41).into_iter().map(|mut event| {
             match event.update_oneof.as_mut().unwrap() {
                 UpdateOneof::Slot(slot) => slot.bank_id = None,

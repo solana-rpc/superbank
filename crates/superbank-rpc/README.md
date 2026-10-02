@@ -1520,3 +1520,10 @@ transaction retains its own bank's commitment token. Metadata comes from the sam
 subscription and must match the sealed blockhash. Reconnect clears old data and
 fences callbacks from the prior generation. Legacy streams are identified by a
 CreatedBank notification without a bank ID; ambiguous protocol changes reconnect.
+
+The gRPC head-cache minimum commitment applies when publishing a frozen bank,
+including to concurrent requests for `processed`. A frozen block is held until
+its commitment token reaches the session's configured minimum; the subsequent
+block-machine status event initializes that token before indexes are exposed.
+Reconnect resets the bank session and never carries node-local IDs or proofs
+from the previous subscription.
