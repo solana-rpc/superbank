@@ -224,6 +224,12 @@ their existing behavior. Use `rbx2` for RBX2 or an empty value for standalone Cl
   It can also read RPC parameter filters from the shared YAML file when started
   with `--config superbank.yaml` / `SUPERBANK_CONFIG=superbank.yaml`.
   See `crates/superbank-rpc/README.md`.
+- `superbank-solparq` hourly archives use a nominal cluster slot cadence:
+  `--hourly-slot-duration-ms` / `SOLPARQ_HOURLY_SLOT_DURATION_MS` defaults to
+  `400` (9000 slots); set `200` for 18000-slot hourly windows on a 200 ms cluster.
+  Cadence changes separately from Alpenglow activation. Epoch/custom ranges and
+  existing archive names remain compatible. See the
+  [hourly archive cadence and transition guidance](crates/superbank-solparq/README.md#hourly-slot-cadence).
 
 ## Docker local development
 

@@ -87,6 +87,61 @@ async fn summary_reads_db_archive_bundle_manifest_and_table_counts() {
 }
 
 #[tokio::test]
+async fn reader_reads_hourly_manifests_for_both_cadences() {
+    use superbank_solparq::{
+        archive::{ArchiveKind, ClickHouseBounds, plan_next_archive_with_hourly_slot_duration},
+        manifest::{ArchiveManifest, MANIFEST_FORMAT_VERSION},
+        read::config::ArchiveTable,
+    };
+
+    for duration in [400, 200] {
+        let (dir, old_bundle_path) = write_test_bundle();
+        let plan = plan_next_archive_with_hourly_slot_duration(
+            ArchiveKind::Hourly,
+            ClickHouseBounds {
+                earliest_slot: 10,
+                latest_slot: 18_009,
+                distinct_slots: 4,
+            },
+            None,
+            true,
+            false,
+            duration,
+        )
+        .unwrap()
+        .unwrap();
+        let bundle_path = dir.path().join(plan.archive_id());
+        std::fs::rename(old_bundle_path, &bundle_path).unwrap();
+        let manifest_path = bundle_path.join("manifest.json");
+        let legacy: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = ArchiveManifest::new(
+            plan.archive_id(),
+            plan.kind,
+            plan.epoch,
+            plan.start_slot,
+            plan.end_slot,
+            serde_json::from_value(legacy["tables"].clone()).unwrap(),
+            vec![],
+        );
+        assert_eq!(manifest.archive_kind, "hourly");
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let summary = summarize_archive(ArchiveInput::LocalBundle {
+            dir: bundle_path,
+            table: ArchiveTable::Transactions,
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.archive_name, plan.archive_id());
+        assert_eq!(summary.format_version, Some(MANIFEST_FORMAT_VERSION));
+        assert_eq!(summary.transaction_rows, 5);
+        assert_eq!(summary.actual_min_slot, Some(10));
+        assert_eq!(summary.actual_max_slot, Some(13));
+    }
+}
+
+#[tokio::test]
 async fn scan_filters_transactions_by_inclusive_slot_range() {
     let (_dir, archive_path) = write_test_archive();
 

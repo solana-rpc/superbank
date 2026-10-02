@@ -587,7 +587,8 @@ archive tasks.
 
 ## Archive Ranges
 
-- `hourly`: 9000 slots
+- `hourly`: one nominal hour of slots at the configured cluster cadence (9000
+  slots with the historical 400 ms default; 18000 slots at 200 ms)
 - `epoch`: 432000 slots, aligned to epoch boundaries
 - `custom`: defaults to 1000 slots
 - `custom:<slots>`: explicit custom size, for example `custom:2500`
@@ -601,6 +602,45 @@ You can also set the custom default with:
 Multiple `--archive-range-type` values are allowed only with `--server-mode`.
 Only one custom archive range size can be configured at a time, because custom
 archives use the shared `custom_*` archive namespace.
+
+### Hourly slot cadence
+
+Set `--hourly-slot-duration-ms` (env `SOLPARQ_HOURLY_SLOT_DURATION_MS`) to the
+nominal slot duration of the cluster/history being archived. The default is
+`400`, preserving existing 9000-slot planning. For a 200 ms cluster, use:
+
+```bash
+cargo run -p superbank-solparq -- \
+  --db-server 127.0.0.1 --db-user default --db-password '' \
+  --archive-range-type hourly --hourly-slot-duration-ms 200 \
+  --archive-file-output-location ./archives
+```
+
+The duration must be positive and divide `3600000` ms exactly. An hourly window
+covers `[start, start + 3600000 / duration - 1]`, inclusive, and waits until
+ClickHouse reaches that end slot. Skipped slots do not shrink the window. This
+is a nominal hour by slot cadence, starting from the earliest available slot
+or the preceding archive's end plus one; it is not aligned to UTC hours or
+measured from block timestamps. The setting leaves epoch slot counts, custom
+windows, explicit `--archive-slot-range` boundaries, and the archive check
+interval unchanged.
+
+[Solana's Alpenglow guide](https://solana.com/upgrades/alpenglow) describes
+reduced slot times as a separate staged change. Do not infer cadence from
+consensus activation or a client version. Keep `400` for historical 400 ms
+data; stop and restart the archiver with the new duration when reaching the
+cluster's cadence transition. A window spanning that transition can represent
+a different elapsed duration; use a one-shot explicit slot range to close the
+old history at the transition boundary before continuing with the new cadence.
+
+Archive IDs remain `hourly_<epoch>_<start>-<end>` and manifests keep their
+existing format and explicit inclusive bounds. Legacy files and newer bundles
+can coexist: continuation uses the stored end slot plus one. Readers accept
+either size, and the `source: solparq` restore path uses recorded ranges without
+requiring the cadence setting. Retention still keeps the configured number of
+archives per kind, ordered by end slot, including mixed-cadence history; it does not promise
+a fixed wall-clock duration. ClickHouse cleanup remains gated by the archived
+high-watermark of every configured kind.
 
 ### Aligned custom archives
 
@@ -823,6 +863,7 @@ Common defaults:
 - `--ops-port 30303`
 - `--metrics-port 31313`
 - `--archive-slot-range` unset
+- `--hourly-slot-duration-ms 400` (env `SOLPARQ_HOURLY_SLOT_DURATION_MS`)
 - `--custom-aligned` unset (off; only affects `custom` — see [Aligned custom archives](#aligned-custom-archives))
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset

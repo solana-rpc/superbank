@@ -97,6 +97,11 @@ grpc-slot-notifications: true
 # bigtable-decode-concurrency: 8
 # bigtable-progress-every-slots: 10000
 
+# The separate superbank-solparq archiver uses CLI/env (not this YAML):
+# --hourly-slot-duration-ms / SOLPARQ_HOURLY_SLOT_DURATION_MS defaults to 400
+# (9000 slots per nominal hour); set 200 for a 200 ms cluster (18000 slots).
+# Restore reads recorded slot bounds and does not need the cadence setting.
+
 # solparq source options (required when source is "solparq"): restore
 # superbank-solparq Parquet archive bundles back into ClickHouse. Loading is
 # ClickHouse-native (s3() for S3, INSERT ... FORMAT Parquet for local) and every
