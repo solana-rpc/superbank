@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- Alpenglow footer fields are internal data, keyed by the producer's bank instance.
+-- Alpenglow footer fields are internal data, keyed by finalized slot; bank IDs are subscription-local diagnostics.
 CREATE TABLE IF NOT EXISTS default.block_footers
 (
     slot UInt64,
@@ -10,4 +10,4 @@ CREATE TABLE IF NOT EXISTS default.block_footers
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY intDiv(slot, 432000)
-ORDER BY (slot, bank_id);
+ORDER BY (slot);

@@ -54,3 +54,24 @@ GSFA note:
 Optional analyst-friendly views over `default.transactions` live in `additional/` and are not
 applied by the base install (Compose, Tilt, k8s). See `additional/README.md` and
 `docs/analyst-views.md`.
+
+## Finalized footer identity and existing-table migration
+
+New `block_footers` storage tables use `ORDER BY (slot)` with ReplacingMergeTree.
+Only finalized canonical footers are written; `bank_id` is retained for diagnostics
+but belongs to a producer subscription and cannot be a cross-reconnect dedup key.
+Reingesting a finalized slot with a different node-local bank ID replaces the row.
+Do not join stored bank IDs across subscriptions or use them to repair replay gaps.
+
+Existing `(slot, bank_id)` tables require a planned rebuild: `CREATE IF NOT EXISTS`
+cannot change their key, and ClickHouse cannot shorten the existing primary key
+with `MODIFY ORDER BY`. Pause footer writes, retain/export the old table, audit
+same-slot records for conflicting bank hashes, and create a replacement from the
+matching new schema with a temporary name. Copy one qualified canonical row per
+slot, verify counts and hashes, then rename/swap storage tables while writers are
+paused. For clusters perform this per shard and update the Distributed target;
+for replicated tables use a distinct Keeper path for the replacement and verify
+all replicas before swapping. Keep the original table as rollback evidence.
+Do not blindly collapse conflicting bank hashes with an arbitrary bank ID. Resume
+writes only after qualification. This is a footer-only migration; transaction,
+entry and block-metadata data stay slot-keyed throughout.

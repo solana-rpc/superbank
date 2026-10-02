@@ -51,7 +51,7 @@ impl DbTables {
             ArchiveDbTable::new(
                 ArchiveTableKind::BlockFooters,
                 self.block_footers_table.clone(),
-                "slot, bank_id",
+                "slot",
                 false,
             ),
             ArchiveDbTable::new(

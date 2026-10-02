@@ -489,3 +489,23 @@ the rejected payload and never calls the client's all-offset `commit()`: Fumarol
 Restart replays the valid prefix idempotently. Retire the bounded consumer or
 qualify a new historical run; repeated restart with the same bound will reach the
 same cutoff, rather than consume postmigration data.
+
+### Footer availability policy
+
+At gRPC startup Superbank qualifies the configured footer table and columns with
+a five-second bounded query. Failure disables ancillary footer writes for that
+session, with a warning and `superbank_ingest_source_errors_total` labels
+`stage="grpc_footer", kind="startup_unavailable"`; restart after repairing DDL.
+Canonical block validation and same-subscription identity qualification remain
+mandatory. Footer inserts retry, then retain the failed row within the bounded
+join window while canonical ingestion continues. Missing/replay-unavailable
+footers and expired failed inserts emit warnings and `missing`, `insert_failed`,
+`expired_insert` or `storage_disabled` kinds, rather than crash-looping the data
+writer. `invalid` footers are discarded, never repaired with guessed identities.
+First-shred turbine telemetry cannot advance the footer join window.
+
+A footer gap may be permanent: upstream replay may provide complete finalized
+blocks and status evidence without historical footers. Archive/report the gap;
+never fabricate bank hashes or join a stored node-local bank ID to a new session.
+New footer tables deduplicate by finalized slot across reconnects; existing
+`(slot, bank_id)` tables need the planned rebuild in [DDL migration notes](../../ddl/README.md#finalized-footer-identity-and-existing-table-migration).

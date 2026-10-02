@@ -337,7 +337,7 @@ pub(crate) async fn flush_buffers_with_retry(
     }
 }
 
-fn split_qualified_table(name: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_qualified_table(name: &str) -> Option<(&str, &str)> {
     let (db, table) = name.split_once('.')?;
     if db.is_empty() || table.is_empty() || table.contains('.') {
         return None;

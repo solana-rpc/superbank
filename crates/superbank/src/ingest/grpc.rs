@@ -33,7 +33,7 @@ use crate::cli::{Args, FromSlotSpec, IngestSource};
 use crate::clickhouse::{
     BlockFooterRow, BlockMetadataRow, EntryRow, InsertTables, RetryConfig, TransactionRow,
     build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers,
-    flush_buffers_with_retry, insert_footer_row,
+    flush_buffers_with_retry, insert_footer_row, split_qualified_table,
 };
 use crate::commitment::parse_durable_commitment;
 use crate::metrics;
@@ -158,7 +158,7 @@ const FOOTER_JOIN_WINDOW_SLOTS: u64 = 8192;
 const PENDING_IDENTITY_MAX_BLOCKS: usize = 256;
 const PENDING_IDENTITY_MAX_BYTES: usize = 128 * 1024 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanonicalIdentity {
     Unknown,
     Legacy,
@@ -193,7 +193,7 @@ struct FinalizedFooterJoin {
     completed: HashSet<(u64, u64)>,
     complete_blocks: HashSet<(u64, u64)>,
     durable_blocks: HashSet<(u64, u64)>,
-    first_footer_slot: Option<u64>,
+    footer_storage_available: Option<bool>,
     highest_slot: u64,
     // These proofs and pending payloads belong only to this subscription.
     known_banks: HashSet<(u64, u64)>,
@@ -281,7 +281,6 @@ impl FinalizedFooterJoin {
         let row = map_block_footer(footer)?;
         let key = (row.slot, row.bank_id);
         self.highest_slot = self.highest_slot.max(row.slot);
-        self.first_footer_slot.get_or_insert(row.slot);
         if self
             .finalized
             .get(&row.slot)
@@ -326,7 +325,6 @@ impl FinalizedFooterJoin {
         &mut self,
         slot: &yellowstone_grpc_proto::prelude::SubscribeUpdateSlot,
     ) -> Result<Option<BlockFooterRow>> {
-        self.highest_slot = self.highest_slot.max(slot.slot);
         let Ok(status) = SlotStatus::try_from(slot.status) else {
             return Ok(None);
         };
@@ -337,6 +335,7 @@ impl FinalizedFooterJoin {
                 | SlotStatus::SlotConfirmed
                 | SlotStatus::SlotFinalized
         ) {
+            self.highest_slot = self.highest_slot.max(slot.slot);
             if let Some(bank_id) = slot.bank_id {
                 ensure!(
                     !self.legacy_slots.contains(&slot.slot),
@@ -362,12 +361,6 @@ impl FinalizedFooterJoin {
         Ok(match status {
             SlotStatus::SlotFinalized => {
                 let Some(bank_id) = slot.bank_id else {
-                    if self
-                        .first_footer_slot
-                        .is_some_and(|first| slot.slot >= first)
-                    {
-                        return Err(anyhow!("finalized slot {} lacks bank ID", slot.slot));
-                    }
                     return Ok(None);
                 };
                 let key = (slot.slot, bank_id);
@@ -395,15 +388,28 @@ impl FinalizedFooterJoin {
 
     fn prune(&mut self) -> Result<()> {
         let oldest = self.highest_slot.saturating_sub(FOOTER_JOIN_WINDOW_SLOTS);
-        if self.finalized.iter().any(|(slot, bank_id)| {
-            *slot < oldest
-                && self.first_footer_slot.is_some_and(|first| *slot >= first)
-                && !self.completed.contains(&(*slot, *bank_id))
-        }) {
-            return Err(anyhow!(
-                "finalized slot was not matched with a footer within {FOOTER_JOIN_WINDOW_SLOTS} slots"
-            ));
+        for (&slot, &bank_id) in &self.finalized {
+            if slot < oldest && !self.completed.contains(&(slot, bank_id)) {
+                metrics::observe_source_error("grpc_footer", "missing");
+                warn!(
+                    slot,
+                    bank_id,
+                    "footer unavailable in join window; canonical data remains valid, replay may not supply footers"
+                );
+            }
         }
+        self.ready_footers.retain(|footer| {
+            if footer.slot < oldest {
+                metrics::observe_source_error("grpc_footer", "expired_insert");
+                warn!(
+                    slot = footer.slot,
+                    "unwritten footer expired from bounded retry window"
+                );
+                false
+            } else {
+                true
+            }
+        });
         self.pending.retain(|(slot, _), _| *slot >= oldest);
         self.finalized.retain(|slot, _| *slot >= oldest);
         self.completed.retain(|(slot, _)| *slot >= oldest);
@@ -416,6 +422,36 @@ impl FinalizedFooterJoin {
         self.known_banks.retain(|(slot, _)| *slot >= oldest);
         self.legacy_slots.retain(|slot| *slot >= oldest);
         Ok(())
+    }
+}
+
+// Ancillary footer persistence uses a fixed best-effort policy. Startup must
+// qualify the table's columns; it never qualifies identity or replay availability.
+async fn qualify_footer_storage(client: &ClickHouseClient, table: &str) -> bool {
+    let (client, table) = match split_qualified_table(table) {
+        Some((database, name)) => (client.clone().with_database(database), name),
+        None => (client.clone(), table),
+    };
+    let result = tokio::time::timeout(Duration::from_secs(5), client.query(
+        "SELECT slot, bank_id, bank_hash, block_producer_time_nanos, block_user_agent FROM ? LIMIT 0"
+    ).bind(clickhouse::sql::Identifier(table)).execute()).await;
+    match result {
+        Ok(Ok(())) => {
+            info!(
+                table,
+                "footer storage qualified; using best-effort ancillary persistence"
+            );
+            true
+        }
+        error => {
+            metrics::observe_source_error("grpc_footer", "startup_unavailable");
+            warn!(
+                table,
+                ?error,
+                "footer storage unqualified; disabling ancillary footer writes for this session, canonical ingestion remains enabled"
+            );
+            false
+        }
     }
 }
 
@@ -474,7 +510,12 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
         initial_from_slot_mode,
         buffered_rows.last_durable_block_slot,
     );
-    let mut footer_join = FinalizedFooterJoin::default();
+    let mut footer_join = FinalizedFooterJoin {
+        footer_storage_available: Some(
+            qualify_footer_storage(&clickhouse, &args.block_footers_table).await,
+        ),
+        ..Default::default()
+    };
     let (pending_update, mut stream) = connect_grpc_stream(
         endpoint,
         args,
@@ -732,6 +773,17 @@ async fn process_canonical_update_inner(
             let prepared = prepare_block(&block, args.entries_table.is_some())?;
             join.stage_identity_block(prepared, block.encoded_len())?;
         }
+        Some(UpdateOneof::BlockFooter(footer)) => {
+            match join.observe_footer(&footer) {
+                Ok(Some(footer)) => join.ready_footers.push(footer),
+                Ok(None) => {}
+                Err(error) => {
+                    metrics::observe_source_error("grpc_footer", "invalid");
+                    warn!(slot = footer.slot, %error, "discarding unqualified footer; canonical identity checks remain required");
+                }
+            }
+            join.prune()?;
+        }
         other => {
             if let Some(footer) = join.observe(SubscribeUpdate {
                 update_oneof: other,
@@ -768,8 +820,23 @@ async fn process_canonical_update_inner(
     while index < join.ready_footers.len() {
         let footer = &join.ready_footers[index];
         if join.durable_blocks.contains(&(footer.slot, footer.bank_id)) {
-            let footer = join.ready_footers.remove(index);
-            insert_footer_row(clickhouse, &args.block_footers_table, &footer, Some(retry)).await?;
+            if join.footer_storage_available == Some(false) {
+                metrics::observe_source_error("grpc_footer", "storage_disabled");
+                join.ready_footers.remove(index);
+                continue;
+            }
+            match insert_footer_row(clickhouse, &args.block_footers_table, footer, Some(retry))
+                .await
+            {
+                Ok(()) => {
+                    join.ready_footers.remove(index);
+                }
+                Err(error) => {
+                    metrics::observe_source_error("grpc_footer", "insert_failed");
+                    warn!(slot = footer.slot, %error, "footer insert exhausted retries; retaining bounded footer while canonical ingestion continues");
+                    index += 1;
+                }
+            }
         } else {
             index += 1;
         }
@@ -2309,6 +2376,7 @@ mod tests {
 
     #[test]
     fn footer_join_discards_losing_banks_and_pre_activation_slots() {
+        crate::metrics::force_init("grpc", None);
         let mut join = FinalizedFooterJoin::default();
         assert!(
             join.observe(slot_update(1, 1, SlotStatus::SlotFinalized))
@@ -2328,7 +2396,8 @@ mod tests {
     }
 
     #[test]
-    fn footer_join_fails_when_finalized_bank_has_no_footer() {
+    fn footer_gap_expires_without_blocking_canonical_ingestion() {
+        crate::metrics::force_init("grpc", None);
         let mut join = FinalizedFooterJoin::default();
         assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
         assert!(
@@ -2336,19 +2405,41 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let err = join.observe(footer_update(42 + super::FOOTER_JOIN_WINDOW_SLOTS + 1, 9));
-        assert!(err.err().unwrap().to_string().contains("finalized slot"));
+        assert!(
+            join.observe(footer_update(42 + super::FOOTER_JOIN_WINDOW_SLOTS + 1, 9))
+                .is_ok()
+        );
+        assert!(!join.finalized.contains_key(&42));
     }
 
     #[test]
-    fn footer_join_rejects_missing_bank_identity_after_activation() {
+    fn footer_cannot_establish_identity_for_a_bank_blind_status() {
         let mut join = FinalizedFooterJoin::default();
         assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
         let mut finalized = slot_update(42, 7, SlotStatus::SlotFinalized);
         if let Some(UpdateOneof::Slot(slot)) = &mut finalized.update_oneof {
             slot.bank_id = None;
         }
-        assert!(join.observe(finalized).is_err());
+        assert!(join.observe(finalized).unwrap().is_none());
+        assert_eq!(
+            join.block_identity(42, 0).unwrap(),
+            super::CanonicalIdentity::Legacy
+        );
+        assert!(join.observe(footer_update(42, 7)).is_err());
+    }
+
+    #[test]
+    fn distant_turbine_first_shred_cannot_prune_footer_or_identity_proofs() {
+        let mut join = FinalizedFooterJoin::default();
+        join.observe(slot_update(42, 7, SlotStatus::SlotFinalized))
+            .unwrap();
+        join.observe(footer_update(42, 7)).unwrap();
+        join.observe(slot_update(100_000, 9, SlotStatus::SlotFirstShredReceived))
+            .unwrap();
+        assert_eq!(join.highest_slot, 42);
+        assert!(join.pending.contains_key(&(42, 7)));
+        assert!(join.known_banks.contains(&(42, 7)));
+        assert!(join.observe_complete_block(42, 7).unwrap().is_some());
     }
 
     #[test]

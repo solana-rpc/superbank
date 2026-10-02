@@ -533,7 +533,7 @@ fn db_archive_tables_cover_superbank_base_and_index_tables() {
                 "block_footers",
                 "block_footers",
                 "block_footers.parquet",
-                "slot, bank_id",
+                "slot",
                 false
             ),
             (

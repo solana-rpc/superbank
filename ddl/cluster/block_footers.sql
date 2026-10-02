@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS default.block_footers_local ON CLUSTER '{cluster}'
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY intDiv(slot, 432000)
-ORDER BY (slot, bank_id);
+ORDER BY (slot);
 
 CREATE TABLE IF NOT EXISTS default.block_footers ON CLUSTER '{cluster}'
 AS default.block_footers_local

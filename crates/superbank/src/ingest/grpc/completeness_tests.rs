@@ -881,3 +881,117 @@ async fn validation_exit_flushes_only_an_earlier_qualified_prefix_and_replays_sa
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn absent_or_failed_footer_storage_cannot_stop_valid_canonical_data() {
+    use axum::{Router, body::Body, extract::Request, http::StatusCode};
+    use tokio::{net::TcpListener, sync::mpsc};
+    metrics::force_init("grpc", None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let app = Router::new().fallback(move |request: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let footer = query.contains("block_footers")
+                || String::from_utf8_lossy(&body).contains("block_footers");
+            tx.send(query).unwrap();
+            if footer {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "footer table unavailable",
+                )
+            } else {
+                (StatusCode::OK, "Ok")
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClickHouseClient::default()
+        .with_url(format!("http://{addr}"))
+        .with_validation(false)
+        .with_compression(clickhouse::Compression::None);
+    let mut args = crate::cli::test_args();
+    args.flush_every_block = true;
+    let tables = InsertTables::from_args(&args);
+    let retry = RetryConfig {
+        max_retries: 0,
+        base_ms: 1,
+        max_ms: 1,
+    };
+    assert!(!qualify_footer_storage(&client, &args.block_footers_table).await);
+    for availability in [Some(false), Some(true)] {
+        let mut join = FinalizedFooterJoin {
+            footer_storage_available: availability,
+            ..Default::default()
+        };
+        let mut rows = buffered_rows();
+        let bank_block = |slot, bank_id| {
+            let mut block = complete_block(slot);
+            block.bank_id = bank_id;
+            for entry in &mut block.entries { entry.bank_id = bank_id; }
+            canonical_envelope(UpdateOneof::Block(block))
+        };
+        for update in [
+            identity_status(42, Some(7), SlotStatus::SlotFinalized),
+            canonical_envelope(UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+                slot: 42,
+                bank_id: 7,
+                bank_hash: vec![9; 32],
+                ..Default::default()
+            })),
+            bank_block(42, 7),
+            bank_block(43, 8),
+        ] {
+            process_canonical_update(
+                update, &args, &tables, &client, &mut rows, &retry, &mut join,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(rows.last_durable_block_slot, Some(43));
+        assert_eq!(
+            join.ready_footers.len(),
+            usize::from(availability == Some(true))
+        );
+    }
+    let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        requests
+            .iter()
+            .filter(|query| query.contains("blocks_metadata"))
+            .count()
+            >= 4
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_footer_startup_qualifies_fqn_and_rejects_absent_table() {
+    let Ok(url) = std::env::var("DISK_CACHE_TEST_URL") else {
+        return;
+    };
+    assert!(url.starts_with("http://127.0.0.1:"));
+    metrics::force_init("grpc", None);
+    let client = ClickHouseClient::default().with_url(url);
+    let table = format!(
+        "review_footer_qualification_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    client.query(&format!("CREATE TABLE default.{table} (slot UInt64, bank_id UInt64, bank_hash FixedString(32), block_producer_time_nanos UInt64, block_user_agent String) ENGINE=ReplacingMergeTree ORDER BY slot")).execute().await.unwrap();
+    assert!(qualify_footer_storage(&client, &format!("default.{table}")).await);
+    assert!(!qualify_footer_storage(&client, &format!("default.{table}_absent")).await);
+    client
+        .query(&format!("DROP TABLE default.{table}"))
+        .execute()
+        .await
+        .unwrap();
+}
+
