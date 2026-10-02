@@ -7,16 +7,20 @@ Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
 default. The `solparq` source runs in reverse: it restores `superbank-solparq`
 Parquet archive bundles (local or S3) back into ClickHouse.
 
-The root workspace is Agave 4.2 / transaction-v1 ready. The standalone Jetstreamer submodule
-under `ingest/` now uses Agave 4.2, and the ClickHouse plugin supports transaction-v1 fields.
-The plugin is outside the root Cargo workspace, so validate it separately before Old Faithful
-backfills; root CI does not cover its build or live ingestion.
+The main ingestor and RPC server target Agave 4.3 with Rust 1.97.1.
+See the [compatibility and rollout notes](../../docs/agave-4.3-compatibility.md). The standalone
+Jetstreamer plugin under `ingest/` has a separate build and qualification gate for
+Alpenglow backfills.
 
 Agave 4.2 also adds the `DeactivatedStake` reward type and changes confidential-transfer parsed
 JSON from `source`/`destination` keys to `account`; consumers of parsed RPC responses should treat
 that JSON-key correction as a compatibility break.
 
 ## Prereqs
+
+Apply the updated `blocks_metadata.sql` before upgrading **any** source, including
+RPC and Bigtable. Reapply it to repair an existing `bank_id` column to
+`Nullable(UInt64) DEFAULT NULL`; old writers can then omit that column during rollout.
 
 - ClickHouse with the matching schema set under `ddl/`: use `ddl/local/transactions.sql` +
   `ddl/local/blocks_metadata.sql` for single-node development, plus `ddl/local/entries.sql`
@@ -45,6 +49,7 @@ SUPERBANK_SOURCE=fumarole \
 FUMAROLE_ENDPOINT=https://your.fumarole.endpoint:443 \
 FUMAROLE_X_TOKEN=your-token \
 FUMAROLE_CONSUMER_GROUP=superbank-mainnet \
+FUMAROLE_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> \
 CLICKHOUSE_URL=http://localhost:8123 \
 CLICKHOUSE_DATABASE=default \
 CLICKHOUSE_ENTRIES_TABLE=default.entries \
@@ -258,6 +263,9 @@ clickhouse-url: "http://localhost:8123"
 clickhouse-database: "default"
 transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
+# Choose one evidenced bound; replace the placeholder before running:
+fumarole-preactivation-through-slot: <recorded-finalized-slot>
+block-footers-table: "default.block_footers"
 entries-table: "default.entries"
 ```
 
@@ -275,6 +283,8 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--source` / `SUPERBANK_SOURCE` (required: `fumarole`, `grpc`, `rpc`, `bigtable`, or `solparq`)
 - `--fumarole-endpoint` / `FUMAROLE_ENDPOINT` (required for fumarole source)
 - `--fumarole-x-token` / `FUMAROLE_X_TOKEN` (optional)
+- `--fumarole-alpenglow-genesis-slot` / `FUMAROLE_ALPENGLOW_GENESIS_SLOT` (trusted certificate slot; mutually exclusive with preactivation attestation)
+- `--fumarole-preactivation-through-slot` / `FUMAROLE_PREACTIVATION_THROUGH_SLOT` (explicit offline attestation of a finalized slot recorded before trusted same-cluster authoritative null; see below)
 - `--fumarole-consumer-group` / `FUMAROLE_CONSUMER_GROUP` (required for fumarole source)
 - `--fumarole-create-consumer-group[=true|false]` / `FUMAROLE_CREATE_CONSUMER_GROUP` (default: false)
 - `--fumarole-data-plane-tcp-connections` / `FUMAROLE_DATA_PLANE_TCP_CONNECTIONS` (default: 4; maximum: 20)
@@ -285,7 +295,9 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--fumarole-no-commit[=true|false]` / `FUMAROLE_NO_COMMIT` (default: false)
 - `--endpoint` / `DRAGONSMOUTH_ENDPOINT` (required for grpc source)
 - `--x-token` / `DRAGONSMOUTH_X_TOKEN` (optional)
-- `--commitment` / `DRAGONSMOUTH_COMMITMENT` (default: `finalized`)
+- `--commitment` / `DRAGONSMOUTH_COMMITMENT` (default and required for gRPC/Fumarole
+  ClickHouse ingestion: `finalized`). Processed data is served by the RPC head cache;
+  slot-keyed ClickHouse tables must not receive competing unfinalized banks.
 - `--dragonsmouth-from-slot` / `DRAGONSMOUTH_FROM_SLOT` (optional for grpc source; use `*`
   for latest slot in `blocks_metadata`, `0` to start from earliest available slot)
 - `--fumarole-from-slot` / `FUMAROLE_FROM_SLOT` (optional for fumarole source; only used when
@@ -294,7 +306,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--grpc-http2-adaptive-window[=true|false]` / `GRPC_HTTP2_ADAPTIVE_WINDOW` (default: false)
 - `--grpc-idle-timeout-secs` / `GRPC_IDLE_TIMEOUT_SECS` (default: 30; grpc source exits if no messages arrive before the timeout)
 - `--grpc-health-watch-enabled[=true|false]` / `GRPC_HEALTH_WATCH_ENABLED` (default: true; grpc source exits if health is not `SERVING`)
-- `--grpc-slot-notifications[=true|false]` / `GRPC_SLOT_NOTIFICATIONS` (default: true; subscribe to slot notifications on the gRPC stream to populate `superbank_ingest_chain_tip_lag`)
+- `--grpc-slot-notifications[=true|false]` / `GRPC_SLOT_NOTIFICATIONS` (default: true; subscribe to extra finalized slot notifications to populate `superbank_ingest_chain_tip_lag`; required bank-status events remain subscribed)
 - `--rpc-url` / `RPC_URL` (required for rpc source)
 - `--rpc-from-slot` / `RPC_FROM_SLOT` (required for rpc source; use `*` for latest slot in
   `blocks_metadata`, `0` to start from earliest available slot). To resume an interrupted
@@ -352,6 +364,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--clickhouse-async-insert` / `CLICKHOUSE_ASYNC_INSERT` (default: `false`)
 - `--transactions-table` / `CLICKHOUSE_TRANSACTIONS_TABLE` (default: `default.transactions`)
 - `--blocks-table` / `CLICKHOUSE_BLOCKS_TABLE` (default: `default.blocks_metadata`)
+- `--block-footers-table` / `CLICKHOUSE_BLOCK_FOOTERS_TABLE` (default: `default.block_footers`; gRPC Alpenglow footer stream)
 - `--entries-table` / `CLICKHOUSE_ENTRIES_TABLE` (default: `default.entries`; Fumarole and gRPC ingest write live PoH entries to this table)
 - `--transactions-flush-rows` / `TRANSACTIONS_FLUSH_ROWS` (default: 25000)
 - `--blocks-flush-rows` / `BLOCKS_FLUSH_ROWS` (default: 2000)
@@ -365,6 +378,10 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
+- For gRPC ingest, apply `block_footers.sql` and the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; a footer is written only after its proven winning bank has complete durable data. Fumarole 0.8 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
+- Fumarole requires exactly one evidenced historical bound: the certificate's
+  genesis slot or `--fumarole-preactivation-through-slot`. It accepts the bound
+  slot and rejects later blocks; use bank-tagged gRPC for later blocks.
 - `/metrics` includes Fumarole backpressure gauges/counters such as
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
   `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
@@ -396,3 +413,107 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - Bigtable slot lists do not require `RPC_URL` because slots are explicit.
 - Superbank forces `async_insert=0` by default for ClickHouse writes; enable `--clickhouse-async-insert`
   only when your ClickHouse profile and dependent materialized views support it.
+
+## Agave 4.3 archive regression
+
+Build the production binaries and run against a disposable loopback ClickHouse
+26.1 or newer (the test creates and drops only uniquely named test databases):
+
+```sh
+cargo build -p superbank -p superbank-solparq -p superbank-rpc --all-features --locked
+DISK_CACHE_TEST_URL=http://127.0.0.1:18196 python3 scripts/test/agave43-archive-roundtrip.py
+```
+
+This exercises local bundle export, manifest discovery, ingestor restore and RPC
+hydration for VAT debits and historical commission fields. Its local produced-slot
+reference is deterministic test data; it does not qualify a live Agave producer.
+
+### Live stream integrity
+
+Canonical gRPC and Fumarole writers require `commitment: finalized`. The head cache
+serves speculative banks. Fumarole 0.8 assembles by `(slot, sealed blockhash)`; a
+legacy envelope without a hash permits only one local bank identity. An evidenced
+`fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound is required: Fumarole does not
+supply the footer evidence needed for postmigration qualification.
+
+Full blocks are validated before buffering or inserts: exact transaction counts
+(including zero), unique contiguous indices and signatures, and, when entries are
+requested, exact entry counts, indices, slot identity and transaction range tiling.
+Omitting `entries-table` permits an omitted entry payload. Malformed payloads never enter writer buffers or acknowledge source offsets.
+A rejected later gRPC update flushes an already complete, qualified earlier
+prefix before exiting. Same-slot contradictions and unresolved bank identity
+retain buffered data without advancing restart progress. Complete Fumarole banks may flush while
+other banks are assembling, but Fumarole commits no pending offsets until every
+pending bank has completed. Restart replays unacknowledged data.
+
+gRPC joins footers, winner status and complete blocks on the same subscription's
+`(slot, bank_id)`. Nonzero scalar IDs supply actual identity; scalar zero also
+represents a missing protobuf field, so a zero block waits for a matching status
+on that subscription. An optional `Some(0)` establishes modern bank zero. A
+CreatedBank or finalized status without an ID permits complete historical data
+under the trusted finalized full-block contract, with metadata `bank_id: NULL`;
+that data cannot qualify a modern footer. No migration boundary is inferred from
+entry shape or dates.
+
+Data arriving before status is validated and held with later blocks, bounded to
+256 blocks and 128 MiB of encoded payload. Timer, pressure, shutdown and
+transport-error flushes cannot advance the durable metadata tip while identity
+is unresolved. Ready footers for earlier proven banks whose complete data is
+already durable can still be inserted without flushing held data or advancing
+the metadata tip; other footers wait for their own data to become durable. Missing evidence fails at the hold/window limit or shutdown;
+restart replays from the previous durable slot. Identity proofs never carry over
+to a new subscription. Producers must supply the requested bank-status events
+for historical replay as well as live traffic.
+
+A footer is written only after complete winning block data is durable.
+Connection-local counters cannot be joined across subscriptions; sealed
+blockhashes identify Fumarole banks across connections.
+
+### Bounded preactivation runs
+
+When trusted same-cluster `getAgGenesisCert` returns authoritative null, first
+record `getSlot` at finalized commitment from that endpoint, **then** its null
+certificate response. Keep both responses and attest a slot at or below that
+finalized tip with `--fumarole-preactivation-through-slot` /
+`FUMAROLE_PREACTIVATION_THROUGH_SLOT` / `fumarole-preactivation-through-slot`.
+This is operator-supplied offline evidence; Superbank does not fetch it itself.
+Failures, missing evidence and unsupported RPC methods never mean preactivation.
+The run remains bounded and cannot follow future activation. A subsequent run
+requires newly qualified evidence or the certificate's genesis slot; never set
+both bounds. A numeric zero is usable only if actually evidenced.
+
+At a Fumarole historical cutoff, the first out-of-bound event flushes prior
+validated complete rows before returning an error. It never assembles or writes
+the rejected payload and never calls the client's all-offset `commit()`: Fumarole
+0.8 has no safe-prefix acknowledgment API. Pending siblings remain unacknowledged.
+Restart replays the valid prefix idempotently. Retire the bounded consumer or
+qualify a new historical run; repeated restart with the same bound will reach the
+same cutoff, rather than consume postmigration data.
+
+### Footer availability policy
+
+At gRPC startup Superbank qualifies the configured footer table and columns with
+a five-second bounded query. Failure disables ancillary footer writes for that
+session, with a warning and `superbank_ingest_source_errors_total` labels
+`stage="grpc_footer", kind="startup_unavailable"`; restart after repairing DDL.
+Canonical block validation and same-subscription identity qualification remain
+mandatory. Footer inserts retry, then retain the failed row within the bounded
+join window while canonical ingestion continues. Missing/replay-unavailable
+footers and expired failed inserts emit warnings and `missing`, `insert_failed`,
+`expired_insert` or `storage_disabled` kinds, rather than crash-looping the data
+writer. `invalid` footers are discarded, never repaired with guessed identities.
+First-shred turbine telemetry cannot advance the footer join window.
+
+A footer gap may be permanent: upstream replay may provide complete finalized
+blocks and status evidence without historical footers. Archive/report the gap;
+never fabricate bank hashes or join a stored node-local bank ID to a new session.
+New footer tables deduplicate by finalized slot across reconnects; existing
+`(slot, bank_id)` tables need the planned rebuild in [DDL migration notes](../../ddl/README.md#finalized-footer-identity-and-existing-table-migration).
+
+Footer rows buffer until a normal data flush (timer, row pressure or shutdown) or
+256 ready footers. Each batch uses a persistent table-specific ClickHouse client,
+reusing its schema metadata cache. Complete bank data is flushed and marked durable
+before any footer in that batch; retries retain the batch on failure. Already
+durable earlier footers may flush during a later unresolved identity hold without
+advancing the metadata tip. This can add up to the configured flush interval to
+footer latency; account for it before archiving a range.

@@ -107,6 +107,8 @@ data:
 {transactions}
   blocks_metadata.sql: |
 {blocks}
+  block_footers.sql: |
+{block_footers}
   entries.sql: |
 {entries}
   gsfa.sql: |
@@ -121,6 +123,7 @@ data:
     namespace=namespace,
     transactions=_indent_block(read_file("ddl/local/transactions.sql"), 4),
     blocks=_indent_block(read_file("ddl/local/blocks_metadata.sql"), 4),
+    block_footers=_indent_block(read_file("ddl/local/block_footers.sql"), 4),
     entries=_indent_block(read_file("ddl/local/entries.sql"), 4),
     gsfa=_indent_block(read_file("ddl/local/gsfa.sql"), 4),
     gsfa_hot=_indent_block(read_file("ddl/local/gsfa_hot.sql"), 4),
@@ -293,6 +296,7 @@ pod="$(kubectl -n "$ns" get pod -l app=clickhouse -o jsonpath='{.items[0].metada
 for f in \\
   ddl/local/transactions.sql \\
   ddl/local/blocks_metadata.sql \\
+  ddl/local/block_footers.sql \\
   ddl/local/entries.sql \\
   ddl/local/gsfa.sql \\
   ddl/local/gsfa_hot.sql \\
@@ -308,6 +312,7 @@ echo "[apply-clickhouse-schema] Done."
     deps=[
         "ddl/local/transactions.sql",
         "ddl/local/blocks_metadata.sql",
+        "ddl/local/block_footers.sql",
         "ddl/local/entries.sql",
         "ddl/local/gsfa.sql",
         "ddl/local/gsfa_hot.sql",

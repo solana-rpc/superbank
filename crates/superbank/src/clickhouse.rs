@@ -94,6 +94,7 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) parent_slot: u64,
     pub(crate) blockhash: Array<u8, 32>,
     pub(crate) parent_blockhash: Array<u8, 32>,
+    pub(crate) bank_id: Option<u64>,
     pub(crate) block_time: Option<i64>,
     pub(crate) block_height: Option<u64>,
     pub(crate) executed_transaction_count: u64,
@@ -106,6 +107,15 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_commission: Vec<Option<u8>>,
     pub(crate) rewards_commission_bps: Vec<Option<u16>>,
     pub(crate) rewards_num_partitions: Option<u64>,
+}
+
+#[derive(Row, Serialize, Clone)]
+pub(crate) struct BlockFooterRow {
+    pub(crate) slot: u64,
+    pub(crate) bank_id: u64,
+    pub(crate) bank_hash: Array<u8, 32>,
+    pub(crate) block_producer_time_nanos: u64,
+    pub(crate) block_user_agent: ByteBuf,
 }
 
 #[derive(Row, Serialize)]
@@ -250,6 +260,58 @@ pub(crate) struct RetryConfig {
     pub(crate) max_ms: u64,
 }
 
+pub(crate) struct FooterWriter {
+    client: ClickHouseClient,
+    table: String,
+}
+
+impl FooterWriter {
+    pub(crate) fn new(client: &ClickHouseClient, table: &str) -> Self {
+        // Normalize once: with_database invalidates clickhouse-rs metadata.
+        let (client, table) = match split_qualified_table(table) {
+            Some((db, name)) => (client.clone().with_database(db), name),
+            None => (client.clone(), table),
+        };
+        Self {
+            client,
+            table: table.to_owned(),
+        }
+    }
+
+    pub(crate) async fn insert(
+        &self,
+        rows: &[BlockFooterRow],
+        retry: Option<&RetryConfig>,
+    ) -> Result<()> {
+        let mut attempt = 0u32;
+        loop {
+            let result: Result<()> = async {
+                let mut insert = self.client.insert::<BlockFooterRow>(&self.table).await?;
+                for row in rows {
+                    insert.write(row).await?;
+                }
+                insert.end().await?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if retry.is_some_and(|config| attempt < config.max_retries) => {
+                    let config = retry.expect("checked above");
+                    attempt += 1;
+                    let delay_ms = config
+                        .base_ms
+                        .saturating_mul(1u64 << (attempt - 1).min(62))
+                        .min(config.max_ms);
+                    warn!(attempt, delay_ms, %error, "footer batch insert failed; retrying");
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => return Err(error).context("insert block footer batch"),
+            }
+        }
+    }
+}
+
 pub(crate) async fn flush_buffers_with_retry(
     client: &ClickHouseClient,
     tables: &InsertTables,
@@ -300,7 +362,7 @@ pub(crate) async fn flush_buffers_with_retry(
     }
 }
 
-fn split_qualified_table(name: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_qualified_table(name: &str) -> Option<(&str, &str)> {
     let (db, table) = name.split_once('.')?;
     if db.is_empty() || table.is_empty() || table.contains('.') {
         return None;
@@ -523,6 +585,8 @@ mod tests {
             fumarole_endpoint: None,
             fumarole_x_token: None,
             fumarole_consumer_group: None,
+            fumarole_alpenglow_genesis_slot: None,
+            fumarole_preactivation_through_slot: None,
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: 2,
@@ -588,6 +652,7 @@ mod tests {
             clickhouse_async_insert: false,
             transactions_table: "default.transactions".to_string(),
             blocks_table: "default.blocks_metadata".to_string(),
+            block_footers_table: "default.block_footers".to_string(),
             entries_table: None,
             transactions_flush_rows: 25_000,
             blocks_flush_rows: 2_000,
@@ -631,5 +696,76 @@ mod tests {
         assert_eq!(split_qualified_table("default."), None);
         assert_eq!(split_qualified_table("a.b.c"), None);
         assert_eq!(split_qualified_table(""), None);
+    }
+}
+
+#[cfg(test)]
+mod footer_native_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_footer_writer_reuses_metadata_and_replaces_reconnect_bank_ids_by_slot() {
+        let Ok(url) = std::env::var("DISK_CACHE_TEST_URL") else {
+            return;
+        };
+        assert!(
+            url.starts_with("http://127.0.0.1:"),
+            "disposable loopback fixture only"
+        );
+        let client = ClickHouseClient::default()
+            .with_url(url)
+            .with_database("default");
+        let name = format!(
+            "review_footer_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        client.query(&format!("CREATE TABLE {name} (slot UInt64, bank_id UInt64, bank_hash FixedString(32), block_producer_time_nanos UInt64, block_user_agent String) ENGINE=ReplacingMergeTree ORDER BY (slot)")).execute().await.unwrap();
+        let writer = FooterWriter::new(&client, &format!("default.{name}"));
+        let row = |slot, bank_id| BlockFooterRow {
+            slot,
+            bank_id,
+            bank_hash: Array([9; 32]),
+            block_producer_time_nanos: 100,
+            block_user_agent: ByteBuf::from(b"fixture".to_vec()),
+        };
+        writer
+            .insert(&[row(42, 7), row(43, 8)], None)
+            .await
+            .unwrap();
+        writer.insert(&[row(42, 0)], None).await.unwrap();
+        let count: u64 = client
+            .query(&format!("SELECT count() FROM {name} FINAL"))
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "node-local IDs cannot duplicate a finalized row on reconnect"
+        );
+        let bank_id: u64 = client
+            .query(&format!("SELECT bank_id FROM {name} FINAL WHERE slot=42"))
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(bank_id, 0);
+        client.query("SYSTEM FLUSH LOGS").execute().await.unwrap();
+        let describes: u64 = client
+            .query("SELECT count() FROM system.query_log WHERE type='QueryFinish' AND query LIKE ?")
+            .bind(format!("DESCRIBE TABLE %{name}%"))
+            .fetch_one()
+            .await
+            .unwrap();
+        assert_eq!(
+            describes, 1,
+            "both batches must reuse one clickhouse-rs metadata cache"
+        );
+        client
+            .query(&format!("DROP TABLE {name}"))
+            .execute()
+            .await
+            .unwrap();
     }
 }

@@ -32,6 +32,16 @@ pub struct ClickhouseIngestConfig {
     pub blocks_metadata_table: String,
     /// Base table for PoH entries.
     pub entries_table: String,
+    /// Trusted Alpenglow genesis slot; this producer can only write through it.
+    pub alpenglow_genesis_slot: Option<u64>,
+    /// Offline attestation: finalized slot observed before trusted same-cluster
+    /// getAgGenesisCert returned authoritative null. Never an unbounded mode.
+    pub preactivation_through_slot: Option<u64>,
+    /// Trusted same-cluster SIMD-0291 activation slot, independent of Alpenglow.
+    /// Required for commission-bearing block rewards unless whole-percent is attested.
+    pub block_reward_commission_bps_from_slot: Option<u64>,
+    /// Explicit attestation that the entire bounded backfill predates SIMD-0291.
+    pub block_reward_commission_percent: bool,
     /// Max rows per ClickHouse insert batch.
     pub flush_max_rows: u64,
     /// Max bytes per ClickHouse insert batch.
@@ -67,6 +77,10 @@ impl Default for ClickhouseIngestConfig {
             transactions_table: "transactions".to_string(),
             blocks_metadata_table: "blocks_metadata".to_string(),
             entries_table: "entries".to_string(),
+            alpenglow_genesis_slot: None,
+            preactivation_through_slot: None,
+            block_reward_commission_bps_from_slot: None,
+            block_reward_commission_percent: false,
             flush_max_rows: 100_000,
             flush_max_bytes: 64 * 1024 * 1024,
             flush_interval_ms: 10_000,
@@ -98,6 +112,13 @@ impl ClickhouseIngestConfig {
 }
 
 fn apply_env_overrides(config: &mut ClickhouseIngestConfig) {
+    apply_era_env_override(config);
+    if let Some(value) = env_u64("JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT") {
+        config.block_reward_commission_bps_from_slot = Some(value);
+    }
+    if let Some(value) = env_bool("JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT") {
+        config.block_reward_commission_percent = value;
+    }
     if let Some(value) = env_u64("JETSTREAMER_CLICKHOUSE_FLUSH_MAX_ROWS") {
         config.flush_max_rows = value;
     }
@@ -130,6 +151,23 @@ fn apply_env_overrides(config: &mut ClickhouseIngestConfig) {
     }
     if let Some(value) = env_u64("JETSTREAMER_CLICKHOUSE_INSERT_END_TIMEOUT_MS") {
         config.insert_end_timeout_ms = value;
+    }
+}
+
+fn apply_era_env_override(config: &mut ClickhouseIngestConfig) {
+    if let Some(value) = env_u64("JETSTREAMER_PREACTIVATION_THROUGH_SLOT") {
+        config.preactivation_through_slot = Some(value);
+    }
+    if let Some(value) = env_u64("JETSTREAMER_ALPENGLOW_GENESIS_SLOT") {
+        config.alpenglow_genesis_slot = Some(value);
+    }
+}
+
+fn log_storage_mode(single_node: bool) {
+    if single_node {
+        log::info!("ClickHouse ingest plugin in single-node mode.");
+    } else {
+        log::info!("ClickHouse ingest plugin in clustered mode.");
     }
 }
 
@@ -171,13 +209,12 @@ fn env_bool(name: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClickhouseIngestConfig, EntryRow, TransactionRow, apply_env_overrides, map_rewards,
+        ClickhouseIngestConfig, ClickhouseIngestPlugin, EntryRow, TransactionRow,
+        apply_env_overrides, map_rewards, versioned_message_fields,
     };
     use jetstreamer_firehose::firehose::{EntryData, TransactionData};
-    use solana_message::{
-        VersionedMessage,
-        v1::{Message, TransactionConfig},
-    };
+    use solana_message::v1::{Message, TransactionConfig};
+    use solana_message::{Hash, VersionedMessage, v1};
     use solana_transaction::versioned::VersionedTransaction;
     use solana_transaction_status::Reward;
 
@@ -277,6 +314,151 @@ mod tests {
     }
 
     #[test]
+    fn legacy_backfill_requires_boundary_and_stops_after_genesis() {
+        let unbounded = ClickhouseIngestPlugin::new(ClickhouseIngestConfig::default(), 1);
+        assert!(unbounded.ensure_legacy_slot(1).is_err());
+
+        let bounded = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(bounded.ensure_legacy_slot(100).is_ok());
+        assert!(bounded.ensure_legacy_slot(101).is_err());
+    }
+
+    #[test]
+    fn trusted_null_fixture_allows_only_an_explicit_finalized_history_bound() {
+        let bounded = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                preactivation_through_slot: Some(42),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(bounded.ensure_legacy_slot(42).is_ok());
+        assert!(bounded.ensure_legacy_slot(43).is_err());
+        let conflicting = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                preactivation_through_slot: Some(42),
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(conflicting.ensure_legacy_slot(42).is_err());
+    }
+
+    #[test]
+    fn runner_range_is_clamped_before_upstream_can_continue_after_callback_errors() {
+        let plugin = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(
+            plugin.historical_slot_range(90, 200).is_err(),
+            "era preflight must precede runner start"
+        );
+        let plugin = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                block_reward_commission_percent: true,
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(plugin.historical_slot_range(90, 200).unwrap(), 90..101);
+        assert_eq!(plugin.historical_slot_range(100, 100).unwrap(), 100..101);
+        assert!(plugin.historical_slot_range(101, 200).is_err());
+        assert!(plugin.historical_slot_range(100, 99).is_err());
+        let max = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(u64::MAX),
+                block_reward_commission_percent: true,
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(max.historical_slot_range(0, u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_postboundary_callbacks_do_not_allocate_pending_rows_or_writers() {
+        use jetstreamer_plugin::Plugin;
+        let plugin = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        let db = Some(std::sync::Arc::new(clickhouse::Client::default()));
+        let entry = EntryData {
+            slot: 101,
+            entry_index: 0,
+            transaction_indexes: 0..0,
+            num_hashes: 1,
+            hash: Default::default(),
+        };
+        let transaction = TransactionData {
+            slot: 101,
+            transaction_slot_index: 0,
+            signature: Default::default(),
+            message_hash: Default::default(),
+            is_vote: false,
+            transaction_status_meta: Default::default(),
+            transaction: VersionedTransaction {
+                signatures: Vec::new(),
+                message: VersionedMessage::Legacy(Default::default()),
+            },
+        };
+        for _ in 0..1000 {
+            assert!(plugin.on_entry(0, db.clone(), &entry).await.is_err());
+            assert!(
+                plugin
+                    .on_transaction(0, db.clone(), &transaction)
+                    .await
+                    .is_err()
+            );
+        }
+        let state = plugin.threads[0].lock();
+        assert!(state.pending_transactions.is_empty());
+        assert!(state.pending_entries.is_empty());
+        assert!(state.pending_slot.is_none());
+        assert!(state.writer.is_none());
+    }
+
+    #[test]
+    fn v1_message_fields_preserve_lifetime_and_config() {
+        let message = VersionedMessage::V1(v1::Message {
+            lifetime_specifier: Hash::new_from_array([7; 32]),
+            config: v1::TransactionConfig {
+                priority_fee: Some(42),
+                compute_unit_limit: Some(100_000),
+                loaded_accounts_data_size_limit: Some(65_536),
+                heap_size: Some(32_768),
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            versioned_message_fields(&message),
+            (
+                Some(1),
+                [7; 32],
+                Some(42),
+                Some(100_000),
+                Some(65_536),
+                Some(32_768)
+            )
+        );
+    }
+
+    #[test]
     fn entry_rows_preserve_poh_metadata() {
         let entry = EntryData {
             slot: 42,
@@ -372,6 +554,44 @@ mod tests {
     }
 
     #[test]
+    fn block_rewards_restore_historical_percent_only_with_qualified_era() {
+        let config = ClickhouseIngestConfig {
+            block_reward_commission_bps_from_slot: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::block_reward_commission(&config, 99, Some(700)).unwrap(),
+            (Some(7), None)
+        );
+        assert_eq!(
+            super::block_reward_commission(&config, 100, Some(725)).unwrap(),
+            (None, Some(725))
+        );
+        assert_eq!(
+            super::block_reward_commission(&config, 100, Some(700)).unwrap(),
+            (None, Some(700))
+        );
+        assert!(super::block_reward_commission(&config, 99, Some(725)).is_err());
+        assert!(
+            super::block_reward_commission(&ClickhouseIngestConfig::default(), 99, Some(700))
+                .is_err()
+        );
+        let percent = ClickhouseIngestConfig {
+            block_reward_commission_percent: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::block_reward_commission(&percent, 99, Some(700)).unwrap(),
+            (Some(7), None)
+        );
+        let conflicting = ClickhouseIngestConfig {
+            block_reward_commission_percent: true,
+            ..config
+        };
+        assert!(super::block_reward_commission(&conflicting, 99, Some(700)).is_err());
+    }
+
+    #[test]
     fn transaction_rewards_keep_basis_point_commission() {
         let rewards = vec![Reward {
             pubkey: String::new(),
@@ -433,6 +653,39 @@ impl ClickhouseIngestPlugin {
         }
     }
 
+    /// Clamp a runner's inclusive range to the explicitly qualified history.
+    /// Upstream logs callback errors and continues, so embedding callers must
+    /// apply this bound before invoking JetstreamerRunner::run.
+    pub fn historical_slot_range(
+        &self,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<std::ops::Range<u64>, PluginError> {
+        if start > end_inclusive {
+            return Err(PluginError::new("start slot must be <= end slot".into()));
+        }
+        self.ensure_legacy_slot(start)?;
+        if self.config.block_reward_commission_percent
+            == self.config.block_reward_commission_bps_from_slot.is_some()
+        {
+            return Err(PluginError::new(
+                "runner requires exactly one qualified block reward commission era before starting"
+                    .into(),
+            ));
+        }
+        let bound = self
+            .config
+            .alpenglow_genesis_slot
+            .or(self.config.preactivation_through_slot)
+            .expect("validated historical bound");
+        let end = end_inclusive.min(bound).checked_add(1).ok_or_else(|| {
+            PluginError::new(
+                "exclusive runner end overflows u64; choose an end below u64::MAX".into(),
+            )
+        })?;
+        Ok(start..end)
+    }
+
     fn resolve_db(&self, fallback: Option<Arc<Client>>) -> Option<Arc<Client>> {
         if let Some(client) = self.ingest_client.lock().clone() {
             Some(client)
@@ -445,6 +698,55 @@ impl ClickhouseIngestPlugin {
         self.threads
             .get(thread_id)
             .ok_or_else(|| PluginError::new(format!("thread_id {} out of range", thread_id)))
+    }
+
+    fn ensure_legacy_slot(&self, slot: u64) -> Result<(), PluginError> {
+        if self.config.alpenglow_genesis_slot.is_some()
+            == self.config.preactivation_through_slot.is_some()
+        {
+            return Err(PluginError::new("exactly one trusted historical bound is required: Alpenglow genesis or preactivation through-slot".into()));
+        }
+        match self
+            .config
+            .alpenglow_genesis_slot
+            .or(self.config.preactivation_through_slot)
+        {
+            Some(genesis_slot) if slot <= genesis_slot => Ok(()),
+            Some(_) => Err(PluginError::new(format!(
+                "Jetstreamer block {slot} exceeds the trusted historical bound; bank ID and footer provenance are unavailable"
+            ))),
+            None => Err(PluginError::new(
+                "JETSTREAMER_ALPENGLOW_GENESIS_SLOT is required to bound the legacy backfill"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn clear_skipped_slot(&self, thread_id: usize, slot: u64) -> Result<(), PluginError> {
+        let state_lock = self.thread_state(thread_id)?;
+        let mut state = state_lock.lock();
+        if state.pending_slot == Some(slot) {
+            if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
+                log::warn!(
+                    "clearing {} buffered transactions and {} buffered entries for skipped slot {}",
+                    state.pending_transactions.len(),
+                    state.pending_entries.len(),
+                    slot
+                );
+            }
+            state.pending_slot = None;
+            state.pending_transactions.clear();
+            state.pending_entries.clear();
+        } else if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
+            log::debug!(
+                "skipped slot {} leaving pending_slot={:?} pending_transactions={} pending_entries={}",
+                slot,
+                state.pending_slot,
+                state.pending_transactions.len(),
+                state.pending_entries.len()
+            );
+        }
+        Ok(())
     }
 
     fn ensure_writer(
@@ -479,6 +781,7 @@ impl Plugin for ClickhouseIngestPlugin {
     fn on_load(&self, db: Option<Arc<Client>>) -> PluginFuture<'_> {
         let this = self;
         async move {
+            this.ensure_legacy_slot(0)?;
             if let Some(dsn) = this
                 .config
                 .ingest_dsn
@@ -494,11 +797,7 @@ impl Plugin for ClickhouseIngestPlugin {
                 log::warn!("ClickHouse ingest plugin loaded with clickhouse disabled.");
                 return Ok(());
             }
-            if this.config.single_node {
-                log::info!("ClickHouse ingest plugin in single-node mode.");
-            } else {
-                log::info!("ClickHouse ingest plugin in clustered mode.");
-            }
+            log_storage_mode(this.config.single_node);
             Ok(())
         }
         .boxed()
@@ -514,6 +813,7 @@ impl Plugin for ClickhouseIngestPlugin {
             let Some(db) = self.resolve_db(db) else {
                 return Ok(());
             };
+            self.ensure_legacy_slot(transaction.slot)?;
             let row = TransactionRow::from_transaction(transaction);
             let _sender = self.ensure_writer(thread_id, db)?;
 
@@ -554,6 +854,7 @@ impl Plugin for ClickhouseIngestPlugin {
             let Some(db) = self.resolve_db(db) else {
                 return Ok(());
             };
+            self.ensure_legacy_slot(entry.slot)?;
             let row = EntryRow::from_entry(entry);
             let _sender = self.ensure_writer(thread_id, db)?;
 
@@ -595,35 +896,14 @@ impl Plugin for ClickhouseIngestPlugin {
                 return Ok(());
             };
             let slot = block.slot();
+            self.ensure_legacy_slot(slot)?;
 
             if block.was_skipped() {
-                let state_lock = self.thread_state(thread_id)?;
-                let mut state = state_lock.lock();
-                if state.pending_slot == Some(slot) {
-                    if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
-                        log::warn!(
-                            "clearing {} buffered transactions and {} buffered entries for skipped slot {}",
-                            state.pending_transactions.len(),
-                            state.pending_entries.len(),
-                            slot
-                        );
-                    }
-                    state.pending_slot = None;
-                    state.pending_transactions.clear();
-                    state.pending_entries.clear();
-                } else if !state.pending_transactions.is_empty() || !state.pending_entries.is_empty() {
-                    log::debug!(
-                        "skipped slot {} leaving pending_slot={:?} pending_transactions={} pending_entries={}",
-                        slot,
-                        state.pending_slot,
-                        state.pending_transactions.len(),
-                        state.pending_entries.len()
-                    );
-                }
+                self.clear_skipped_slot(thread_id, slot)?;
                 return Ok(());
             }
 
-            let block_row = match BlocksMetadataRow::from_block(block) {
+            let block_row = match BlocksMetadataRow::from_block(block, &self.config)? {
                 Some(row) => row,
                 None => return Ok(()),
             };
@@ -814,7 +1094,7 @@ struct WorkerHandle {
 }
 
 #[derive(Debug)]
-struct PluginError(String);
+pub struct PluginError(String);
 
 impl PluginError {
     fn new(msg: String) -> Self {
@@ -1141,8 +1421,47 @@ struct BlocksMetadataRow {
     rewards_num_partitions: Option<u64>,
 }
 
+// The pinned firehose normalizes legacy percent into the runtime bps field.
+// BlockData loses its source-era flag, so only operator-qualified SIMD-0291
+// evidence can decide which archive/RPC column to populate.
+fn block_reward_commission(
+    config: &ClickhouseIngestConfig,
+    slot: u64,
+    normalized_bps: Option<u16>,
+) -> Result<(Option<u8>, Option<u16>), PluginError> {
+    let Some(value) = normalized_bps else {
+        return Ok((None, None));
+    };
+    if config.block_reward_commission_percent
+        == config.block_reward_commission_bps_from_slot.is_some()
+    {
+        return Err(PluginError::new(
+            "commission-bearing block rewards require exactly one qualified SIMD-0291 era setting"
+                .into(),
+        ));
+    }
+    let historical = config.block_reward_commission_percent
+        || config
+            .block_reward_commission_bps_from_slot
+            .is_some_and(|activation| slot < activation);
+    if historical {
+        // Validation of upstream's percent*100 conversion, never era inference.
+        if value > 10_000 || value % 100 != 0 {
+            return Err(PluginError::new(
+                "block reward contradicts the qualified historical percent era".into(),
+            ));
+        }
+        Ok((Some((value / 100) as u8), None))
+    } else {
+        Ok((None, Some(value)))
+    }
+}
+
 impl BlocksMetadataRow {
-    fn from_block(block: &BlockData) -> Option<Self> {
+    fn from_block(
+        block: &BlockData,
+        config: &ClickhouseIngestConfig,
+    ) -> Result<Option<Self>, PluginError> {
         match block {
             BlockData::Block {
                 parent_slot,
@@ -1167,14 +1486,16 @@ impl BlocksMetadataRow {
                     rewards_lamports.push(reward.lamports);
                     rewards_post_balance.push(reward.post_balance);
                     rewards_type.push(Some(reward.reward_type.to_string()));
-                    rewards_commission.push(None);
-                    rewards_commission_bps.push(reward.commission_bps);
+                    let (percent, bps) =
+                        block_reward_commission(config, *slot, reward.commission_bps)?;
+                    rewards_commission.push(percent);
+                    rewards_commission_bps.push(bps);
                 }
 
                 let rewards_present =
                     (!rewards_pubkey.is_empty() || rewards.num_partitions.is_some()) as u8;
 
-                Some(Self {
+                Ok(Some(Self {
                     slot: *slot,
                     parent_slot: *parent_slot,
                     blockhash: blockhash.to_bytes(),
@@ -1191,9 +1512,9 @@ impl BlocksMetadataRow {
                     rewards_commission,
                     rewards_commission_bps,
                     rewards_num_partitions: rewards.num_partitions,
-                })
+                }))
             }
-            BlockData::PossibleLeaderSkipped { .. } => None,
+            BlockData::PossibleLeaderSkipped { .. } => Ok(None),
         }
     }
 }
@@ -1316,25 +1637,14 @@ impl TransactionRow {
             .map(|key| key.to_bytes())
             .collect::<Vec<_>>();
 
-        let tx_recent_blockhash = message.recent_blockhash().to_bytes();
-
         let (
             tx_version,
-            tx_config_priority_fee,
-            tx_config_compute_unit_limit,
-            tx_config_loaded_accounts_data_size_limit,
-            tx_config_heap_size,
-        ) = match message {
-            VersionedMessage::Legacy(_) => (None, None, None, None, None),
-            VersionedMessage::V0(_) => (Some(0), None, None, None, None),
-            VersionedMessage::V1(message) => (
-                Some(1),
-                message.config.priority_fee,
-                message.config.compute_unit_limit,
-                message.config.loaded_accounts_data_size_limit,
-                message.config.heap_size,
-            ),
-        };
+            tx_recent_blockhash,
+            priority_fee,
+            compute_unit_limit,
+            loaded_accounts_data_size_limit,
+            heap_size,
+        ) = versioned_message_fields(message);
 
         let tx_instructions_program_id_index = instructions
             .iter()
@@ -1416,10 +1726,10 @@ impl TransactionRow {
             message_hash: transaction.message_hash.to_bytes(),
             is_vote: transaction.is_vote as u8,
             tx_version,
-            tx_config_priority_fee,
-            tx_config_compute_unit_limit,
-            tx_config_loaded_accounts_data_size_limit,
-            tx_config_heap_size,
+            tx_config_priority_fee: priority_fee,
+            tx_config_compute_unit_limit: compute_unit_limit,
+            tx_config_loaded_accounts_data_size_limit: loaded_accounts_data_size_limit,
+            tx_config_heap_size: heap_size,
             tx_signatures,
             tx_num_required_signatures: header.num_required_signatures,
             tx_num_readonly_signed_accounts: header.num_readonly_signed_accounts,
@@ -1479,6 +1789,44 @@ impl TransactionRow {
             meta_compute_units_consumed: meta.compute_units_consumed,
             meta_cost_units: meta.cost_units,
         }
+    }
+}
+
+type VersionedMessageFields = (
+    Option<u8>,
+    [u8; 32],
+    Option<u64>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+);
+
+fn versioned_message_fields(message: &VersionedMessage) -> VersionedMessageFields {
+    match message {
+        VersionedMessage::Legacy(msg) => (
+            None,
+            msg.recent_blockhash.to_bytes(),
+            None,
+            None,
+            None,
+            None,
+        ),
+        VersionedMessage::V0(msg) => (
+            Some(0),
+            msg.recent_blockhash.to_bytes(),
+            None,
+            None,
+            None,
+            None,
+        ),
+        VersionedMessage::V1(msg) => (
+            Some(1),
+            msg.lifetime_specifier.to_bytes(),
+            msg.config.priority_fee,
+            msg.config.compute_unit_limit,
+            msg.config.loaded_accounts_data_size_limit,
+            msg.config.heap_size,
+        ),
     }
 }
 

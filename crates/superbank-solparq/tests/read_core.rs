@@ -87,6 +87,61 @@ async fn summary_reads_db_archive_bundle_manifest_and_table_counts() {
 }
 
 #[tokio::test]
+async fn reader_reads_hourly_manifests_for_both_cadences() {
+    use superbank_solparq::{
+        archive::{ArchiveKind, ClickHouseBounds, plan_next_archive_with_hourly_slot_duration},
+        manifest::{ArchiveManifest, MANIFEST_FORMAT_VERSION},
+        read::config::ArchiveTable,
+    };
+
+    for duration in [400, 200] {
+        let (dir, old_bundle_path) = write_test_bundle();
+        let plan = plan_next_archive_with_hourly_slot_duration(
+            ArchiveKind::Hourly,
+            ClickHouseBounds {
+                earliest_slot: 10,
+                latest_slot: 18_009,
+                distinct_slots: 4,
+            },
+            None,
+            true,
+            false,
+            duration,
+        )
+        .unwrap()
+        .unwrap();
+        let bundle_path = dir.path().join(plan.archive_id());
+        std::fs::rename(old_bundle_path, &bundle_path).unwrap();
+        let manifest_path = bundle_path.join("manifest.json");
+        let legacy: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = ArchiveManifest::new(
+            plan.archive_id(),
+            plan.kind,
+            plan.epoch,
+            plan.start_slot,
+            plan.end_slot,
+            serde_json::from_value(legacy["tables"].clone()).unwrap(),
+            vec![],
+        );
+        assert_eq!(manifest.archive_kind, "hourly");
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let summary = summarize_archive(ArchiveInput::LocalBundle {
+            dir: bundle_path,
+            table: ArchiveTable::Transactions,
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.archive_name, plan.archive_id());
+        assert_eq!(summary.format_version, Some(MANIFEST_FORMAT_VERSION));
+        assert_eq!(summary.transaction_rows, 5);
+        assert_eq!(summary.actual_min_slot, Some(10));
+        assert_eq!(summary.actual_max_slot, Some(13));
+    }
+}
+
+#[tokio::test]
 async fn scan_filters_transactions_by_inclusive_slot_range() {
     let (_dir, archive_path) = write_test_archive();
 
@@ -381,4 +436,73 @@ fn write_archive_with_invalid_utf8_column() -> (TempDir, std::path::PathBuf) {
     row_group.close().expect("close row group");
     writer.close().expect("close parquet writer");
     (dir, archive_path)
+}
+
+#[tokio::test]
+async fn footer_bundle_schema_and_scan_use_manifest_and_inclusive_slot_filter() {
+    let (_dir, bundle) = write_test_bundle();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slot", DataType::UInt64, false),
+        Field::new("bank_id", DataType::UInt64, false),
+        Field::new("block_producer_time_nanos", DataType::UInt64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 11, 12])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![0, 7, 9])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![100, 110, 120])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        File::create(bundle.join("block_footers.parquet")).unwrap(),
+        schema,
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let path = bundle.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["tables"].as_array_mut().unwrap().push(json!({
+        "kind": "block_footers", "file_name": "block_footers.parquet",
+        "table_name": "block_footers", "row_count": 3, "required": false
+    }));
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let cli = Cli::try_parse_from([
+        "reader",
+        "schema",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "block_footers",
+    ])
+    .unwrap();
+    assert!(
+        render(cli)
+            .await
+            .unwrap()
+            .contains("block_producer_time_nanos")
+    );
+    let cli = Cli::try_parse_from([
+        "reader",
+        "scan",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "block_footers",
+        "--slot-range",
+        "10-11",
+        "--columns",
+        "slot,bank_id",
+        "--format",
+        "json",
+    ])
+    .unwrap();
+    let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
+    assert_eq!(
+        rows,
+        json!([{"slot": 10, "bank_id": 0}, {"slot": 11, "bank_id": 7}])
+    );
 }

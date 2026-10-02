@@ -51,11 +51,20 @@ Range grammar (same as the ingestor's `--bigtable-range`): `a:b` = slots
   replica of Agave's `verify_tick_hash_count` (per-tick `num_hashes` windows
   against the era's `hashes_per_tick`), transaction-index tiling, the
   last-entry-hash == blockhash equality, and blockhash chain linkage.
+- After the Alpenglow genesis certificate slot, structural mode requires one
+  ending Alpentick and `num_hashes = 1` for every entry. Skipped slots do not
+  add ticks. Provide `--alpenglow-rpc-url` for a trusted Agave 4.3+ RPC
+  `getAgGenesisCert` response or `--alpenglow-genesis-block
+  <slot>:<base58-block-id>` for an offline run. If both are supplied, they
+  must agree. The certified genesis slot itself still uses PoH rules. The
+  certificate's consensus block ID is not treated as an RPC blockhash anchor.
 - **full**: everything above **plus** recomputing every SHA-256 hash of every
   entry, including the transaction-signature merkle mixin, and comparing
   against the recorded entry hashes and blockhash. Roughly 800k hashes per
   slot in the 12,500 hashes-per-tick era (~4M in the current 62,500 era);
   budget multiple days for a genesis-to-tip run on a large machine.
+  In Alpenglow slots this checks the low power entry hash chain; it does not
+  prove elapsed time or verify Alpenglow consensus certificates.
 
 ### Optional duplicate-conflict audit
 
@@ -114,6 +123,9 @@ block is reported as unverifiable, not silently ignored).
 `--checkpoint-file` saves progress after every window (atomic rename);
 `--resume` continues an interrupted run as long as the job parameters (range
 start, mode, tables, era schedule, genesis pin, and anchors) are identical.
+A trusted Alpenglow boundary may be added once while the saved `next_start` is
+at most `G + 1`, before any postboundary slot was verified with historical rules.
+The updated descriptor is persisted immediately; removing or changing it is rejected.
 For `--full`, the upper bound is a live tip: resume accepts a later tip and
 continues from the saved cursor. It rejects a regressed tip or a changed range
 start. Checkpoints retain already checked anchors and the genesis-pin check, so
@@ -161,8 +173,29 @@ golden vectors.
   `--audit-duplicate-conflicts` to report differing duplicates as
   `duplicate_conflict`; otherwise the baseline verifier does not scan for
   them.
-- Not yet handled: the Alpenglow migration (post-PoH tick rules on Agave
-  master) — revisit the era schedule when it activates on a target cluster.
+- Configure the Alpenglow genesis boundary before verifying postmigration
+  ranges. Without it the verifier applies the legacy PoH rules to every slot.
 - `getEpochSchedule` in superbank-rpc ignores mainnet's warmup epochs; this
   crate carries its own epoch math (`src/epoch.rs`) instead of sharing that
   code.
+
+### Trusted migration evidence
+
+Configure `--alpenglow-rpc-url` / `SUPERBANK_VERIFY_ALPENGLOW_RPC_URL` /
+`alpenglow-rpc-url` with a trusted endpoint for the same cluster as the stored data,
+or `--alpenglow-genesis-block` / `SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK` /
+`alpenglow-genesis-block` with its certificate's `<slot>:<base58-block-id>` pair.
+CLI overrides env, which overrides YAML. The certificate slot is the last historical
+PoH slot; new entry rules apply strictly after it. A missing boundary retains PoH rules.
+An authoritative successful null means no certificate; unsupported, unavailable and
+malformed responses are operational errors, never null. Discovery is bounded to ten
+seconds and 64 KiB, rejects redirects, and does not include upstream URLs/messages in
+errors. Wire validation establishes shape only; no BLS or stake verification is claimed.
+
+The resolved slot and consensus block ID are part of checkpoint identity. Legacy
+checkpoints without this field resume with historical rules. A `None` to trusted
+`Some(G, ID)` handoff is allowed only with `next_start <= G + 1`; later progress
+requires starting a fresh verification job. Removing or changing either component
+rejects resume even after the boundary is behind the cursor. The comparison handles
+`G = UInt64::MAX` without wrapping.
+The consensus block ID is distinct from the entry blockhash; use `--anchor` separately.

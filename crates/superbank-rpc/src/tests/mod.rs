@@ -168,6 +168,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
     clickhouse.set_token_owner_activity_available_for_tests(available);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -278,6 +279,7 @@ pub(crate) fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppSta
     clickhouse.set_token_owner_activity_available_for_tests(true);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -342,6 +344,7 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         .await;
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -398,6 +401,7 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
     clickhouse.set_token_owner_activity_available_for_tests(true);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -456,6 +460,7 @@ fn test_state_with_head_cache_and_clickhouse_url(
     clickhouse.set_token_owner_activity_available_for_tests(true);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -521,6 +526,7 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         .await;
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -3309,10 +3315,7 @@ async fn get_inflation_reward_rejects_more_than_configured_address_limit() {
     let parsed = parse_json_rpc_response(response).await;
     let err = parsed.error.expect("error present");
     assert_eq!(err.code, -32602);
-    assert_eq!(
-        err.message,
-        "Invalid params: too many addresses; maximum is 100"
-    );
+    assert_eq!(err.message, "Too many inputs provided; max 100");
 }
 
 #[tokio::test]
@@ -8045,6 +8048,10 @@ async fn get_block_clickhouse_partial_payload_repair() {
     execute(&http, &url, format!("DROP DATABASE {database}")).await;
 }
 
+mod agave_43;
+
+#[cfg(feature = "grpc-head-cache")]
+mod agave43_cached_encoding;
 #[cfg(feature = "disk-cache")]
 mod gsfa_race {
     //! getSignaturesForAddress races the local page against the primary's full page.
@@ -8324,6 +8331,21 @@ async fn get_transaction_primary_cache_hit_is_byte_identical_to_primary_hydratio
             )
             .await
             .expect("hit response");
+            // Agave 4.3 rejects this request before any cache or hydration access.
+            if encoding == UiTransactionEncoding::Base58
+                && max_version.is_some_and(|version| version >= 1)
+            {
+                let error = parse_json_rpc_response(hit)
+                    .await
+                    .error
+                    .expect("encoding rejection");
+                assert_eq!(error.code, -32602);
+                assert_eq!(
+                    error.message,
+                    "base58 encoding is not supported with maxSupportedTransactionVersion >= 1"
+                );
+                continue;
+            }
             let mut route = crate::handlers::RouteMetric::for_state("getTransaction", &state);
             let expected = crate::handlers::transactions::respond_with_hydrated_transaction(
                 &state,

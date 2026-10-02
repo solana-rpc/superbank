@@ -125,6 +125,14 @@ struct CliArgs {
     #[arg(long, env = "SUPERBANK_VERIFY_HASHES_PER_TICK_SCHEDULE")]
     hashes_per_tick_schedule: Option<String>,
 
+    /// Trusted Agave RPC URL for getAgGenesisCert (returns the finalized genesis block)
+    #[arg(long, env = "SUPERBANK_VERIFY_ALPENGLOW_RPC_URL")]
+    alpenglow_rpc_url: Option<String>,
+
+    /// Offline Alpenglow genesis override: <slot>:<base58-block-id>
+    #[arg(long, env = "SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK")]
+    alpenglow_genesis_block: Option<String>,
+
     /// Slots fetched and verified per window (maximum 128)
     #[arg(
         long,
@@ -306,6 +314,10 @@ struct FileConfig {
         alias = "hashes_per_tick_schedule"
     )]
     hashes_per_tick_schedule: Option<String>,
+    #[serde(rename = "alpenglow-rpc-url", alias = "alpenglow_rpc_url")]
+    alpenglow_rpc_url: Option<String>,
+    #[serde(rename = "alpenglow-genesis-block", alias = "alpenglow_genesis_block")]
+    alpenglow_genesis_block: Option<String>,
     #[serde(rename = "window-slots", alias = "window_slots")]
     window_slots: Option<u64>,
     #[serde(rename = "fetch-ahead", alias = "fetch_ahead")]
@@ -365,6 +377,8 @@ pub(crate) struct Args {
     pub(crate) ticks_per_slot: u64,
     pub(crate) expected_genesis_hash: Option<Hash32>,
     pub(crate) hashes_per_tick_schedule: HashesPerTickSchedule,
+    pub(crate) alpenglow_rpc_url: Option<String>,
+    pub(crate) alpenglow_genesis_block: Option<(u64, Hash32)>,
     pub(crate) window_slots: u64,
     pub(crate) fetch_ahead: usize,
     pub(crate) audit_duplicate_conflicts: bool,
@@ -473,6 +487,13 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
         None => HashesPerTickSchedule::mainnet(),
     };
 
+    let alpenglow_genesis_block = parse_optional_alpenglow_genesis(merge_option(
+        matches,
+        "alpenglow_genesis_block",
+        cli.alpenglow_genesis_block,
+        config.alpenglow_genesis_block,
+    ))?;
+
     let anchor_specs = if matches
         .value_source("anchor")
         .is_none_or(|source| matches!(source, ValueSource::DefaultValue))
@@ -486,12 +507,7 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
         .map(|spec| parse_anchor(spec))
         .collect::<Result<Vec<_>>>()?;
 
-    let export_fixture = match (cli.export_fixture_slot, cli.export_fixture_out) {
-        (Some(slot), Some(path)) => Some((slot, path)),
-        (Some(_), None) => bail!("--export-fixture-slot requires --export-fixture-out"),
-        (None, Some(_)) => bail!("--export-fixture-out requires --export-fixture-slot"),
-        (None, None) => None,
-    };
+    let export_fixture = resolve_export_fixture(cli.export_fixture_slot, cli.export_fixture_out)?;
 
     let args = Args {
         range,
@@ -517,6 +533,13 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
         ),
         expected_genesis_hash,
         hashes_per_tick_schedule,
+        alpenglow_rpc_url: merge_option(
+            matches,
+            "alpenglow_rpc_url",
+            cli.alpenglow_rpc_url,
+            config.alpenglow_rpc_url,
+        ),
+        alpenglow_genesis_block,
         window_slots: merge_value(
             matches,
             "window_slots",
@@ -634,6 +657,25 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
 
     validate_args(&args)?;
     Ok(args)
+}
+
+fn parse_optional_alpenglow_genesis(spec: Option<String>) -> Result<Option<(u64, [u8; 32])>> {
+    spec.as_deref()
+        .map(parse_anchor)
+        .transpose()
+        .context("parse --alpenglow-genesis-block")
+}
+
+fn resolve_export_fixture(
+    slot: Option<u64>,
+    path: Option<PathBuf>,
+) -> Result<Option<(u64, PathBuf)>> {
+    match (slot, path) {
+        (Some(slot), Some(path)) => Ok(Some((slot, path))),
+        (Some(_), None) => bail!("--export-fixture-slot requires --export-fixture-out"),
+        (None, Some(_)) => bail!("--export-fixture-out requires --export-fixture-slot"),
+        (None, None) => Ok(None),
+    }
 }
 
 fn validate_args(args: &Args) -> Result<()> {

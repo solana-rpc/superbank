@@ -22,7 +22,7 @@ fn emit_git_sha() {
 
 #[cfg(feature = "grpc-streaming")]
 fn compile_protos() -> Result<(), Box<dyn std::error::Error>> {
-    let protos = ["proto/superbank.proto", "proto/confirmed_block.proto"];
+    let protos = ["proto/superbank.proto"];
     for proto in &protos {
         println!("cargo:rerun-if-changed={proto}");
     }

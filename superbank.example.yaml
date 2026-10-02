@@ -10,6 +10,15 @@
 # DISK_CACHE_GET_TX_UNKNOWN_TIMEOUT_MS=150 replaces it while the signature index is
 # being rebuilt (more than 4 unknown partitions, e.g. after a restart).
 #
+# RPC certificate source options are CLI/env settings, not YAML fields:
+# AG_GENESIS_CERT_RPC_URL=https://your-cluster-rpc.example must be a trusted
+# same-cluster Agave 4.3+ endpoint supporting getAgGenesisCert (never this server).
+# AG_GENESIS_CERT_RPC_TIMEOUT_MS=2000 is the total source budget, including admission;
+# it must be below RPC_REQUEST_TIMEOUT_MS when a source is configured.
+# AG_GENESIS_CERT_REFRESH_INTERVAL_SECS=5 caches authoritative null before migration.
+# Certificates stay cached until restart; failures are cached for one second.
+# Unconfigured/unsupported/unavailable evidence returns an error, never null.
+#
 # Optional superbank-rpc exact request filters. Pass this same file to
 # superbank-rpc with --config / SUPERBANK_CONFIG. Each entry contains the
 # method followed by its complete params array. Matching calls return HTTP 405
@@ -30,12 +39,21 @@ grpc-max-decoding-bytes: 67108864
 grpc-http2-adaptive-window: false
 grpc-idle-timeout-secs: 30
 grpc-health-watch-enabled: true
+# Bank-status events on this same subscription are required even if the extra
+# slot notifications below are disabled. Scalar zero waits for optional-ID
+# evidence; legacy CreatedBank/finalized status without an ID stores bank_id NULL.
+# Unresolved identity holds all flushes (256 blocks / 128 MiB encoded payload).
 grpc-slot-notifications: true
 
 # Fumarole source options (required when source is "fumarole")
 # fumarole-endpoint: "https://your.fumarole.endpoint:443"
 # fumarole-x-token: "your-token"
 # fumarole-consumer-group: "superbank-mainnet"
+# Configure exactly one evidenced historical bound (no zero placeholder):
+# fumarole-alpenglow-genesis-slot: <trusted-certificate-slot>
+# Before activation, record trusted same-cluster finalized getSlot BEFORE an
+# authoritative null getAgGenesisCert, then attest that finalized slot here:
+# fumarole-preactivation-through-slot: <recorded-finalized-slot>
 # fumarole-create-consumer-group: false
 # fumarole-from-slot: 0
 # fumarole-data-plane-tcp-connections: 4
@@ -83,6 +101,11 @@ grpc-slot-notifications: true
 # bigtable-decode-concurrency: 8
 # bigtable-progress-every-slots: 10000
 
+# The separate superbank-solparq archiver uses CLI/env (not this YAML):
+# --hourly-slot-duration-ms / SOLPARQ_HOURLY_SLOT_DURATION_MS defaults to 400
+# (9000 slots per nominal hour); set 200 for a 200 ms cluster (18000 slots).
+# Restore reads recorded slot bounds and does not need the cadence setting.
+
 # solparq source options (required when source is "solparq"): restore
 # superbank-solparq Parquet archive bundles back into ClickHouse. Loading is
 # ClickHouse-native (s3() for S3, INSERT ... FORMAT Parquet for local) and every
@@ -121,6 +144,7 @@ clickhouse-password: ""
 # clickhouse-async-insert: false
 transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
+block-footers-table: "default.block_footers"
 entries-table: "default.entries"
 
 transactions-flush-rows: 25000

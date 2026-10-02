@@ -3,6 +3,10 @@
 Solana-compatible JSON-RPC server backed by ClickHouse tables produced by `superbank` (or any
 writer that matches the same schemas).
 
+See the [Agave 4.3 compatibility and rollout notes](../../docs/agave-4.3-compatibility.md)
+for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries.
+Build with the pinned Rust 1.97.1 toolchain.
+
 ## Supported methods
 
 - `getSignaturesForAddress`
@@ -22,6 +26,7 @@ writer that matches the same schemas).
 - `minimumLedgerSlot`
 - `getInflationReward`
 - `getEpochSchedule`
+- `getAgGenesisCert`
 - `getTransactionsForAddress` (custom)
 
 Notes:
@@ -44,7 +49,9 @@ Notes:
   `200`, with `slot`, `currentBlockHeight`, and `rewardsCompleteBlockHeight` in `error.data`.
   Missing rewards are returned as `null` only after the address's required partition is available.
   Dedicated address, concurrency, timeout, thread, memory, and read-byte limits are enabled by
-  default.
+  default. Address-limit rejections use code `-32602` and message
+  `Too many inputs provided; max N`, where N is the configured limit. The default
+  remains 100; set `GET_INFLATION_REWARD_MAX_ADDRESSES=32` for Agave limit parity.
   Historical non-partitioned rewards do not require block height metadata. Partitioned rewards
   still require it to locate payout blocks and determine reward availability.
   Validated payout boundaries and, once every partition block exists, the epoch's partition
@@ -54,6 +61,11 @@ Notes:
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
+- `getBlock` and `getTransaction` reject `base58` or `binary` with
+  `maxSupportedTransactionVersion >= 1` using code `-32602`, before cache/storage access.
+  `getTransactionsForAddress` applies the same check to its supported `base58` encoding.
+- `VATDebit` rewards preserve negative lamports; stored values also accept the producer
+  spelling `validator-admission-ticket-debit`. Inflation reward queries exclude these debits.
 - Transaction v1 (SIMD-0385) is supported. Requests must set
   `maxSupportedTransactionVersion: 1`; JSON encodings report `version: 1` and expose the inline
   `message.transactionConfig`, while binary encodings preserve the signed v1 wire bytes.
@@ -356,6 +368,55 @@ This setting controls both `getEpochSchedule` responses and internal `getInflati
 epoch math. For testnet, supply its exact current genesis file: testnet uses warmup epochs,
 so the no-warmup fallback is incorrect even for recent payout boundaries.
 
+### Alpenglow genesis certificate source
+
+[`getAgGenesisCert`](https://solana.com/docs/rpc/http/getaggenesiscert) accepts no
+parameters (omitted, `null`, or `[]`). It returns an authoritative `null` before
+migration and the certificate afterward, preserving `block.slot` as a JSON `u64`,
+`block.blockId` as 32 byte values, `signature.signature` as 192 byte values, and
+`signature.bitmap` as a variable-length byte array. There is no commitment parameter
+or context wrapper. The certificate slot is passed through exactly as supplied.
+
+Set `AG_GENESIS_CERT_RPC_URL` to an operator-trusted HTTP(S) RPC endpoint on the
+**same cluster as the ClickHouse data**, supporting the Agave 4.3+ method. This
+endpoint is the authority for migration evidence: Superbank validates the response
+shape but does not independently verify the aggregate BLS signature or cluster
+identity. Do not point it back at this Superbank instance or through a route that
+forwards the call back here. Store credentialed URLs in the environment, outside git.
+For example, run with `--ag-genesis-cert-rpc-url https://your-cluster-rpc.example`.
+
+The first request bootstraps the source lazily; startup requires valid configuration
+but does not require a reachable provider. Requests share one in-flight fetch with a
+total `AG_GENESIS_CERT_RPC_TIMEOUT_MS` budget (default 2000 ms) covering admission,
+connection, and response body. There are no automatic retries or redirects, and
+responses are capped at 64 KiB, including streamed bodies. A successful `null` is
+cached for `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` (default 5 seconds, range 1–300);
+the next request after expiry refreshes it. Expired evidence is never served when
+refresh fails. Failures, including unsupported upstream methods, are cached for one
+second before retrying on demand. Once obtained, the immutable finalized-bank
+certificate is cached for the process lifetime and remains available during provider
+outages. A restart bootstraps again; there is no durable certificate copy or background
+polling. Changing cluster/source requires restarting with the correct endpoint.
+
+An unconfigured, unavailable, timed-out, malformed, or unsupported source returns
+JSON-RPC `-32019` with `error.data.reason` equal to `source_not_configured`,
+`upstream_unavailable`, `source_timeout`, `invalid_upstream_response`, or
+`upstream_unsupported`, respectively. Other upstream RPC errors use `upstream_error`.
+Upstream RPC errors include `upstreamCode` but do not expose provider messages or URLs.
+These errors never become `null`; a pre-4.3 upstream's `-32601` means unsupported
+evidence, not TowerBFT. With `--emit-http-errors`, source failures return HTTP 503;
+otherwise they return HTTP 200 with the JSON-RPC error body. Nonempty or named
+parameters return `-32602` without fetching the source.
+
+This source is independent of `GENESIS_PATH`, which controls epoch schedules, and
+of finalized block storage and speculative head buffering. The existing ClickHouse
+schemas hold no genesis certificate, and the compatibility-reference Yellowstone
+[footer message](https://github.com/rpcpool/yellowstone-grpc/blob/v16.0.0-rc10%2Bsolana.4.3.0/yellowstone-grpc-proto/proto/geyser.proto)
+omits certificates. Dates, validator versions, local latest slots, and missing footer
+fields are not used to infer migration. Agave's
+[implementation](https://github.com/anza-xyz/agave/blob/v4.3.0/rpc/src/rpc.rs)
+reads the certificate from its finalized bank.
+
 ## Exact method and parameter filters
 
 `superbank-rpc` can reject configured method and parameter combinations before they enter handler
@@ -446,7 +507,7 @@ to describe handler outcomes before envelope promotion.
 ## Optional gRPC head cache (`grpc-head-cache`)
 
 When compiled with `--features grpc-head-cache` and enabled at runtime, superbank-rpc subscribes to
-a Yellowstone DragonsMouth gRPC stream via `yellowstone-block-machine` and keeps a small
+a Yellowstone DragonsMouth gRPC stream of complete bank-tagged blocks and keeps a small
 in-memory cache of the most recent slots. RPC handlers can merge this "head" data with ClickHouse
 to hide the typical ingestion lag.
 
@@ -548,7 +609,9 @@ Configuration:
 | `--grpc-max-decoding-bytes` | `GRPC_MAX_DECODING_BYTES` | `67108864` | Max gRPC decoding message size. |
 
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
-The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (also AGPL-3.0).
+The optional `grpc-head-cache` feature pulls in Yellowstone gRPC client and protobuf crates
+(also AGPL-3.0). A 4.3 producer must supply bank IDs; bank replacement evicts the
+replaced slot and its cached descendants.
 
 ## Optional local ClickHouse forward cache (`disk-cache`)
 
@@ -984,6 +1047,9 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
 | `--genesis-path` | `GENESIS_PATH` | unset | Path to the target cluster's mounted `genesis.bin`. The server fails startup if a configured file cannot be read or decoded. Leave unset only for the no-warmup fallback. |
+| `--ag-genesis-cert-rpc-url` | `AG_GENESIS_CERT_RPC_URL` | unset | Trusted same-cluster Agave 4.3+ certificate RPC source. Unset keeps startup optional but `getAgGenesisCert` returns an unavailable-source error. |
+| `--ag-genesis-cert-rpc-timeout-ms` | `AG_GENESIS_CERT_RPC_TIMEOUT_MS` | `2000` | Positive total source budget, including admission; must be below `RPC_REQUEST_TIMEOUT_MS` when a source is configured. |
+| `--ag-genesis-cert-refresh-interval-secs` | `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` | `5` | Authoritative null TTL (1–300 seconds); certificates stay cached until restart, failures for 1 second. |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |
 | `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Only available with `--features grpc-streaming`; enables the gRPC endpoint at runtime. |
 | `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Only available with `--features grpc-streaming`. |
@@ -1444,3 +1510,39 @@ local tip that trails the source (with and without a covering head cache), missi
 slots or one slot, historical position mismatch, eviction fallback, ordering, encodings and
 unsupported versions. Failed runs can leave fixture databases for inspection. Small synthetic
 fixtures establish regression behavior, not production latency or capacity.
+
+### Bank-aware head streams
+
+The head cache buffers `(slot, bank_id)` inside one subscription generation, including
+modern bank ID zero. It seals complete transactions and entry ranges, chooses the
+bank named by confirmed/finalized status, and removes losing-bank indexes. Each
+transaction retains its own bank's commitment token. Metadata comes from the same
+subscription and must match the sealed blockhash. Reconnect clears old data and
+fences callbacks from the prior generation. Legacy streams are identified by a
+CreatedBank notification without a bank ID; ambiguous protocol changes reconnect.
+
+The gRPC head-cache minimum commitment applies when publishing a frozen bank,
+including to concurrent requests for `processed`. A frozen block is held until
+its commitment token reaches the session's configured minimum; the subsequent
+block-machine status event initializes that token before indexes are exposed.
+Reconnect resets the bank session and never carries node-local IDs or proofs
+from the previous subscription.
+
+
+The head subscriber currently uses the pinned client's ordinary
+`subscribe_with_request` and an outer retry loop. A transport interruption drops
+its `CoverageSession`, clears all cached slots (including finalized slots), and
+starts a fresh protocol adapter, block machine and proof chain. Old returned
+records keep their original immutable content and bank token; replacement status
+cannot promote them, even if the node reuses the same bank ID. Requests use the
+configured ClickHouse fallback while the head rebuilds; recent data not yet in
+ClickHouse can temporarily be unavailable.
+
+The client's `subscribe_with_reconnect`/`DiscardBanks` API is not integrated.
+Preserving cached results with that API requires handling connection generations
+and replacement finality/discard decisions before both the metadata tap and
+block machine, resetting legacy protocol evidence and invalidating range proofs
+at each boundary. Feeding only its replacement updates into the existing adapter
+would join unrelated node-local banks. The current full reset deliberately trades
+cache continuity for this explicit session fence; it does not provide retained
+finalized results or seamless replay across reconnects.

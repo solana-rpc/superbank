@@ -56,6 +56,7 @@ impl HeadCoverage {
         *self = Self::default();
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata(&mut self, link: Link) {
         if self
             .nodes
@@ -66,6 +67,25 @@ impl HeadCoverage {
             self.invalidate_branch(link.slot);
         }
         self.nodes.entry(link.slot).or_default().link = Some(link);
+    }
+
+    /// Replace the projected bank only after bank-aware reconstruction/selection.
+    pub(super) fn select_bank(&mut self, link: Link) {
+        if self
+            .nodes
+            .get(&link.slot)
+            .and_then(|node| node.link)
+            .is_some_and(|old| old != link)
+        {
+            self.invalidate_branch(link.slot);
+        }
+        self.nodes.insert(
+            link.slot,
+            Node {
+                link: Some(link),
+                ..Default::default()
+            },
+        );
     }
 
     pub(crate) fn invalidate_branch(&mut self, slot: u64) {

@@ -72,7 +72,7 @@ Adding `processed` commitment (in addition to `confirmed`/`finalized`) requires 
 ## Prerequisites
 
 - **ClickHouse** — 26.x or later. Docker is the fastest way to get one running.
-- **Rust** — stable toolchain specified by `rust-toolchain.toml`. Install via [rustup.rs](https://rustup.rs).
+- **Rust** — 1.97.1 toolchain (pinned in `rust-toolchain.toml`). Install via [rustup.rs](https://rustup.rs).
 - **A Dragon's Mouth gRPC endpoint or Fumarole subscription** — for live ingestion. Get one at [customers.triton.one](https://customers.triton.one). For backfill only, the JSON-RPC source works with any public endpoint.
 - Git and standard build tools (`gcc`, `pkg-config`, `libssl-dev` on Linux / Xcode Command Line Tools on macOS).
 
@@ -134,12 +134,13 @@ curl -s http://localhost:8123/ping
 
 ## Step 3: Apply the DDL
 
-Superbank uses three base tables and several materialized views. Apply the local (single-node) DDL:
+Superbank uses base tables and several materialized views. Apply the local (single-node) DDL:
 
 ```bash
 # Base tables
 cat ddl/local/transactions.sql    | docker exec -i superbank-clickhouse clickhouse-client --multiquery
 cat ddl/local/blocks_metadata.sql | docker exec -i superbank-clickhouse clickhouse-client --multiquery
+cat ddl/local/block_footers.sql   | docker exec -i superbank-clickhouse clickhouse-client --multiquery
 cat ddl/local/entries.sql         | docker exec -i superbank-clickhouse clickhouse-client --multiquery  # required for the Fumarole/gRPC defaults shown below
 
 # Materialized views (derived by ClickHouse at insert time — not by the ingestor)
@@ -215,7 +216,7 @@ blocks-table: "default.blocks_metadata"
 entries-table: "default.entries"
 ```
 
-For live ingestion via **Fumarole** (persistent consumer group — resumes from where it left off):
+For bounded historical ingestion via **Fumarole** (persistent consumer group — resumes from where it left off):
 
 ```yaml
 source: "fumarole"
@@ -223,6 +224,9 @@ source: "fumarole"
 fumarole-endpoint: "https://your-endpoint.rpcpool.com:443"
 fumarole-x-token: "your-token"
 fumarole-consumer-group: "superbank-mainnet"
+# Uncomment exactly one after recording trusted same-cluster evidence:
+# fumarole-alpenglow-genesis-slot: <trusted-certificate-slot>
+# fumarole-preactivation-through-slot: <recorded-finalized-slot>
 fumarole-create-consumer-group: true  # set to false after first run
 fumarole-data-plane-tcp-connections: 4       # parallel TCP connections for download; max 20
 fumarole-concurrent-download-limit-per-tcp: 2
@@ -250,13 +254,13 @@ INFO superbank::clickhouse: clickhouse insert committed table="default.entries" 
 
 After the first run, set `fumarole-create-consumer-group: false` — the group persists on the server and resumes from its last committed position on restart.
 
-Fumarole is generally preferred for production: it uses a persistent consumer group that survives restarts, has at-least-once delivery guarantees, and also populates the `entries` table like the gRPC source. Dragon's Mouth gRPC is simpler for local dev.
+Fumarole's persistent consumer group is useful for pre-Alpenglow production ingestion and populates the `entries` table. Its legacy envelope cannot provide bank IDs or footers, so switch to a qualified Dragon's Mouth gRPC producer for slots after the trusted genesis boundary.
 
 For **historical backfill**, there are two approaches depending on scale:
 
-**Pre-v1 historical backfill: Jetstreamer + Old Faithful**
+**Historical backfill through the Alpenglow genesis slot: Jetstreamer + Old Faithful**
 
-The standalone Jetstreamer workspaces remain on Agave 3 and must not be used for post-v1 history. Use the root ingestor’s RPC or Bigtable source for transaction-v1 history; see the [ingestor compatibility notes](../crates/superbank/README.md).
+The standalone Jetstreamer plugin uses upstream Agave 4 and preserves v1 transaction configuration. Set `JETSTREAMER_ALPENGLOW_GENESIS_SLOT` from a trusted certificate; the plugin rejects later blocks because Jetstreamer does not expose bank ID or footer provenance. Use the root ingestor’s qualified gRPC, RPC, or Bigtable source for later history; see the [ingestor compatibility notes](../crates/superbank/README.md).
 
 For ingesting months or years of history, use the [Jetstreamer adapter](../ingest/jetstreamer-clickhouse-plugin/) pointed at Triton's [Old Faithful](https://docs.triton.one/project-yellowstone/old-faithful-historical-archive) archival backend. Old Faithful has full history back to genesis and serves data at wire speed — far faster than polling `getBlock` over HTTP. Bound the range with the epoch or slot arguments; see the [Filtering section](#filtering-to-your-own-transactions) for trade-offs if you also want a program filter.
 
@@ -675,12 +679,28 @@ Note: the replicated tables will fail to create if ClickHouse Keeper or ZooKeepe
 
 ### Use Fumarole as the ingestion source
 
-Fumarole is the recommended source for production:
+Fumarole can ingest legacy slots through one explicitly evidenced finite bound:
 - Persistent consumer groups survive ingestor restarts
 - At-least-once delivery with commit checkpoints
 - Lower reconnect risk than raw gRPC streaming
 
-Set `source: fumarole` in your YAML and configure `fumarole-consumer-group`. After the first run, set `fumarole-create-consumer-group: false`.
+Set `source: fumarole` and `fumarole-consumer-group`, then configure exactly one
+bound. For a trusted same-cluster non-null `getAgGenesisCert`, set
+`fumarole-alpenglow-genesis-slot` to its certified slot. For preactivation,
+record a trusted finalized `getSlot` response **before** a successful authoritative
+same-cluster null `getAgGenesisCert`, retain both responses and endpoint/cluster
+evidence, then explicitly attest that finite slot with
+`fumarole-preactivation-through-slot`. Missing responses, failed requests and
+untrusted nulls do not establish preactivation. Do not use zero as a placeholder
+or automatically move an attested bound forward. The two settings are mutually
+exclusive; leaving both unset fails startup. See the
+[operational rollout](agave-4.3-compatibility.md#alpenglow-operational-rollout)
+for evidence and migration requirements.
+
+After the first run, set `fumarole-create-consumer-group: false`. Fumarole stops
+at its selected bound; valid prior rows flush without committing pending/rejected
+offsets. Use a qualified finalized bank-tagged Yellowstone gRPC producer for
+later slots.
 
 ### Metrics
 

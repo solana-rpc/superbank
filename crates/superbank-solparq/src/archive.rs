@@ -27,9 +27,25 @@ use crate::{
     storage::{self, ArchiveDestination},
 };
 
+/// Historical hourly window at the default 400 ms slot cadence.
 pub const HOURLY_SLOTS: u64 = 9_000;
+pub const DEFAULT_HOURLY_SLOT_DURATION_MS: u64 = 400;
 pub const EPOCH_SLOTS: u64 = 432_000;
 pub const DEFAULT_CUSTOM_SLOTS: u64 = 1_000;
+
+/// Convert the operator's nominal cluster cadence to an exact one-hour slot span.
+pub fn hourly_slot_count(slot_duration_ms: u64) -> Result<u64> {
+    const HOUR_MS: u64 = 3_600_000;
+    if slot_duration_ms == 0
+        || slot_duration_ms > HOUR_MS
+        || !HOUR_MS.is_multiple_of(slot_duration_ms)
+    {
+        return Err(anyhow!(
+            "hourly-slot-duration-ms must be positive and divide 3600000 milliseconds exactly"
+        ));
+    }
+    Ok(HOUR_MS / slot_duration_ms)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ArchiveSlotRange {
@@ -88,6 +104,8 @@ impl ArchiveKind {
         }
     }
 
+    /// Historical slot span; configurable hourly planning uses
+    /// [`hourly_slot_count`] with the operator's cluster cadence instead.
     pub fn slot_count(self) -> u64 {
         match self {
             ArchiveKind::Hourly => HOURLY_SLOTS,
@@ -215,6 +233,27 @@ pub fn plan_next_archive(
     continue_from_last_archive: bool,
     custom_aligned: bool,
 ) -> Result<Option<ArchivePlan>> {
+    plan_next_archive_with_hourly_slot_duration(
+        kind,
+        bounds,
+        last_archive_name,
+        continue_from_last_archive,
+        custom_aligned,
+        DEFAULT_HOURLY_SLOT_DURATION_MS,
+    )
+}
+
+/// Plan nominal hourly windows using the configured cluster slot cadence.
+/// Existing archive names provide the continuation boundary regardless of the
+/// cadence used to write them. Epoch and custom slot spans remain unchanged.
+pub fn plan_next_archive_with_hourly_slot_duration(
+    kind: ArchiveKind,
+    bounds: ClickHouseBounds,
+    last_archive_name: Option<&str>,
+    continue_from_last_archive: bool,
+    custom_aligned: bool,
+    hourly_slot_duration_ms: u64,
+) -> Result<Option<ArchivePlan>> {
     if bounds.latest_slot < bounds.earliest_slot {
         return Ok(None);
     }
@@ -253,7 +292,10 @@ pub fn plan_next_archive(
         _ => start_slot,
     };
 
-    let slot_count = kind.slot_count();
+    let slot_count = match kind {
+        ArchiveKind::Hourly => hourly_slot_count(hourly_slot_duration_ms)?,
+        _ => kind.slot_count(),
+    };
     let end_slot = start_slot
         .checked_add(slot_count - 1)
         .ok_or_else(|| anyhow!("archive end slot overflowed"))?;
@@ -775,6 +817,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         archive_kind = kind.to_string(),
         transactions_table = tables.transactions_table,
         blocks_table = tables.blocks_table,
+        hourly_slot_duration_ms = config.hourly_slot_duration_ms,
         "checking ClickHouse archive source"
     );
     let available_archive_tables = client.check_tables(&tables).await?;
@@ -834,12 +877,13 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             );
         }
         (
-            plan_next_archive(
+            plan_next_archive_with_hourly_slot_duration(
                 kind,
                 bounds,
                 last_archive.as_deref(),
                 config.continue_from_last_archive,
                 config.custom_aligned,
+                config.hourly_slot_duration_ms,
             )?,
             "not enough ClickHouse slots available for the next archive",
         )

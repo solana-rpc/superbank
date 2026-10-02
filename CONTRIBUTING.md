@@ -63,7 +63,7 @@ Notes:
 
 You can contribute without Nix. Ensure these tools are installed and on `PATH`:
 
-- Rust stable toolchain (repo uses `rust-toolchain.toml`, plus `rustfmt` and `clippy`)
+- Rust 1.97.1 toolchain (repo uses `rust-toolchain.toml`, plus `rustfmt` and `clippy`)
 - `protoc` (CI installs 25.3; a recent 25.x is recommended)
 - libclang/LLVM development libraries (needed by crates that use bindgen)
 - Docker (for local ClickHouse, or point at a remote ClickHouse)

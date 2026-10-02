@@ -16,6 +16,7 @@ once_cell = "1.21.3"
 prometheus-client.workspace = true
 prometheus-client-derive-encode.workspace = true
 rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde.workspace = true
 serde-big-array = "0.5"
 serde_json.workspace = true

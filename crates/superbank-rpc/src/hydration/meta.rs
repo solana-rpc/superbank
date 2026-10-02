@@ -915,30 +915,28 @@ fn build_rewards_from_fields(
 pub(crate) fn parse_reward_type(
     value: &Option<String>,
 ) -> Result<Option<RewardType>, TransactionHydrationError> {
-    let Some(value) = value.as_deref() else {
-        return Ok(None);
-    };
+    value.as_deref().map(parse_reward_type_name).transpose()
+}
 
+fn parse_reward_type_name(value: &str) -> Result<RewardType, TransactionHydrationError> {
     // Historical data may use different casing ("fee" vs "Fee"). Solana reward types are ASCII.
     let value = value.trim();
 
-    if value.eq_ignore_ascii_case("fee") {
-        Ok(Some(RewardType::Fee))
-    } else if value.eq_ignore_ascii_case("rent") {
-        Ok(Some(RewardType::Rent))
-    } else if value.eq_ignore_ascii_case("staking") {
-        Ok(Some(RewardType::Staking))
-    } else if value.eq_ignore_ascii_case("voting") {
-        Ok(Some(RewardType::Voting))
-    } else if value.eq_ignore_ascii_case("deactivatedstake")
-        || value.eq_ignore_ascii_case("deactivated-stake")
-    {
-        Ok(Some(RewardType::DeactivatedStake))
-    } else {
-        Err(TransactionHydrationError::InvalidStoredMetadata(format!(
-            "unknown reward type '{value}'"
-        )))
-    }
+    let normalized = value.to_ascii_lowercase();
+    let reward_type = match normalized.as_str() {
+        "fee" => RewardType::Fee,
+        "rent" => RewardType::Rent,
+        "staking" => RewardType::Staking,
+        "voting" => RewardType::Voting,
+        "deactivatedstake" | "deactivated-stake" => RewardType::DeactivatedStake,
+        "vatdebit" | "validator-admission-ticket-debit" => RewardType::VATDebit,
+        _ => {
+            return Err(TransactionHydrationError::InvalidStoredMetadata(format!(
+                "unknown reward type '{value}'"
+            )));
+        }
+    };
+    Ok(reward_type)
 }
 
 #[cfg(test)]
