@@ -45,10 +45,15 @@ without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
 entries for later PoH-specific tooling.
 When present, `block_footers.parquet` retains Alpenglow bank hash, producer time,
 and user agent for internal inspection and restore. The archive manifest format
-is version 3; older bundles remain readable. Footer ingestion runs on a separate
-processed stream and persists rows only after matching finalization. Archive a
-range only after its finalized `(slot, bank_id)` footer rows have arrived; a
-premature archive can omit footers that appear later.
+is version 3; older bundles remain readable. Canonical block data, bank status
+and processed footers share one gRPC subscription; footer batches persist only
+after matching finalized banks have complete durable data. Bank counters belong
+to that subscription and can change across reconnects; new footer tables deduplicate
+by finalized slot. Startup table failures disable ancillary writes, and replay may
+not provide historical footers. Audit and record gaps, then archive only after the
+qualified footer batches have flushed. A premature archive can omit later footers;
+block completeness does not establish footer completeness. See the
+[rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
 
 `SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
 bundle. `report.json` is a machine-readable run report: it carries a

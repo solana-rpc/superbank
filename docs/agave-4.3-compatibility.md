@@ -130,3 +130,78 @@ the standalone `grpc-streaming` feature build.
 Live producer qualification, production canaries, and historical audits require
 the target endpoints and ingestion provenance. They are release gates, not
 claims established by the local source change.
+
+## Alpenglow operational rollout
+
+Treat certificate discovery, source qualification and storage rollout as separate
+gates. Record evidence for the cluster holding the ledger, rather than relying on
+the current state of a public network or the producer's binary version.
+
+1. Configure a trusted same-cluster Agave endpoint for `getAgGenesisCert`. The RPC
+   server uses `AG_GENESIS_CERT_RPC_URL`; the verifier uses `--alpenglow-rpc-url`, or
+   an offline `--alpenglow-genesis-block <G>:<block-ID>`. An authoritative successful
+   null is preactivation evidence; unsupported, missing, malformed and unavailable
+   responses are errors. The certificate's G is the **last historical PoH slot**;
+   Alpenglow entry rules apply strictly after G. Its consensus block ID is distinct
+   from an entry blockhash or verifier `--anchor`.
+2. Legacy Fumarole and Jetstreamer require a finite historical bound. Use the
+   certificate slot, or before activation record finalized `getSlot` **before** a
+   subsequent authoritative null from the same trusted endpoint. Retain both
+   responses, then explicitly attest that finalized slot (or earlier) through
+   `FUMAROLE_PREACTIVATION_THROUGH_SLOT` or `JETSTREAMER_PREACTIVATION_THROUGH_SLOT`.
+   These are offline operator attestations, mutually exclusive with the genesis
+   bound; missing evidence cannot select this mode. The bound never advances
+   automatically. Independently qualify Jetstreamer block commissions using the
+   same cluster's SIMD-0291 activation/source era; Alpenglow G does not determine
+   whether a reward's original units were percent or basis points.
+3. Apply the matching local, cluster or replicated DDL **before** upgraded readers
+   or writers. Reapply `blocks_metadata.sql` even when `bank_id` already exists:
+   its explicit `Nullable(UInt64) DEFAULT NULL` repair supports omitted-column old
+   writers, including RPC and Bigtable. Apply transaction reward/config columns,
+   entries for the sources requiring them, and footer schemas. New footer tables
+   deduplicate finalized slots; old `(slot, bank_id)` keys require the planned
+   rebuild and conflict audit in [DDL migration notes](../ddl/README.md#finalized-footer-identity-and-existing-table-migration).
+   Keep old footer tables/export evidence until counts, hashes and replica state
+   have been verified; `CREATE IF NOT EXISTS` does not migrate sorting keys.
+4. Canary complete **finalized canonical** ingestion. gRPC joins block data, bank
+   status and processed footers on one subscription. Fumarole assembles sealed
+   `(slot, blockhash)` banks; it cannot supply postmigration footer qualification.
+   RPC/Bigtable backfills supply canonical block data but no entry/footer stream.
+   Validate exact transaction/entry completeness before writing. A scalar zero
+   gRPC bank ID needs matching optional-ID status evidence; unresolved identity
+   holds later data and every metadata flush for replay. Never move those proofs
+   across reconnects. At a Fumarole cutoff, valid prior rows flush without the
+   client's all-offset acknowledgment, so a restart may replay the valid prefix.
+5. Monitor footer availability separately from canonical progress. Startup has a
+   five-second table/column qualification and an explicit best-effort footer
+   policy; a missing table disables ancillary writes until restart. Batch inserts
+   follow complete durable bank data, reuse metadata and retry within a bounded
+   window. Insert failures, gaps and expired footers produce warnings and
+   `superbank_ingest_source_errors_total` with `stage="grpc_footer"`; they do not
+   disable canonical validation or bypass an unresolved identity hold. First-shred
+   turbine telemetry cannot advance that window. Replay may never supply historical
+   footers: record gaps without fabricating a hash or joining stored node-local IDs.
+   Wait for batch flushes and independently audit footer completeness before
+   archiving; a complete block archive alone does not prove footer coverage.
+6. Qualify speculative serving separately. The head cache scopes bank counters and
+   commitment tokens to a subscription/session, retains competing banks until a
+   winner is proven, discards dead/skipped branches, and clears proofs on reconnect.
+   Frozen content cannot publish below the configured minimum, even to concurrent
+   `processed` readers. A signature retried on a winning slot must acquire that
+   slot's projection and token after its abandoned branch is removed. Stored
+   finalized data remains slot-keyed and is never treated as a session ID registry.
+7. Configure the verifier boundary before postmigration work. Resume can add a
+   trusted `None -> Some(G, ID)` boundary only when `next_start <= G + 1`, before
+   postboundary slots were verified with historical rules; it persists that
+   descriptor. Removal, changed boundaries, anchors or other job settings reject
+   resume. A moving `--full` tip can only advance. Rollback leaves additive DDL
+   and qualified readers in place, pauses sources that cannot safely represent
+   the active era, and retains recorded evidence/checkpoints. Do not remove a
+   trusted verifier boundary or deploy historical-only writers beyond their bound.
+
+See [ingestor integrity and footer policy](../crates/superbank/README.md#live-stream-integrity),
+[Jetstreamer runner/commission qualification](../ingest/jetstreamer-clickhouse-plugin/README.md),
+and [Solparq footer inspection](../crates/superbank-solparq/README.md#read-archives).
+Local wire, ClickHouse and archive fixtures qualify implementation behavior;
+production producer captures, canaries, replay retention and target-cluster evidence
+remain operator release gates.
