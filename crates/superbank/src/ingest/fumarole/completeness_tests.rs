@@ -264,3 +264,104 @@ fn sealed_same_slot_winner_cannot_acknowledge_an_incomplete_sibling_on_reconnect
     commit_if_assembled(&replay, || acknowledgments += 1);
     assert_eq!(acknowledgments, 1);
 }
+
+#[tokio::test]
+async fn boundary_stop_flushes_buffered_genesis_before_timer_without_acknowledging_a_sibling_or_rejected_slot()
+ {
+    use axum::{Router, body::Body, extract::Request};
+    use tokio::{net::TcpListener, sync::mpsc};
+    metrics::force_init("fumarole", None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let app = Router::new().fallback(move |request: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            tx.send((query, body)).unwrap();
+            "Ok"
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClickHouseClient::default()
+        .with_url(format!("http://{addr}"))
+        .with_validation(false)
+        .with_compression(clickhouse::Compression::None);
+    let mut args = crate::cli::test_args();
+    args.source = crate::cli::IngestSource::Fumarole;
+    args.fumarole_alpenglow_genesis_slot = Some(42);
+    args.entries_table = None;
+    let tables = InsertTables::from_args(&args);
+    let mut assembler = FumaroleBlockAssembler::new(true, false);
+    // An incomplete sibling must survive the cutoff and prevent broad commit.
+    submit(
+        &mut assembler,
+        41,
+        UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+            slot: 41,
+            executed_transaction_count: 1,
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    let block = SubscribeUpdateBlock {
+        slot: 42,
+        parent_slot: 41,
+        blockhash: bs58::encode([1; 32]).into_string(),
+        parent_blockhash: bs58::encode([2; 32]).into_string(),
+        ..Default::default()
+    };
+    let mut rows = BufferedRows::new(&args);
+    let envelope = |block| SubscribeUpdate {
+        update_oneof: Some(UpdateOneof::Block(block)),
+        ..Default::default()
+    };
+    assert!(
+        !process_update(
+            envelope(block.clone()),
+            &args,
+            &tables,
+            &client,
+            &mut rows,
+            None
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "genesis remains buffered before timer"
+    );
+    assert!(
+        !stop_at_historical_bound(42, &args, &client, &tables, &mut rows)
+            .await
+            .unwrap()
+    );
+    assert!(
+        stop_at_historical_bound(43, &args, &client, &tables, &mut rows)
+            .await
+            .unwrap()
+    );
+    assert!(rows.is_empty());
+    let (query, body) = rx.try_recv().unwrap();
+    assert!(query.contains("blocks_metadata"));
+    assert_eq!(u64::from_le_bytes(body[..8].try_into().unwrap()), 42);
+    assert!(rx.try_recv().is_err(), "no rejected block can be inserted");
+    let mut acknowledgments = 0;
+    commit_if_assembled(&assembler, || acknowledgments += 1);
+    assert_eq!(acknowledgments, 0);
+    assert_eq!(assembler.pending_slots(), 1);
+    // No offsets were acknowledged: replay of the valid prefix is harmless and
+    // uses the same slot-keyed metadata row, never the rejected successor.
+    process_update(envelope(block), &args, &tables, &client, &mut rows, None)
+        .await
+        .unwrap();
+    stop_at_historical_bound(43, &args, &client, &tables, &mut rows)
+        .await
+        .unwrap();
+    assert_eq!(rx.try_recv().unwrap().1, body);
+    server.abort();
+}

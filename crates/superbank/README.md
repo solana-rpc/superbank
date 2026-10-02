@@ -439,8 +439,10 @@ supply the footer evidence needed for postmigration qualification.
 Full blocks are validated before buffering or inserts: exact transaction counts
 (including zero), unique contiguous indices and signatures, and, when entries are
 requested, exact entry counts, indices, slot identity and transaction range tiling.
-Omitting `entries-table` permits an omitted entry payload. Malformed payloads fail
-before flushing or acknowledging source offsets. Complete Fumarole banks may flush while
+Omitting `entries-table` permits an omitted entry payload. Malformed payloads never enter writer buffers or acknowledge source offsets.
+A rejected later gRPC update flushes an already complete, qualified earlier
+prefix before exiting. Same-slot contradictions and unresolved bank identity
+retain buffered data without advancing restart progress. Complete Fumarole banks may flush while
 other banks are assembling, but Fumarole commits no pending offsets until every
 pending bank has completed. Restart replays unacknowledged data.
 
@@ -479,3 +481,11 @@ Failures, missing evidence and unsupported RPC methods never mean preactivation.
 The run remains bounded and cannot follow future activation. A subsequent run
 requires newly qualified evidence or the certificate's genesis slot; never set
 both bounds. A numeric zero is usable only if actually evidenced.
+
+At a Fumarole historical cutoff, the first out-of-bound event flushes prior
+validated complete rows before returning an error. It never assembles or writes
+the rejected payload and never calls the client's all-offset `commit()`: Fumarole
+0.8 has no safe-prefix acknowledgment API. Pending siblings remain unacknowledged.
+Restart replays the valid prefix idempotently. Retire the bounded consumer or
+qualify a new historical run; repeated restart with the same bound will reach the
+same cutoff, rather than consume postmigration data.

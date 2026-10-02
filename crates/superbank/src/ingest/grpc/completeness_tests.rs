@@ -773,3 +773,111 @@ async fn ready_earlier_footer_persists_while_later_identity_holds_restart_progre
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn validation_exit_flushes_only_an_earlier_qualified_prefix_and_replays_safely() {
+    use axum::{Router, body::Body, extract::Request};
+    use tokio::{net::TcpListener, sync::mpsc};
+    metrics::force_init("grpc", None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let app = Router::new().fallback(move |request: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            tx.send((query, body)).unwrap();
+            "Ok"
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClickHouseClient::default()
+        .with_url(format!("http://{addr}"))
+        .with_validation(false)
+        .with_compression(clickhouse::Compression::None);
+    let args = crate::cli::test_args();
+    let tables = InsertTables::from_args(&args);
+    let retry = RetryConfig {
+        max_retries: 0,
+        base_ms: 1,
+        max_ms: 1,
+    };
+    for (held, conflict) in [(false, false), (true, false), (false, true)] {
+        let mut first_replay = None;
+        for _ in 0..2 {
+            let mut rows = buffered_rows();
+            let mut join = FinalizedFooterJoin::default();
+            let mut valid = complete_block(42);
+            valid.bank_id = 7;
+            for entry in &mut valid.entries {
+                entry.bank_id = 7;
+            }
+            for update in [
+                identity_status(42, Some(7), SlotStatus::SlotFinalized),
+                canonical_envelope(UpdateOneof::Block(valid)),
+            ] {
+                process_canonical_update(
+                    update, &args, &tables, &client, &mut rows, &retry, &mut join,
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                rx.is_empty(),
+                "valid prefix must be buffered before the timer"
+            );
+            if held {
+                process_canonical_update(
+                    canonical_envelope(UpdateOneof::Block(complete_block(43))),
+                    &args,
+                    &tables,
+                    &client,
+                    &mut rows,
+                    &retry,
+                    &mut join,
+                )
+                .await
+                .unwrap();
+            }
+            let rejected = if conflict {
+                identity_status(42, Some(8), SlotStatus::SlotFinalized)
+            } else {
+                let mut invalid = complete_block(if held { 44 } else { 43 });
+                invalid.transactions.pop();
+                canonical_envelope(UpdateOneof::Block(invalid))
+            };
+            assert!(
+                process_canonical_update(
+                    rejected, &args, &tables, &client, &mut rows, &retry, &mut join
+                )
+                .await
+                .is_err()
+            );
+            let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            if held || conflict {
+                assert!(
+                    requests.is_empty(),
+                    "unidentified or contradicted data must not flush"
+                );
+                assert_eq!(rows.last_durable_block_slot, Some(40));
+                assert_eq!(rows.block_rows.len(), 1);
+            } else {
+                assert_eq!(requests.len(), 3);
+                assert!(rows.is_empty());
+                assert_eq!(rows.last_durable_block_slot, Some(42));
+                assert_eq!(
+                    next_subscribe_from_slot(None, rows.last_durable_block_slot).unwrap(),
+                    Some(43)
+                );
+                if let Some(first) = &first_replay {
+                    assert_eq!(first, &requests);
+                }
+                first_replay = Some(requests);
+            }
+        }
+    }
+    server.abort();
+}

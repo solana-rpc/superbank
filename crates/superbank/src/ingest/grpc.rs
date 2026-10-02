@@ -683,6 +683,35 @@ async fn process_canonical_update(
     retry: &RetryConfig,
     join: &mut FinalizedFooterJoin,
 ) -> Result<()> {
+    let affected_slot = match update.update_oneof.as_ref() {
+        Some(UpdateOneof::Block(block)) => Some(block.slot),
+        Some(UpdateOneof::Slot(slot)) => Some(slot.slot),
+        Some(UpdateOneof::BlockFooter(footer)) => Some(footer.slot),
+        _ => None,
+    };
+    let result =
+        process_canonical_update_inner(update, args, tables, clickhouse, rows, retry, join).await;
+    if let Err(error) = &result {
+        // A rejected later update must not repeatedly starve a complete prefix.
+        // Same-slot contradictions cannot qualify that slot's buffered data,
+        // and unresolved identities retain the existing all-data progress hold.
+        if affected_slot.is_some_and(|slot| rows.block_rows.iter().all(|row| row.slot < slot)) {
+            warn!(%error, affected_slot, "canonical update rejected; flushing only complete earlier qualified data");
+            flush_after_fatal_condition(clickhouse, tables, rows, &error.to_string(), join).await?;
+        }
+    }
+    result
+}
+
+async fn process_canonical_update_inner(
+    update: SubscribeUpdate,
+    args: &Args,
+    tables: &InsertTables,
+    clickhouse: &ClickHouseClient,
+    rows: &mut BufferedRows,
+    retry: &RetryConfig,
+    join: &mut FinalizedFooterJoin,
+) -> Result<()> {
     match update.update_oneof {
         Some(UpdateOneof::Block(block)) => {
             validate_block_bank(

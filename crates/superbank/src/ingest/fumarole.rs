@@ -162,6 +162,12 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                 match event {
                     Some(Ok(event)) => {
                         reset_idle_timer(idle_timer.as_mut(), idle_timeout);
+                        let event_slot = match &event {
+                            FumaroleEvent::Data { slot, .. } | FumaroleEvent::SlotEnded { slot, .. } => *slot,
+                        };
+                        if stop_at_historical_bound(event_slot, args, &clickhouse, &insert_tables, &mut buffered_rows).await? {
+                            return Err(anyhow!("Fumarole reached slot {event_slot} beyond its qualified historical bound; prior valid rows flushed without acknowledging rejected progress"));
+                        }
                         match event {
                             FumaroleEvent::Data { slot, blockhash, update } => {
                                 match block_assembler.handle_update((slot, blockhash), update)? {
@@ -798,6 +804,33 @@ async fn resolve_create_consumer_group_from_slot(
         Some(FromSlotSpec::Slot(slot)) => Ok(Some(slot)),
         None => Ok(None),
     }
+}
+
+async fn stop_at_historical_bound(
+    event_slot: u64,
+    args: &Args,
+    clickhouse: &ClickHouseClient,
+    tables: &InsertTables,
+    rows: &mut BufferedRows,
+) -> Result<bool> {
+    let bound = args
+        .fumarole_alpenglow_genesis_slot
+        .or(args.fumarole_preactivation_through_slot)
+        .context("Fumarole requires an evidenced historical bound")?;
+    if event_slot <= bound {
+        return Ok(false);
+    }
+    metrics::observe_source_error("fumarole_stream", "historical_bound");
+    // Reject before assembly and flush only previously validated complete blocks.
+    // FumaroleStream::commit drains every offset, including newly consumed
+    // progress, so no acknowledgment is safe here. Restart replays the prefix.
+    rows.flush(clickhouse, tables).await?;
+    warn!(
+        event_slot,
+        bound,
+        "Fumarole historical bound reached; flushed valid prior rows without committing offsets"
+    );
+    Ok(true)
 }
 
 async fn flush_and_commit(
