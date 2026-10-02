@@ -486,9 +486,13 @@ impl BlockIndex {
             database = self.cfg.database,
             "block index: historical worker started"
         );
+        let mut last_latest = None;
         loop {
-            let latest = match source.get_latest_finalized_slot().await {
-                Ok(Some(slot)) => slot,
+            let latest = match source.get_latest_finalized_slot_since(last_latest).await {
+                Ok(Some(slot)) => {
+                    last_latest = Some(slot);
+                    slot
+                }
                 Ok(None) => {
                     if wait_or_shutdown(&mut shutdown, Duration::from_secs(5)).await {
                         break;

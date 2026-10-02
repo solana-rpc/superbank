@@ -22,8 +22,8 @@ without a DDL migration. Old commission rows continue to omit unavailable
 ## Ingestion and streaming boundaries
 
 JSON-RPC and Bigtable ingestion use Agave 4.3 types. Yellowstone gRPC ingestion,
-Fumarole block assembly, and the head cache explicitly preserve raw reward value
-6 because the published Yellowstone protobuf enum does not yet name it. Prost
+Fumarole block assembly, and the head cache preserve VAT reward value 6 with
+the stable Yellowstone 13 schema (upgraded from 13.0.0-rc4). Prost
 retains this i32 value when decoding and re-encoding. The `grpc-streaming` feature
 uses Agave's `solana-storage-proto = 4.3.0`
 generated output types, including `VATDebit = 6`, without changing existing field

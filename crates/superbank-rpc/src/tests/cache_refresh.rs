@@ -375,3 +375,33 @@ async fn cache_refresh_recovers_after_batch_envelope_deadline() {
         assert_eq!(backend.call_count(), 2);
     }
 }
+
+#[tokio::test]
+async fn cache_refresh_passes_previous_slot_as_latest_hint() {
+    const LATEST: u64 = 500_000;
+    let mut backend = Backend::start().await;
+    let state = backend.state().await;
+    let first = tokio::spawn(CacheKind::Slot.refresh(state.clone()));
+    let query = backend.next(CacheKind::Slot).await;
+    assert!(!query.sql.contains("WHERE"), "no hint yet: {}", query.sql);
+    CacheKind::Slot.respond(query, Some(LATEST));
+    assert_eq!(first.await.unwrap().unwrap(), Some(LATEST));
+
+    // Expire the entry so the next caller leads a refresh.
+    state
+        .latest_slot_cache
+        .last_updated_ms
+        .store(0, Ordering::Relaxed);
+    let second = tokio::spawn(CacheKind::Slot.refresh(state.clone()));
+    let query = backend.next(CacheKind::Slot).await;
+    assert!(
+        query
+            .sql
+            .contains("WHERE slot >= 490000 ORDER BY slot DESC LIMIT 1"),
+        "{}",
+        query.sql
+    );
+    CacheKind::Slot.respond(query, Some(LATEST + 4));
+    assert_eq!(second.await.unwrap().unwrap(), Some(LATEST + 4));
+    assert_eq!(backend.call_count(), 2);
+}

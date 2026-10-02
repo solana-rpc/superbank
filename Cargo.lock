@@ -1161,11 +1161,27 @@ dependencies = [
 
 [[package]]
 name = "bytesize"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e93abca9e28e0a1b9877922aacb20576e05d4679ffa78c3d6dc22a26a216659"
+
+[[package]]
+name = "bytesize"
 version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bd91ee7b2422bcb158d90ef4d14f75ef67f340943fc4149891dcce8f8b972a3"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "bytesize-serde"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86d1eb2fd2668859e9785b99700c66b7ea9fdeda35d99f95827a4e5493440178"
+dependencies = [
+ "bytesize 1.3.3",
+ "serde",
 ]
 
 [[package]]
@@ -1543,6 +1559,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "convert_case"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1856,6 +1881,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "derive_more"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
+dependencies = [
+ "derive_more-impl",
+]
+
+[[package]]
+name = "derive_more-impl"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "rustc_version",
+ "syn 2.0.117",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -8253,10 +8301,8 @@ dependencies = [
  "wincode 0.2.5",
  "wincode 0.6.1",
  "yellowstone-fumarole-client",
- "yellowstone-grpc-client 13.4.0",
- "yellowstone-grpc-client 14.0.0-rc.0",
- "yellowstone-grpc-proto 12.6.0",
- "yellowstone-grpc-proto 13.0.0-rc4",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]
@@ -8326,8 +8372,9 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "wincode 0.6.1",
- "yellowstone-grpc-client 14.0.0-rc.0",
- "yellowstone-grpc-proto 13.0.0-rc4",
+ "yellowstone-block-machine",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]
@@ -9011,6 +9058,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"
@@ -9771,13 +9824,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "yellowstone-fumarole-client"
-version = "0.7.1+solana.3"
+name = "yellowstone-block-machine"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1b3d402d2f388045076658cac9a6158c2dc1792c904aff5d2e0c994e3e76d9"
+checksum = "47b08deeb579c396acc71ffa127f3711b06325bf18ab4c767e71abba6b242256"
+dependencies = [
+ "bs58",
+ "bytesize 2.3.1",
+ "bytesize-serde",
+ "derive_more",
+ "futures-util",
+ "rustc-hash",
+ "serde",
+ "solana-clock 4.0.0",
+ "solana-commitment-config",
+ "solana-hash 4.6.0",
+ "solana-pubkey 4.3.0",
+ "solana-signature",
+ "thiserror 2.0.20",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
+]
+
+[[package]]
+name = "yellowstone-fumarole-client"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43acd8e2d6922d02d2ce676522d4899bcbcd9d3c6addfe9d89531cdd9cc684f7"
 dependencies = [
  "async-trait",
- "bytesize",
+ "bytesize 2.3.1",
  "crossbeam",
  "futures",
  "http",
@@ -9792,7 +9871,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serde_yaml",
- "solana-clock 3.2.1",
+ "solana-clock 4.0.0",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
@@ -9804,14 +9883,14 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
- "yellowstone-grpc-proto 12.6.0",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]
 name = "yellowstone-grpc-client"
-version = "13.4.0"
+version = "14.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e96912ad158e97fa6e3632436b11761324452d559ca5595ce8dce7b98fb6a29"
+checksum = "e209e7d3c4581583b5a8be60659c956e0f6dc25d79189bad2902ce87bf2dee31"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -9825,51 +9904,14 @@ dependencies = [
  "tonic",
  "tonic-health",
  "tower",
- "yellowstone-grpc-proto 12.6.0",
-]
-
-[[package]]
-name = "yellowstone-grpc-client"
-version = "14.0.0-rc.0"
-source = "git+https://github.com/rpcpool/yellowstone-grpc?rev=a8d88b17445e470f25cab6b72b8c742578e11cce#a8d88b17445e470f25cab6b72b8c742578e11cce"
-dependencies = [
- "arc-swap",
- "bytes",
- "futures",
- "hyper",
- "hyper-util",
- "log",
- "pin-project",
- "thiserror 2.0.20",
- "tokio",
- "tonic",
- "tonic-health",
- "tower",
- "yellowstone-grpc-proto 13.0.0-rc4",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]
 name = "yellowstone-grpc-proto"
-version = "12.6.0"
+version = "13.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdceeb3f02e4b31ab481eb9fd714854d757e76d2eb7b4f9c00136ed19edf183f"
-dependencies = [
- "anyhow",
- "prost 0.14.4",
- "prost-types",
- "protoc-bin-vendored",
- "siphasher 1.0.2",
- "solana-pubkey 4.3.0",
- "thiserror 2.0.20",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "yellowstone-grpc-proto"
-version = "13.0.0-rc4"
-source = "git+https://github.com/rpcpool/yellowstone-grpc?rev=a8d88b17445e470f25cab6b72b8c742578e11cce#a8d88b17445e470f25cab6b72b8c742578e11cce"
+checksum = "6c3e496d8fd80a592ee4daea506bfd8c3ce87aeda55055ba88439c8eec6a9a62"
 dependencies = [
  "anyhow",
  "prost 0.14.4",

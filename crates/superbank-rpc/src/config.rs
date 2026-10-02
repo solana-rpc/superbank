@@ -74,6 +74,70 @@ pub struct RpcConfig {
     #[arg(long, env = "GET_BLOCK_RESPONSE_CACHE_MAX_BYTES", default_value_t = 0)]
     pub(crate) get_block_response_cache_max_bytes: u64,
 
+    /// Maximum approximate bytes of primary-served getTransaction records retained in memory;
+    /// zero disables the cache.
+    #[arg(
+        long,
+        env = "GET_TRANSACTION_PRIMARY_CACHE_MAX_BYTES",
+        default_value_t = 0
+    )]
+    pub(crate) get_transaction_primary_cache_max_bytes: u64,
+
+    /// Seconds a primary-served getTransaction record stays cached after insertion.
+    #[arg(
+        long,
+        env = "GET_TRANSACTION_PRIMARY_CACHE_TTL_SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    pub(crate) get_transaction_primary_cache_ttl_secs: u64,
+
+    /// Let confirmed getBlock requests read and populate the finalized response
+    /// cache when their data is provably finalized (set false to disable).
+    #[arg(
+        long,
+        env = "GET_BLOCK_RESPONSE_CACHE_SHARE_CONFIRMED",
+        default_value_t = true
+    )]
+    pub(crate) get_block_response_cache_share_confirmed: bool,
+
+    /// Remember deterministic getBlock `-32015` (unsupported transaction version) answers for
+    /// finalized blocks while the response cache is enabled. `false` recomputes them on every
+    /// request.
+    #[arg(
+        long,
+        env = "GET_BLOCK_RESPONSE_CACHE_UNSUPPORTED_VERSION",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) get_block_response_cache_unsupported_version: bool,
+
+    /// Signatures whose empty primary history-search answer is remembered for
+    /// getSignatureStatuses; zero (the default) disables the absence cache.
+    #[arg(
+        long,
+        env = "SIGNATURE_STATUS_HISTORY_CACHE_ENTRIES",
+        default_value_t = 0
+    )]
+    pub(crate) signature_status_history_cache_entries: u64,
+
+    /// Memory bound for the getSignatureStatuses absence cache (bytes; ~384 per entry).
+    #[arg(
+        long,
+        env = "SIGNATURE_STATUS_HISTORY_CACHE_MAX_BYTES",
+        default_value_t = 64 * 1024 * 1024
+    )]
+    pub(crate) signature_status_history_cache_max_bytes: u64,
+
+    /// How long an empty primary history-search answer may skip the primary (seconds, 1-300).
+    #[arg(
+        long,
+        env = "SIGNATURE_STATUS_HISTORY_CACHE_TTL_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..=300)
+    )]
+    pub(crate) signature_status_history_cache_ttl_secs: u64,
+
     /// Compress JSON-RPC responses when the client advertises gzip support.
     #[arg(long, env = "RPC_RESPONSE_GZIP_ENABLED", default_value_t = false)]
     pub(crate) rpc_response_gzip_enabled: bool,
@@ -141,6 +205,15 @@ pub struct RpcConfig {
         default_value_t = 536_870_912
     )]
     pub(crate) get_inflation_reward_max_bytes_to_read: u64,
+
+    /// Byte budget for the in-process cache of validated getInflationReward epoch boundary and
+    /// partition-slot metadata; zero disables the cache.
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES",
+        default_value_t = 16_777_216
+    )]
+    pub(crate) get_inflation_reward_epoch_cache_max_bytes: u64,
 
     /// Emit HTTP 503 for JSON-RPC server-side failures while keeping response bodies unchanged.
     #[arg(long, env = "SUPERBANK_RPC_EMIT_HTTP_ERRORS", default_value_t = false)]
@@ -289,6 +362,75 @@ pub struct RpcConfig {
     )]
     pub(crate) clickhouse_get_transaction_query_cache_min_query_runs: u64,
 
+    /// Resolve an uncached getTransaction signature position and read its payload in one
+    /// primary ClickHouse query (one round trip) instead of two sequential queries.
+    /// Distributed scope only; shard-direct keeps the two-query path.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_GET_TRANSACTION_SINGLE_ROUND_TRIP",
+        default_value_t = false
+    )]
+    pub(crate) clickhouse_get_transaction_single_round_trip: bool,
+
+    /// Bound the latest-finalized-slot query to slots at or above the caller's previous
+    /// answer minus a margin. `false` sends the unbounded query every time.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_LATEST_SLOT_HINT",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) clickhouse_latest_slot_hint: bool,
+
+    /// Return `slot:idx` paginationTokens for ClickHouse-sourced getTransactionsForAddress
+    /// rows (head/disk rows already do), so the next page needs no primary signature lookup.
+    /// Signature tokens are still accepted.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_POSITION_TOKENS",
+        default_value_t = false
+    )]
+    pub(crate) clickhouse_transactions_for_address_position_tokens: bool,
+
+    /// Remember the position of each ClickHouse-sourced getTransactionsForAddress page's last
+    /// row (in process, keyed by signature) so a follow-up page on this node that sends that
+    /// signature as its cursor skips the primary signature lookup.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_CURSOR_CACHE",
+        default_value_t = false
+    )]
+    pub(crate) clickhouse_transactions_for_address_cursor_cache: bool,
+
+    /// Push the getTransactionsForAddress token-accounts filter, ORDER BY and LIMIT into each
+    /// UNION branch. `false` applies the filter outside the union, as before.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) clickhouse_transactions_for_address_union_pushdown: bool,
+
+    /// Resolve a getSignaturesForAddress `before`/`until` cursor that the head and local
+    /// tiers missed inside the primary page query (one round trip) instead of a separate
+    /// primary lookup first. Distributed scope only; shard-direct and the transaction-table
+    /// GSFA fallback keep the separate lookup.
+    #[arg(long, env = "CLICKHOUSE_GSFA_INLINE_CURSOR", default_value_t = false)]
+    pub(crate) clickhouse_gsfa_inline_cursor: bool,
+
+    /// Route primary signature lookups (signature -> slot and getSignatureStatuses history) to
+    /// the owner shard: read `cluster(CLICKHOUSE_CLUSTER, <signatures local table>,
+    /// cityHash64(signature))` with `optimize_skip_unused_shards=1` instead of the
+    /// `default.signatures` view, which queries every shard. Verified at startup.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    pub(crate) clickhouse_signatures_owner_shard_routing: bool,
+
     /// Share ClickHouse query cache entries between users.
     #[arg(
         long,
@@ -361,6 +503,11 @@ pub struct RpcConfig {
     /// Max concurrent CPU-heavy hydration jobs (limits spawn_blocking usage).
     #[arg(long, env = "HYDRATION_CPU_CONCURRENCY", default_value_t = 8)]
     pub(crate) hydration_cpu_concurrency: usize,
+
+    /// Max blocking threads one getBlock full/accounts build may use. Extra
+    /// threads come from the hydration pool only when free; 1 disables.
+    #[arg(long, env = "GET_BLOCK_HYDRATION_PARALLELISM", default_value_t = 4)]
+    pub(crate) get_block_hydration_parallelism: usize,
 
     /// ClickHouse transport used for all shard-direct queries.
     #[arg(long, env = "CLICKHOUSE_TRANSPORT", value_enum, default_value = "http")]
@@ -465,6 +612,17 @@ pub struct RpcConfig {
     pub(crate) head_cache_enabled: bool,
 
     #[cfg(feature = "grpc-head-cache")]
+    /// Clamp an explicit getBlocks/getBlocksWithLimit end to the trusted head tip.
+    /// `false` keeps the requested end and asks the primary for slots above the tip.
+    #[arg(
+        long,
+        env = "GET_BLOCKS_CLAMP_TO_HEAD_TIP",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) get_blocks_clamp_to_head_tip: bool,
+
+    #[cfg(feature = "grpc-head-cache")]
     /// Yellowstone gRPC endpoint (DragonsMouth).
     #[arg(long, env = "DRAGONSMOUTH_ENDPOINT")]
     pub(crate) dragonsmouth_endpoint: Option<String>,
@@ -550,9 +708,105 @@ pub struct RpcConfig {
     pub(crate) disk_cache_query_timeout_ms: u64,
 
     #[cfg(feature = "disk-cache")]
+    /// Budget for one local getTransaction attempt; the primary starts when it expires.
+    /// Capped at DISK_CACHE_QUERY_TIMEOUT_MS.
+    #[arg(long, env = "DISK_CACHE_GET_TX_TIMEOUT_MS", default_value_t = 1_000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) disk_cache_get_tx_timeout_ms: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Resolve a local getTransaction position and read its payload in one query, falling
+    /// back to the two-step lookup. `false` uses only the two-step lookup.
+    #[arg(
+        long,
+        env = "DISK_CACHE_FUSED_GET_TX",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) disk_cache_fused_get_tx: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// After an empty fused getTransaction read over several candidate partitions, ask the
+    /// whole span for a position once before the per-partition probes. `false` always runs
+    /// the per-partition probes.
+    #[arg(
+        long,
+        env = "DISK_CACHE_GET_TX_SPAN_CHECK",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) disk_cache_get_tx_span_check: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// Serve a local getTransaction hit that raced an eviction while its slot stays covered.
+    /// `false` discards every read that raced an eviction.
+    #[arg(
+        long,
+        env = "DISK_CACHE_EVICTION_SAFE_HITS",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) disk_cache_eviction_safe_hits: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// Look up local signature statuses with one query over the candidate slot span.
+    /// `false` queries each candidate partition in turn.
+    #[arg(
+        long,
+        env = "DISK_CACHE_STATUS_SPAN_QUERY",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) disk_cache_status_span_query: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// Write new local `transactions` parts as Compact (see README). `false` resets the
+    /// layout settings so new parts use the server default again.
+    #[arg(
+        long,
+        env = "DISK_CACHE_COMPACT_TRANSACTIONS_PARTS",
+        default_value_t = false
+    )]
+    pub(crate) disk_cache_compact_transactions_parts: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// Race the local getSignaturesForAddress page against the primary's full page.
+    /// `false` awaits the local page first and asks the primary only for the remainder.
+    #[arg(
+        long,
+        env = "GSFA_RACE_PRIMARY",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) gsfa_race_primary: bool,
+
+    #[cfg(feature = "disk-cache")]
+    /// Budget for one local getTransaction attempt while the signature index has more
+    /// than 4 unknown-membership partitions (after a restart). Capped at the
+    /// getTransaction budget; set it equal to DISK_CACHE_GET_TX_TIMEOUT_MS to disable.
+    #[arg(long, env = "DISK_CACHE_GET_TX_UNKNOWN_TIMEOUT_MS", default_value_t = 150, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) disk_cache_get_tx_unknown_timeout_ms: u64,
+
+    #[cfg(feature = "disk-cache")]
     /// Shared cache budget for one address request, including cursor lookup and hydration.
     #[arg(long, env = "DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS", default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) disk_cache_address_query_timeout_ms: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// How long getSignaturesForAddress remembers that an address had no primary rows at or
+    /// below a finalized slot, so a repeat request is answered from the head and local tiers
+    /// when they prove the newer range. 0 disables the watermark cache.
+    #[arg(
+        long,
+        env = "DISK_CACHE_GSFA_EMPTY_WATERMARK_TTL_SECS",
+        default_value_t = 0
+    )]
+    pub(crate) disk_cache_gsfa_empty_watermark_ttl_secs: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Maximum addresses in the getSignaturesForAddress empty-address watermark cache
+    /// (about 128 bytes each).
+    #[arg(long, env = "DISK_CACHE_GSFA_EMPTY_WATERMARK_MAX_ENTRIES", default_value_t = 100_000, value_parser = clap::value_parser!(u64).range(1..=10_000_000))]
+    pub(crate) disk_cache_gsfa_empty_watermark_max_entries: u64,
 
     #[cfg(feature = "disk-cache")]
     /// Total partition routing index budget, including build buffers.
@@ -563,6 +817,13 @@ pub struct RpcConfig {
     /// Concurrent local interactive queries.
     #[arg(long, env = "DISK_CACHE_QUERY_CONCURRENCY", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=64))]
     pub(crate) disk_cache_query_concurrency: u64,
+
+    #[cfg(feature = "disk-cache")]
+    /// Concurrent local background reads (coverage reloads, fill count validation,
+    /// signature-membership scans). Defaults to min(query concurrency, 8), so raising
+    /// interactive concurrency above 8 does not also raise background load.
+    #[arg(long, env = "DISK_CACHE_BACKGROUND_QUERY_CONCURRENCY", value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub(crate) disk_cache_background_query_concurrency: Option<u64>,
 
     #[cfg(feature = "disk-cache")]
     /// Execution threads per local interactive query.
@@ -836,7 +1097,23 @@ impl RpcConfig {
             .iter()
             .any(|name| name == METRICS_CAPTURE_HEADER_X_ACCOUNT_ID)
     }
+
+    /// Background local-read lane size. Unset keeps the historical lane (equal to query
+    /// concurrency) up to 8 and stops it growing with interactive concurrency beyond that.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn disk_cache_background_query_concurrency(&self) -> u64 {
+        self.disk_cache_background_query_concurrency
+            .unwrap_or_else(|| {
+                self.disk_cache_query_concurrency
+                    .min(DEFAULT_DISK_CACHE_BACKGROUND_QUERY_CONCURRENCY_CAP)
+            })
+    }
 }
+
+/// Upper bound of the default background lane: the lane size every deployment had at the
+/// default `DISK_CACHE_QUERY_CONCURRENCY=8` before the lane was configurable.
+#[cfg(feature = "disk-cache")]
+const DEFAULT_DISK_CACHE_BACKGROUND_QUERY_CONCURRENCY_CAP: u64 = 8;
 
 /// Serializes tests that read or mutate process-global environment variables through
 /// `RpcConfig::parse_from`. Shared across test modules in this crate (e.g. `server::tests`,
@@ -959,6 +1236,38 @@ mod config_tests {
     }
 
     #[test]
+    fn signature_status_history_cache_flags() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.signature_status_history_cache_entries, 0);
+        assert_eq!(
+            cfg.signature_status_history_cache_max_bytes,
+            64 * 1024 * 1024
+        );
+        assert_eq!(cfg.signature_status_history_cache_ttl_secs, 300);
+
+        let _entries = EnvVarGuard::set("SIGNATURE_STATUS_HISTORY_CACHE_ENTRIES", "100000");
+        let _bytes = EnvVarGuard::set("SIGNATURE_STATUS_HISTORY_CACHE_MAX_BYTES", "1048576");
+        let _ttl = EnvVarGuard::set("SIGNATURE_STATUS_HISTORY_CACHE_TTL_SECS", "60");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.signature_status_history_cache_entries, 100_000);
+        assert_eq!(cfg.signature_status_history_cache_max_bytes, 1_048_576);
+        assert_eq!(cfg.signature_status_history_cache_ttl_secs, 60);
+
+        for ttl in ["0", "301"] {
+            assert!(
+                RpcConfig::try_parse_from([
+                    "superbank-rpc",
+                    "--signature-status-history-cache-ttl-secs",
+                    ttl,
+                ])
+                .is_err(),
+                "{ttl}"
+            );
+        }
+    }
+
+    #[test]
     fn signature_status_limits_cli_overrides() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let cfg = RpcConfig::parse_from([
@@ -984,8 +1293,19 @@ mod config_tests {
         assert_eq!(cfg.clickhouse_query_cache_ttl_seconds, 1);
         assert!(!cfg.clickhouse_query_cache_share_between_users);
         assert!(!cfg.clickhouse_query_condition_cache_enabled);
+        assert!(!cfg.clickhouse_get_transaction_single_round_trip);
+        assert!(cfg.clickhouse_latest_slot_hint);
+        assert!(!cfg.clickhouse_transactions_for_address_position_tokens);
+        assert!(!cfg.clickhouse_transactions_for_address_cursor_cache);
+        assert!(cfg.clickhouse_transactions_for_address_union_pushdown);
+        assert!(!cfg.clickhouse_gsfa_inline_cursor);
         assert!(!cfg.emit_http_errors);
         assert_eq!(cfg.get_block_response_cache_max_bytes, 0);
+        assert_eq!(cfg.get_transaction_primary_cache_max_bytes, 0);
+        assert_eq!(cfg.get_transaction_primary_cache_ttl_secs, 600);
+        assert!(cfg.get_block_response_cache_share_confirmed);
+        assert!(cfg.get_block_response_cache_unsupported_version);
+        assert_eq!(cfg.get_block_hydration_parallelism, 4);
         assert!(!cfg.rpc_response_gzip_enabled);
         assert!(!cfg.metrics_capture_x_endpoint());
         assert!(!cfg.metrics_capture_x_rpc_node());
@@ -999,6 +1319,7 @@ mod config_tests {
         assert_eq!(cfg.get_inflation_reward_max_threads, 2);
         assert_eq!(cfg.get_inflation_reward_max_memory_bytes, 536_870_912);
         assert_eq!(cfg.get_inflation_reward_max_bytes_to_read, 536_870_912);
+        assert_eq!(cfg.get_inflation_reward_epoch_cache_max_bytes, 16_777_216);
     }
 
     #[test]
@@ -1028,6 +1349,8 @@ mod config_tests {
             "268435456",
             "--get-inflation-reward-max-bytes-to-read",
             "1073741824",
+            "--get-inflation-reward-epoch-cache-max-bytes",
+            "0",
         ]);
 
         assert_eq!(cfg.get_inflation_reward_max_addresses, 50);
@@ -1036,6 +1359,7 @@ mod config_tests {
         assert_eq!(cfg.get_inflation_reward_max_threads, 4);
         assert_eq!(cfg.get_inflation_reward_max_memory_bytes, 268_435_456);
         assert_eq!(cfg.get_inflation_reward_max_bytes_to_read, 1_073_741_824);
+        assert_eq!(cfg.get_inflation_reward_epoch_cache_max_bytes, 0);
     }
 
     #[test]
@@ -1070,6 +1394,209 @@ mod config_tests {
     }
 
     #[test]
+    fn get_transaction_single_round_trip_flag_parses() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-get-transaction-single-round-trip",
+        ]);
+
+        assert!(cfg.clickhouse_get_transaction_single_round_trip);
+    }
+
+    #[test]
+    fn transactions_for_address_position_tokens_flag_and_env_parse() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-transactions-for-address-position-tokens",
+        ]);
+        assert!(cfg.clickhouse_transactions_for_address_position_tokens);
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvVarGuard::set(
+            "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_POSITION_TOKENS",
+            "true",
+        );
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert!(cfg.clickhouse_transactions_for_address_position_tokens);
+    }
+
+    #[test]
+    fn transactions_for_address_cursor_cache_flag_and_env_parse() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-transactions-for-address-cursor-cache",
+        ]);
+        assert!(cfg.clickhouse_transactions_for_address_cursor_cache);
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvVarGuard::set("CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_CURSOR_CACHE", "true");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert!(cfg.clickhouse_transactions_for_address_cursor_cache);
+    }
+
+    #[test]
+    fn gsfa_inline_cursor_env_parses() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvVarGuard::set("CLICKHOUSE_GSFA_INLINE_CURSOR", "true");
+
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+
+        assert!(cfg.clickhouse_gsfa_inline_cursor);
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn gsfa_empty_watermark_defaults_off_and_env_parses() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.disk_cache_gsfa_empty_watermark_ttl_secs, 0);
+        assert_eq!(cfg.disk_cache_gsfa_empty_watermark_max_entries, 100_000);
+
+        let _ttl = EnvVarGuard::set("DISK_CACHE_GSFA_EMPTY_WATERMARK_TTL_SECS", "600");
+        let _max = EnvVarGuard::set("DISK_CACHE_GSFA_EMPTY_WATERMARK_MAX_ENTRIES", "5000");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.disk_cache_gsfa_empty_watermark_ttl_secs, 600);
+        assert_eq!(cfg.disk_cache_gsfa_empty_watermark_max_entries, 5000);
+    }
+
+    #[test]
+    fn get_transaction_single_round_trip_env_parses() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvVarGuard::set("CLICKHOUSE_GET_TRANSACTION_SINGLE_ROUND_TRIP", "true");
+
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+
+        assert!(cfg.clickhouse_get_transaction_single_round_trip);
+    }
+
+    /// Rollout switches: default-on kill switches take an explicit value on the command
+    /// line, so each can be turned off by flag as well as by environment.
+    #[test]
+    fn rollout_switch_flags_parse() {
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--clickhouse-latest-slot-hint=false"]);
+        assert!(!cfg.clickhouse_latest_slot_hint);
+        assert!(!cfg.clickhouse_signatures_owner_shard_routing);
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-signatures-owner-shard-routing=true",
+        ]);
+        assert!(cfg.clickhouse_signatures_owner_shard_routing);
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--clickhouse-signatures-owner-shard-routing=yes please",
+            ])
+            .is_err()
+        );
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-block-response-cache-unsupported-version=false",
+        ]);
+        assert!(!cfg.get_block_response_cache_unsupported_version);
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-transactions-for-address-union-pushdown=false",
+        ]);
+        assert!(!cfg.clickhouse_transactions_for_address_union_pushdown);
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--clickhouse-latest-slot-hint", "true"]);
+        assert!(cfg.clickhouse_latest_slot_hint);
+        assert!(
+            RpcConfig::try_parse_from(["superbank-rpc", "--clickhouse-latest-slot-hint=maybe"])
+                .is_err()
+        );
+        #[cfg(feature = "grpc-head-cache")]
+        {
+            assert!(RpcConfig::parse_from(["superbank-rpc"]).get_blocks_clamp_to_head_tip);
+            let cfg =
+                RpcConfig::parse_from(["superbank-rpc", "--get-blocks-clamp-to-head-tip=false"]);
+            assert!(!cfg.get_blocks_clamp_to_head_tip);
+        }
+        #[cfg(feature = "disk-cache")]
+        {
+            let cfg = RpcConfig::parse_from([
+                "superbank-rpc",
+                "--disk-cache-fused-get-tx=false",
+                "--disk-cache-get-tx-span-check=false",
+                "--disk-cache-eviction-safe-hits=false",
+                "--disk-cache-status-span-query=false",
+                "--gsfa-race-primary=false",
+                "--disk-cache-compact-transactions-parts",
+            ]);
+            assert!(!cfg.disk_cache_fused_get_tx);
+            assert!(!cfg.disk_cache_get_tx_span_check);
+            assert!(!cfg.disk_cache_eviction_safe_hits);
+            assert!(!cfg.disk_cache_status_span_query);
+            assert!(!cfg.gsfa_race_primary);
+            assert!(cfg.disk_cache_compact_transactions_parts);
+        }
+    }
+
+    #[test]
+    fn rollout_switch_env_overrides() {
+        // Other tests parse defaults without ENV_LOCK. Isolate all env mutation.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::config_tests::rollout_switch_env_in_isolation",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[ignore = "run by rollout_switch_env_overrides in an isolated process"]
+    fn rollout_switch_env_in_isolation() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _hint = EnvVarGuard::set("CLICKHOUSE_LATEST_SLOT_HINT", "false");
+        let _unsupported =
+            EnvVarGuard::set("GET_BLOCK_RESPONSE_CACHE_UNSUPPORTED_VERSION", "false");
+        let _pushdown = EnvVarGuard::set(
+            "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN",
+            "false",
+        );
+        #[cfg(feature = "grpc-head-cache")]
+        let _clamp = EnvVarGuard::set("GET_BLOCKS_CLAMP_TO_HEAD_TIP", "false");
+        #[cfg(feature = "disk-cache")]
+        let _disk = [
+            EnvVarGuard::set("DISK_CACHE_FUSED_GET_TX", "false"),
+            EnvVarGuard::set("DISK_CACHE_GET_TX_SPAN_CHECK", "false"),
+            EnvVarGuard::set("DISK_CACHE_EVICTION_SAFE_HITS", "false"),
+            EnvVarGuard::set("DISK_CACHE_STATUS_SPAN_QUERY", "false"),
+            EnvVarGuard::set("GSFA_RACE_PRIMARY", "false"),
+            EnvVarGuard::set("DISK_CACHE_COMPACT_TRANSACTIONS_PARTS", "true"),
+        ];
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert!(!cfg.clickhouse_latest_slot_hint);
+        assert!(!cfg.get_block_response_cache_unsupported_version);
+        assert!(!cfg.clickhouse_transactions_for_address_union_pushdown);
+        #[cfg(feature = "grpc-head-cache")]
+        assert!(!cfg.get_blocks_clamp_to_head_tip);
+        #[cfg(feature = "disk-cache")]
+        {
+            assert!(!cfg.disk_cache_fused_get_tx);
+            assert!(!cfg.disk_cache_get_tx_span_check);
+            assert!(!cfg.disk_cache_eviction_safe_hits);
+            assert!(!cfg.disk_cache_status_span_query);
+            assert!(!cfg.gsfa_race_primary);
+            assert!(cfg.disk_cache_compact_transactions_parts);
+        }
+    }
+
+    #[test]
     fn emit_http_errors_flag_parses() {
         let cfg = RpcConfig::parse_from(["superbank-rpc", "--emit-http-errors"]);
 
@@ -1093,9 +1620,23 @@ mod config_tests {
             "--get-block-response-cache-max-bytes",
             "1073741824",
             "--rpc-response-gzip-enabled",
+            "--get-transaction-primary-cache-max-bytes",
+            "536870912",
+            "--get-transaction-primary-cache-ttl-secs",
+            "300",
         ]);
 
         assert_eq!(cfg.get_block_response_cache_max_bytes, 1_073_741_824);
+        assert_eq!(cfg.get_transaction_primary_cache_max_bytes, 536_870_912);
+        assert_eq!(cfg.get_transaction_primary_cache_ttl_secs, 300);
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--get-transaction-primary-cache-ttl-secs",
+                "0",
+            ])
+            .is_err()
+        );
         assert!(cfg.rpc_response_gzip_enabled);
     }
 
@@ -1246,6 +1787,36 @@ mod disk_cache_config_tests {
     }
 
     #[test]
+    fn get_tx_cache_budget_is_positive_and_independent() {
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--disk-cache-get-tx-timeout-ms", "750"]);
+        assert_eq!(cfg.disk_cache_get_tx_timeout_ms, 750);
+        assert_eq!(cfg.disk_cache_query_timeout_ms, 2_000);
+        assert!(
+            RpcConfig::try_parse_from(["superbank-rpc", "--disk-cache-get-tx-timeout-ms", "0"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn get_tx_unknown_cache_budget_is_positive_and_independent() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--disk-cache-get-tx-unknown-timeout-ms",
+            "300",
+        ]);
+        assert_eq!(cfg.disk_cache_get_tx_unknown_timeout_ms, 300);
+        assert_eq!(cfg.disk_cache_get_tx_timeout_ms, 1_000);
+        assert!(
+            RpcConfig::try_parse_from([
+                "superbank-rpc",
+                "--disk-cache-get-tx-unknown-timeout-ms",
+                "0"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn disk_cache_defaults() {
         let cfg = RpcConfig::parse_from(["superbank-rpc"]);
 
@@ -1256,6 +1827,14 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_max_bytes, 0);
         assert_eq!(cfg.disk_cache_partition_slots, None);
         assert_eq!(cfg.disk_cache_query_timeout_ms, 2_000);
+        assert_eq!(cfg.disk_cache_get_tx_timeout_ms, 1_000);
+        assert!(cfg.disk_cache_fused_get_tx);
+        assert!(cfg.disk_cache_get_tx_span_check);
+        assert!(cfg.disk_cache_eviction_safe_hits);
+        assert!(cfg.disk_cache_status_span_query);
+        assert!(!cfg.disk_cache_compact_transactions_parts);
+        assert!(cfg.gsfa_race_primary);
+        assert_eq!(cfg.disk_cache_get_tx_unknown_timeout_ms, 150);
         assert_eq!(cfg.disk_cache_address_query_timeout_ms, 100);
         assert!(cfg.disk_cache_memory_tables.is_empty());
         assert_eq!(cfg.disk_cache_memory_retain_slots, None);
@@ -1268,6 +1847,9 @@ mod disk_cache_config_tests {
         assert!(cfg.disk_cache_backfill_enabled);
         assert_eq!(cfg.disk_cache_backfill_slots_per_query, 8);
         assert_eq!(cfg.disk_cache_backfill_concurrency, 4);
+        assert_eq!(cfg.disk_cache_query_concurrency, 8);
+        assert_eq!(cfg.disk_cache_background_query_concurrency, None);
+        assert_eq!(cfg.disk_cache_background_query_concurrency(), 8);
         assert_eq!(cfg.disk_cache_backfill_max_slots_per_sec, 50);
         assert_eq!(cfg.disk_cache_backfill_query_timeout_ms, 30_000);
         assert_eq!(cfg.disk_cache_repair_interval_ms, 5_000);
@@ -1320,6 +1902,53 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_block_index_query_timeout_ms, 120_000);
         assert_eq!(cfg.disk_cache_backfill_max_slots_per_sec, 200);
         assert_eq!(cfg.disk_cache_backfill_concurrency, 12);
+    }
+
+    #[test]
+    fn disk_cache_background_lane_default_tracks_query_concurrency_up_to_eight() {
+        let lane = |args: &[&str]| {
+            let mut argv = vec!["superbank-rpc"];
+            argv.extend_from_slice(args);
+            RpcConfig::parse_from(argv).disk_cache_background_query_concurrency()
+        };
+        // Unset: identical to the historical lane (== query concurrency) through 8.
+        for q in 1..=8u64 {
+            let q_arg = q.to_string();
+            assert_eq!(lane(&["--disk-cache-query-concurrency", &q_arg]), q);
+        }
+        // Unset: independent of interactive concurrency above 8.
+        for q in ["9", "16", "24", "64"] {
+            assert_eq!(lane(&["--disk-cache-query-concurrency", q]), 8);
+        }
+        // Explicit values win in both directions.
+        assert_eq!(
+            lane(&[
+                "--disk-cache-query-concurrency",
+                "16",
+                "--disk-cache-background-query-concurrency",
+                "12",
+            ]),
+            12
+        );
+        assert_eq!(
+            lane(&[
+                "--disk-cache-query-concurrency",
+                "4",
+                "--disk-cache-background-query-concurrency",
+                "16",
+            ]),
+            16
+        );
+        for invalid in ["0", "65"] {
+            assert!(
+                RpcConfig::try_parse_from([
+                    "superbank-rpc",
+                    "--disk-cache-background-query-concurrency",
+                    invalid,
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

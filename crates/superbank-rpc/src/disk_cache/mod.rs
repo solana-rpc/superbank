@@ -30,6 +30,9 @@ use crate::solana_sdk;
 pub(crate) mod block_index;
 pub(crate) mod coverage;
 pub(crate) mod filler;
+// Used by the head-cache getSignaturesForAddress path only.
+#[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+pub(crate) mod gsfa_watermark;
 pub(crate) mod index;
 pub(crate) mod key_index;
 mod key_reads;
@@ -40,7 +43,8 @@ mod schema_settings;
 
 pub(crate) use block_index::{BlockIndexConfig, BlockTimeLookup};
 use coverage::CoverageMap;
-pub(crate) use index::DiskSigStatus;
+pub(crate) use index::{DiskSigStatus, DiskStatusLookup, DiskStatusLookups};
+pub(crate) use key_reads::{gsfa_tip_gap, tfa_tip_gap, tip_gap_covered};
 use schema::{CacheSchemaConfig, CacheTableKind, SourceSchemaSnapshot};
 
 const BYTE_BUDGET_LOW_WATER_PERCENT: u64 = 90;
@@ -76,10 +80,34 @@ pub(crate) struct DiskCacheConfig {
     pub(crate) max_bytes: u64,
     pub(crate) key_index_max_memory_bytes: u64,
     pub(crate) query_concurrency: usize,
+    /// Permits of the background lane shared by coverage, count-validation and membership reads.
+    pub(crate) background_query_concurrency: usize,
     pub(crate) query_max_threads: u64,
     pub(crate) partition_slots: u64,
     pub(crate) query_timeout: Duration,
+    /// Local getTransaction budget; the effective budget is capped at `query_timeout`.
+    pub(crate) get_tx_timeout: Duration,
+    /// One-query local getTransaction read before the two-step lookup (`DISK_CACHE_FUSED_GET_TX`).
+    pub(crate) fused_get_tx: bool,
+    /// Span position check before the per-partition probes after an empty fused read
+    /// (`DISK_CACHE_GET_TX_SPAN_CHECK`).
+    pub(crate) get_tx_span_check: bool,
+    /// Serve found getTransaction rows across an eviction-only epoch bump
+    /// (`DISK_CACHE_EVICTION_SAFE_HITS`); off, eviction invalidates every in-flight read.
+    pub(crate) eviction_safe_hits: bool,
+    /// One span query for signature statuses (`DISK_CACHE_STATUS_SPAN_QUERY`).
+    pub(crate) status_span_query: bool,
+    /// Compact `transactions` part layout (`DISK_CACHE_COMPACT_TRANSACTIONS_PARTS`).
+    pub(crate) compact_transactions_parts: bool,
+    /// Race the local getSignaturesForAddress page against the primary (`GSFA_RACE_PRIMARY`).
+    pub(crate) gsfa_race_primary: bool,
+    /// Local getTransaction budget while the signature index has many unknown-membership
+    /// partitions (after a restart); capped at the effective `get_tx_timeout` budget.
+    pub(crate) get_tx_unknown_timeout: Duration,
     pub(crate) address_query_timeout: Duration,
+    /// getSignaturesForAddress empty-address watermark TTL; zero disables it.
+    pub(crate) gsfa_empty_watermark_ttl: Duration,
+    pub(crate) gsfa_empty_watermark_max_entries: usize,
     pub(crate) schema_check_interval: Duration,
     pub(crate) memory_blocks_metadata: bool,
     pub(crate) memory_retain_slots: Option<u64>,
@@ -95,6 +123,7 @@ impl DiskCacheConfig {
             memory_blocks_metadata: self.memory_blocks_metadata,
             memory_retain_slots: self.memory_retain_slots,
             memory_max_bytes: self.memory_max_bytes,
+            compact_transactions_parts: self.compact_transactions_parts,
         }
     }
 }
@@ -260,6 +289,8 @@ pub(crate) struct DiskCacheInner {
     key_index: Arc<key_index::KeyIndex>,
     min_retained: AtomicU64,
     ready: AtomicBool,
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    gsfa_watermarks: gsfa_watermark::GsfaWatermarks,
 }
 
 impl DiskCache {
@@ -294,6 +325,7 @@ impl DiskCache {
                 block_index: index.map(Arc::new),
                 min_retained: AtomicU64::new(0),
                 ready: AtomicBool::new(true),
+                gsfa_watermarks: gsfa_watermark::GsfaWatermarks::new(Duration::ZERO, 1),
             }),
         }
     }
@@ -352,12 +384,22 @@ impl DiskCache {
             .with_startup_table_check(ClickHouseStartupTableCheck::Exists),
         );
         local.use_table_names(table_names);
-        local.read_endpoint = local.read_endpoint.with_target("cache");
+        // Serving reads are bounded server-side (see `releasing_on_abandon`); holding their
+        // few permits until an abandoned read is verified gone starved live requests.
+        local.read_endpoint = local
+            .read_endpoint
+            .with_target("cache")
+            .releasing_on_abandon();
         local.client = local
             .client
             .clone()
             .with_setting("max_threads", cfg.query_max_threads.to_string());
         local.set_blocks_metadata_supports_prewhere(!cfg.memory_blocks_metadata);
+        // Local gTFA reads share the query builder, so they follow the primary's
+        // CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN setting.
+        local.set_transactions_for_address_union_pushdown(
+            source.transactions_for_address_union_pushdown,
+        );
 
         let snapshot = bootstrap_schema(&cfg, source, &admin, &mut local).await?;
         let block_index = match cfg.block_index.clone() {
@@ -369,10 +411,17 @@ impl DiskCache {
 
         let key_index = Arc::new(key_index::KeyIndex::new(&cfg));
         // Persist admission across retries; long scans have dedicated single-reader lanes.
-        let maintenance_reader = local.background_read_client(cfg.query_concurrency);
+        // Sized apart from serving reads so raising interactive concurrency does not also
+        // raise background load on the local server (notably during refills).
+        let maintenance_reader = local.background_read_client(cfg.background_query_concurrency);
         let address_index_reader = local.background_read_client(1);
         let signature_index_reader = local.background_read_client(1);
+        let gsfa_watermarks = gsfa_watermark::GsfaWatermarks::new(
+            cfg.gsfa_empty_watermark_ttl,
+            cfg.gsfa_empty_watermark_max_entries,
+        );
         let inner = Arc::new(DiskCacheInner {
+            gsfa_watermarks,
             key_index,
             cfg,
             admin,
@@ -407,6 +456,11 @@ impl DiskCache {
         self.inner.ready.load(Ordering::Acquire)
     }
 
+    /// `GSFA_RACE_PRIMARY`: race the local getSignaturesForAddress page against the primary.
+    pub(crate) fn gsfa_race_primary(&self) -> bool {
+        self.inner.cfg.gsfa_race_primary
+    }
+
     pub(crate) fn required(&self) -> bool {
         self.inner.cfg.required
     }
@@ -438,6 +492,12 @@ impl DiskCache {
     pub(crate) fn set_ready(&self, ready: bool) {
         self.inner.ready.store(ready, Ordering::Release);
         crate::metrics::disk_cache_set_active(ready);
+    }
+
+    /// getSignaturesForAddress empty-address watermarks (see [`gsfa_watermark`]).
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    pub(crate) fn gsfa_watermarks(&self) -> &gsfa_watermark::GsfaWatermarks {
+        &self.inner.gsfa_watermarks
     }
 
     pub(crate) fn tip_span(&self) -> Option<(u64, u64)> {
@@ -1110,7 +1170,12 @@ impl DiskCache {
         if new_floor <= old_floor {
             return Ok(false);
         }
-        self.inner.key_index.invalidate_reads();
+        // Eviction deletes rows only below the new floor and rewrites none: a row an
+        // in-flight read already found is finalized data, and `covers_slot` rejects its
+        // slot once `min_retained` moves. Only in-flight negatives must be discarded.
+        self.inner
+            .key_index
+            .invalidate_for_eviction(self.inner.cfg.eviction_safe_hits);
         let _mutation = self.inner.key_index.mutation(0, new_floor - 1);
         self.drop_partitions_below(new_floor).await?;
         self.inner.key_index.evict_signatures(new_floor);
@@ -1213,10 +1278,16 @@ async fn bootstrap_schema(
         .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
     let schema_config = cfg.schema_config();
     let snapshot = schema::inspect_source_schema(source, &schema_config).await?;
-    let rebuilt = schema::initialize_cache_schema(admin, &snapshot, &schema_config).await?;
-    if rebuilt {
+    let outcome = schema::initialize_cache_schema(admin, &snapshot, &schema_config).await?;
+    if outcome.wiped() {
         crate::metrics::disk_cache_wipe();
     }
+    crate::metrics::disk_cache_bootstrap(outcome.as_str());
+    info!(
+        outcome = outcome.as_str(),
+        database = %cfg.database,
+        "disk cache: schema bootstrap"
+    );
     local
         .initialize_read_cancellation()
         .await

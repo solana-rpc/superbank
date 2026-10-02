@@ -25,6 +25,7 @@ use crate::clickhouse::{
     SignatureSlot, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
     TransactionStatusFilter, TransactionsForAddressQuery,
 };
+use crate::get_transaction_primary_cache::PrimaryTransactionCacheKey;
 use crate::handlers::{
     RouteMetric,
     types::{
@@ -152,6 +153,7 @@ async fn resolve_signature_slot_for_bounds(
     state: &AppState,
     route: &mut RouteMetric,
     signature: &str,
+    cursor_cache_eligible: bool,
     #[cfg(feature = "disk-cache")] disk_request: Option<(
         &Arc<crate::disk_cache::DiskCache>,
         tokio::time::Instant,
@@ -181,6 +183,19 @@ async fn resolve_signature_slot_for_bounds(
         }
     }
 
+    // A page this node served ended at this signature: continue from that row's
+    // position without a primary lookup (opt-in; see the cursor cache flag).
+    // Only for a pagination cursor: filter bounds always resolve through
+    // `signatures`, so their results never depend on this node's cache state.
+    if cursor_cache_eligible
+        && let Some(position) = state
+            .clickhouse
+            .transactions_for_address_cursor(signature)
+            .await
+    {
+        return Ok((Some(position), QueryTimings::zero()));
+    }
+
     route.source_clickhouse();
     state.clickhouse.get_signature_slot(signature).await
 }
@@ -207,6 +222,22 @@ fn unique_bound_signatures(query: &TransactionsForAddressQuery) -> Vec<&str> {
         }
     }
     signatures
+}
+
+/// Whether `signature` may resolve from the gTFA cursor cache: it is the
+/// pagination cursor and no signature filter bound shares its (deduplicated)
+/// lookup.
+fn cursor_cache_eligible(query: &TransactionsForAddressQuery, signature: &str) -> bool {
+    let is_cursor = matches!(
+        &query.pagination,
+        Some(PaginationToken::Signature(cursor)) if cursor == signature
+    );
+    let is_filter_bound = query.signature_filter.as_ref().is_some_and(|filter| {
+        [&filter.gte, &filter.gt, &filter.lte, &filter.lt]
+            .into_iter()
+            .any(|bound| bound.as_deref() == Some(signature))
+    });
+    is_cursor && !is_filter_bound
 }
 
 /// Called only after every unique lookup succeeds. None is a confirmed miss;
@@ -253,7 +284,7 @@ fn unsupported_transaction_version_message(version: u8) -> String {
 /// Hydrate a stored record and build the JSON-RPC response; shared by the
 /// head-cache, disk-cache, and ClickHouse branches of getTransaction.
 #[allow(clippy::too_many_arguments)]
-async fn respond_with_hydrated_transaction(
+pub(crate) async fn respond_with_hydrated_transaction(
     state: &AppState,
     id: Value,
     route: &mut RouteMetric,
@@ -390,9 +421,6 @@ pub(crate) async fn handle_get_transaction(
             None,
         ));
     }
-    #[cfg(not(feature = "grpc-head-cache"))]
-    let _ = signature;
-
     let parsed_config = match params.into_iter().next() {
         Some(config_value) => match parse_get_transaction_config_value(config_value) {
             Ok(parsed) => parsed,
@@ -500,6 +528,32 @@ pub(crate) async fn handle_get_transaction(
         }
     }
 
+    // The primary holds finalized history and is read without regard to the requested
+    // commitment, so a record it returned is served here for any commitment, as a repeat primary
+    // read would be. Pinned and unpinned reads keep separate entries (different queries).
+    let primary_cache_key = PrimaryTransactionCacheKey {
+        signature: *signature.as_array(),
+        pinned_slot: requested_slot,
+    };
+    if let Some(record) = state
+        .get_transaction_primary_cache
+        .get(&primary_cache_key)
+        .await
+    {
+        route.source_response_cache();
+        return respond_with_hydrated_transaction(
+            state.as_ref(),
+            id,
+            &mut route,
+            signature_str,
+            record,
+            encoding,
+            config.max_supported_transaction_version,
+            None,
+        )
+        .await;
+    }
+
     route.source_clickhouse();
     let transaction_result = if let Some(slot) = requested_slot {
         state
@@ -535,18 +589,76 @@ pub(crate) async fn handle_get_transaction(
         add_downstream_header(&mut resp, &timings);
         return Ok(resp);
     };
+    observe_primary_slot_age(state.as_ref(), record.slot);
+    let record = Arc::new(record);
+    state
+        .get_transaction_primary_cache
+        .insert(primary_cache_key, record.clone())
+        .await;
 
     respond_with_hydrated_transaction(
         state.as_ref(),
         id,
         &mut route,
         signature_str,
-        Arc::new(record),
+        record,
         encoding,
         config.max_supported_transaction_version,
         Some(timings),
     )
     .await
+}
+
+/// A cached tip older than this is skipped rather than recorded as a skewed age.
+const PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS: u64 = 10 * 60 * 1000;
+
+/// Records the age of a primary-served transaction against the finalized tip, which sizes
+/// disk-cache retention. It reads the head cache's finalized tip, or the latest-slot cache when
+/// the head cache has none, without refreshing either, so it adds no query.
+fn observe_primary_slot_age(state: &AppState, slot: u64) {
+    // The finalized slot can fall outside a small `HEAD_CACHE_RETAIN_SLOTS` window; the head's
+    // processed tip is then a few dozen slots ahead, far below the smallest (216,000-slot) bucket.
+    #[cfg(feature = "grpc-head-cache")]
+    let head_tip = state.head_cache.as_ref().map_or(0, |cache| {
+        match cache.latest_slot_at_least(CommitmentLevel::Finalized) {
+            0 => cache.latest_slot(),
+            finalized => finalized,
+        }
+    });
+    #[cfg(not(feature = "grpc-head-cache"))]
+    let head_tip = 0;
+    let cache = &state.latest_slot_cache;
+    match primary_slot_age_tip(
+        head_tip,
+        cache.value.load(std::sync::atomic::Ordering::Relaxed),
+        cache
+            .last_updated_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        crate::util::current_time_millis(),
+    ) {
+        Ok(tip) => metrics::get_transaction_primary_slot_age(tip.saturating_sub(slot)),
+        Err(reason) => metrics::get_transaction_primary_slot_age_skipped(reason),
+    }
+}
+
+/// Picks the finalized tip for [`observe_primary_slot_age`]: the head cache's when it has one,
+/// otherwise the latest-slot cache's while it is set and fresh. The error is the skip reason.
+fn primary_slot_age_tip(
+    head_tip: u64,
+    cached_tip: u64,
+    cached_updated_ms: u64,
+    now_ms: u64,
+) -> Result<u64, &'static str> {
+    if head_tip > 0 {
+        return Ok(head_tip);
+    }
+    if cached_tip == 0 {
+        return Err("no_tip");
+    }
+    if now_ms.saturating_sub(cached_updated_ms) > PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS {
+        return Err("stale_tip");
+    }
+    Ok(cached_tip)
 }
 
 pub(crate) async fn handle_get_transactions_for_address(
@@ -966,6 +1078,7 @@ pub(crate) async fn handle_get_transactions_for_address(
             state.as_ref(),
             &mut route,
             signature,
+            cursor_cache_eligible(&query, signature),
             #[cfg(feature = "disk-cache")]
             disk_request,
         )
@@ -1083,7 +1196,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                             memo: meta.memo.clone(),
                             block_time: meta.block_time,
                             confirmation_status: Some(
-                                cache.confirmation_status_string(meta.pos.slot).to_string(),
+                                cache.confirmation_status_string(meta).to_string(),
                             ),
                         })
                         .collect::<Vec<_>>();
@@ -1327,6 +1440,39 @@ pub(crate) async fn handle_get_transactions_for_address(
         .await
     };
 
+    // A descending page starts at the local tip, which trails the source's finalized
+    // tip: rows owed above it come only from the head merge below, or else the whole
+    // page from ClickHouse (a `slot < floor` remainder would skip them too). The head
+    // counts only for a page that skips ClickHouse, so no await separates this check
+    // from the head read; a page that reached the floor queries ClickHouse anyway.
+    #[cfg(feature = "disk-cache")]
+    let disk_page = disk_page.filter(|page| {
+        #[cfg(feature = "grpc-head-cache")]
+        let head_floor = || {
+            let head = head_cache?;
+            let merges_whole_gap = !page.reached_floor
+                && query.token_accounts == TokenAccountsFilter::None
+                && query.signature_filter.is_none()
+                && query.block_time_filter.is_none()
+                && !matches!(query.pagination, Some(PaginationToken::Signature(_)))
+                // The head merge filters these after taking `limit` rows.
+                && query.slot_filter.is_none()
+                && query.status == TransactionStatusFilter::Any;
+            if !merges_whole_gap {
+                return None;
+            }
+            let chain_floor = head.chain_floor(min_commitment);
+            head.address_floor(&address_pubkey, chain_floor)
+        };
+        #[cfg(not(feature = "grpc-head-cache"))]
+        let head_floor = || None;
+        crate::disk_cache::tip_gap_covered(
+            "transactions_for_address",
+            crate::disk_cache::tfa_tip_gap(page.tip, &query),
+            head_floor,
+        )
+    });
+
     #[cfg(feature = "disk-cache")]
     let (skip_clickhouse, clickhouse_query) = match disk_page.as_ref() {
         Some(page)
@@ -1519,9 +1665,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                     err: meta.err.clone(),
                     memo: meta.memo.clone(),
                     block_time: meta.block_time,
-                    confirmation_status: cache
-                        .confirmation_status_string(meta.pos.slot)
-                        .to_string(),
+                    confirmation_status: cache.confirmation_status_string(&meta).to_string(),
                 });
             }
 
@@ -1541,17 +1685,46 @@ pub(crate) async fn handle_get_transactions_for_address(
         }
     }
 
+    // Head and disk rows always return a position token. ClickHouse rows return
+    // their signature unless position tokens are enabled; a signature token
+    // costs the next page a signature-position lookup (a primary round trip
+    // for rows older than the local caches).
+    let clickhouse_position_tokens = state.clickhouse.transactions_for_address_position_tokens();
+
     if transaction_details == TransactionsForAddressDetails::Signatures {
+        if let Some(record) = merged_records.last()
+            && record.source == RecordSource::ClickHouse
+        {
+            state
+                .clickhouse
+                .remember_transactions_for_address_cursor(
+                    &record.signature,
+                    SignatureSlot {
+                        slot: record.slot,
+                        slot_idx: record.slot_idx,
+                    },
+                )
+                .await;
+        }
+
         #[cfg(feature = "grpc-head-cache")]
         let pagination_token = merged_records.last().map(|record| match record.source {
-            RecordSource::ClickHouse => record.signature.clone(),
-            RecordSource::Head => format!("{}:{}", record.slot, record.slot_idx),
+            RecordSource::ClickHouse if !clickhouse_position_tokens => record.signature.clone(),
+            RecordSource::ClickHouse | RecordSource::Head => {
+                format!("{}:{}", record.slot, record.slot_idx)
+            }
             #[cfg(feature = "disk-cache")]
             RecordSource::Disk => format!("{}:{}", record.slot, record.slot_idx),
         });
 
         #[cfg(not(feature = "grpc-head-cache"))]
-        let pagination_token = merged_records.last().map(|record| record.signature.clone());
+        let pagination_token = merged_records.last().map(|record| {
+            if clickhouse_position_tokens {
+                format!("{}:{}", record.slot, record.slot_idx)
+            } else {
+                record.signature.clone()
+            }
+        });
 
         let data = merged_records
             .into_iter()
@@ -1692,13 +1865,16 @@ pub(crate) async fn handle_get_transactions_for_address(
         /// ClickHouse signature cursor).
         #[cfg(feature = "grpc-head-cache")]
         position_token: bool,
+        from_clickhouse: bool,
         stored: Arc<crate::clickhouse::StoredTransactionRecord>,
     }
 
     let mut inputs = Vec::with_capacity(merged_records.len());
     for record in merged_records {
         #[cfg(feature = "grpc-head-cache")]
-        let position_token = record.source != RecordSource::ClickHouse;
+        let position_token =
+            clickhouse_position_tokens || record.source != RecordSource::ClickHouse;
+        let from_clickhouse = record.source == RecordSource::ClickHouse;
         let stored = match record.source {
             RecordSource::ClickHouse => {
                 let Some(stored) = transaction_map.remove(&record.signature) else {
@@ -1739,6 +1915,7 @@ pub(crate) async fn handle_get_transactions_for_address(
             signature: record.signature,
             #[cfg(feature = "grpc-head-cache")]
             position_token,
+            from_clickhouse,
             stored,
         });
     }
@@ -1764,6 +1941,8 @@ pub(crate) async fn handle_get_transactions_for_address(
 
         let mut data = Vec::with_capacity(inputs.len());
         let mut pagination_token = None;
+        // Position of the row the token names, when it came from ClickHouse.
+        let mut clickhouse_cursor = None;
         for input in inputs {
             let encoded = match hydrate_transaction_record(
                 input.stored.as_ref(),
@@ -1780,6 +1959,15 @@ pub(crate) async fn handle_get_transactions_for_address(
                 }
             };
 
+            clickhouse_cursor = input.from_clickhouse.then(|| {
+                (
+                    input.signature.clone(),
+                    SignatureSlot {
+                        slot: input.slot,
+                        slot_idx: input.slot_idx,
+                    },
+                )
+            });
             data.push(TransactionsForAddressFullInfo {
                 slot: input.slot,
                 transaction_index: input.slot_idx,
@@ -1799,11 +1987,15 @@ pub(crate) async fn handle_get_transactions_for_address(
             }
             #[cfg(not(feature = "grpc-head-cache"))]
             {
-                pagination_token = Some(input.signature);
+                pagination_token = Some(if clickhouse_position_tokens {
+                    format!("{}:{}", input.slot, input.slot_idx)
+                } else {
+                    input.signature
+                });
             }
         }
 
-        Ok::<_, HydrationFailure>((data, pagination_token))
+        Ok::<_, HydrationFailure>((data, pagination_token, clickhouse_cursor))
     })
     .await
     {
@@ -1841,7 +2033,13 @@ pub(crate) async fn handle_get_transactions_for_address(
         }
     };
 
-    let (data, pagination_token) = hydrated;
+    let (data, pagination_token, clickhouse_cursor) = hydrated;
+    if let Some((signature, position)) = clickhouse_cursor {
+        state
+            .clickhouse
+            .remember_transactions_for_address_cursor(&signature, position)
+            .await;
+    }
 
     let result = TransactionsForAddressResult {
         data,
@@ -1932,6 +2130,27 @@ mod tests {
             query.signature_filter.is_some(),
             "retain cache eligibility metadata"
         );
+    }
+
+    #[test]
+    fn cursor_cache_only_resolves_an_unshared_pagination_cursor() {
+        let mut query = address_query_with_duplicate_bounds();
+        query.pagination = Some(PaginationToken::Signature("cursor".into()));
+        assert!(cursor_cache_eligible(&query, "cursor"));
+        assert!(!cursor_cache_eligible(&query, "shared"));
+        assert!(!cursor_cache_eligible(&query, "other"));
+        // A cursor that is also a filter bound shares one lookup, which must
+        // resolve through `signatures` like any filter bound.
+        let mut shared = address_query_with_duplicate_bounds();
+        assert!(matches!(
+            &shared.pagination,
+            Some(PaginationToken::Signature(cursor)) if cursor == "shared"
+        ));
+        assert!(!cursor_cache_eligible(&shared, "shared"));
+        shared.signature_filter = None;
+        assert!(cursor_cache_eligible(&shared, "shared"));
+        shared.pagination = Some(PaginationToken::SlotIndex { slot: 40, idx: 3 });
+        assert!(!cursor_cache_eligible(&shared, "shared"));
     }
 
     #[test]
@@ -2067,5 +2286,26 @@ mod tests {
             err,
             "Invalid params: untilSlot cannot be combined with filters.slot.gt or filters.slot.gte"
         );
+    }
+
+    #[test]
+    fn primary_slot_age_tip_prefers_head_cache_then_fresh_cached_tip() {
+        let now = 1_000_000_000;
+        let fresh = now - 1_000;
+        let stale = now - PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS - 1;
+        // The head cache's finalized tip wins, even over an empty or stale latest-slot cache.
+        assert_eq!(primary_slot_age_tip(500, 400, fresh, now), Ok(500));
+        assert_eq!(primary_slot_age_tip(500, 0, 0, now), Ok(500));
+        assert_eq!(primary_slot_age_tip(500, 400, stale, now), Ok(500));
+        // Without one, the latest-slot cache counts only while set and fresh.
+        assert_eq!(primary_slot_age_tip(0, 400, fresh, now), Ok(400));
+        assert_eq!(
+            primary_slot_age_tip(0, 400, now - PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS, now),
+            Ok(400)
+        );
+        assert_eq!(primary_slot_age_tip(0, 400, stale, now), Err("stale_tip"));
+        assert_eq!(primary_slot_age_tip(0, 0, fresh, now), Err("no_tip"));
+        // An update stamped after `now` (clock step) is fresh, not an underflow.
+        assert_eq!(primary_slot_age_tip(0, 400, now + 5, now), Ok(400));
     }
 }

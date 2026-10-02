@@ -55,6 +55,8 @@ pub(crate) const ROUTE_OUTCOME_INVALID_PARAMS: &str = "invalid_params";
 pub(crate) const ROUTE_OUTCOME_RPC_ERROR: &str = "rpc_error";
 pub(crate) const ROUTE_OUTCOME_BACKEND_ERROR: &str = "backend_error";
 pub(crate) const ROUTE_OUTCOME_TIMEOUT: &str = "timeout";
+/// The handler future was dropped before it returned, e.g. the caller disconnected.
+pub(crate) const ROUTE_OUTCOME_ABANDONED: &str = "abandoned";
 const ROUTE_HEADER_LABEL_MISSING: &str = "missing";
 const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
 const JSON_RPC_REQUEST_TIMEOUT_CODE: i64 = -32000;
@@ -151,6 +153,25 @@ fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
 
 tokio::task_local! {
     static RESPONSE_HEADER_METRICS_CONTEXT: Arc<ResponseHeaderMetricsContext>;
+}
+
+tokio::task_local! {
+    /// Present only while the dispatcher polls a handler. A handler's locals drop inside
+    /// that poll when it returns, and outside it when the handler future itself is dropped.
+    static HANDLER_POLL: ();
+}
+
+fn in_handler_poll() -> bool {
+    HANDLER_POLL.try_with(|_| ()).is_ok()
+}
+
+/// Polls `handler` inside [`HANDLER_POLL`] so a [`RouteMetric`] can tell a handler that
+/// returned from one that was dropped mid-flight.
+fn mark_handler_polls<F>(mut handler: std::pin::Pin<Box<F>>) -> impl Future<Output = F::Output>
+where
+    F: Future + ?Sized,
+{
+    std::future::poll_fn(move |cx| HANDLER_POLL.sync_scope((), || handler.as_mut().poll(cx)))
 }
 
 async fn with_response_header_metrics_context<F, T>(
@@ -339,6 +360,8 @@ pub(crate) struct RouteMetric {
     outcome: &'static str,
     started: Instant,
     timeout: std::time::Duration,
+    /// Created by a handler the JSON-RPC dispatcher is polling.
+    dispatched: bool,
     x_endpoint: Option<String>,
     x_rpc_node: Option<String>,
     x_subscription_id: Option<String>,
@@ -359,6 +382,7 @@ impl RouteMetric {
             outcome: ROUTE_OUTCOME_BACKEND_ERROR,
             started: Instant::now(),
             timeout: state.rpc_request_timeout,
+            dispatched: in_handler_poll(),
             x_endpoint: request_headers.x_endpoint,
             x_rpc_node: request_headers.x_rpc_node,
             x_subscription_id: request_headers.x_subscription_id,
@@ -443,15 +467,28 @@ impl RouteMetric {
     }
 }
 
+/// `backend_error` is the unset default, so it also covers handlers that never finished:
+/// past the request timeout that is a timeout, and a dispatched handler dropped outside its
+/// poll was abandoned by its caller. Explicit outcomes always stand.
+fn route_drop_outcome(outcome: &'static str, timed_out: bool, dropped: bool) -> &'static str {
+    if outcome != ROUTE_OUTCOME_BACKEND_ERROR {
+        outcome
+    } else if timed_out {
+        ROUTE_OUTCOME_TIMEOUT
+    } else if dropped {
+        ROUTE_OUTCOME_ABANDONED
+    } else {
+        outcome
+    }
+}
+
 impl Drop for RouteMetric {
     fn drop(&mut self) {
-        let outcome = if self.outcome == ROUTE_OUTCOME_BACKEND_ERROR
-            && self.started.elapsed() >= self.timeout
-        {
-            ROUTE_OUTCOME_TIMEOUT
-        } else {
-            self.outcome
-        };
+        let outcome = route_drop_outcome(
+            self.outcome,
+            self.started.elapsed() >= self.timeout,
+            self.dispatched && !in_handler_poll(),
+        );
         metrics::route(metrics::RouteMetricLabels {
             method: self.method,
             transport: self.transport,
@@ -961,6 +998,7 @@ async fn dispatch_json_rpc_request(
             )),
         }
     });
+    let dispatch = mark_handler_polls(dispatch);
     let result = if let Some(timeout) = timeout {
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(result) => result,
@@ -1702,5 +1740,63 @@ mod tests {
 
         let err = validate_json_rpc_response_value(&value).expect_err("expected invalid response");
         assert_eq!(err, "response error code field is missing or invalid");
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn route_drop_outcome_distinguishes_timeout_and_abandonment() {
+        let unset = ROUTE_OUTCOME_BACKEND_ERROR;
+        assert_eq!(
+            route_drop_outcome(unset, false, false),
+            ROUTE_OUTCOME_BACKEND_ERROR
+        );
+        assert_eq!(
+            route_drop_outcome(unset, false, true),
+            ROUTE_OUTCOME_ABANDONED
+        );
+        // A request dropped at its timeout is a timeout, not an abandonment.
+        assert_eq!(route_drop_outcome(unset, true, true), ROUTE_OUTCOME_TIMEOUT);
+        assert_eq!(
+            route_drop_outcome(unset, true, false),
+            ROUTE_OUTCOME_TIMEOUT
+        );
+        for explicit in [ROUTE_OUTCOME_SUCCESS, ROUTE_OUTCOME_RPC_ERROR] {
+            assert_eq!(route_drop_outcome(explicit, true, true), explicit);
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_poll_marker_separates_return_from_drop() {
+        struct Probe(Arc<std::sync::Mutex<Vec<bool>>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push(in_handler_poll());
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(!in_handler_poll());
+
+        let probe = Probe(seen.clone());
+        mark_handler_polls(Box::pin(async move {
+            let _probe = probe;
+            tokio::task::yield_now().await;
+        }))
+        .await;
+
+        let probe = Probe(seen.clone());
+        let dropped = mark_handler_polls(Box::pin(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), dropped)
+                .await
+                .is_err()
+        );
+        assert_eq!(*seen.lock().unwrap(), [true, false]);
     }
 }

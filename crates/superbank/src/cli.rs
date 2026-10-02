@@ -1707,6 +1707,13 @@ fn merge_option<T>(
 }
 
 #[cfg(test)]
+pub(crate) fn test_args() -> Args {
+    let mut args = tests::fumarole_args();
+    args.source = IngestSource::Grpc;
+    args
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
@@ -2150,7 +2157,7 @@ rpc-from-slot: 456
         );
     }
 
-    fn fumarole_args() -> Args {
+    pub(super) fn fumarole_args() -> Args {
         Args {
             source: IngestSource::Fumarole,
             endpoint: None,

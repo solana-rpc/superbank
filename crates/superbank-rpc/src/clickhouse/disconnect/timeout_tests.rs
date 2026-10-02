@@ -73,7 +73,12 @@ impl Fixture {
             .with_validation(false)
             .with_compression(clickhouse::Compression::None);
         Self {
-            verifier: DisconnectVerifier::new(client, Some("{cluster}".into()), timeouts),
+            verifier: DisconnectVerifier::new(
+                client,
+                Some("{cluster}".into()),
+                timeouts,
+                PendingBudget::for_admission(usize::MAX),
+            ),
             delays,
             requests,
             server,

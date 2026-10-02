@@ -7,10 +7,11 @@ use std::{
     collections::HashMap,
     fs,
     num::{NonZeroU8, NonZeroUsize},
+    sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use clickhouse::Client as ClickHouseClient;
 use futures::StreamExt;
 use prost::Message as _;
@@ -34,19 +35,9 @@ use yellowstone_grpc_proto::prelude::{
 use crate::cli::{Args, FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP, FromSlotSpec};
 use crate::clickhouse::{InsertTables, build_clickhouse_client, fetch_latest_slot_from_blocks};
 use crate::commitment::parse_durable_commitment;
-use crate::ingest::grpc::{BufferedRows, process_update};
+use crate::ingest::grpc::{BufferedRows, process_update, validate_block_completeness};
 use crate::metrics;
 use crate::shutdown::spawn_shutdown_watch;
-
-// Fumarole 0.7.1 exports Yellowstone 12.6 updates. The 4.3 block mapper
-// consumes the compatible wire envelope while finalized-only Fumarole remains
-// on the legacy producer protocol. Fields unknown to 12.6 are unavailable.
-fn upgrade_update(
-    update: SubscribeUpdate,
-) -> Result<yellowstone_grpc_proto_43::prelude::SubscribeUpdate> {
-    yellowstone_grpc_proto_43::prelude::SubscribeUpdate::decode(update.encode_to_vec().as_slice())
-        .context("decode Fumarole update with Agave 4.3 Yellowstone schema")
-}
 
 pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
     let endpoint = fumarole_endpoint(args)?;
@@ -108,7 +99,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
     let (_sink, stream) = subscription.split();
     let mut stream = stream;
     let track_estimated_bytes = args.fumarole_memory_soft_limit_bytes > 0;
-    let mut block_assembler = FumaroleBlockAssembler::new(track_estimated_bytes);
+    let mut block_assembler = FumaroleBlockAssembler::new(track_estimated_bytes, include_entries);
     let mut pressure_guard = FumarolePressureGuard::new(args.fumarole_memory_soft_limit_bytes);
     pressure_guard.observe(&block_assembler);
 
@@ -139,6 +130,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                     &insert_tables,
                     &mut buffered_rows,
                     &mut stream,
+                    &block_assembler,
                     false,
                 )
                 .await?;
@@ -160,6 +152,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                     &insert_tables,
                     &mut buffered_rows,
                     &mut stream,
+                    &block_assembler,
                     &reason,
                 )
                 .await?;
@@ -170,8 +163,8 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                     Some(Ok(event)) => {
                         reset_idle_timer(idle_timer.as_mut(), idle_timeout);
                         match event {
-                            FumaroleEvent::Data { slot, update } => {
-                                match block_assembler.handle_update(slot, update)? {
+                            FumaroleEvent::Data { slot, blockhash, update } => {
+                                match block_assembler.handle_update((slot, blockhash), update)? {
                                     FumaroleAssembledUpdate::None => {}
                                     FumaroleAssembledUpdate::SlotStatus(status_slot, status) => {
                                         observe_processed_slot(&mut last_processed_block_slot, status_slot);
@@ -181,29 +174,32 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                                     }
                                     FumaroleAssembledUpdate::Block(update) => {
                                         let update = *update;
-                                        if let Some(slot) = processed_fumarole_block_slot(&update) {
-                                            observe_processed_slot(&mut last_processed_block_slot, slot);
-                                        }
-                                        if process_update(
-                                            upgrade_update(update)?,
+                                        let block_slot = processed_fumarole_block_slot(&update);
+                                        let flushed = process_update(
+                                            update,
                                             args,
                                             &insert_tables,
                                             &clickhouse,
                                             &mut buffered_rows,
                                             None,
                                         )
-                                        .await?
-                                        {
-                                            stream.commit();
+                                        .await?;
+                                        if let Some(slot) = block_slot {
+                                            observe_processed_slot(&mut last_processed_block_slot, slot);
+                                        }
+                                        if flushed {
+                                            commit_if_assembled(&block_assembler, || stream.commit());
                                         }
                                     }
                                 }
                             }
-                            FumaroleEvent::SlotEnded(slot) => {
-                                observe_processed_slot(&mut last_processed_block_slot, slot);
-                                if let Some(update) = block_assembler.finish_slot(slot)? {
+                            FumaroleEvent::SlotEnded { slot, blockhash } => {
+                                // Validation errors exit before flushing or committing. In
+                                // particular, do not use the fatal transport-error flush path:
+                                // it could acknowledge the rejected slot's source offset.
+                                if let Some(update) = block_assembler.finish_slot((slot, blockhash))? {
                                     if process_update(
-                                        upgrade_update(update)?,
+                                        update,
                                         args,
                                         &insert_tables,
                                         &clickhouse,
@@ -212,11 +208,12 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                                     )
                                     .await?
                                     {
-                                        stream.commit();
+                                        commit_if_assembled(&block_assembler, || stream.commit());
                                     }
                                 } else if buffered_rows.is_empty() {
-                                    stream.commit();
+                                    commit_if_assembled(&block_assembler, || stream.commit());
                                 }
+                                observe_processed_slot(&mut last_processed_block_slot, slot);
                             }
                         }
                         maybe_flush_for_pressure(
@@ -242,6 +239,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                             &insert_tables,
                             &mut buffered_rows,
                             &mut stream,
+                            &block_assembler,
                             &reason,
                         )
                         .await?;
@@ -259,6 +257,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                             &insert_tables,
                             &mut buffered_rows,
                             &mut stream,
+                            &block_assembler,
                             &reason,
                         )
                         .await?;
@@ -276,6 +275,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
             &insert_tables,
             &mut buffered_rows,
             &mut stream,
+            &block_assembler,
             false,
         ) => {
             result?;
@@ -473,14 +473,19 @@ enum FumaroleAssembledUpdate {
     Block(Box<SubscribeUpdate>),
 }
 
+// Fumarole IDs are sealed blockhashes, rather than validator-local Geyser counters.
+type FumaroleBankKey = (u64, Option<Arc<str>>);
+
 struct FumaroleBlockAssembler {
-    blocks: HashMap<u64, FumaroleBlockParts>,
+    blocks: HashMap<FumaroleBankKey, FumaroleBlockParts>,
     estimated_buffered_bytes: u64,
     track_estimated_bytes: bool,
+    include_entries: bool,
 }
 
 #[derive(Default)]
 struct FumaroleBlockParts {
+    bank_id: Option<u64>,
     block_meta: Option<SubscribeUpdateBlockMeta>,
     block_meta_created_at: Option<prost_types::Timestamp>,
     block_meta_bytes: u64,
@@ -490,11 +495,12 @@ struct FumaroleBlockParts {
 }
 
 impl FumaroleBlockAssembler {
-    fn new(track_estimated_bytes: bool) -> Self {
+    fn new(track_estimated_bytes: bool, include_entries: bool) -> Self {
         Self {
             blocks: HashMap::new(),
             estimated_buffered_bytes: 0,
             track_estimated_bytes,
+            include_entries,
         }
     }
 
@@ -508,15 +514,68 @@ impl FumaroleBlockAssembler {
 
     fn handle_update(
         &mut self,
-        stream_slot: u64,
+        key: FumaroleBankKey,
         update: SubscribeUpdate,
     ) -> Result<FumaroleAssembledUpdate> {
+        let stream_slot = key.0;
+        let bank = match update.update_oneof.as_ref() {
+            Some(UpdateOneof::BlockMeta(meta)) => {
+                validate_fumarole_hash(&key, &meta.blockhash)?;
+                Some((meta.slot, meta.bank_id))
+            }
+            Some(UpdateOneof::Transaction(tx)) => Some((tx.slot, tx.bank_id)),
+            Some(UpdateOneof::Entry(entry)) => Some((entry.slot, entry.bank_id)),
+            Some(UpdateOneof::Block(block)) => {
+                validate_fumarole_hash(&key, &block.blockhash)?;
+                Some((block.slot, block.bank_id))
+            }
+            _ => None,
+        };
+        if let Some((slot, bank_id)) = bank {
+            anyhow::ensure!(
+                slot == stream_slot,
+                "Fumarole payload slot {slot} differs from envelope slot {stream_slot}"
+            );
+            let previous = self.blocks.get(&key);
+            ensure!(
+                key.1.is_some()
+                    || previous
+                        .and_then(|p| p.bank_id)
+                        .is_none_or(|id| id == bank_id),
+                "Fumarole bank identity changed within slot {slot}; cannot combine node-local bank IDs"
+            );
+        }
+        match update.update_oneof.as_ref() {
+            Some(UpdateOneof::Block(block)) => {
+                validate_block_completeness(block, self.include_entries)?
+            }
+            Some(UpdateOneof::Transaction(tx)) => ensure!(
+                tx.transaction.is_some(),
+                "Fumarole transaction update missing transaction info"
+            ),
+            Some(UpdateOneof::BlockMeta(meta)) => ensure!(
+                self.blocks
+                    .get(&key)
+                    .and_then(|p| p.block_meta.as_ref())
+                    .is_none_or(|old| old == meta),
+                "Fumarole block {stream_slot} received conflicting block meta"
+            ),
+            _ => {}
+        }
+        if let Some((_, bank_id)) = bank {
+            self.blocks.entry(key.clone()).or_default().bank_id = Some(bank_id);
+        }
         let update_bytes = self.estimated_update_bytes(&update);
         match update.update_oneof {
             Some(UpdateOneof::Slot(slot)) => {
                 Ok(FumaroleAssembledUpdate::SlotStatus(slot.slot, slot.status))
             }
             Some(UpdateOneof::Block(block)) => {
+                if let Some(parts) = self.blocks.remove(&key) {
+                    self.estimated_buffered_bytes = self
+                        .estimated_buffered_bytes
+                        .saturating_sub(parts.estimated_bytes);
+                }
                 Ok(FumaroleAssembledUpdate::Block(Box::new(SubscribeUpdate {
                     filters: update.filters,
                     created_at: update.created_at,
@@ -524,14 +583,7 @@ impl FumaroleBlockAssembler {
                 })))
             }
             Some(UpdateOneof::BlockMeta(meta)) => {
-                if meta.slot != stream_slot {
-                    warn!(
-                        stream_slot,
-                        block_meta_slot = meta.slot,
-                        "Fumarole block meta slot mismatch"
-                    );
-                }
-                let block = self.blocks.entry(stream_slot).or_default();
+                let block = self.blocks.entry(key).or_default();
                 if block.block_meta.is_some() {
                     self.estimated_buffered_bytes = self
                         .estimated_buffered_bytes
@@ -548,15 +600,8 @@ impl FumaroleBlockAssembler {
                 Ok(FumaroleAssembledUpdate::None)
             }
             Some(UpdateOneof::Transaction(tx)) => {
-                if tx.slot != stream_slot {
-                    warn!(
-                        stream_slot,
-                        transaction_slot = tx.slot,
-                        "Fumarole transaction slot mismatch"
-                    );
-                }
                 if let Some(info) = tx.transaction {
-                    let block = self.blocks.entry(stream_slot).or_default();
+                    let block = self.blocks.entry(key).or_default();
                     block.transactions.push(info);
                     block.estimated_bytes = block.estimated_bytes.saturating_add(update_bytes);
                     self.estimated_buffered_bytes =
@@ -570,14 +615,7 @@ impl FumaroleBlockAssembler {
                 Ok(FumaroleAssembledUpdate::None)
             }
             Some(UpdateOneof::Entry(entry)) => {
-                if entry.slot != stream_slot {
-                    warn!(
-                        stream_slot,
-                        entry_slot = entry.slot,
-                        "Fumarole entry slot mismatch"
-                    );
-                }
-                let block = self.blocks.entry(stream_slot).or_default();
+                let block = self.blocks.entry(key).or_default();
                 block.entries.push(entry);
                 block.estimated_bytes = block.estimated_bytes.saturating_add(update_bytes);
                 self.estimated_buffered_bytes =
@@ -604,20 +642,26 @@ impl FumaroleBlockAssembler {
         }
     }
 
-    fn finish_slot(&mut self, slot: u64) -> Result<Option<SubscribeUpdate>> {
-        let Some(parts) = self.blocks.remove(&slot) else {
+    fn finish_slot(&mut self, key: FumaroleBankKey) -> Result<Option<SubscribeUpdate>> {
+        let slot = key.0;
+        let Some(parts) = self.blocks.remove(&key) else {
             return Ok(None);
         };
         self.estimated_buffered_bytes = self
             .estimated_buffered_bytes
             .saturating_sub(parts.estimated_bytes);
-        parts.into_subscribe_update(slot)
+        parts.into_subscribe_update(slot, self.include_entries)
     }
 }
 
 impl FumaroleBlockParts {
-    fn into_subscribe_update(self, slot: u64) -> Result<Option<SubscribeUpdate>> {
+    fn into_subscribe_update(
+        self,
+        slot: u64,
+        include_entries: bool,
+    ) -> Result<Option<SubscribeUpdate>> {
         let Self {
+            bank_id: _,
             block_meta,
             block_meta_created_at,
             block_meta_bytes: _,
@@ -637,11 +681,12 @@ impl FumaroleBlockParts {
             ));
         };
 
-        Ok(Some(SubscribeUpdate {
+        let update = SubscribeUpdate {
             filters: Vec::new(),
             created_at: block_meta_created_at,
             update_oneof: Some(UpdateOneof::Block(SubscribeUpdateBlock {
                 slot,
+                bank_id: meta.bank_id,
                 blockhash: meta.blockhash,
                 rewards: meta.rewards,
                 block_time: meta.block_time,
@@ -655,8 +700,23 @@ impl FumaroleBlockParts {
                 entries_count: meta.entries_count,
                 entries,
             })),
-        }))
+        };
+        if let Some(UpdateOneof::Block(block)) = update.update_oneof.as_ref() {
+            validate_block_completeness(block, include_entries)?;
+        }
+        Ok(Some(update))
     }
+}
+
+fn validate_fumarole_hash(key: &FumaroleBankKey, blockhash: &str) -> Result<()> {
+    if let Some(expected) = &key.1 {
+        anyhow::ensure!(
+            !expected.is_empty() && expected.as_ref() == blockhash,
+            "Fumarole sealed blockhash differs from envelope for slot {}",
+            key.0
+        );
+    }
+    Ok(())
 }
 
 fn processed_fumarole_block_slot(update: &SubscribeUpdate) -> Option<u64> {
@@ -745,12 +805,13 @@ async fn flush_and_commit(
     insert_tables: &InsertTables,
     buffered_rows: &mut BufferedRows,
     stream: &mut FumaroleStream,
+    block_assembler: &FumaroleBlockAssembler,
     commit_if_empty: bool,
 ) -> Result<()> {
     let had_rows = !buffered_rows.is_empty();
     buffered_rows.flush(clickhouse, insert_tables).await?;
     if had_rows || commit_if_empty {
-        stream.commit();
+        commit_if_assembled(block_assembler, || stream.commit());
     }
     Ok(())
 }
@@ -760,11 +821,27 @@ async fn flush_after_fatal_condition(
     insert_tables: &InsertTables,
     buffered_rows: &mut BufferedRows,
     stream: &mut FumaroleStream,
+    block_assembler: &FumaroleBlockAssembler,
     reason: &str,
 ) -> Result<()> {
-    flush_and_commit(clickhouse, insert_tables, buffered_rows, stream, false)
-        .await
-        .with_context(|| format!("flush buffered rows after fatal Fumarole condition: {reason}"))
+    flush_and_commit(
+        clickhouse,
+        insert_tables,
+        buffered_rows,
+        stream,
+        block_assembler,
+        false,
+    )
+    .await
+    .with_context(|| format!("flush buffered rows after fatal Fumarole condition: {reason}"))
+}
+
+fn commit_if_assembled(block_assembler: &FumaroleBlockAssembler, commit: impl FnOnce()) {
+    // The client acknowledges all pending source progress together. A flush of
+    // complete rows must not acknowledge other slots still being reconstructed.
+    if block_assembler.pending_slots() == 0 {
+        commit();
+    }
 }
 
 async fn maybe_flush_for_pressure(
@@ -804,7 +881,15 @@ async fn maybe_flush_for_pressure(
         "Fumarole memory pressure detected; flushing buffered rows before polling more events"
     );
     metrics::observe_fumarole_pressure_flush();
-    flush_and_commit(clickhouse, insert_tables, buffered_rows, stream, false).await?;
+    flush_and_commit(
+        clickhouse,
+        insert_tables,
+        buffered_rows,
+        stream,
+        block_assembler,
+        false,
+    )
+    .await?;
     pressure_guard.clear_logged();
     pressure_guard.observe(block_assembler);
     Ok(())
@@ -847,9 +932,9 @@ mod tests {
         };
         let wire = meta.encode_to_vec();
         let decoded = SubscribeUpdate::decode(wire.as_slice()).unwrap();
-        let mut assembler = FumaroleBlockAssembler::new(false);
-        assembler.handle_update(42, decoded).unwrap();
-        let update = assembler.finish_slot(42).unwrap().unwrap();
+        let mut assembler = FumaroleBlockAssembler::new(false, false);
+        assembler.handle_update((42, None), decoded).unwrap();
+        let update = assembler.finish_slot((42, None)).unwrap().unwrap();
         let Some(UpdateOneof::Block(block)) = update.update_oneof else {
             panic!("block")
         };
@@ -861,10 +946,10 @@ mod tests {
 
     #[test]
     fn fumarole_block_assembler_builds_block_update_without_block_stream_adapter() {
-        let mut assembler = FumaroleBlockAssembler::new(false);
+        let mut assembler = FumaroleBlockAssembler::new(false, false);
         assembler
             .handle_update(
-                42,
+                (42, None),
                 SubscribeUpdate {
                     update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
                         slot: 42,
@@ -878,14 +963,15 @@ mod tests {
             .expect("block meta");
         assembler
             .handle_update(
-                42,
+                (42, None),
                 SubscribeUpdate {
                     update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
                         slot: 42,
                         transaction: Some(SubscribeUpdateTransactionInfo {
-                            index: 7,
+                            index: 0,
                             ..Default::default()
                         }),
+                        ..Default::default()
                     })),
                     ..Default::default()
                 },
@@ -893,7 +979,7 @@ mod tests {
             .expect("transaction");
 
         let update = assembler
-            .finish_slot(42)
+            .finish_slot((42, None))
             .expect("finish slot")
             .expect("block update");
 
@@ -902,29 +988,32 @@ mod tests {
         };
         assert_eq!(block.slot, 42);
         assert_eq!(block.transactions.len(), 1);
-        assert_eq!(block.transactions[0].index, 7);
+        assert_eq!(block.transactions[0].index, 0);
     }
 
     #[test]
     fn fumarole_block_assembler_rejects_payload_without_block_meta() {
-        let mut assembler = FumaroleBlockAssembler::new(false);
+        let mut assembler = FumaroleBlockAssembler::new(false, false);
         assembler
             .handle_update(
-                42,
+                (42, None),
                 SubscribeUpdate {
                     update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
                         slot: 42,
                         transaction: Some(SubscribeUpdateTransactionInfo {
-                            index: 7,
+                            index: 0,
                             ..Default::default()
                         }),
+                        ..Default::default()
                     })),
                     ..Default::default()
                 },
             )
             .expect("transaction");
 
-        let err = assembler.finish_slot(42).expect_err("missing block meta");
+        let err = assembler
+            .finish_slot((42, None))
+            .expect_err("missing block meta");
 
         assert!(
             err.to_string()
@@ -934,16 +1023,16 @@ mod tests {
 
     #[test]
     fn fumarole_block_assembler_tracks_pending_slots_and_estimated_bytes() {
-        let mut assembler = FumaroleBlockAssembler::new(true);
+        let mut assembler = FumaroleBlockAssembler::new(true, false);
 
         assembler
             .handle_update(
-                42,
+                (42, None),
                 SubscribeUpdate {
                     update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
                         slot: 42,
                         blockhash: "hash".to_string(),
-                        executed_transaction_count: 1,
+                        executed_transaction_count: 0,
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -956,14 +1045,15 @@ mod tests {
 
         assembler
             .handle_update(
-                43,
+                (43, None),
                 SubscribeUpdate {
                     update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
                         slot: 43,
                         transaction: Some(SubscribeUpdateTransactionInfo {
-                            index: 7,
+                            index: 0,
                             ..Default::default()
                         }),
+                        ..Default::default()
                     })),
                     ..Default::default()
                 },
@@ -973,14 +1063,16 @@ mod tests {
         assert!(assembler.estimated_buffered_bytes() > after_meta_bytes);
 
         let update = assembler
-            .finish_slot(42)
+            .finish_slot((42, None))
             .expect("finish slot")
             .expect("block update");
         assert_eq!(processed_fumarole_block_slot(&update), Some(42));
         assert_eq!(assembler.pending_slots(), 1);
         assert!(assembler.estimated_buffered_bytes() > 0);
 
-        let err = assembler.finish_slot(43).expect_err("missing block meta");
+        let err = assembler
+            .finish_slot((43, None))
+            .expect_err("missing block meta");
         assert!(
             err.to_string()
                 .contains("ended without block meta after receiving 1 transactions")
@@ -991,11 +1083,11 @@ mod tests {
 
     #[test]
     fn fumarole_block_assembler_skips_estimated_bytes_when_tracking_disabled() {
-        let mut assembler = FumaroleBlockAssembler::new(false);
+        let mut assembler = FumaroleBlockAssembler::new(false, false);
 
         assembler
             .handle_update(
-                42,
+                (42, None),
                 SubscribeUpdate {
                     update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
                         slot: 42,
@@ -1009,14 +1101,15 @@ mod tests {
             .expect("block meta");
         assembler
             .handle_update(
-                42,
+                (42, None),
                 SubscribeUpdate {
                     update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
                         slot: 42,
                         transaction: Some(SubscribeUpdateTransactionInfo {
-                            index: 7,
+                            index: 0,
                             ..Default::default()
                         }),
+                        ..Default::default()
                     })),
                     ..Default::default()
                 },
@@ -1027,7 +1120,7 @@ mod tests {
         assert_eq!(assembler.estimated_buffered_bytes(), 0);
 
         let update = assembler
-            .finish_slot(42)
+            .finish_slot((42, None))
             .expect("finish slot")
             .expect("block update");
         assert_eq!(processed_fumarole_block_slot(&update), Some(42));
@@ -1051,4 +1144,132 @@ VmRSS:\t   12345 kB
         assert_eq!(parse_proc_status_rss_bytes("Name:\tsuperbank\n"), None);
         assert_eq!(parse_proc_status_rss_bytes("VmRSS:\t123 MB\n"), None);
     }
+    #[test]
+    fn fumarole_requires_finalized_canonical_ingestion() {
+        assert!(parse_durable_commitment("processed").is_err());
+        assert!(parse_durable_commitment("confirmed").is_err());
+        assert_eq!(parse_durable_commitment("finalized").unwrap() as i32, 2);
+    }
+
+    #[test]
+    fn protobuf_decoding_preserves_competing_bank_ids() {
+        let a = SubscribeUpdateTransaction::decode(&[0x10, 42, 0x18, 1][..]).unwrap();
+        let b = SubscribeUpdateTransaction::decode(&[0x10, 42, 0x18, 2][..]).unwrap();
+        assert_eq!(a.slot, b.slot);
+        assert_ne!(a.bank_id, b.bank_id);
+    }
+
+    #[test]
+    fn fumarole_interleaves_same_slot_banks_and_finishes_only_the_named_hash() {
+        let mut assembler = FumaroleBlockAssembler::new(true, false);
+        let a = (42, Some(Arc::<str>::from("hash-a")));
+        let b = (42, Some(Arc::<str>::from("hash-b")));
+        for (key, bank_id) in [(&a, 1), (&b, 2)] {
+            assembler
+                .handle_update(
+                    key.clone(),
+                    SubscribeUpdate {
+                        update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                            slot: 42,
+                            bank_id,
+                            transaction: Some(SubscribeUpdateTransactionInfo {
+                                index: 0,
+                                signature: vec![bank_id as u8; 64],
+                                ..Default::default()
+                            }),
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        for (key, bank_id) in [(&b, 2), (&a, 1)] {
+            assembler
+                .handle_update(
+                    key.clone(),
+                    SubscribeUpdate {
+                        update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                            slot: 42,
+                            bank_id,
+                            blockhash: key.1.as_ref().unwrap().to_string(),
+                            executed_transaction_count: 1,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let Some(UpdateOneof::Block(block)) =
+            assembler.finish_slot(b).unwrap().unwrap().update_oneof
+        else {
+            panic!("block");
+        };
+        assert_eq!(block.bank_id, 2);
+        assert_eq!(block.blockhash, "hash-b");
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].index, 0);
+        assert_eq!(block.transactions[0].signature, vec![2; 64]);
+        assert_eq!(assembler.pending_slots(), 1);
+        let Some(UpdateOneof::Block(block)) =
+            assembler.finish_slot(a).unwrap().unwrap().update_oneof
+        else {
+            panic!("block");
+        };
+        assert_eq!(block.bank_id, 1);
+        assert_eq!(block.transactions[0].index, 0);
+        assert_eq!(assembler.estimated_buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn fumarole_rejects_ambiguous_legacy_banks_and_wrong_envelopes() {
+        let mut assembler = FumaroleBlockAssembler::new(false, false);
+        for bank_id in [1, 2] {
+            let result = assembler.handle_update(
+                (42, None),
+                SubscribeUpdate {
+                    update_oneof: Some(UpdateOneof::Entry(SubscribeUpdateEntry {
+                        slot: 42,
+                        bank_id,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.is_ok(), bank_id == 1);
+        }
+        assert!(
+            assembler
+                .handle_update(
+                    (42, Some(Arc::from("hash-a"))),
+                    SubscribeUpdate {
+                        update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                            slot: 42,
+                            bank_id: 1,
+                            blockhash: "hash-b".to_string(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            assembler
+                .handle_update(
+                    (42, None),
+                    SubscribeUpdate {
+                        update_oneof: Some(UpdateOneof::Entry(SubscribeUpdateEntry {
+                            slot: 43,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+    }
 }
+
+#[cfg(test)]
+mod completeness_tests;

@@ -44,6 +44,7 @@ use crate::clickhouse::{
     RoutingTransport, SignatureSlot, StoredBlockPayload, StoredBlockRecord,
     StoredTransactionRecord,
 };
+use crate::get_transaction_primary_cache::{PrimaryTransactionCache, PrimaryTransactionCacheKey};
 use crate::handlers::blocks::{
     handle_get_block, handle_get_block_height, handle_get_block_time, handle_get_blocks,
     handle_get_blocks_with_limit, handle_get_epoch_schedule, handle_get_first_available_block,
@@ -59,6 +60,10 @@ use crate::handlers::types::{InflationRewardInfo, MAX_GET_BLOCKS_RANGE};
 use crate::hydration::BlockHydrationError;
 use crate::hydration::build_transaction_status_meta;
 use crate::hydration::build_transaction_status_meta_for_accounts;
+use crate::hydration::{
+    BlockBuildError, assemble_block_chunks, block_hydration_chunk_count,
+    hydrate_serialize_block_chunk, split_block_payload,
+};
 use crate::hydration::{
     TransactionHydrationError, build_versioned_transaction, hydrate_block_payload,
     hydrate_block_record, hydrate_transaction_record, parse_instruction_error_display,
@@ -177,7 +182,11 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         epoch_schedule: EpochSchedule::without_warmup(),
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        get_block_hydration_parallelism: 4,
+        get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
+        get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
+        status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
         #[cfg(feature = "disk-cache")]
@@ -240,7 +249,7 @@ fn test_state_with_clickhouse_latest_slot(latest_slot: Option<u64>) -> Arc<AppSt
     Arc::new(state)
 }
 
-fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
+pub(crate) fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
     let cache = LatestSlotCache::new(Duration::from_millis(1000));
     cache.value.store(1, Ordering::Relaxed);
     cache
@@ -283,7 +292,11 @@ fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppState> {
         epoch_schedule: EpochSchedule::without_warmup(),
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        get_block_hydration_parallelism: 4,
+        get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
+        get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
+        status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
         #[cfg(feature = "disk-cache")]
@@ -343,7 +356,11 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         epoch_schedule: EpochSchedule::without_warmup(),
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        get_block_hydration_parallelism: 4,
+        get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
+        get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
+        status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
         #[cfg(feature = "disk-cache")]
@@ -395,7 +412,11 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         epoch_schedule: EpochSchedule::without_warmup(),
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        get_block_hydration_parallelism: 4,
+        get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
+        get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
+        status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
@@ -449,7 +470,11 @@ fn test_state_with_head_cache_and_clickhouse_url(
         epoch_schedule: EpochSchedule::without_warmup(),
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        get_block_hydration_parallelism: 4,
+        get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
+        get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
+        status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
@@ -510,7 +535,11 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         epoch_schedule: EpochSchedule::without_warmup(),
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
+        get_block_hydration_parallelism: 4,
+        get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
+        get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
+        status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
@@ -563,7 +592,7 @@ async fn handle_json_rpc_request(state: Arc<AppState>, request: &JsonRpcRequest)
     handle_json_rpc_value(state, &value).await
 }
 
-fn base_transaction_record() -> StoredTransactionRecord {
+pub(crate) fn base_transaction_record() -> StoredTransactionRecord {
     StoredTransactionRecord {
         signature: [0u8; 64],
         slot: 1,
@@ -675,6 +704,360 @@ fn transaction_variant_records() -> [StoredTransactionRecord; 4] {
         transaction_variant_record(Some(1), true),
         transaction_variant_record(Some(1), false),
     ]
+}
+
+/// Synthetic block with `count` transactions cycling through legacy, v0, v1
+/// (or v0 again) and metadata-missing records, each with a distinct signature,
+/// plus two block rewards.
+pub(crate) fn large_synthetic_block_record(count: usize, include_v1: bool) -> StoredBlockRecord {
+    let mut block = base_block_record(4_242);
+    block.metadata.block_time = Some(1_700_000_000);
+    block.metadata.block_height = Some(4_000);
+    block.metadata.executed_transaction_count = count as u64;
+    block.metadata.entry_count = count as u64;
+    block.metadata.rewards_present = true;
+    for (index, kind) in ["Fee", "Rent"].into_iter().enumerate() {
+        block.metadata.rewards_pubkey.push([index as u8 + 40; 32]);
+        block.metadata.rewards_lamports.push(1_000 + index as i64);
+        block
+            .metadata
+            .rewards_post_balance
+            .push(5_000 + index as u64);
+        block.metadata.rewards_type.push(Some(kind.to_string()));
+        block.metadata.rewards_commission.push(None);
+    }
+    block.transactions = (0..count)
+        .map(|index| {
+            let mut record = match index % 4 {
+                0 => transaction_variant_record(None, false),
+                1 => transaction_variant_record(Some(0), false),
+                2 if include_v1 => transaction_variant_record(Some(1), true),
+                2 => transaction_variant_record(Some(0), false),
+                _ => base_transaction_record(),
+            };
+            let mut signature = [0u8; 64];
+            signature[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            signature[63] = 0xa5;
+            record.signature = signature;
+            record.tx_signatures = vec![signature];
+            record.slot = 4_242;
+            record.slot_idx = index as u32;
+            if index % 4 != 3 {
+                record.meta_fee = 5_000 + index as u64;
+            }
+            record
+        })
+        .collect();
+    block
+}
+
+/// `large_synthetic_block_record` with mainnet-like transactions: 24 account
+/// keys, 4 instructions, inner instructions, 12 log lines and token balances
+/// on every metadata-present transaction.
+pub(crate) fn realistic_synthetic_block_record(count: usize) -> StoredBlockRecord {
+    let mut block = large_synthetic_block_record(count, true);
+    for (index, record) in block.transactions.iter_mut().enumerate() {
+        if index % 4 == 3 {
+            continue;
+        }
+        let key = |k: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            bytes[8] = k as u8;
+            bytes[31] = 0x5a;
+            bytes
+        };
+        record.tx_account_keys = (0..24).map(key).collect();
+        record.tx_num_readonly_unsigned_accounts = 8;
+        record.tx_instructions_program_id_index = vec![20, 21, 22, 23];
+        record.tx_instructions_accounts = (0..4).map(|i| (i..i + 8).collect()).collect();
+        record.tx_instructions_data = (0..4).map(|i| vec![i as u8; 48]).collect();
+        record.meta_pre_balances = (0..24).map(|k| 1_000_000 + k).collect();
+        record.meta_post_balances = (0..24).map(|k| 999_000 + k).collect();
+        record.meta_inner_instructions_present = true;
+        record.meta_inner_instructions_index = vec![0];
+        record.meta_inner_instructions_program_id_index = vec![vec![21, 22, 23]];
+        record.meta_inner_instructions_accounts = vec![vec![vec![1, 2, 3, 4]; 3]];
+        record.meta_inner_instructions_data = vec![vec![vec![7u8; 32]; 3]];
+        record.meta_inner_instructions_stack_height = vec![vec![Some(2); 3]];
+        record.meta_log_messages_present = true;
+        record.meta_log_messages = (0..12)
+            .map(|line| {
+                format!("Program log: synthetic transaction {index} line {line} with some payload")
+            })
+            .collect();
+        for pre in [true, false] {
+            let (present, account_index, mint, owner, program, amount, decimals, ui, ui_string) =
+                if pre {
+                    (
+                        &mut record.meta_pre_token_balances_present,
+                        &mut record.meta_pre_token_account_index,
+                        &mut record.meta_pre_token_mint,
+                        &mut record.meta_pre_token_owner,
+                        &mut record.meta_pre_token_program_id,
+                        &mut record.meta_pre_token_amount,
+                        &mut record.meta_pre_token_decimals,
+                        &mut record.meta_pre_token_ui_amount,
+                        &mut record.meta_pre_token_ui_amount_string,
+                    )
+                } else {
+                    (
+                        &mut record.meta_post_token_balances_present,
+                        &mut record.meta_post_token_account_index,
+                        &mut record.meta_post_token_mint,
+                        &mut record.meta_post_token_owner,
+                        &mut record.meta_post_token_program_id,
+                        &mut record.meta_post_token_amount,
+                        &mut record.meta_post_token_decimals,
+                        &mut record.meta_post_token_ui_amount,
+                        &mut record.meta_post_token_ui_amount_string,
+                    )
+                };
+            *present = true;
+            for k in 0..4u8 {
+                account_index.push(4 + k);
+                mint.push([30 + k; 32]);
+                owner.push(Some(key(k as usize)));
+                program.push(Some([6u8; 32]));
+                amount.push(format!("{}", 123_456 + u64::from(k)));
+                decimals.push(6);
+                ui.push(Some(0.123_456 + f64::from(k)));
+                ui_string.push(format!("{}", 0.123_456 + f64::from(k)));
+            }
+        }
+    }
+    block
+}
+
+/// Reference result: the unsplit path the handler has always used.
+fn sequential_block_bytes(
+    payload: StoredBlockPayload,
+    encoding: UiTransactionEncoding,
+    details: TransactionDetails,
+    show_rewards: bool,
+    max_version: Option<u8>,
+) -> Result<Vec<u8>, String> {
+    hydrate_block_payload(payload, encoding, details, show_rewards, max_version)
+        .map(|block| serde_json::to_vec(&block).expect("serialize block"))
+        .map_err(|err| format!("{err:?}"))
+}
+
+fn chunked_block_bytes(
+    payload: StoredBlockPayload,
+    encoding: UiTransactionEncoding,
+    details: TransactionDetails,
+    show_rewards: bool,
+    max_version: Option<u8>,
+    chunk_count: usize,
+) -> Result<Vec<u8>, String> {
+    let split = split_block_payload(payload, details, chunk_count).expect("payload splits");
+    assert_eq!(split.chunks.len(), chunk_count);
+    let outputs = split
+        .chunks
+        .into_iter()
+        .map(|chunk| hydrate_serialize_block_chunk(chunk, encoding, show_rewards, max_version))
+        .collect();
+    assemble_block_chunks(
+        split.metadata,
+        encoding,
+        details,
+        show_rewards,
+        max_version,
+        outputs,
+    )
+    .map_err(|err| match err {
+        BlockBuildError::Hydration(err) => format!("{err:?}"),
+        BlockBuildError::Serialize(err) => format!("serialize: {err}"),
+    })
+}
+
+#[test]
+fn chunked_block_hydration_is_byte_identical_to_sequential() {
+    for block in [
+        large_synthetic_block_record(1_001, true),
+        realistic_synthetic_block_record(513),
+    ] {
+        assert_chunked_block_hydration_matches(block);
+    }
+}
+
+fn assert_chunked_block_hydration_matches(block: StoredBlockRecord) {
+    let count = block.transactions.len();
+    let accounts_payload = StoredBlockPayload::Accounts {
+        metadata: block.metadata.clone(),
+        transactions: block.transactions.iter().cloned().map(Into::into).collect(),
+    };
+    let full_payload = StoredBlockPayload::Full(block);
+    let cases = [
+        (
+            TransactionDetails::Full,
+            UiTransactionEncoding::Json,
+            &full_payload,
+        ),
+        (
+            TransactionDetails::Full,
+            UiTransactionEncoding::JsonParsed,
+            &full_payload,
+        ),
+        (
+            TransactionDetails::Full,
+            UiTransactionEncoding::Base64,
+            &full_payload,
+        ),
+        (
+            TransactionDetails::Full,
+            UiTransactionEncoding::Base58,
+            &full_payload,
+        ),
+        (
+            TransactionDetails::Full,
+            UiTransactionEncoding::Binary,
+            &full_payload,
+        ),
+        (
+            TransactionDetails::Accounts,
+            UiTransactionEncoding::Json,
+            &full_payload,
+        ),
+        (
+            TransactionDetails::Accounts,
+            UiTransactionEncoding::Base64,
+            &accounts_payload,
+        ),
+    ];
+    for (details, encoding, payload) in cases {
+        for show_rewards in [false, true] {
+            let expected =
+                sequential_block_bytes(payload.clone(), encoding, details, show_rewards, Some(1))
+                    .expect("sequential build succeeds");
+            let parsed: Value = serde_json::from_slice(&expected).expect("valid json");
+            assert_eq!(parsed["transactions"].as_array().unwrap().len(), count);
+            for chunk_count in [2, 3, 4, 7, count] {
+                let actual = chunked_block_bytes(
+                    payload.clone(),
+                    encoding,
+                    details,
+                    show_rewards,
+                    Some(1),
+                    chunk_count,
+                )
+                .expect("chunked build succeeds");
+                assert!(
+                    actual == expected,
+                    "{details:?}/{encoding:?}/rewards={show_rewards}/chunks={chunk_count} differ"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn chunked_block_hydration_reports_the_sequential_error() {
+    let legacy_block = |count: usize| {
+        let mut block = large_synthetic_block_record(count, false);
+        for (index, record) in block.transactions.iter_mut().enumerate() {
+            if index % 4 == 1 || index % 4 == 2 {
+                record.tx_version = None;
+            }
+        }
+        block
+    };
+    let make_hydration_error = |record: &mut StoredTransactionRecord| {
+        record.tx_num_required_signatures = 2;
+    };
+
+    // Earliest unsupported version wins across chunks: v1 at 300 before v0 at 450.
+    let mut versions = legacy_block(512);
+    versions.transactions[300] = {
+        let mut record = transaction_variant_record(Some(1), true);
+        record.tx_signatures = versions.transactions[300].tx_signatures.clone();
+        record
+    };
+    versions.transactions[450].tx_version = Some(0);
+
+    // A later hydration error outranks an earlier encode error.
+    let mut hydration_after_encode = versions.clone();
+    make_hydration_error(&mut hydration_after_encode.transactions[480]);
+
+    // Two hydration errors: the lower index wins.
+    let mut two_hydration = legacy_block(512);
+    make_hydration_error(&mut two_hydration.transactions[400]);
+    two_hydration.transactions[200].tx_account_keys.clear();
+    two_hydration.transactions[200].tx_num_required_signatures = 1;
+
+    // A block-reward error outranks every transaction error.
+    let mut rewards_error = hydration_after_encode.clone();
+    rewards_error.metadata.rewards_commission.pop();
+
+    let cases = [
+        ("versions", versions),
+        ("hydration_after_encode", hydration_after_encode),
+        ("two_hydration", two_hydration),
+        ("rewards_error", rewards_error),
+    ];
+    for (name, block) in cases {
+        for details in [TransactionDetails::Full, TransactionDetails::Accounts] {
+            let payload = StoredBlockPayload::Full(block.clone());
+            let expected = sequential_block_bytes(
+                payload.clone(),
+                UiTransactionEncoding::Json,
+                details,
+                true,
+                None,
+            )
+            .expect_err("sequential build fails");
+            if name == "versions" {
+                assert!(
+                    expected.contains("UnsupportedTransactionVersion(1)"),
+                    "{expected}"
+                );
+            } else {
+                assert!(
+                    !expected.contains("UnsupportedTransactionVersion"),
+                    "{expected}"
+                );
+            }
+            for chunk_count in [2, 3, 4] {
+                let actual = chunked_block_bytes(
+                    payload.clone(),
+                    UiTransactionEncoding::Json,
+                    details,
+                    true,
+                    None,
+                    chunk_count,
+                )
+                .expect_err("chunked build fails");
+                assert_eq!(actual, expected, "{name}/{details:?}/chunks={chunk_count}");
+            }
+        }
+    }
+}
+
+#[test]
+fn split_block_payload_declines_unsplittable_payloads() {
+    let block = large_synthetic_block_record(8, true);
+    let full = StoredBlockPayload::Full(block.clone());
+    assert!(split_block_payload(full.clone(), TransactionDetails::Full, 1).is_err());
+    assert!(split_block_payload(full.clone(), TransactionDetails::Full, 9).is_err());
+    assert!(split_block_payload(full.clone(), TransactionDetails::Signatures, 2).is_err());
+    let accounts = StoredBlockPayload::Accounts {
+        metadata: block.metadata.clone(),
+        transactions: block.transactions.into_iter().map(Into::into).collect(),
+    };
+    // Full detail needs a full payload; the sequential path reports that error.
+    assert!(split_block_payload(accounts, TransactionDetails::Full, 2).is_err());
+    let split = split_block_payload(full, TransactionDetails::Full, 3).expect("splits");
+    assert_eq!(split.chunks.len(), 3);
+}
+
+#[test]
+fn block_hydration_chunk_count_respects_minimum_chunk_size() {
+    assert_eq!(block_hydration_chunk_count(0, 4), 1);
+    assert_eq!(block_hydration_chunk_count(255, 4), 1);
+    assert_eq!(block_hydration_chunk_count(256, 4), 2);
+    assert_eq!(block_hydration_chunk_count(1_290, 4), 4);
+    assert_eq!(block_hydration_chunk_count(1_290, 1), 1);
+    assert_eq!(block_hydration_chunk_count(1_290, 0), 1);
 }
 
 fn base_block_record(slot: u64) -> StoredBlockRecord {
@@ -1854,6 +2237,197 @@ async fn get_block_does_not_cache_confirmed_only_head_response() {
 
     state.block_response_cache.run_pending_tasks().await;
     assert_eq!(state.block_response_cache.entry_count(), 0);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_block_confirmed_request_reads_finalized_response_cache() {
+    let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+    let slot = 201u64;
+    let mut block = base_block_record(slot);
+    block.metadata.executed_transaction_count = 0;
+    cache.note_block_metadata(block.metadata);
+    cache.note_slot_commitment(slot, CommitmentLevel::Finalized);
+
+    let mut state =
+        test_state_with_head_cache_and_clickhouse_url(cache.clone(), "http://127.0.0.1:1");
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .block_response_cache = BlockResponseCache::new(1024 * 1024);
+    let params = |commitment: &str| {
+        Some(vec![
+            json!(slot),
+            json!({ "transactionDetails": "none", "commitment": commitment }),
+        ])
+    };
+
+    let finalized = handle_get_block(state.clone(), json!(1), params("finalized"))
+        .await
+        .expect("finalized response");
+    let finalized = parse_json_rpc_response(finalized).await;
+    assert!(finalized.error.is_none());
+
+    // With the head cache gone and storage unreachable, only the finalized
+    // response cache can answer the confirmed request.
+    cache.remove_slot(slot);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "confirmed",
+        "method": "getBlock",
+        "params": params("confirmed")
+    });
+    let confirmed = handle_json_rpc_value(state.clone(), &request).await;
+    assert_eq!(confirmed.headers()["X-Superbank-Sources"], "response-cache");
+    let confirmed = parse_json_rpc_response(confirmed).await;
+    assert!(confirmed.error.is_none());
+    assert_eq!(confirmed.result, finalized.result);
+    state.block_response_cache.run_pending_tasks().await;
+    assert_eq!(state.block_response_cache.entry_count(), 1);
+
+    // With sharing disabled, confirmed requests bypass the cache as before.
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .get_block_response_cache_share_confirmed = false;
+    let bypass = handle_json_rpc_value(state.clone(), &request).await;
+    let bypass = parse_json_rpc_response(bypass).await;
+    assert_eq!(bypass.error.expect("storage unreachable").code, -32603);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_block_remembers_unsupported_version_only_for_finalized_blocks() {
+    for head_commitment in [CommitmentLevel::Finalized, CommitmentLevel::Confirmed] {
+        let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+        let slot = 202u64;
+        let mut block = base_block_record(slot);
+        block.metadata.executed_transaction_count = 1;
+        block.metadata.entry_count = 1;
+        cache.note_block_metadata(block.metadata);
+        cache.note_slot_commitment(slot, head_commitment);
+        let mut record = transaction_variant_record(Some(1), true);
+        record.slot = slot;
+        let signature = Signature::from(record.signature);
+        cache.insert_for_tests(
+            signature,
+            record,
+            0,
+            &[Pubkey::new_from_array([1; 32])],
+            head_commitment,
+        );
+
+        let mut state =
+            test_state_with_head_cache_and_clickhouse_url(cache.clone(), "http://127.0.0.1:1");
+        Arc::get_mut(&mut state)
+            .expect("unique state")
+            .block_response_cache = BlockResponseCache::new(1024 * 1024);
+        let request = |commitment: &str, max_version: Option<u8>| {
+            let mut config = json!({ "commitment": commitment });
+            if let Some(max_version) = max_version {
+                config["maxSupportedTransactionVersion"] = json!(max_version);
+            }
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "getBlock",
+                "params": [slot, config]
+            })
+        };
+        let head_request = if head_commitment == CommitmentLevel::Finalized {
+            "finalized"
+        } else {
+            "confirmed"
+        };
+
+        let first = handle_json_rpc_value(state.clone(), &request(head_request, None)).await;
+        let first = parse_json_rpc_response(first).await;
+        let err = first.error.expect("unsupported version error");
+        assert_eq!(err.code, -32015);
+        assert!(
+            err.message.contains("Transaction version (1)"),
+            "{}",
+            err.message
+        );
+
+        cache.remove_slot(slot);
+        for commitment in ["finalized", "confirmed"] {
+            let response = handle_json_rpc_value(state.clone(), &request(commitment, None)).await;
+            let cached = head_commitment == CommitmentLevel::Finalized;
+            if cached {
+                assert_eq!(response.headers()["X-Superbank-Sources"], "response-cache");
+            }
+            let parsed = parse_json_rpc_response(response).await;
+            let err = parsed.error.expect("error");
+            // A confirmed-only head block is never remembered; the request then
+            // reaches (unreachable) storage.
+            assert_eq!(
+                err.code,
+                if cached { -32015 } else { -32603 },
+                "{commitment}"
+            );
+            if cached {
+                assert!(err.message.contains("Transaction version (1)"));
+            }
+        }
+        // A different maxSupportedTransactionVersion is a different key.
+        let other = handle_json_rpc_value(state.clone(), &request("finalized", Some(1))).await;
+        let other = parse_json_rpc_response(other).await;
+        assert_eq!(other.error.expect("storage error").code, -32603);
+        state.block_response_cache.run_pending_tasks().await;
+        assert_eq!(state.block_response_cache.entry_count(), 0);
+    }
+}
+
+/// GET_BLOCK_RESPONSE_CACHE_UNSUPPORTED_VERSION=false: a repeated finalized request that
+/// failed with -32015 is not answered from the cache; it reaches storage again.
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_block_unsupported_version_cache_switch_off_refetches() {
+    let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+    let slot = 202u64;
+    let mut block = base_block_record(slot);
+    block.metadata.executed_transaction_count = 1;
+    block.metadata.entry_count = 1;
+    cache.note_block_metadata(block.metadata);
+    cache.note_slot_commitment(slot, CommitmentLevel::Finalized);
+    let mut record = transaction_variant_record(Some(1), true);
+    record.slot = slot;
+    let signature = Signature::from(record.signature);
+    cache.insert_for_tests(
+        signature,
+        record,
+        0,
+        &[Pubkey::new_from_array([1; 32])],
+        CommitmentLevel::Finalized,
+    );
+
+    let mut state =
+        test_state_with_head_cache_and_clickhouse_url(cache.clone(), "http://127.0.0.1:1");
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .block_response_cache =
+        BlockResponseCache::new(1024 * 1024).with_unsupported_version_cache(false);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "getBlock",
+        "params": [slot, { "commitment": "finalized" }]
+    });
+
+    let first = handle_json_rpc_value(state.clone(), &request).await;
+    let first = parse_json_rpc_response(first).await;
+    assert_eq!(first.error.expect("unsupported version error").code, -32015);
+
+    cache.remove_slot(slot);
+    let second = handle_json_rpc_value(state.clone(), &request).await;
+    assert_ne!(
+        second
+            .headers()
+            .get("X-Superbank-Sources")
+            .and_then(|value| value.to_str().ok()),
+        Some("response-cache")
+    );
+    let second = parse_json_rpc_response(second).await;
+    assert_eq!(second.error.expect("storage error").code, -32603);
 }
 
 #[cfg(feature = "grpc-head-cache")]
@@ -7125,6 +7699,95 @@ async fn handle_json_rpc_batch_response_aggregates_clickhouse_metrics_header() {
     assert_eq!(items.len(), 2);
 }
 
+/// Confirmed requests served by source ClickHouse populate and reuse the
+/// finalized response cache, including the deterministic -32015 result.
+#[tokio::test]
+#[ignore = "requires BLO576_CLICKHOUSE_TEST_URL pointing to local ClickHouse"]
+async fn get_block_clickhouse_confirmed_requests_share_finalized_cache() {
+    let url = std::env::var("BLO576_CLICKHOUSE_TEST_URL").expect("set BLO576_CLICKHOUSE_TEST_URL");
+    let http = reqwest::Client::new();
+    let database = format!(
+        "block_cache_confirmed_{}_{}",
+        std::process::id(),
+        current_time_millis()
+    );
+    async fn execute(http: &reqwest::Client, url: &str, sql: String) {
+        let response = http.post(url).body(sql).send().await.expect("ClickHouse");
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "ClickHouse {status}: {body}");
+    }
+    execute(&http, &url, format!("CREATE DATABASE {database}")).await;
+    for ddl in [
+        include_str!("../../../../ddl/local/transactions.sql"),
+        include_str!("../../../../ddl/local/blocks_metadata.sql"),
+    ] {
+        for statement in ddl
+            .replace("default.", &format!("{database}."))
+            .split(";\n")
+        {
+            if !statement.trim().is_empty() {
+                execute(&http, &url, statement.to_string()).await;
+            }
+        }
+    }
+    for (slot, second_version) in [(701u64, "NULL"), (702, "1")] {
+        execute(&http, &url, format!(
+            "INSERT INTO {database}.blocks_metadata (slot, parent_slot, blockhash, parent_blockhash, executed_transaction_count) VALUES ({slot}, {}, repeat('b', 32), repeat('p', 32), 2)", slot - 1
+        )).await;
+        for (index, letter, version) in [(0, 'a', "NULL"), (1, 'z', second_version)] {
+            execute(&http, &url, format!(
+                "INSERT INTO {database}.transactions (signature, slot, slot_idx, tx_version, tx_signatures, tx_num_required_signatures, tx_account_keys, tx_recent_blockhash, meta_status_ok, meta_pre_balances, meta_post_balances) VALUES (repeat('{letter}', 64), {slot}, {index}, {version}, [repeat('{letter}', 64)], 1, [repeat('k', 32)], repeat('h', 32), 1, [10], [10])"
+            )).await;
+        }
+    }
+
+    let mut state = test_state_with_clickhouse_url(&url);
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.clickhouse.transaction_table = format!("{database}.transactions");
+    mutable.clickhouse.blocks_metadata_table = format!("{database}.blocks_metadata");
+    mutable
+        .clickhouse
+        .initialize_read_cancellation()
+        .await
+        .expect("fixture cancellation preflight");
+    mutable.block_response_cache = BlockResponseCache::new(1024 * 1024);
+    let request = |slot: u64, commitment: &str, max_version: Option<u8>| {
+        let mut config = json!({ "commitment": commitment });
+        if let Some(max_version) = max_version {
+            config["maxSupportedTransactionVersion"] = json!(max_version);
+        }
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "getBlock", "params": [slot, config] })
+    };
+
+    let confirmed = handle_json_rpc_value(state.clone(), &request(701, "confirmed", Some(1))).await;
+    assert_ne!(confirmed.headers()["X-Superbank-Sources"], "response-cache");
+    let confirmed = parse_json_rpc_response(confirmed).await;
+    assert!(confirmed.error.is_none(), "{:?}", confirmed.error);
+    let unsupported = handle_json_rpc_value(state.clone(), &request(702, "confirmed", None)).await;
+    let unsupported = parse_json_rpc_response(unsupported).await;
+    assert_eq!(unsupported.error.expect("-32015").code, -32015);
+    state.block_response_cache.run_pending_tasks().await;
+    assert_eq!(state.block_response_cache.entry_count(), 1);
+
+    // Remove the source: only the shared cache can answer now.
+    execute(&http, &url, format!("DROP DATABASE {database}")).await;
+    for commitment in ["finalized", "confirmed"] {
+        let cached = handle_json_rpc_value(state.clone(), &request(701, commitment, Some(1))).await;
+        assert_eq!(cached.headers()["X-Superbank-Sources"], "response-cache");
+        let cached = parse_json_rpc_response(cached).await;
+        assert_eq!(cached.result, confirmed.result, "{commitment}");
+        let error = handle_json_rpc_value(state.clone(), &request(702, commitment, None)).await;
+        assert_eq!(error.headers()["X-Superbank-Sources"], "response-cache");
+        let error = parse_json_rpc_response(error).await;
+        assert_eq!(error.error.expect("cached -32015").code, -32015);
+    }
+    // The success entry is keyed by its shaping options, and so is the error.
+    let other = handle_json_rpc_value(state.clone(), &request(702, "finalized", Some(1))).await;
+    let other = parse_json_rpc_response(other).await;
+    assert_eq!(other.error.expect("source is gone").code, -32603);
+}
+
 /// Uses a dedicated database on an explicitly supplied local ClickHouse instance.
 #[tokio::test]
 #[ignore = "requires BLO576_CLICKHOUSE_TEST_URL pointing to local ClickHouse"]
@@ -7266,10 +7929,21 @@ async fn get_block_clickhouse_partial_payload_repair() {
                             max_bytes: 0,
                             key_index_max_memory_bytes: 128 * 1024 * 1024,
                             query_concurrency: 2,
+                            background_query_concurrency: 2,
                             query_max_threads: 2,
                             partition_slots: 100,
                             query_timeout: Duration::from_secs(10),
+                            get_tx_timeout: Duration::from_secs(10),
+                            fused_get_tx: true,
+                            get_tx_span_check: true,
+                            eviction_safe_hits: true,
+                            status_span_query: true,
+                            compact_transactions_parts: false,
+                            gsfa_race_primary: true,
+                            get_tx_unknown_timeout: Duration::from_secs(10),
                             address_query_timeout: Duration::from_millis(100),
+                            gsfa_empty_watermark_ttl: Duration::ZERO,
+                            gsfa_empty_watermark_max_entries: 1,
                             schema_check_interval: Duration::from_secs(60),
                             memory_blocks_metadata: false,
                             memory_retain_slots: None,
@@ -7372,3 +8046,563 @@ mod agave_43;
 
 #[cfg(feature = "grpc-head-cache")]
 mod agave43_cached_encoding;
+#[cfg(feature = "disk-cache")]
+mod gsfa_race {
+    //! getSignaturesForAddress races the local page against the primary's full page.
+    use crate::clickhouse::{QueryTimings, SignatureRecord};
+    use crate::disk_cache::DiskGsfaPage;
+    use crate::handlers::signatures::{PrimaryGsfaPage, race_gsfa_page};
+    use crate::processing::{ProcessingError, ProcessingResult};
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    type PrimaryResult = ProcessingResult<(Vec<SignatureRecord>, QueryTimings)>;
+
+    fn record(slot: u64) -> SignatureRecord {
+        SignatureRecord {
+            signature: format!("sig-{slot}"),
+            slot,
+            slot_idx: 0,
+            err: None,
+            memo: None,
+            block_time: Some(slot as i64),
+        }
+    }
+
+    fn page(slots: &[u64], reached_floor: bool) -> DiskGsfaPage {
+        DiskGsfaPage {
+            records: slots.iter().copied().map(record).collect(),
+            reached_floor,
+            reached_tip: false,
+            floor: 10,
+            tip: 100,
+        }
+    }
+
+    fn primary_rows(slots: &[u64]) -> PrimaryResult {
+        Ok((
+            slots.iter().copied().map(record).collect(),
+            QueryTimings::zero(),
+        ))
+    }
+
+    fn slots(records: &[SignatureRecord]) -> Vec<u64> {
+        records.iter().map(|record| record.slot).collect()
+    }
+
+    /// Distinguishes a tier future that ran to completion from one that was dropped.
+    #[derive(Clone, Default)]
+    struct Probe {
+        finished: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Probe {
+        fn finished(&self) -> bool {
+            self.finished.load(Ordering::SeqCst)
+        }
+
+        fn dropped(&self) -> bool {
+            self.dropped.load(Ordering::SeqCst)
+        }
+
+        /// Resolves to `value` once the returned sender fires (or is dropped).
+        fn gate<T: Send + 'static>(
+            &self,
+            value: T,
+        ) -> (
+            oneshot::Sender<()>,
+            impl Future<Output = T> + Send + 'static,
+        ) {
+            let (release, wait) = oneshot::channel();
+            let finished = self.finished.clone();
+            let guard = DropFlag(self.dropped.clone());
+            let future = async move {
+                let _guard = guard;
+                let _ = wait.await;
+                finished.store(true, Ordering::SeqCst);
+                value
+            };
+            (release, future)
+        }
+    }
+
+    fn boxed(future: impl Future<Output = PrimaryResult> + Send + 'static) -> PrimaryGsfaPage {
+        Box::pin(future)
+    }
+
+    async fn wait_until(condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("condition not reached");
+    }
+
+    #[tokio::test]
+    async fn complete_local_page_wins_and_the_primary_read_drains() {
+        let primary = Probe::default();
+        let (release, primary_future) = primary.gate(primary_rows(&[9, 8]));
+        let (records, _, disk) = race_gsfa_page(
+            async { Some(page(&[99, 98], false)) },
+            boxed(primary_future),
+        )
+        .await
+        .unwrap();
+        assert!(records.is_empty());
+        assert_eq!(slots(&disk.unwrap().records), vec![99, 98]);
+        // The submitted primary read is neither awaited by the request nor cancelled.
+        assert!(!primary.dropped());
+        release.send(()).unwrap();
+        wait_until(|| primary.dropped()).await;
+        assert!(
+            primary.finished(),
+            "the losing primary read must drain, not abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_or_missing_local_page_serves_the_primary_full_page() {
+        for local in [Some(page(&[99], true)), None] {
+            let primary = Probe::default();
+            let (release, primary_future) = primary.gate(primary_rows(&[99, 50, 9]));
+            let answer = tokio::spawn(race_gsfa_page(
+                std::future::ready(local),
+                boxed(primary_future),
+            ));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                !answer.is_finished(),
+                "a short page must wait for the primary"
+            );
+            release.send(()).unwrap();
+            let (records, _, disk) = answer.await.unwrap().unwrap();
+            // The full page stands alone: nothing from the local page is merged.
+            assert_eq!(slots(&records), vec![99, 50, 9]);
+            assert!(disk.is_none());
+            assert!(primary.finished());
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_answer_cancels_the_pending_local_read() {
+        let local = Probe::default();
+        let (_hold, local_future) = local.gate(Some(page(&[99], false)));
+        let (records, _, disk) = race_gsfa_page(local_future, boxed(async { primary_rows(&[7]) }))
+            .await
+            .unwrap();
+        assert_eq!(slots(&records), vec![7]);
+        assert!(disk.is_none());
+        assert!(local.dropped());
+        assert!(!local.finished());
+    }
+
+    #[tokio::test]
+    async fn primary_error_falls_back_to_a_complete_local_page() {
+        let local = Probe::default();
+        let (release, local_future) = local.gate(Some(page(&[99, 98], false)));
+        let answer = tokio::spawn(race_gsfa_page(
+            local_future,
+            boxed(async { Err(ProcessingError::database_msg("primary down")) }),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !answer.is_finished(),
+            "a primary error must wait for the local page"
+        );
+        release.send(()).unwrap();
+        let (records, _, disk) = answer.await.unwrap().unwrap();
+        assert!(records.is_empty());
+        assert_eq!(slots(&disk.unwrap().records), vec![99, 98]);
+    }
+
+    #[tokio::test]
+    async fn primary_error_without_a_complete_local_page_is_returned() {
+        for local in [Some(page(&[99], true)), None] {
+            // The local page settles first, then the primary fails.
+            let error = race_gsfa_page(
+                std::future::ready(local),
+                boxed(async { Err(ProcessingError::database_msg("primary down")) }),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("primary down"), "{error}");
+        }
+        for local in [Some(page(&[99], true)), None] {
+            // The primary fails first, then the local page settles short.
+            let probe = Probe::default();
+            let (release, local_future) = probe.gate(local);
+            let answer = tokio::spawn(race_gsfa_page(
+                local_future,
+                boxed(async { Err(ProcessingError::database_msg("primary down")) }),
+            ));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(!answer.is_finished());
+            release.send(()).unwrap();
+            let error = answer.await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("primary down"), "{error}");
+        }
+    }
+}
+
+fn test_state_with_primary_cache(clickhouse_url: &str, max_bytes: u64) -> Arc<AppState> {
+    let mut state = test_state_with_clickhouse_url(clickhouse_url);
+    Arc::get_mut(&mut state)
+        .expect("unique state")
+        .get_transaction_primary_cache =
+        PrimaryTransactionCache::new(max_bytes, Duration::from_secs(600));
+    state
+}
+
+fn primary_cache_key(signature: [u8; 64], pinned_slot: Option<u64>) -> PrimaryTransactionCacheKey {
+    PrimaryTransactionCacheKey {
+        signature,
+        pinned_slot,
+    }
+}
+
+/// Every encoding × `maxSupportedTransactionVersion` × commitment combination a primary read
+/// serves; the hydration outcome (success or `-32015`) depends only on the record and these.
+fn primary_cache_request_configs() -> Vec<(Value, UiTransactionEncoding, Option<u8>)> {
+    let mut configs = Vec::new();
+    for (name, encoding) in [
+        ("json", UiTransactionEncoding::Json),
+        ("jsonParsed", UiTransactionEncoding::JsonParsed),
+        ("base58", UiTransactionEncoding::Base58),
+        ("base64", UiTransactionEncoding::Base64),
+    ] {
+        for max_version in [None, Some(0), Some(1)] {
+            for commitment in ["confirmed", "finalized"] {
+                let mut config = json!({ "encoding": name, "commitment": commitment });
+                if let Some(max_version) = max_version {
+                    config["maxSupportedTransactionVersion"] = json!(max_version);
+                }
+                configs.push((config, encoding, max_version));
+            }
+        }
+    }
+    configs
+}
+
+async fn response_body_bytes(response: Response) -> Bytes {
+    to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes")
+}
+
+/// A hit is hydrated by the same function the primary branch calls, so its body is byte-identical
+/// to a primary-served response for the same record, including the unsupported-version error.
+/// The primary is a refused port: a miss would return an internal error instead.
+#[tokio::test]
+async fn get_transaction_primary_cache_hit_is_byte_identical_to_primary_hydration() {
+    let state = test_state_with_primary_cache("http://127.0.0.1:1", 1 << 20);
+    let mut unsupported_version_errors = 0;
+    for record in transaction_variant_records() {
+        let signature_str = bs58::encode(record.signature).into_string();
+        let record = Arc::new(record);
+        state
+            .get_transaction_primary_cache
+            .insert(primary_cache_key(record.signature, None), record.clone())
+            .await;
+        for (config, encoding, max_version) in primary_cache_request_configs() {
+            let hit = crate::handlers::transactions::handle_get_transaction(
+                state.clone(),
+                json!(7),
+                Some(vec![json!(&signature_str), config.clone()]),
+            )
+            .await
+            .expect("hit response");
+            // Agave 4.3 rejects this request before any cache or hydration access.
+            if encoding == UiTransactionEncoding::Base58
+                && max_version.is_some_and(|version| version >= 1)
+            {
+                let error = parse_json_rpc_response(hit)
+                    .await
+                    .error
+                    .expect("encoding rejection");
+                assert_eq!(error.code, -32602);
+                assert_eq!(
+                    error.message,
+                    "base58 encoding is not supported with maxSupportedTransactionVersion >= 1"
+                );
+                continue;
+            }
+            let mut route = crate::handlers::RouteMetric::for_state("getTransaction", &state);
+            let expected = crate::handlers::transactions::respond_with_hydrated_transaction(
+                &state,
+                json!(7),
+                &mut route,
+                &signature_str,
+                record.clone(),
+                encoding,
+                max_version,
+                None,
+            )
+            .await
+            .expect("expected response");
+            let hit = response_body_bytes(hit).await;
+            assert_eq!(
+                hit,
+                response_body_bytes(expected).await,
+                "version {:?} config {config}",
+                record.tx_version
+            );
+            let parsed: JsonRpcResponse = serde_json::from_slice(&hit).expect("json");
+            if let Some(error) = parsed.error {
+                assert_eq!(error.code, -32015, "config {config}: {}", error.message);
+                unsupported_version_errors += 1;
+            }
+        }
+    }
+    assert!(unsupported_version_errors > 0);
+
+    // The route reports the in-process cache, not ClickHouse.
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [bs58::encode([11u8; 64]).into_string()]
+    });
+    let response = handle_json_rpc_value(state.clone(), &request).await;
+    assert_eq!(response.headers()["X-Superbank-Sources"], "response-cache");
+    assert!(parse_json_rpc_response(response).await.error.is_none());
+}
+
+#[tokio::test]
+async fn get_transaction_primary_cache_is_disabled_by_default() {
+    let state = test_state_with_clickhouse_url("http://127.0.0.1:1");
+    let record = Arc::new(transaction_variant_record(None, false));
+    state
+        .get_transaction_primary_cache
+        .insert(primary_cache_key(record.signature, None), record.clone())
+        .await;
+    let response = crate::handlers::transactions::handle_get_transaction(
+        state.clone(),
+        json!(1),
+        Some(vec![json!(bs58::encode(record.signature).into_string())]),
+    )
+    .await
+    .expect("response");
+    let error = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("primary error");
+    assert_eq!(error.code, -32603);
+}
+
+#[tokio::test]
+async fn get_transaction_primary_cache_keeps_pinned_slot_reads_separate() {
+    let state = test_state_with_primary_cache("http://127.0.0.1:1", 1 << 20);
+    let mut record = transaction_variant_record(None, false);
+    record.slot = 5;
+    let record = Arc::new(record);
+    let signature_str = bs58::encode(record.signature).into_string();
+    let request = |slot: Option<u64>| {
+        let mut config = json!({});
+        if let Some(slot) = slot {
+            config["slot"] = json!(slot);
+        }
+        crate::handlers::transactions::handle_get_transaction(
+            state.clone(),
+            json!(1),
+            Some(vec![json!(&signature_str), config]),
+        )
+    };
+    let code = |parsed: JsonRpcResponse| parsed.error.map(|error| error.code);
+
+    // An unpinned entry does not answer a pinned request, even at the same slot.
+    state
+        .get_transaction_primary_cache
+        .insert(primary_cache_key(record.signature, None), record.clone())
+        .await;
+    let pinned = parse_json_rpc_response(request(Some(5)).await.expect("pinned")).await;
+    assert_eq!(code(pinned), Some(-32603));
+
+    // A pinned entry answers only its own slot.
+    state
+        .get_transaction_primary_cache
+        .insert(primary_cache_key(record.signature, Some(5)), record.clone())
+        .await;
+    let pinned = parse_json_rpc_response(request(Some(5)).await.expect("pinned")).await;
+    assert_eq!(pinned.error.map(|error| error.code), None);
+    assert_eq!(pinned.result.expect("result")["slot"], json!(5));
+    let other = parse_json_rpc_response(request(Some(6)).await.expect("other slot")).await;
+    assert_eq!(code(other), Some(-32603));
+}
+
+#[tokio::test]
+async fn get_transaction_primary_cache_does_not_bypass_processed_commitment_check() {
+    let state = test_state_with_primary_cache("http://127.0.0.1:1", 1 << 20);
+    let record = Arc::new(transaction_variant_record(None, false));
+    state
+        .get_transaction_primary_cache
+        .insert(primary_cache_key(record.signature, None), record.clone())
+        .await;
+    let response = crate::handlers::transactions::handle_get_transaction(
+        state,
+        json!(1),
+        Some(vec![
+            json!(bs58::encode(record.signature).into_string()),
+            json!({ "commitment": "processed" }),
+        ]),
+    )
+    .await
+    .expect("response");
+    let error = parse_json_rpc_response(response)
+        .await
+        .error
+        .expect("invalid params");
+    assert_eq!(error.code, -32602);
+}
+
+/// Primary reads against a disposable local ClickHouse: the first request is served by the
+/// primary and cached, repeats are hits with byte-identical bodies for every encoding and
+/// `maxSupportedTransactionVersion` (including `-32015`), pinned reads keep their own entries,
+/// and not-found results are never cached.
+#[tokio::test]
+#[ignore = "requires SUPERBANK_PRIMARY_CACHE_CLICKHOUSE_TEST_URL pointing to local ClickHouse"]
+async fn get_transaction_primary_cache_clickhouse_round_trip() {
+    let url = std::env::var("SUPERBANK_PRIMARY_CACHE_CLICKHOUSE_TEST_URL")
+        .expect("set SUPERBANK_PRIMARY_CACHE_CLICKHOUSE_TEST_URL");
+    let http = reqwest::Client::new();
+    let database = format!(
+        "primary_cache_{}_{}",
+        std::process::id(),
+        current_time_millis()
+    );
+    async fn execute(http: &reqwest::Client, url: &str, sql: String) {
+        let response = http.post(url).body(sql).send().await.expect("request");
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "ClickHouse {status}: {body}");
+    }
+    execute(&http, &url, format!("CREATE DATABASE {database}")).await;
+    for ddl in [
+        include_str!("../../../../ddl/local/transactions.sql"),
+        include_str!("../../../../ddl/local/signatures.sql"),
+    ] {
+        for statement in ddl
+            .replace("default.", &format!("{database}."))
+            .split(";\n")
+        {
+            if !statement.trim().is_empty() {
+                execute(&http, &url, statement.to_string()).await;
+            }
+        }
+    }
+    // A legacy and a v0 transaction; the view writes their signatures rows.
+    for (fill, slot, version) in [('a', 700, "NULL"), ('v', 701, "0")] {
+        execute(&http, &url, format!(
+            "INSERT INTO {database}.transactions (signature, slot, slot_idx, tx_version, tx_signatures, tx_num_required_signatures, tx_num_readonly_unsigned_accounts, tx_account_keys, tx_recent_blockhash, tx_instructions_program_id_index, tx_instructions_accounts, tx_instructions_data, meta_status_ok, meta_fee, meta_pre_balances, meta_post_balances, meta_log_messages_present, meta_log_messages) VALUES (repeat('{fill}', 64), {slot}, 3, {version}, [repeat('{fill}', 64)], 1, 1, [repeat('k', 32), repeat('p', 32)], repeat('h', 32), [1], [[0]], ['abc'], 1, 5000, [10, 20], [5, 20], 1, ['Program log: hi'])"
+        ))
+        .await;
+    }
+
+    // Both primary read paths on this branch: two queries and the fused single round trip.
+    for single_round_trip in [false, true] {
+        let state_for = |cache_bytes: u64| {
+            let mut state = test_state_with_primary_cache(&url, cache_bytes);
+            let clickhouse = &mut Arc::get_mut(&mut state).expect("unique").clickhouse;
+            clickhouse.transaction_table = format!("{database}.transactions");
+            clickhouse.signature_statuses_table = format!("{database}.signatures");
+            clickhouse.set_get_transaction_single_round_trip(single_round_trip);
+            state
+        };
+        let cached = state_for(1 << 24);
+        let uncached = state_for(0);
+        for state in [&cached, &uncached] {
+            state
+                .clickhouse
+                .initialize_read_cancellation()
+                .await
+                .expect("cancellation preflight");
+        }
+        let body = |state: &Arc<AppState>, signature: String, config: Value| {
+            let state = state.clone();
+            async move {
+                let response = crate::handlers::transactions::handle_get_transaction(
+                    state,
+                    json!(1),
+                    Some(vec![json!(signature), config]),
+                )
+                .await
+                .expect("response");
+                response_body_bytes(response).await
+            }
+        };
+
+        let (miss, insert, hit) = (
+            crate::metrics::get_transaction_primary_cache_access_count_for_tests("miss"),
+            crate::metrics::get_transaction_primary_cache_access_count_for_tests("insert"),
+            crate::metrics::get_transaction_primary_cache_access_count_for_tests("hit"),
+        );
+        let mut unsupported_version_errors = 0;
+        for (fill, slot) in [(b'a', 700u64), (b'v', 701)] {
+            let signature = bs58::encode([fill; 64]).into_string();
+            for pinned_slot in [None, Some(slot)] {
+                for (mut config, _, _) in primary_cache_request_configs() {
+                    if let Some(slot) = pinned_slot {
+                        config["slot"] = json!(slot);
+                    }
+                    let primary = body(&uncached, signature.clone(), config.clone()).await;
+                    let first = body(&cached, signature.clone(), config.clone()).await;
+                    let repeat = body(&cached, signature.clone(), config.clone()).await;
+                    assert_eq!(first, primary, "{} {config}", fill as char);
+                    assert_eq!(repeat, primary, "{} {config}", fill as char);
+                    let parsed: JsonRpcResponse = serde_json::from_slice(&primary).expect("json");
+                    match parsed.error {
+                        Some(error) => {
+                            assert_eq!(error.code, -32015, "{config}: {}", error.message);
+                            unsupported_version_errors += 1;
+                        }
+                        None => assert_eq!(parsed.result.expect("result")["slot"], json!(slot)),
+                    }
+                }
+            }
+        }
+        assert!(unsupported_version_errors > 0);
+        // One primary read (miss + insert) per signature and pin; every other request hit.
+        let inserts =
+            crate::metrics::get_transaction_primary_cache_access_count_for_tests("insert") - insert;
+        assert_eq!(inserts, 4);
+        assert!(
+            crate::metrics::get_transaction_primary_cache_access_count_for_tests("miss") - miss
+                >= 4
+        );
+        let requests = 2 * 2 * primary_cache_request_configs().len() as u64 * 2;
+        assert_eq!(
+            crate::metrics::get_transaction_primary_cache_access_count_for_tests("hit") - hit,
+            requests - 4
+        );
+
+        // A pinned request at another slot, and an unknown signature, are not found and not cached.
+        let unknown = bs58::encode([b'u'; 64]).into_string();
+        let other_slot = bs58::encode([b'a'; 64]).into_string();
+        for (signature, config) in [(unknown, json!({})), (other_slot, json!({ "slot": 999 }))] {
+            for _ in 0..2 {
+                let parsed: JsonRpcResponse =
+                    serde_json::from_slice(&body(&cached, signature.clone(), config.clone()).await)
+                        .expect("json");
+                assert_eq!(parsed.result, Some(Value::Null));
+            }
+        }
+        assert_eq!(
+            crate::metrics::get_transaction_primary_cache_access_count_for_tests("insert") - insert,
+            4
+        );
+    }
+    execute(&http, &url, format!("DROP DATABASE {database}")).await;
+}

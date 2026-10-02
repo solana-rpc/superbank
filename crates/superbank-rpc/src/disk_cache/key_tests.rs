@@ -93,6 +93,189 @@ async fn assert_transaction_invalidation(cache: &DiskCache) {
     assert!(matches!(read.await, DiskTransactionResult::Unavailable));
 }
 
+/// Starts a getTransaction behind held admission permits, runs `event` while it is
+/// in flight, then releases the permits and returns what the read served.
+async fn get_tx_across<F: Future<Output = ()>>(
+    cache: &DiskCache,
+    slot: u64,
+    event: impl FnOnce() -> F,
+) -> DiskTransactionResult {
+    let permits = cache
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    // Boxed: debug-build read futures are large and this fixture runs deep.
+    let mut read = Box::pin(cache.get_tx(signature(slot), None));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut read)
+            .await
+            .is_err()
+    );
+    Box::pin(event()).await;
+    drop(permits);
+    read.await
+}
+
+/// Eviction moves only the floor: a found row whose slot is still covered is served.
+/// Data-invalidating events (poison) and evicted slots still fall back.
+async fn assert_transaction_read_revalidation(cache: &DiskCache) {
+    let found = get_tx_across(cache, 45, || async {
+        assert!(cache.evict_below(12, "window").await.unwrap());
+    })
+    .await;
+    assert_eq!(found_transaction(found).slot, 45);
+    // Poison of the row's own slot, and of any other slot, rejects the in-flight row.
+    for poisoned in [43, 44] {
+        let result = get_tx_across(cache, 44, || cache.poison_slot(poisoned)).await;
+        assert!(matches!(result, DiskTransactionResult::Unavailable));
+    }
+    let result = get_tx_across(cache, 25, || async {
+        assert!(cache.evict_below(30, "window").await.unwrap());
+    })
+    .await;
+    assert!(matches!(result, DiskTransactionResult::Unavailable));
+    assert!(!cache.covers_slot(25));
+    assert_eq!(
+        found_transaction(Box::pin(cache.get_tx(signature(45), None)).await).slot,
+        45
+    );
+}
+
+/// A stalled local server (every interactive permit held): getTransaction gives up at
+/// its own budget while a status read on the same cache still waits the full timeout.
+async fn assert_get_tx_budget(source: &ClickHouseClient, cfg: &DiskCacheConfig) {
+    let mut cfg = cfg.clone();
+    cfg.query_timeout = Duration::from_millis(1_500);
+    cfg.get_tx_timeout = Duration::from_millis(200);
+    let cache = Box::pin(DiskCache::open(cfg, source)).await.unwrap();
+    let _permits = cache
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (tx, statuses) = tokio::join!(
+        async {
+            let result = Box::pin(cache.get_tx(signature(45), None)).await;
+            (result, started.elapsed())
+        },
+        async {
+            let result = Box::pin(cache.get_sig_statuses(vec![signature(45)])).await;
+            (result, started.elapsed())
+        },
+    );
+    assert!(matches!(tx.0, DiskTransactionResult::Unavailable));
+    assert!(
+        tx.1 >= Duration::from_millis(200) && tx.1 < Duration::from_millis(700),
+        "get_tx gave up after {:?}",
+        tx.1
+    );
+    assert!(statuses.0[0].is_none());
+    assert!(
+        statuses.1 >= Duration::from_millis(1_500),
+        "status read gave up after {:?}",
+        statuses.1
+    );
+}
+
+/// Times one getTransaction against a stalled local server (every interactive permit held).
+async fn stalled_get_tx(cache: &DiskCache, slot: u64, requested_slot: Option<u64>) -> Duration {
+    let _permits = cache
+        .inner
+        .local
+        .http_query_sem
+        .acquire_many(2)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let result = Box::pin(cache.get_tx(signature(slot), requested_slot)).await;
+    let elapsed = started.elapsed();
+    // An expired budget is never proof of absence, even for a covered requested slot.
+    assert!(
+        matches!(result, DiskTransactionResult::Unavailable),
+        "{result:?}"
+    );
+    elapsed
+}
+
+/// After a restart or a signature-index reset every partition is unknown. With more
+/// than `GET_TX_UNKNOWN_PARTITION_LIMIT` of them a stalled getTransaction gives up at
+/// the unknown-membership budget while a fast hit is still served; a built index, or
+/// one partition left unknown by a repair, keeps the normal budget.
+async fn assert_get_tx_unknown_budget(
+    client: &clickhouse::Client,
+    source: &ClickHouseClient,
+    cfg: &DiskCacheConfig,
+) {
+    let mut cfg = cfg.clone();
+    cfg.database = format!("{}_unknown", cfg.database);
+    // Eight partitions (2..=9) over slots 10..49, twice the gate's limit.
+    cfg.partition_slots = 5;
+    cfg.query_timeout = Duration::from_millis(2_000);
+    cfg.get_tx_timeout = Duration::from_millis(800);
+    cfg.get_tx_unknown_timeout = Duration::from_millis(100);
+    let (normal, short) = (cfg.get_tx_timeout, cfg.get_tx_unknown_timeout);
+    let cache = Box::pin(DiskCache::open(cfg.clone(), source))
+        .await
+        .unwrap();
+    insert_transactions(client, &cfg.database).await;
+    cache
+        .publish_range_coverage(
+            (10..50)
+                .map(|slot| (slot, SlotStatus::Covered { tx_count: 1 }))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cache.unknown_signature_partitions(), 8);
+    // Gated, but a responsive local server still serves the hit.
+    assert_eq!(
+        found_transaction(Box::pin(cache.get_tx(signature(45), None)).await).slot,
+        45
+    );
+    // A gated miss that completes probes every unknown partition and is still no proof.
+    let started = std::time::Instant::now();
+    let miss = Box::pin(cache.get_tx(signature(500), None)).await;
+    eprintln!("unknown x8 miss took {:?}", started.elapsed());
+    assert!(
+        matches!(miss, DiskTransactionResult::Unavailable),
+        "{miss:?}"
+    );
+    for (slot, requested_slot) in [(45, None), (45, Some(45)), (500, Some(45))] {
+        let elapsed = stalled_get_tx(&cache, slot, requested_slot).await;
+        eprintln!("unknown x8 stalled get_tx gave up after {elapsed:?}");
+        assert!(
+            elapsed >= short && elapsed < normal / 2,
+            "gated get_tx gave up after {elapsed:?}"
+        );
+    }
+    cache.build_signature_indexes().await;
+    assert_eq!(cache.unknown_signature_partitions(), 0);
+    let elapsed = stalled_get_tx(&cache, 45, None).await;
+    eprintln!("known stalled get_tx gave up after {elapsed:?}");
+    assert!(elapsed >= normal, "known get_tx gave up after {elapsed:?}");
+    // A repair leaves one partition unknown: below the limit, the normal budget.
+    let repair = cache.begin_fill(25, 25);
+    assert_eq!(cache.unknown_signature_partitions(), 1);
+    let elapsed = stalled_get_tx(&cache, 45, None).await;
+    assert!(elapsed >= normal, "repair get_tx gave up after {elapsed:?}");
+    drop(repair);
+    // A signature-index reset makes every partition unknown again.
+    cache.inner.key_index.clear_signatures();
+    assert_eq!(cache.unknown_signature_partitions(), 8);
+    let elapsed = stalled_get_tx(&cache, 45, None).await;
+    assert!(
+        elapsed >= short && elapsed < normal / 2,
+        "reset get_tx gave up after {elapsed:?}"
+    );
+    execute(client, &format!("DROP DATABASE {} SYNC", cfg.database)).await;
+}
+
 async fn assert_transaction_append_race(client: &clickhouse::Client, cache: &DiskCache) {
     cache.inner.key_index.clear_signatures();
     let permits = cache
@@ -253,9 +436,21 @@ pub(super) fn config(url: String, database: String) -> DiskCacheConfig {
         max_bytes: 0,
         partition_slots: 10,
         query_timeout: Duration::from_secs(2),
+        get_tx_timeout: Duration::from_secs(2),
+        fused_get_tx: true,
+        get_tx_span_check: true,
+        eviction_safe_hits: true,
+        status_span_query: true,
+        compact_transactions_parts: false,
+        gsfa_race_primary: true,
+        // Equal to get_tx_timeout: the unknown-membership gate is a no-op unless a test sets it.
+        get_tx_unknown_timeout: Duration::from_secs(2),
         address_query_timeout: Duration::from_millis(100),
+        gsfa_empty_watermark_ttl: Duration::ZERO,
+        gsfa_empty_watermark_max_entries: 1,
         key_index_max_memory_bytes: 128 * 1024 * 1024,
         query_concurrency: 2,
+        background_query_concurrency: 2,
         query_max_threads: 2,
         schema_check_interval: Duration::from_secs(300),
         memory_blocks_metadata: false,
@@ -367,6 +562,67 @@ async fn assert_pagination(cache: &DiskCache) {
             expected.reverse();
         }
         assert_eq!(slots, expected);
+    }
+}
+
+/// Bounded gsfa pages over several partitions, as one local query, must equal the
+/// unbounded page filtered by the same bounds: order, limit and exclusive edges.
+async fn assert_gsfa_bounds_across_partitions(cache: &DiskCache) {
+    use crate::clickhouse::{SignatureSlot, SlotBoundary};
+    let all = cache
+        .signatures_for_address(address("address"), None, None, 1000)
+        .await
+        .unwrap()
+        .records;
+    let position = |slot| {
+        let row = all.iter().find(|row| row.slot == slot).unwrap();
+        SlotBoundary::Position(SignatureSlot {
+            slot,
+            slot_idx: row.slot_idx,
+        })
+    };
+    let key = |row: &crate::clickhouse::SignatureRecord| (row.slot, row.slot_idx);
+    let newer_than = |row, bound: Option<SlotBoundary>| match bound {
+        None => true,
+        Some(SlotBoundary::Slot(slot)) => key(row).0 > slot,
+        Some(SlotBoundary::Position(p)) => key(row) > (p.slot, p.slot_idx),
+    };
+    let older_than = |row, bound: Option<SlotBoundary>| match bound {
+        None => true,
+        Some(SlotBoundary::Slot(slot)) => key(row).0 < slot,
+        Some(SlotBoundary::Position(p)) => key(row) < (p.slot, p.slot_idx),
+    };
+    let befores = [None, Some(position(37)), Some(SlotBoundary::Slot(33))];
+    let untils = [None, Some(position(12)), Some(SlotBoundary::Slot(21))];
+    for before in befores {
+        for until in untils {
+            for limit in [1, 5, 15, 100] {
+                let expected: Vec<_> = all
+                    .iter()
+                    .filter(|row| older_than(row, before) && newer_than(row, until))
+                    .take(limit)
+                    .map(|row| (row.slot, row.slot_idx, row.signature.clone()))
+                    .collect();
+                let page = cache
+                    .signatures_for_address(address("address"), before, until, limit)
+                    .await
+                    .unwrap_or_else(|| panic!("no page for {before:?} {until:?} {limit}"));
+                let actual: Vec<_> = page
+                    .records
+                    .iter()
+                    .map(|row| (row.slot, row.slot_idx, row.signature.clone()))
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "before={before:?} until={until:?} limit={limit}"
+                );
+                // Both `until` bounds lie inside coverage, so only unbounded pages reach it.
+                assert_eq!(
+                    page.reached_floor,
+                    expected.len() < limit && until.is_none()
+                );
+            }
+        }
     }
 }
 
@@ -648,15 +904,17 @@ async fn assert_resumable_rebuild(cache: &DiskCache, cfg: &DiskCacheConfig) {
             .unwrap(),
         marker
     );
-    assert!(
+    assert_eq!(
         schema::initialize_cache_schema(&admin, &cache.source_schema(), &cfg.schema_config())
             .await
-            .unwrap()
+            .unwrap(),
+        schema::SchemaBootstrap::Rebuilt
     );
-    assert!(
-        !schema::initialize_cache_schema(&admin, &cache.source_schema(), &cfg.schema_config())
+    assert_eq!(
+        schema::initialize_cache_schema(&admin, &cache.source_schema(), &cfg.schema_config())
             .await
-            .unwrap()
+            .unwrap(),
+        schema::SchemaBootstrap::Reused
     );
     assert_eq!(
         admin
@@ -667,6 +925,171 @@ async fn assert_resumable_rebuild(cache: &DiskCache, cfg: &DiskCacheConfig) {
             .unwrap(),
         marker
     );
+}
+
+async fn select_queries(client: &clickhouse::Client) -> u64 {
+    client
+        .query("SELECT value FROM system.events WHERE event = 'SelectQuery'")
+        .fetch_one::<u64>()
+        .await
+        .unwrap()
+}
+
+/// Local SELECTs issued by `read`, excluding the counter probes themselves.
+async fn local_selects<T>(client: &clickhouse::Client, read: impl Future<Output = T>) -> (T, u64) {
+    let probe = select_queries(client).await;
+    let before = select_queries(client).await;
+    let value = Box::pin(read).await;
+    let after = select_queries(client).await;
+    (value, (after - before) - (before - probe))
+}
+
+async fn explain(client: &clickhouse::Client, query: &str) -> String {
+    let explain = client
+        .query(&format!("EXPLAIN indexes=1 {query}"))
+        .fetch_all::<String>()
+        .await
+        .unwrap()
+        .join("\n");
+    eprintln!("EXPLAIN indexes=1 {query}\n{explain}");
+    // Plan indentation and tree glyphs differ across server versions.
+    explain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+async fn assert_fused_transaction(client: &clickhouse::Client, cache: &DiskCache) {
+    let database = &cache.inner.cfg.database;
+    let bytes = signature(15);
+    let literal = format!(
+        "toFixedString(unhex('{}'), 64)",
+        hex::encode(bytes.as_ref()).to_uppercase()
+    );
+    let bucket = ch_cityhash102::cityhash64(bytes.as_ref())
+        % cache.query_client().signatures_bucket_modulus();
+    let query = crate::clickhouse::build_fused_transaction_query(
+        &format!("{database}.transactions"),
+        &format!("{database}.signatures"),
+        bucket,
+        &literal,
+        (10, 49),
+        "",
+    );
+    // The IN set drives payload primary-key analysis; the position lookup is keyed.
+    let outer = explain(client, &query).await;
+    assert!(
+        outer.contains("(slot, slot_idx) in 1-element set"),
+        "{outer}"
+    );
+    assert!(outer.contains("Search Algorithm: binary search"), "{outer}");
+    let (_, inner) = query.split_once("IN (").unwrap();
+    let (inner, _) = inner.rsplit_once(')').unwrap();
+    let inner = explain(client, inner).await;
+    assert!(
+        inner.contains("PrimaryKey Keys: sig_bucket signature"),
+        "{inner}"
+    );
+    assert!(inner.contains("Search Algorithm: binary search"), "{inner}");
+
+    // A hit is one local query.
+    let (found, selects) = local_selects(client, cache.get_tx(signature(25), None)).await;
+    assert_eq!(found_transaction(found).slot, 25);
+    assert_eq!(selects, 1);
+
+    // A stale newest position yields no fused row; the legacy retry still finds it.
+    execute(client, &format!("INSERT INTO {database}.signatures (signature,slot,slot_idx) VALUES (toFixedString('sig-35',64),35,99)")).await;
+    let (found, selects) = local_selects(client, cache.get_tx(signature(35), Some(35))).await;
+    let found = found_transaction(found);
+    assert_eq!((found.slot, found.slot_idx), (35, 0));
+    assert_eq!(selects, 4, "fused, position, exact payload, legacy payload");
+    execute(client, &format!("ALTER TABLE {database}.signatures DELETE WHERE slot_idx = 99 SETTINGS mutations_sync = 2")).await;
+
+    // The newest row sits in a skipped partition inside the span: the per-partition
+    // search never reads it, so neither may the fused read.
+    execute(client, &format!("INSERT INTO {database}.transactions (signature,slot,slot_idx,tx_signatures) VALUES (toFixedString('sig-15',64),35,5,[toFixedString('sig-15',64)])")).await;
+    assert!(!signature_candidate(cache, 3, signature(15)));
+    let repair = cache.begin_fill(45, 45);
+    let (found, selects) = local_selects(client, cache.get_tx(signature(15), None)).await;
+    assert_eq!(found_transaction(found).slot, 15);
+    assert!(selects > 1, "rejected fused row must fall back");
+    drop(repair);
+    for table in ["transactions", "signatures"] {
+        execute(client, &format!("ALTER TABLE {database}.{table} DELETE WHERE slot = 35 AND slot_idx = 5 SETTINGS mutations_sync = 2")).await;
+    }
+    cache.build_signature_indexes().await;
+    assert!(cache.signature_indexes_ready());
+
+    // Candidates without rows (as for a Bloom false positive) are not absence by
+    // themselves: the pinned slot decides, as after the per-partition probes. With
+    // no position anywhere in the span, one span lookup stands in for those probes.
+    cache.inner.key_index.clear_signatures();
+    let (absent, selects) = local_selects(client, cache.get_tx(signature(500), Some(45))).await;
+    assert!(matches!(absent, DiskTransactionResult::Absent));
+    assert_eq!(
+        selects, 3,
+        "fused, span position lookup, pinned slot status"
+    );
+    for requested in [None, Some(500)] {
+        let (miss, selects) = local_selects(client, cache.get_tx(signature(500), requested)).await;
+        assert!(matches!(miss, DiskTransactionResult::Unavailable));
+        assert_eq!(selects, 2, "fused, span position lookup");
+    }
+    // A position in the span whose payload does not match (here stale) still takes
+    // the per-partition probes, newest first: partition 4 is empty, 3 holds it.
+    execute(client, &format!("INSERT INTO {database}.signatures (signature,slot,slot_idx) VALUES (toFixedString('sig-35',64),35,99)")).await;
+    let (found, selects) = local_selects(client, cache.get_tx(signature(35), None)).await;
+    let found = found_transaction(found);
+    assert_eq!((found.slot, found.slot_idx), (35, 0));
+    assert_eq!(
+        selects, 6,
+        "fused, span, two positions, exact payload, legacy payload"
+    );
+    execute(client, &format!("ALTER TABLE {database}.signatures DELETE WHERE slot_idx = 99 SETTINGS mutations_sync = 2")).await;
+    cache.build_signature_indexes().await;
+    assert!(cache.signature_indexes_ready());
+}
+
+/// DISK_CACHE_FUSED_GET_TX=false: a hit is the two-step lookup (position, then payload)
+/// that ran before the fused read.
+async fn assert_two_step_transaction(
+    client: &clickhouse::Client,
+    source: &ClickHouseClient,
+    cfg: &DiskCacheConfig,
+) {
+    let mut cfg = cfg.clone();
+    cfg.fused_get_tx = false;
+    let cache = Box::pin(DiskCache::open(cfg, source)).await.unwrap();
+    Box::pin(cache.build_key_indexes()).await;
+    Box::pin(cache.build_signature_indexes()).await;
+    assert!(cache.signature_indexes_ready());
+    let (found, selects) = local_selects(client, cache.get_tx(signature(25), None)).await;
+    assert_eq!(found_transaction(found).slot, 25);
+    assert_eq!(selects, 2, "position, then payload");
+}
+
+/// DISK_CACHE_GET_TX_SPAN_CHECK=false: an empty fused read over unknown-membership
+/// partitions takes the per-partition probes again instead of one span lookup.
+async fn assert_span_check_off(
+    client: &clickhouse::Client,
+    source: &ClickHouseClient,
+    cfg: &DiskCacheConfig,
+) {
+    let mut cfg = cfg.clone();
+    cfg.get_tx_span_check = false;
+    let cache = Box::pin(DiskCache::open(cfg, source)).await.unwrap();
+    Box::pin(cache.build_key_indexes()).await;
+    Box::pin(cache.build_signature_indexes()).await;
+    assert!(cache.signature_indexes_ready());
+    cache.inner.key_index.clear_signatures();
+    let (miss, selects) = local_selects(client, cache.get_tx(signature(500), None)).await;
+    assert!(matches!(miss, DiskTransactionResult::Unavailable));
+    // With the switch on this is 2 (fused, span lookup); off it is the fused read plus
+    // one position probe per candidate partition, as before the span check.
+    eprintln!("span check off: {selects} local selects");
+    assert!(
+        selects > 2,
+        "fused read plus per-partition probes, got {selects}"
+    );
+    Box::pin(cache.build_signature_indexes()).await;
+    assert!(cache.signature_indexes_ready());
 }
 
 async fn assert_pruning(client: &clickhouse::Client, database: &str) {
@@ -743,6 +1166,41 @@ async fn key_routing_clickhouse_integration() {
             source.verification_timeouts
         );
     }
+    let lanes_database = format!("{cache_database}_lanes");
+    {
+        // Raising serving concurrency leaves the background lane at its own size.
+        let mut lanes_cfg = cfg.clone();
+        lanes_cfg.database = lanes_database.clone();
+        lanes_cfg.query_concurrency = 16;
+        lanes_cfg.background_query_concurrency = 8;
+        let lanes = DiskCache::open(lanes_cfg, &source).await.unwrap();
+        assert_eq!(lanes.inner.local.read_endpoint.available_permits(), 16);
+        assert_eq!(
+            lanes
+                .inner
+                .maintenance_reader
+                .read_endpoint
+                .available_permits(),
+            8
+        );
+        assert_eq!(
+            lanes
+                .inner
+                .address_index_reader
+                .read_endpoint
+                .available_permits(),
+            1
+        );
+        assert_eq!(
+            lanes
+                .inner
+                .signature_index_reader
+                .read_endpoint
+                .available_permits(),
+            1
+        );
+        drop(lanes);
+    }
     insert_transactions(&client, &cache_database).await;
     cache
         .publish_range_coverage(
@@ -805,6 +1263,7 @@ async fn key_routing_clickhouse_integration() {
         page.records.iter().map(|r| r.slot).collect::<Vec<_>>(),
         (10..50).rev().collect::<Vec<_>>()
     );
+    assert_gsfa_bounds_across_partitions(&cache).await;
     for (key, tokens) in [
         ("address", TokenAccountsFilter::None),
         ("owner", TokenAccountsFilter::All),
@@ -843,13 +1302,39 @@ async fn key_routing_clickhouse_integration() {
     assert_transaction_position_fallback(&cache).await;
     assert_pagination(&cache).await;
     assert_pruning(&client, &cache_database).await;
+    let fused_client = client.clone();
+    let fused_cache = cache.clone();
+    let (two_step_source, two_step_cfg) = (source.clone(), cfg.clone());
+    tokio::spawn(async move {
+        // Boxed so the test body stays under the 2 MiB debug test-thread stack.
+        Box::pin(assert_fused_transaction(&fused_client, &fused_cache)).await;
+        Box::pin(assert_two_step_transaction(
+            &fused_client,
+            &two_step_source,
+            &two_step_cfg,
+        ))
+        .await;
+        Box::pin(assert_span_check_off(
+            &fused_client,
+            &two_step_source,
+            &two_step_cfg,
+        ))
+        .await;
+    })
+    .await
+    .unwrap();
     // Poll migration separately so nested debug lookup futures do not consume
     // the fixture task's stack as well as their own.
     let migration_client = client.clone();
     let migration_source = source.clone();
     let migration_cfg = cfg.clone();
     tokio::spawn(async move {
-        assert_migration(&migration_client, &migration_source, &migration_cfg).await;
+        Box::pin(assert_migration(
+            &migration_client,
+            &migration_source,
+            &migration_cfg,
+        ))
+        .await;
     })
     .await
     .unwrap();
@@ -859,7 +1344,7 @@ async fn key_routing_clickhouse_integration() {
     let tx_source = source.clone();
     let tx_cache = cache.clone();
     tokio::spawn(async move {
-        assert_transaction_reads(&tx_client, &tx_source, &tx_cache).await;
+        Box::pin(assert_transaction_reads(&tx_client, &tx_source, &tx_cache)).await;
     })
     .await
     .unwrap();
@@ -869,6 +1354,21 @@ async fn key_routing_clickhouse_integration() {
         DiskTransactionResult::Unavailable
     ));
     assert!(!signature_candidate(&cache, 1, signature(500)));
+    let (budget_client, budget_source, budget_cfg, revalidation_cache) =
+        (client.clone(), source.clone(), cfg.clone(), cache.clone());
+    // Boxed so the spawned block stays small inside this already large test body.
+    tokio::spawn(async move {
+        Box::pin(assert_get_tx_budget(&budget_source, &budget_cfg)).await;
+        Box::pin(assert_get_tx_unknown_budget(
+            &budget_client,
+            &budget_source,
+            &budget_cfg,
+        ))
+        .await;
+        Box::pin(assert_transaction_read_revalidation(&revalidation_cache)).await;
+    })
+    .await
+    .unwrap();
     let mut reopened_cfg = cfg;
     reopened_cfg.query_timeout = Duration::from_millis(50);
     let reopened = DiskCache::open(reopened_cfg, &source).await.unwrap();
@@ -909,15 +1409,16 @@ async fn key_routing_clickhouse_integration() {
     let tx_source = source.clone();
     let tx_cache = reopened.clone();
     tokio::spawn(async move {
-        assert_transaction_fallback(&tx_source, &tx_cache).await;
+        Box::pin(assert_transaction_fallback(&tx_source, &tx_cache)).await;
     })
     .await
     .unwrap();
     drop(_permits);
     if std::env::var_os("DISK_CACHE_TEST_KEEP").is_some() {
-        eprintln!("Kept source database {database} and cache {cache_database}");
+        eprintln!("Kept source database {database} and caches {cache_database}, {lanes_database}");
         return;
     }
+    execute(&client, &format!("DROP DATABASE {lanes_database} SYNC")).await;
     execute(&client, &format!("DROP DATABASE {cache_database} SYNC")).await;
     execute(&client, &format!("DROP DATABASE {database} SYNC")).await;
 }
@@ -928,3 +1429,12 @@ mod address_latency;
 
 mod address_budget;
 mod agave43;
+
+mod gsfa_cursor_watermark;
+
+mod part_layout;
+
+mod status_span;
+
+#[cfg(feature = "grpc-head-cache")]
+mod status_history;

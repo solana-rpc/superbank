@@ -30,6 +30,9 @@
 //   PARITY_ADDRESSES      how many pool addresses to walk (default 5)
 //   PARITY_PAGE_SIZE      gSFA/gTFA page size (default 100)
 //   PARITY_MAX_PAGES      page cap per address walk (default 10)
+//   PARITY_MAX_TX_VERSION maxSupportedTransactionVersion for getBlock/getTransaction (default 1;
+//                         with 0, blocks containing v1 transactions return -32015 and no
+//                         signatures are harvested for the signature-shaped sections)
 
 import http from 'k6/http';
 import { check, fail } from 'k6';
@@ -44,6 +47,7 @@ const blockSamples = Number(__ENV.PARITY_BLOCK_SAMPLES || 12);
 const addressCount = Number(__ENV.PARITY_ADDRESSES || 5);
 const pageSize = Number(__ENV.PARITY_PAGE_SIZE || 100);
 const maxPages = Number(__ENV.PARITY_MAX_PAGES || 10);
+const maxTxVersion = Number(__ENV.PARITY_MAX_TX_VERSION || 1);
 const addressPool = initAddressPool();
 
 export const options = {
@@ -139,7 +143,7 @@ export default function (data) {
       {
         transactionDetails: 'full',
         rewards: true,
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: maxTxVersion,
         commitment: 'finalized',
       },
     ]);
@@ -149,7 +153,7 @@ export default function (data) {
         {
           transactionDetails: details,
           rewards: details !== 'none',
-          maxSupportedTransactionVersion: 0,
+          maxSupportedTransactionVersion: maxTxVersion,
           commitment: 'finalized',
         },
       ]);
@@ -174,7 +178,7 @@ export default function (data) {
   for (const signature of harvestedSignatures.slice(0, 25)) {
     compareCall('getTransaction', 'getTransaction', [
       signature,
-      { maxSupportedTransactionVersion: 0, commitment: 'finalized' },
+      { maxSupportedTransactionVersion: maxTxVersion, commitment: 'finalized' },
     ]);
   }
   if (harvestedSignatures.length > 0) {

@@ -37,9 +37,11 @@ mod solana_sdk {
 
 mod block_response_cache;
 mod clickhouse;
+mod get_transaction_primary_cache;
 mod metrics;
 mod processing;
 mod request_filter;
+mod status_history_cache;
 
 mod config;
 #[cfg(feature = "disk-cache")]

@@ -61,7 +61,12 @@ impl Fixture {
             .with_validation(false)
             .with_compression(clickhouse::Compression::None);
         Self {
-            verifier: DisconnectVerifier::new(client, None, Default::default()),
+            verifier: DisconnectVerifier::new(
+                client,
+                None,
+                Default::default(),
+                PendingBudget::for_admission(usize::MAX),
+            ),
             mode,
             requests,
             entered,

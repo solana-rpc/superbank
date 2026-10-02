@@ -298,7 +298,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--grpc-http2-adaptive-window[=true|false]` / `GRPC_HTTP2_ADAPTIVE_WINDOW` (default: false)
 - `--grpc-idle-timeout-secs` / `GRPC_IDLE_TIMEOUT_SECS` (default: 30; grpc source exits if no messages arrive before the timeout)
 - `--grpc-health-watch-enabled[=true|false]` / `GRPC_HEALTH_WATCH_ENABLED` (default: true; grpc source exits if health is not `SERVING`)
-- `--grpc-slot-notifications[=true|false]` / `GRPC_SLOT_NOTIFICATIONS` (default: true; subscribe to slot notifications on the gRPC stream to populate `superbank_ingest_chain_tip_lag`)
+- `--grpc-slot-notifications[=true|false]` / `GRPC_SLOT_NOTIFICATIONS` (default: true; subscribe to extra finalized slot notifications to populate `superbank_ingest_chain_tip_lag`; required bank-status events remain subscribed)
 - `--rpc-url` / `RPC_URL` (required for rpc source)
 - `--rpc-from-slot` / `RPC_FROM_SLOT` (required for rpc source; use `*` for latest slot in
   `blocks_metadata`, `0` to start from earliest available slot). To resume an interrupted
@@ -370,7 +370,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
-- For gRPC ingest, apply `block_footers.sql` and the updated `blocks_metadata.sql` before starting. A 4.3 Yellowstone producer must provide bank IDs. Footers arrive on a separate processed stream and are written only after that bank finalizes. Fumarole 0.7.1 still emits a legacy envelope and leaves block bank IDs empty.
+- For gRPC ingest, apply `block_footers.sql` and the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; a footer is written only after its proven winning bank has complete durable data. Fumarole 0.8 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
 - Fumarole requires `--fumarole-alpenglow-genesis-slot` / `FUMAROLE_ALPENGLOW_GENESIS_SLOT` from a trusted genesis certificate. It accepts the genesis block and stops before the next slot; use bank-tagged gRPC for later blocks.
 - `/metrics` includes Fumarole backpressure gauges/counters such as
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
@@ -417,3 +417,42 @@ DISK_CACHE_TEST_URL=http://127.0.0.1:18196 python3 scripts/test/agave43-archive-
 This exercises local bundle export, manifest discovery, ingestor restore and RPC
 hydration for VAT debits and historical commission fields. Its local produced-slot
 reference is deterministic test data; it does not qualify a live Agave producer.
+
+### Live stream integrity
+
+Canonical gRPC and Fumarole writers require `commitment: finalized`. The head cache
+serves speculative banks. Fumarole 0.8 assembles by `(slot, sealed blockhash)`; a
+legacy envelope without a hash permits only one local bank identity. The existing
+trusted `fumarole-alpenglow-genesis-slot` bound remains required: Fumarole does not
+supply the footer evidence needed for postmigration qualification.
+
+Full blocks are validated before buffering or inserts: exact transaction counts
+(including zero), unique contiguous indices and signatures, and, when entries are
+requested, exact entry counts, indices, slot identity and transaction range tiling.
+Omitting `entries-table` permits an omitted entry payload. Malformed payloads fail
+before flushing or acknowledging source offsets. Complete Fumarole banks may flush while
+other banks are assembling, but Fumarole commits no pending offsets until every
+pending bank has completed. Restart replays unacknowledged data.
+
+gRPC joins footers, winner status and complete blocks on the same subscription's
+`(slot, bank_id)`. Nonzero scalar IDs supply actual identity; scalar zero also
+represents a missing protobuf field, so a zero block waits for a matching status
+on that subscription. An optional `Some(0)` establishes modern bank zero. A
+CreatedBank or finalized status without an ID permits complete historical data
+under the trusted finalized full-block contract, with metadata `bank_id: NULL`;
+that data cannot qualify a modern footer. No migration boundary is inferred from
+entry shape or dates.
+
+Data arriving before status is validated and held with later blocks, bounded to
+256 blocks and 128 MiB of encoded payload. Timer, pressure, shutdown and
+transport-error flushes cannot advance the durable metadata tip while identity
+is unresolved. Ready footers for earlier proven banks whose complete data is
+already durable can still be inserted without flushing held data or advancing
+the metadata tip; other footers wait for their own data to become durable. Missing evidence fails at the hold/window limit or shutdown;
+restart replays from the previous durable slot. Identity proofs never carry over
+to a new subscription. Producers must supply the requested bank-status events
+for historical replay as well as live traffic.
+
+A footer is written only after complete winning block data is durable.
+Connection-local counters cannot be joined across subscriptions; sealed
+blockhashes identify Fumarole banks across connections.

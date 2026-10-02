@@ -12,6 +12,7 @@ use solana_transaction_status::{
 
 use crate::clickhouse::{
     BlockMetadataRecord, StoredAccountsTransactionRecord, StoredBlockPayload, StoredBlockRecord,
+    StoredTransactionRecord,
 };
 use crate::hydration::errors::{BlockHydrationError, TransactionHydrationError};
 use crate::hydration::meta::{
@@ -90,21 +91,7 @@ fn hydrate_full_block_record(
 
     let mut transactions = Vec::with_capacity(record.transactions.len());
     for tx_record in record.transactions {
-        let meta = build_transaction_status_meta(&tx_record)?;
-        let tx_with_meta = match meta {
-            Some(meta) => {
-                let transaction = build_versioned_transaction(&tx_record)?;
-                TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
-                    transaction,
-                    meta,
-                })
-            }
-            None => {
-                let transaction = build_legacy_transaction(&tx_record)?;
-                TransactionWithStatusMeta::MissingMetadata(transaction)
-            }
-        };
-        transactions.push(tx_with_meta);
+        transactions.push(hydrate_full_transaction(&tx_record)?);
     }
 
     confirmed_block(metadata, transactions, rewards)
@@ -117,6 +104,304 @@ fn hydrate_full_block_record(
             },
         )
         .map_err(BlockHydrationError::from)
+}
+
+fn hydrate_full_transaction(
+    tx_record: &StoredTransactionRecord,
+) -> Result<TransactionWithStatusMeta, BlockHydrationError> {
+    let meta = build_transaction_status_meta(tx_record)?;
+    Ok(match meta {
+        Some(meta) => {
+            let transaction = build_versioned_transaction(tx_record)?;
+            TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
+                transaction,
+                meta,
+            })
+        }
+        None => {
+            let transaction = build_legacy_transaction(tx_record)?;
+            TransactionWithStatusMeta::MissingMetadata(transaction)
+        }
+    })
+}
+
+fn hydrate_accounts_transaction(
+    tx_record: &StoredAccountsTransactionRecord,
+) -> Result<TransactionWithStatusMeta, BlockHydrationError> {
+    let meta = build_transaction_status_meta_for_accounts(tx_record)?;
+    Ok(match meta {
+        Some(meta) => {
+            let transaction = build_accounts_versioned_transaction(tx_record)?;
+            TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
+                transaction,
+                meta,
+            })
+        }
+        None => {
+            let transaction = build_accounts_legacy_transaction(tx_record)?;
+            TransactionWithStatusMeta::MissingMetadata(transaction)
+        }
+    })
+}
+
+/// Minimum transactions per parallel chunk; smaller blocks hydrate on one thread.
+pub(crate) const MIN_TRANSACTIONS_PER_HYDRATION_CHUNK: usize = 128;
+
+/// Number of contiguous chunks a block with `transaction_count` transactions is
+/// split into, given at most `parallelism` blocking threads. 1 means sequential.
+pub(crate) fn block_hydration_chunk_count(transaction_count: usize, parallelism: usize) -> usize {
+    (transaction_count / MIN_TRANSACTIONS_PER_HYDRATION_CHUNK).clamp(1, parallelism.max(1))
+}
+
+/// Contiguous slice of a block's transactions, in block order.
+pub(crate) enum BlockTransactionChunk {
+    Full(Vec<StoredTransactionRecord>),
+    Accounts(Vec<StoredAccountsTransactionRecord>),
+}
+
+pub(crate) struct SplitBlockPayload {
+    pub(crate) metadata: BlockMetadataRecord,
+    pub(crate) chunks: Vec<BlockTransactionChunk>,
+}
+
+/// Failure while building a block response outside `hydrate_block_payload`.
+#[derive(Debug)]
+pub(crate) enum BlockBuildError {
+    Hydration(BlockHydrationError),
+    Serialize(serde_json::Error),
+}
+
+/// The sequential path hydrates every transaction before encoding any, and
+/// encodes every transaction before serializing. Its error is therefore the
+/// lowest-index failure of the earliest failing stage; `Ord` encodes that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BlockChunkStage {
+    Hydrate,
+    Encode,
+    Serialize,
+}
+
+#[derive(Debug)]
+pub(crate) struct BlockChunkFailure {
+    stage: BlockChunkStage,
+    error: BlockBuildError,
+}
+
+/// Splits a full or accounts payload into `chunk_count` contiguous, balanced
+/// chunks. Returns the payload unchanged when it cannot be split for the
+/// requested detail level (the sequential path then reports the same error it
+/// always has) or when `chunk_count < 2`.
+pub(crate) fn split_block_payload(
+    payload: StoredBlockPayload,
+    transaction_details: TransactionDetails,
+    chunk_count: usize,
+) -> Result<SplitBlockPayload, Box<StoredBlockPayload>> {
+    let len = payload.observed_transaction_count().unwrap_or(0);
+    if chunk_count < 2 || len < chunk_count {
+        return Err(Box::new(payload));
+    }
+    match (transaction_details, payload) {
+        (TransactionDetails::Full, StoredBlockPayload::Full(record)) => Ok(SplitBlockPayload {
+            metadata: record.metadata,
+            chunks: split_contiguous(record.transactions, chunk_count)
+                .into_iter()
+                .map(BlockTransactionChunk::Full)
+                .collect(),
+        }),
+        (TransactionDetails::Accounts, StoredBlockPayload::Full(record)) => Ok(SplitBlockPayload {
+            metadata: record.metadata,
+            chunks: split_contiguous(record.transactions, chunk_count)
+                .into_iter()
+                .map(|chunk| {
+                    BlockTransactionChunk::Accounts(chunk.into_iter().map(Into::into).collect())
+                })
+                .collect(),
+        }),
+        (
+            TransactionDetails::Accounts,
+            StoredBlockPayload::Accounts {
+                metadata,
+                transactions,
+            },
+        ) => Ok(SplitBlockPayload {
+            metadata,
+            chunks: split_contiguous(transactions, chunk_count)
+                .into_iter()
+                .map(BlockTransactionChunk::Accounts)
+                .collect(),
+        }),
+        (_, payload) => Err(Box::new(payload)),
+    }
+}
+
+fn split_contiguous<T>(mut items: Vec<T>, chunk_count: usize) -> Vec<Vec<T>> {
+    let base = items.len() / chunk_count;
+    let extra = items.len() % chunk_count;
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for index in (1..chunk_count).rev() {
+        let size = base + usize::from(index < extra);
+        chunks.push(items.split_off(items.len() - size));
+    }
+    chunks.push(items);
+    chunks.reverse();
+    chunks
+}
+
+/// Hydrates, encodes and serializes one chunk. On success returns the chunk's
+/// transactions as comma-separated JSON values (no surrounding brackets).
+pub(crate) fn hydrate_serialize_block_chunk(
+    chunk: BlockTransactionChunk,
+    encoding: UiTransactionEncoding,
+    show_rewards: bool,
+    max_supported_transaction_version: Option<u8>,
+) -> Result<Vec<u8>, BlockChunkFailure> {
+    let hydrate_failure = |error| BlockChunkFailure {
+        stage: BlockChunkStage::Hydrate,
+        error: BlockBuildError::Hydration(error),
+    };
+    let (transactions, encoding, transaction_details) = match chunk {
+        BlockTransactionChunk::Full(records) => {
+            let mut transactions = Vec::with_capacity(records.len());
+            for tx_record in &records {
+                transactions.push(hydrate_full_transaction(tx_record).map_err(hydrate_failure)?);
+            }
+            (transactions, encoding, TransactionDetails::Full)
+        }
+        BlockTransactionChunk::Accounts(records) => {
+            let mut transactions = Vec::with_capacity(records.len());
+            for tx_record in &records {
+                transactions
+                    .push(hydrate_accounts_transaction(tx_record).map_err(hydrate_failure)?);
+            }
+            // `encode_accounts_block` always encodes accounts as JSON.
+            (
+                transactions,
+                UiTransactionEncoding::Json,
+                TransactionDetails::Accounts,
+            )
+        }
+    };
+
+    // Encode through the same library entry point as the sequential path so
+    // per-transaction version checks and errors are identical.
+    let encoded = ConfirmedBlock {
+        previous_blockhash: String::new(),
+        blockhash: String::new(),
+        parent_slot: 0,
+        transactions,
+        rewards: Vec::new(),
+        num_partitions: None,
+        block_time: None,
+        block_height: None,
+    }
+    .encode_with_options(
+        encoding,
+        BlockEncodingOptions {
+            transaction_details,
+            show_rewards,
+            max_supported_transaction_version,
+        },
+    )
+    .map_err(|error| BlockChunkFailure {
+        stage: BlockChunkStage::Encode,
+        error: BlockBuildError::Hydration(BlockHydrationError::from(error)),
+    })?;
+
+    let mut bytes = Vec::new();
+    for (index, transaction) in encoded.transactions.unwrap_or_default().iter().enumerate() {
+        if index > 0 {
+            bytes.push(b',');
+        }
+        serde_json::to_writer(&mut bytes, transaction).map_err(|error| BlockChunkFailure {
+            stage: BlockChunkStage::Serialize,
+            error: BlockBuildError::Serialize(error),
+        })?;
+    }
+    Ok(bytes)
+}
+
+const TRANSACTIONS_PLACEHOLDER: &[u8] = b"\"transactions\":[]";
+
+/// Builds the serialized block from per-chunk results (in block order) so the
+/// bytes and the reported error match `serde_json::to_vec` of
+/// `hydrate_block_payload` for the unsplit payload.
+pub(crate) fn assemble_block_chunks(
+    metadata: BlockMetadataRecord,
+    encoding: UiTransactionEncoding,
+    transaction_details: TransactionDetails,
+    show_rewards: bool,
+    max_supported_transaction_version: Option<u8>,
+    chunks: Vec<Result<Vec<u8>, BlockChunkFailure>>,
+) -> Result<Vec<u8>, BlockBuildError> {
+    // Block rewards are built before any transaction on the sequential path.
+    let rewards = if show_rewards {
+        build_block_rewards(&metadata).map_err(BlockBuildError::Hydration)?
+    } else {
+        Vec::new()
+    };
+
+    let mut first_failure: Option<BlockChunkFailure> = None;
+    let mut parts = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        match chunk {
+            Ok(bytes) => parts.push(bytes),
+            // Chunks arrive in block order, so a strictly earlier stage wins and
+            // the lowest chunk index breaks ties.
+            Err(failure) => {
+                if first_failure
+                    .as_ref()
+                    .is_none_or(|current| failure.stage < current.stage)
+                {
+                    first_failure = Some(failure);
+                }
+            }
+        }
+    }
+    if let Some(failure) = first_failure {
+        return Err(failure.error);
+    }
+
+    let encoding = match transaction_details {
+        TransactionDetails::Accounts => UiTransactionEncoding::Json,
+        _ => encoding,
+    };
+    let template = confirmed_block(metadata, Vec::new(), rewards)
+        .encode_with_options(
+            encoding,
+            BlockEncodingOptions {
+                transaction_details,
+                show_rewards,
+                max_supported_transaction_version,
+            },
+        )
+        .map_err(|error| BlockBuildError::Hydration(BlockHydrationError::from(error)))?;
+    let template = serde_json::to_vec(&template).map_err(BlockBuildError::Serialize)?;
+
+    // `transactions` follows `previousBlockhash`, `blockhash` (base58) and
+    // `parentSlot` (a number), none of which can contain a quote, so the first
+    // match is the field itself.
+    let position = template
+        .windows(TRANSACTIONS_PLACEHOLDER.len())
+        .position(|window| window == TRANSACTIONS_PLACEHOLDER)
+        .ok_or_else(|| {
+            BlockBuildError::Hydration(BlockHydrationError::InvalidBlockMetadata(
+                "serialized block template has no transactions field".to_string(),
+            ))
+        })?;
+    let split_at = position + TRANSACTIONS_PLACEHOLDER.len() - 1;
+    let body_len: usize = parts.iter().map(|part| part.len() + 1).sum();
+    let mut out = Vec::with_capacity(template.len() + body_len);
+    out.extend_from_slice(&template[..split_at]);
+    let mut wrote_any = false;
+    for part in parts.iter().filter(|part| !part.is_empty()) {
+        if wrote_any {
+            out.push(b',');
+        }
+        out.extend_from_slice(part);
+        wrote_any = true;
+    }
+    out.extend_from_slice(&template[split_at..]);
+    Ok(out)
 }
 
 pub(crate) fn encode_metadata_only_block(
@@ -162,21 +447,7 @@ pub(crate) fn encode_accounts_block(
 
     let mut encoded_transactions = Vec::with_capacity(transactions.len());
     for tx_record in transactions {
-        let meta = build_transaction_status_meta_for_accounts(&tx_record)?;
-        let tx_with_meta = match meta {
-            Some(meta) => {
-                let transaction = build_accounts_versioned_transaction(&tx_record)?;
-                TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
-                    transaction,
-                    meta,
-                })
-            }
-            None => {
-                let transaction = build_accounts_legacy_transaction(&tx_record)?;
-                TransactionWithStatusMeta::MissingMetadata(transaction)
-            }
-        };
-        encoded_transactions.push(tx_with_meta);
+        encoded_transactions.push(hydrate_accounts_transaction(&tx_record)?);
     }
 
     confirmed_block(metadata, encoded_transactions, rewards)

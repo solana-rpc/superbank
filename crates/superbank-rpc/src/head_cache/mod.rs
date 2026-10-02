@@ -17,9 +17,11 @@ use crate::clickhouse::{
     StoredBlockRecord, StoredTransactionRecord, extract_memo,
 };
 
+mod banks;
 mod convert;
 pub(crate) mod coverage;
 pub(crate) mod dragonsmouth;
+mod protocol;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SlotIndex {
@@ -35,9 +37,9 @@ pub(crate) struct HeadSigKey {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HeadTxMeta {
+    bank_commitment: Option<Arc<std::sync::atomic::AtomicU8>>,
     pub(crate) signature_str: Arc<str>,
     pub(crate) pos: SlotIndex,
-    pub(crate) bank_id: u64,
     pub(crate) err: Option<serde_json::Value>,
     pub(crate) memo: Option<String>,
     pub(crate) block_time: Option<i64>,
@@ -55,6 +57,7 @@ pub(crate) struct TransactionCountOverlay {
 /// This is optimized for read concurrency (DashMap + immutable `Arc` values) and
 /// fast merges in the RPC handlers.
 pub(crate) struct HeadCache {
+    banks: std::sync::RwLock<banks::BankState>,
     pub(crate) coverage: std::sync::RwLock<coverage::HeadCoverage>,
     retain_slots: u64,
     max_per_address: usize,
@@ -77,19 +80,25 @@ pub(crate) struct HeadCache {
 
     // address -> newest-first list of signatures touching the address
     sigs_by_address: DashMap<Pubkey, VecDeque<HeadSigKey>>,
+    // address -> highest slot of a key dropped by the `max_per_address` cap: rows of that
+    // slot and below may be missing although they are still inside retention
+    address_truncated_slot: DashMap<Pubkey, u64>,
     // slot -> signatures (eviction of the signature-indexed maps)
     sigs_by_slot: DashMap<u64, Vec<Signature>>,
     // slot -> addresses touched (pruning of `sigs_by_address` on slot eviction)
     addrs_by_slot: DashMap<u64, Vec<Pubkey>>,
     // slot -> latest observed commitment
     slot_commitment: DashMap<u64, CommitmentLevel>,
-    // One selected bank per slot is exposed through the slot-keyed RPC facade.
-    slot_bank_id: DashMap<u64, u64>,
+
+    /// Clamp explicit getBlocks/getBlocksWithLimit ends to the trusted tip
+    /// (`GET_BLOCKS_CLAMP_TO_HEAD_TIP`).
+    clamp_explicit_end: bool,
 }
 
 impl HeadCache {
     pub(crate) fn new(retain_slots: u64, max_per_address: usize) -> Self {
         Self {
+            banks: std::sync::RwLock::default(),
             coverage: std::sync::RwLock::default(),
             retain_slots: retain_slots.max(1),
             max_per_address: max_per_address.max(1),
@@ -101,11 +110,22 @@ impl HeadCache {
             tx_by_signature: DashMap::new(),
             meta_by_signature: DashMap::new(),
             sigs_by_address: DashMap::new(),
+            address_truncated_slot: DashMap::new(),
             sigs_by_slot: DashMap::new(),
             addrs_by_slot: DashMap::new(),
             slot_commitment: DashMap::new(),
-            slot_bank_id: DashMap::new(),
+            clamp_explicit_end: true,
         }
+    }
+
+    /// `false` keeps explicit getBlocks ends as requested, even above the trusted tip.
+    pub(crate) fn with_explicit_end_clamp(mut self, enabled: bool) -> Self {
+        self.clamp_explicit_end = enabled;
+        self
+    }
+
+    pub(crate) fn clamps_explicit_end(&self) -> bool {
+        self.clamp_explicit_end
     }
 
     pub(crate) fn latest_slot(&self) -> u64 {
@@ -154,10 +174,16 @@ impl HeadCache {
         self.slot_block_time.get(&slot).map(|value| *value.value())
     }
 
+    #[cfg(test)]
+    pub(crate) fn slot_block_time_for_tests(&self, slot: u64) -> Option<i64> {
+        self.block_time_for_slot(slot)
+    }
+
     pub(crate) fn latest_block_height_at_least(
         &self,
         min_commitment: CommitmentLevel,
     ) -> Option<u64> {
+        let _view = self.banks.read().expect("head bank lock");
         let mut latest: Option<u64> = None;
         for entry in self.slot_block_height.iter() {
             let slot = *entry.key();
@@ -174,6 +200,7 @@ impl HeadCache {
         &self,
         min_commitment: CommitmentLevel,
     ) -> Option<(u64, [u8; 32], u64)> {
+        let _view = self.banks.read().expect("head bank lock");
         let latest_slot = self.latest_slot();
         if latest_slot != 0 && commitment_meets(self.slot_commitment(latest_slot), min_commitment) {
             let blockhash = self.slot_blockhash.get(&latest_slot).map(|v| *v.value());
@@ -207,6 +234,7 @@ impl HeadCache {
         min_block_height: u64,
         min_commitment: CommitmentLevel,
     ) -> Option<bool> {
+        let _view = self.banks.read().expect("head bank lock");
         let mut found_at_commitment = false;
         for entry in self.slot_blockhash.iter() {
             if *entry.value() != blockhash {
@@ -244,6 +272,7 @@ impl HeadCache {
     }
 
     pub(crate) fn latest_slot_at_least(&self, min_commitment: CommitmentLevel) -> u64 {
+        let _view = self.banks.read().expect("head bank lock");
         if min_commitment == CommitmentLevel::Processed {
             return self.latest_slot();
         }
@@ -264,6 +293,7 @@ impl HeadCache {
         min_commitment: CommitmentLevel,
         clickhouse_slot: u64,
     ) -> Option<TransactionCountOverlay> {
+        let _view = self.banks.read().expect("head bank lock");
         let mut candidate_tips = self
             .slot_block_metadata
             .iter()
@@ -308,6 +338,15 @@ impl HeadCache {
         None
     }
 
+    /// Whether the head list for `address` may have dropped older signatures: it is at the
+    /// per-address cap, which evicts the oldest entry on every insert.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn address_list_full(&self, address: &Pubkey) -> bool {
+        self.sigs_by_address
+            .get(address)
+            .is_some_and(|entry| entry.len() >= self.max_per_address)
+    }
+
     pub(crate) fn min_retained_slot(&self) -> u64 {
         let latest = self.latest_slot();
         latest.saturating_sub(self.retain_slots.saturating_sub(1))
@@ -321,10 +360,8 @@ impl HeadCache {
     }
 
     pub(crate) fn signature_position(&self, signature: &Signature) -> Option<SlotIndex> {
-        self.meta_by_signature.get(signature).and_then(|meta| {
-            self.bank_is_current(meta.pos.slot, meta.bank_id)
-                .then_some(meta.pos)
-        })
+        let _view = self.banks.read().expect("head bank lock");
+        self.meta_by_signature.get(signature).map(|meta| meta.pos)
     }
 
     pub(crate) fn get_tx(
@@ -332,8 +369,9 @@ impl HeadCache {
         signature: &Signature,
         min_commitment: CommitmentLevel,
     ) -> Option<Arc<StoredTransactionRecord>> {
+        let _view = self.banks.read().expect("head bank lock");
         let meta = self.meta_by_signature.get(signature)?;
-        if !self.meta_is_available(&meta, min_commitment) {
+        if !commitment_meets(self.meta_commitment(&meta), min_commitment) {
             return None;
         }
         self.tx_by_signature.get(signature).map(|v| v.clone())
@@ -344,15 +382,23 @@ impl HeadCache {
         signature: &Signature,
         min_commitment: CommitmentLevel,
     ) -> Option<Arc<HeadTxMeta>> {
+        let _view = self.banks.read().expect("head bank lock");
         let meta = self.meta_by_signature.get(signature)?;
-        if !self.meta_is_available(&meta, min_commitment) {
+        if !commitment_meets(self.meta_commitment(&meta), min_commitment) {
             return None;
         }
         Some(meta.clone())
     }
 
-    pub(crate) fn confirmation_status_string(&self, slot: u64) -> &'static str {
-        commitment_to_str(self.slot_commitment(slot))
+    fn meta_commitment(&self, meta: &HeadTxMeta) -> CommitmentLevel {
+        meta.bank_commitment.as_ref().map_or_else(
+            || self.slot_commitment(meta.pos.slot),
+            |commitment| banks::decode_commitment(commitment.load(Ordering::Acquire)),
+        )
+    }
+
+    pub(crate) fn confirmation_status_string(&self, meta: &HeadTxMeta) -> &'static str {
+        commitment_to_str(self.meta_commitment(meta))
     }
 
     pub(crate) fn get_block(
@@ -361,6 +407,7 @@ impl HeadCache {
         min_commitment: CommitmentLevel,
         transaction_details: TransactionDetails,
     ) -> Option<StoredBlockPayload> {
+        let _view = self.banks.read().expect("head bank lock");
         if !commitment_meets(self.slot_commitment(slot), min_commitment) {
             return None;
         }
@@ -433,6 +480,7 @@ impl HeadCache {
         limit: usize,
         min_commitment: CommitmentLevel,
     ) -> Vec<Arc<HeadTxMeta>> {
+        let _view = self.banks.read().expect("head bank lock");
         let Some(keys) = self.sigs_by_address.get(address) else {
             return Vec::new();
         };
@@ -449,12 +497,12 @@ impl HeadCache {
             {
                 continue;
             }
+            if !commitment_meets(self.slot_commitment(key.pos.slot), min_commitment) {
+                continue;
+            }
             let Some(meta) = self.meta_by_signature.get(&key.signature) else {
                 continue;
             };
-            if !self.meta_is_available(&meta, min_commitment) {
-                continue;
-            }
             out.push(meta.clone());
             if out.len() >= limit {
                 break;
@@ -462,11 +510,6 @@ impl HeadCache {
         }
 
         out
-    }
-
-    fn meta_is_available(&self, meta: &HeadTxMeta, min_commitment: CommitmentLevel) -> bool {
-        self.bank_is_current(meta.pos.slot, meta.bank_id)
-            && commitment_meets(self.slot_commitment(meta.pos.slot), min_commitment)
     }
 
     pub(crate) fn note_slot_commitment(&self, slot: u64, commitment: CommitmentLevel) {
@@ -488,61 +531,11 @@ impl HeadCache {
     }
 
     pub(crate) fn remove_slot(&self, slot: u64) {
-        self.clear_from(slot);
         self.coverage
             .write()
             .expect("head coverage lock")
             .invalidate_branch(slot);
-    }
-
-    pub(crate) fn current_bank(&self, slot: u64) -> Option<u64> {
-        self.slot_bank_id.get(&slot).map(|value| *value)
-    }
-
-    pub(crate) fn select_bank(&self, slot: u64, bank_id: u64) {
-        if self.current_bank(slot) == Some(bank_id) {
-            return;
-        }
-        if self.current_bank(slot).is_some() {
-            self.clear_from(slot);
-        }
-        self.slot_bank_id.insert(slot, bank_id);
-    }
-
-    pub(crate) fn clear_from(&self, slot: u64) {
-        let mut slots = self
-            .slot_commitment
-            .iter()
-            .map(|entry| *entry.key())
-            .filter(|candidate| *candidate >= slot)
-            .collect::<Vec<_>>();
-        slots.extend(
-            self.slot_bank_id
-                .iter()
-                .map(|entry| *entry.key())
-                .filter(|candidate| *candidate >= slot),
-        );
-        slots.sort_unstable();
-        slots.dedup();
-        for candidate in slots {
-            self.remove_slot_inner(candidate);
-        }
-        let mut proof = self.coverage.write().expect("head coverage lock");
-        proof.forget_from(slot);
-        let latest = self
-            .slot_commitment
-            .iter()
-            .map(|entry| *entry.key())
-            .max()
-            .unwrap_or(0);
-        self.latest_slot.store(latest, Ordering::Relaxed);
-    }
-
-    fn bank_is_current(&self, slot: u64, bank_id: u64) -> bool {
-        match self.current_bank(slot) {
-            Some(selected) => selected == bank_id,
-            None => bank_id == 0,
-        }
+        self.remove_slot_inner(slot);
     }
 
     fn remove_slot_inner(&self, slot: u64) {
@@ -551,7 +544,6 @@ impl HeadCache {
         proof.retain(self.latest_slot(), self.retain_slots);
         drop(proof);
         self.slot_commitment.remove(&slot);
-        self.slot_bank_id.remove(&slot);
         self.slot_block_height.remove(&slot);
         self.slot_blockhash.remove(&slot);
         self.slot_block_time.remove(&slot);
@@ -585,11 +577,11 @@ impl HeadCache {
         }
     }
 
-    pub(crate) fn ingest_transaction(
+    fn ingest_bank_transaction(
         &self,
         slot: u64,
-        bank_id: u64,
         tx_info: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo,
+        bank_commitment: Option<Arc<std::sync::atomic::AtomicU8>>,
     ) {
         // Skip transactions that are already outside the retained window. This avoids doing
         // conversion work and prevents address indexes from accumulating stale keys.
@@ -636,9 +628,9 @@ impl HeadCache {
 
         let signature_str: Arc<str> = bs58::encode(signature_bytes).into_string().into();
         let meta = Arc::new(HeadTxMeta {
+            bank_commitment,
             signature_str,
             pos,
-            bank_id,
             err: err_value,
             memo,
             block_time,
@@ -684,16 +676,7 @@ impl HeadCache {
         }
 
         for addr in unique_pubkeys {
-            let mut entry = self.sigs_by_address.entry(addr).or_default();
-            entry.push_front(key);
-            while let Some(back) = entry.back()
-                && back.pos.slot < min_slot
-            {
-                entry.pop_back();
-            }
-            while entry.len() > self.max_per_address {
-                entry.pop_back();
-            }
+            self.index_address(addr, key, min_slot);
         }
 
         // In the common path, `note_slot_commitment` has already advanced `latest_slot` for this
@@ -734,9 +717,9 @@ impl HeadCache {
 
         let pos = SlotIndex { slot, idx };
         let meta = Arc::new(HeadTxMeta {
+            bank_commitment: None,
             signature_str,
             pos,
-            bank_id: 0,
             err: err_value,
             memo,
             block_time: record.block_time,
@@ -762,22 +745,70 @@ impl HeadCache {
         }
 
         for address in addresses {
-            let mut entry = self.sigs_by_address.entry(*address).or_default();
-            entry.push_front(key);
-            while let Some(back) = entry.back()
-                && back.pos.slot < min_slot
-            {
-                entry.pop_back();
-            }
-            while entry.len() > self.max_per_address {
-                entry.pop_back();
-            }
+            self.index_address(*address, key, min_slot);
         }
 
         let prev_latest = self.latest_slot.fetch_max(slot, Ordering::Relaxed);
         if slot > prev_latest {
             self.evict_old_slots();
         }
+    }
+
+    fn index_address(&self, address: Pubkey, key: HeadSigKey, min_slot: u64) {
+        let mut entry = self.sigs_by_address.entry(address).or_default();
+        entry.push_front(key);
+        while let Some(back) = entry.back()
+            && back.pos.slot < min_slot
+        {
+            entry.pop_back();
+        }
+        let mut truncated = None;
+        while entry.len() > self.max_per_address {
+            if let Some(dropped) = entry.pop_back() {
+                truncated = truncated.max(Some(dropped.pos.slot));
+            }
+        }
+        if let Some(slot) = truncated {
+            self.address_truncated_slot
+                .entry(address)
+                .and_modify(|highest| *highest = (*highest).max(slot))
+                .or_insert(slot);
+        }
+    }
+
+    /// Oldest slot of this session's chain proof at `commitment`: every slot from it
+    /// up to that commitment's tip is either skipped (a proven parent edge jumps it) or
+    /// was frozen and ingested whole before its commitment was published (the block
+    /// machine emits a commitment update only for frozen blocks, after the block, and
+    /// both are applied in order by one task). `None` when the stream is disconnected,
+    /// the tip has not advanced within [`coverage::TIP_MAX_AGE`], or no verified parent
+    /// edge reaches the tip. A reconnect starts a new proof, so slots the head never
+    /// received are never inside it. Take it before reading head rows, and pass it to
+    /// [`Self::address_floor`] after.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn chain_floor(&self, commitment: CommitmentLevel) -> Option<u64> {
+        let (_, proof) = self
+            .coverage
+            .read()
+            .expect("head coverage lock")
+            .snapshot(0, None, commitment, std::time::Instant::now())
+            .ok()?;
+        proof.intervals.first().map(|&(floor, _)| floor)
+    }
+
+    /// Lowest slot from which this cache holds every row of `address` visible at the
+    /// commitment of `chain_floor` ([`Self::chain_floor`]): the chain floor, raised to
+    /// the retention floor and above any slot the per-address cap dropped keys from.
+    /// Call it after reading the head rows: both raises only grow, so a value read
+    /// afterwards also bounds whatever eviction or truncation preceded that read.
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn address_floor(&self, address: &Pubkey, chain_floor: Option<u64>) -> Option<u64> {
+        let floor = chain_floor?.max(self.min_retained_slot());
+        Some(
+            self.address_truncated_slot
+                .get(address)
+                .map_or(floor, |slot| floor.max(slot.saturating_add(1))),
+        )
     }
 
     fn evict_old_slots(&self) {
@@ -789,9 +820,17 @@ impl HeadCache {
                 old.push(slot);
             }
         }
+        if old.is_empty() {
+            return;
+        }
         for slot in old {
             self.remove_slot_inner(slot);
         }
+        // A truncation record matters while its slot is retained; below that the
+        // retention floor dominates it. Fork and dead-slot removal must not clear it:
+        // keys the cap dropped from other retained slots stay missing.
+        self.address_truncated_slot
+            .retain(|_, slot| *slot >= min_slot);
     }
 
     fn backfill_slot_block_time(&self, slot: u64, block_time: i64) {
@@ -981,6 +1020,87 @@ mod tests {
             rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
         }
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn address_floor_needs_a_session_chain_and_respects_the_per_address_cap() {
+        use coverage::Link;
+        use std::time::{Duration, Instant};
+        let cache = HeadCache::new(600, 2);
+        let busy = Pubkey::new_unique();
+        let quiet = Pubkey::new_unique();
+        for (slot, idx) in [(1_000, 0), (1_001, 0), (1_001, 1), (1_002, 0)] {
+            let sig = Signature::new_unique();
+            let mut tx = base_transaction(slot, [1; 32]);
+            tx.signature = *sig.as_array();
+            let addresses: &[Pubkey] = if slot == 1_000 {
+                &[busy, quiet]
+            } else {
+                &[busy]
+            };
+            cache.insert_for_tests(sig, tx, idx, addresses, CommitmentLevel::Finalized);
+        }
+        let chain = |slots: std::ops::RangeInclusive<u64>, commitment, at| {
+            let mut proof = cache.coverage.write().unwrap();
+            for slot in slots {
+                proof.metadata(Link {
+                    slot,
+                    hash: [slot as u8; 32],
+                    parent: slot - 1,
+                    parent_hash: [(slot - 1) as u8; 32],
+                });
+                proof.publish(slot, commitment);
+                proof.observe(slot, commitment, at);
+            }
+        };
+        let now = Instant::now();
+
+        // Disconnected: the head cannot vouch for rows it may never have received.
+        chain(1_000..=1_002, CommitmentLevel::Finalized, now);
+        assert_eq!(cache.chain_floor(CommitmentLevel::Finalized), None);
+
+        // A fresh session that started after slot 1000 (a restart or reconnect): the
+        // rows retained at 1000 predate it, and nothing proves the session saw them.
+        cache.coverage.write().unwrap().connect();
+        chain(1_001..=1_002, CommitmentLevel::Confirmed, now);
+        // Proofs are per commitment.
+        assert_eq!(cache.chain_floor(CommitmentLevel::Finalized), None);
+        let floor = cache.chain_floor(CommitmentLevel::Confirmed);
+        assert_eq!(floor, Some(1_001));
+        assert!(cache.min_retained_slot() < 1_000);
+        assert_eq!(cache.address_floor(&quiet, floor), Some(1_001));
+        // The cap dropped keys at slots 1000 and 1001, so only 1002 up is whole.
+        assert_eq!(cache.address_floor(&busy, floor), Some(1_002));
+        assert_eq!(cache.address_floor(&quiet, None), None);
+
+        // A stale tip proves nothing.
+        cache.coverage.write().unwrap().connect();
+        let stale = now - coverage::TIP_MAX_AGE - Duration::from_millis(10);
+        chain(1_000..=1_002, CommitmentLevel::Finalized, stale);
+        assert_eq!(cache.chain_floor(CommitmentLevel::Finalized), None);
+
+        // A fresh session holding every slot from 1000 up.
+        cache.coverage.write().unwrap().connect();
+        chain(1_000..=1_002, CommitmentLevel::Finalized, now);
+        let floor = cache.chain_floor(CommitmentLevel::Finalized);
+        assert_eq!(floor, Some(1_000));
+        assert_eq!(cache.address_floor(&quiet, floor), Some(1_000));
+
+        // Fork or dead-slot removal of the address's remaining keys must not forget
+        // keys the cap dropped from a slot that is still retained.
+        cache.remove_slot(1_002);
+        cache.remove_slot(1_001);
+        assert!(cache.sigs_by_address.get(&busy).is_none());
+        assert_eq!(cache.address_floor(&busy, Some(1_000)), Some(1_002));
+
+        // Eviction past the recorded slot drops the record: retention dominates it.
+        let sig = Signature::new_unique();
+        let mut tx = base_transaction(1_700, [1; 32]);
+        tx.signature = *sig.as_array();
+        cache.insert_for_tests(sig, tx, 0, &[quiet], CommitmentLevel::Finalized);
+        assert!(cache.min_retained_slot() > 1_001);
+        assert!(cache.address_truncated_slot.get(&busy).is_none());
     }
 
     #[test]

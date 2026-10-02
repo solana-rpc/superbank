@@ -7,7 +7,7 @@
 //! termination; they never issue KILL or acquire a source-query permit.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit};
 use tokio::time::Instant;
 
-use super::util::next_required_query_id;
+use super::util::{max_execution_time_secs, next_required_query_id};
 use super::verification::VerificationTimeouts;
 use crate::processing::{ProcessingError, ProcessingResult};
 
@@ -25,6 +25,55 @@ const IDLE_WORKER_WAKEUP: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const UNCONFIRMED_AFTER: Duration = Duration::from_secs(5);
 const INITIALIZATION_BACKOFF: Duration = Duration::from_secs(1);
+/// Slack past a bounded read's server-side `max_execution_time` before its
+/// admission is released without confirmed termination.
+const EXPIRY_MARGIN: Duration = Duration::from_secs(5);
+/// Bounded abandoned reads may hold at most 1/N of their endpoint's admission.
+const BOUNDED_PENDING_SHARE_DIVISOR: usize = 4;
+
+/// Most abandoned bounded reads that may hold admission sized `capacity`; beyond
+/// it the oldest release early so abandoned work cannot starve every live read.
+pub(crate) fn bounded_pending_cap(capacity: usize) -> usize {
+    (capacity / BOUNDED_PENDING_SHARE_DIVISOR).max(1)
+}
+
+/// Abandoned bounded reads held across every verifier whose reads share one
+/// admission pool. Primary and shard endpoints of a client share one budget:
+/// their pending entries all keep workflow leases on the same HTTP semaphore.
+pub(crate) struct PendingBudget {
+    cap: usize,
+    held: AtomicUsize,
+}
+
+impl PendingBudget {
+    pub(crate) fn for_admission(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            cap: bounded_pending_cap(capacity),
+            held: AtomicUsize::new(0),
+        })
+    }
+
+    fn over_cap(&self) -> bool {
+        self.held.load(Ordering::SeqCst) > self.cap
+    }
+}
+
+/// One bounded pending entry's share of its [`PendingBudget`], returned on drop
+/// by every release path.
+struct BudgetSlot(Arc<PendingBudget>);
+
+impl BudgetSlot {
+    fn take(budget: &Arc<PendingBudget>) -> Self {
+        budget.held.fetch_add(1, Ordering::SeqCst);
+        Self(budget.clone())
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        self.0.held.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[cfg(test)]
 mod initialization_tests;
@@ -41,6 +90,7 @@ struct Inner {
     topology: OnceCell<Topology>,
     retry_after: Mutex<Option<Instant>>,
     pending: Mutex<BTreeMap<String, Pending>>,
+    pending_budget: Arc<PendingBudget>,
     notify: Arc<Notify>,
     worker_running: AtomicBool,
 }
@@ -56,6 +106,11 @@ struct Pending {
     _additional: Vec<OwnedSemaphorePermit>,
     _workflow: Vec<Arc<OwnedSemaphorePermit>>,
     abandoned_at: Instant,
+    /// Set for reads whose server-side `max_execution_time` is known: admission
+    /// is released at this instant whatever the probes report.
+    release_at: Option<Instant>,
+    /// Held exactly when `release_at` is set.
+    _budget: Option<BudgetSlot>,
     quiet_observations: u8,
     unconfirmed: bool,
     operation: &'static str,
@@ -93,6 +148,8 @@ pub(crate) struct DisconnectGuard {
     operation: &'static str,
     target: &'static str,
     submitted: bool,
+    retain_until_verified: bool,
+    max_execution: Option<Duration>,
     additional: Vec<OwnedSemaphorePermit>,
     workflow: Vec<Arc<OwnedSemaphorePermit>>,
 }
@@ -103,10 +160,15 @@ impl DisconnectVerifier {
         self.0.timeouts
     }
 
+    pub(crate) fn pending_budget(&self) -> Arc<PendingBudget> {
+        self.0.pending_budget.clone()
+    }
+
     pub(crate) fn new(
         client: HttpClient,
         cluster: Option<String>,
         timeouts: VerificationTimeouts,
+        pending_budget: Arc<PendingBudget>,
     ) -> Self {
         Self(Arc::new(Inner {
             client,
@@ -115,6 +177,7 @@ impl DisconnectVerifier {
             topology: OnceCell::new(),
             retry_after: Mutex::new(None),
             pending: Mutex::new(BTreeMap::new()),
+            pending_budget,
             notify: Arc::new(Notify::new()),
             worker_running: AtomicBool::new(false),
         }))
@@ -140,6 +203,8 @@ impl DisconnectVerifier {
             operation: "signature_statuses",
             target: "primary",
             submitted: true,
+            retain_until_verified: true,
+            max_execution: None,
             additional: Vec::new(),
             workflow: Vec::new(),
         })
@@ -163,12 +228,17 @@ impl DisconnectVerifier {
         }
     }
 
+    /// `max_execution` is the server-side `max_execution_time` every statement of
+    /// this read carries. When set, an abandoned read releases admission once that
+    /// limit plus a margin has passed, and counts toward the pending cap; `None`
+    /// retains admission until termination is confirmed.
     pub(crate) fn arm_ready(
         &self,
         query_id: String,
         permit: OwnedSemaphorePermit,
         operation: &'static str,
         target: &'static str,
+        max_execution: Option<Duration>,
     ) -> ProcessingResult<DisconnectGuard> {
         self.require_ready()?;
         Ok(DisconnectGuard {
@@ -178,6 +248,8 @@ impl DisconnectVerifier {
             operation,
             target,
             submitted: false,
+            retain_until_verified: true,
+            max_execution,
             additional: Vec::new(),
             workflow: Vec::new(),
         })
@@ -245,6 +317,11 @@ impl DisconnectGuard {
     pub(crate) fn submitted(&mut self) {
         self.submitted = true;
     }
+    /// Release admission when the response is closed instead of holding it until
+    /// termination is observed. Only for reads that ClickHouse bounds on its own.
+    pub(crate) fn release_on_abandon(&mut self) {
+        self.retain_until_verified = false;
+    }
     #[cfg(any(test, feature = "disk-cache"))]
     pub(crate) fn set_query_id(&mut self, id: String) {
         self.query_id = id;
@@ -268,15 +345,38 @@ fn enqueue_abandoned(guard: &mut DisconnectGuard) {
     if !guard.submitted {
         return;
     }
+    if !guard.retain_until_verified {
+        // Permits drop with the guard, after the owning cursor closed the response.
+        if guard.permit.take().is_some() {
+            crate::metrics::read_disconnect_verification(
+                guard.operation,
+                guard.target,
+                "released_unverified",
+            );
+        }
+        return;
+    }
     let Some(permit) = guard.permit.take() else {
         return;
     };
     record_pending(guard.operation, guard.target, 1);
+    let abandoned_at = Instant::now();
     let pending = Pending {
         _permit: permit,
         _additional: std::mem::take(&mut guard.additional),
         _workflow: std::mem::take(&mut guard.workflow),
-        abandoned_at: Instant::now(),
+        abandoned_at,
+        // The client deadline starts before submission, so the server normally started
+        // the query no later than `abandoned_at`; the margin covers request bytes still
+        // in flight and a short `max_concurrent_queries` queue wait. This bounds
+        // admission, not server work: an initiator idle-waiting on a hung leaf ends at
+        // its `receive_timeout` gap (also the deadline), up to one more limit later.
+        release_at: guard.max_execution.map(|limit| {
+            abandoned_at + Duration::from_secs(max_execution_time_secs(limit)) + EXPIRY_MARGIN
+        }),
+        _budget: guard
+            .max_execution
+            .map(|_| BudgetSlot::take(&guard.owner.pending_budget)),
         quiet_observations: 0,
         unconfirmed: false,
         operation: guard.operation,
@@ -284,12 +384,15 @@ fn enqueue_abandoned(guard: &mut DisconnectGuard) {
     };
     // Required query IDs are unique across the client lifetime. Keeping the
     // map in the owner also retains admission if no runtime can run probes.
-    guard
-        .owner
-        .pending
-        .lock()
-        .expect("disconnect state poisoned")
-        .insert(guard.query_id.clone(), pending);
+    {
+        let mut pending_map = guard
+            .owner
+            .pending
+            .lock()
+            .expect("disconnect state poisoned");
+        pending_map.insert(guard.query_id.clone(), pending);
+        release_over_cap(&mut pending_map, &guard.owner.pending_budget);
+    }
     start_worker(&guard.owner);
     guard.owner.notify.notify_one();
 }
@@ -350,6 +453,8 @@ async fn worker(weak: Weak<Inner>, notify: Arc<Notify>, _exit: WorkerExit) {
 async fn probe_batches(owner: &Inner, ids: &[String]) -> Duration {
     let mut interval = POLL_INTERVAL;
     for batch in ids.chunks(128) {
+        // A hung probe delays this sweep by at most one runtime verification budget.
+        release_expired(&mut owner.pending.lock().expect("disconnect state poisoned"));
         let started = Instant::now();
         let result = probe(owner, batch).await;
         crate::metrics::read_disconnect_probe(
@@ -389,10 +494,68 @@ fn apply_observation(owner: &Inner, ids: &[String], active: Option<&HashSet<Stri
             record_verification(entry, "unconfirmed");
         }
     }
+    release_expired(&mut pending);
     if pending.values().all(|entry| entry.unconfirmed) {
         UNCONFIRMED_RETRY_DELAY
     } else {
         POLL_INTERVAL
+    }
+}
+
+/// Release bounded reads whose server-side execution limit has passed, whatever
+/// the probes reported: probe errors, lost coverage or a changed topology must not
+/// hold admission indefinitely.
+fn release_expired(pending: &mut BTreeMap<String, Pending>) {
+    let now = Instant::now();
+    let mut released = 0usize;
+    pending.retain(|id, entry| {
+        if entry.release_at.is_none_or(|release_at| now < release_at) {
+            return true;
+        }
+        tracing::debug!(query_id = %id, target = entry.target, quiet_observations = entry.quiet_observations, "Releasing admission of an abandoned ClickHouse read past its execution limit");
+        record_verification(entry, "released_expired");
+        released += 1;
+        false
+    });
+    if released > 0 {
+        tracing::warn!(
+            released,
+            "ClickHouse read termination unconfirmed past the execution limit; releasing admission"
+        );
+    }
+}
+
+/// Keep bounded pending reads within the shared budget by releasing this
+/// verifier's oldest first. Unbounded (background, cache) entries are neither
+/// counted nor released. Concurrent enqueues on other verifiers can overshoot the
+/// cap by at most one entry each until their own enqueue trims it.
+fn release_over_cap(pending: &mut BTreeMap<String, Pending>, budget: &PendingBudget) {
+    if !budget.over_cap() {
+        return;
+    }
+    let mut oldest: Vec<(Instant, String)> = pending
+        .iter()
+        .filter(|(_, entry)| entry.release_at.is_some())
+        .map(|(id, entry)| (entry.abandoned_at, id.clone()))
+        .collect();
+    oldest.sort_unstable();
+    let mut released = 0usize;
+    for (_, id) in oldest {
+        if !budget.over_cap() {
+            break;
+        }
+        if let Some(entry) = pending.remove(&id) {
+            tracing::debug!(query_id = %id, target = entry.target, "Releasing admission of the oldest abandoned ClickHouse read over the pending share");
+            record_verification(&entry, "released_over_cap");
+            released += 1;
+        }
+    }
+    if released > 0 {
+        tracing::warn!(
+            released,
+            cap = budget.cap,
+            "Abandoned ClickHouse reads exceed their admission share; released the oldest"
+        );
     }
 }
 
@@ -691,11 +854,15 @@ async fn fetch<T: clickhouse::RowOwned + clickhouse::RowRead>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use tokio::sync::Semaphore;
 
     fn verifier() -> DisconnectVerifier {
-        let verifier = DisconnectVerifier::new(HttpClient::default(), None, Default::default());
+        let verifier = DisconnectVerifier::new(
+            HttpClient::default(),
+            None,
+            Default::default(),
+            PendingBudget::for_admission(usize::MAX),
+        );
         verifier
             .0
             .topology
@@ -716,6 +883,8 @@ mod tests {
                 _additional: Vec::new(),
                 _workflow: Vec::new(),
                 abandoned_at: Instant::now(),
+                release_at: None,
+                _budget: None,
                 quiet_observations: 0,
                 unconfirmed: false,
                 operation: "signature_statuses",
@@ -808,6 +977,250 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 1);
     }
 
+    fn bounded_guard(
+        verifier: &DisconnectVerifier,
+        semaphore: &Arc<Semaphore>,
+        id: &str,
+        target: &'static str,
+        max_execution: Option<Duration>,
+    ) -> DisconnectGuard {
+        DisconnectGuard {
+            owner: verifier.0.clone(),
+            query_id: id.into(),
+            permit: Some(semaphore.clone().try_acquire_owned().unwrap()),
+            operation: "signature_statuses",
+            target,
+            submitted: true,
+            retain_until_verified: true,
+            max_execution,
+            additional: Vec::new(),
+            workflow: Vec::new(),
+        }
+    }
+
+    // The build has no tokio `test-util`, so these tests move deadlines instead of the clock.
+    #[tokio::test]
+    async fn unverifiable_bounded_work_releases_admission_after_execution_limit() {
+        let verifier = verifier();
+        let semaphore = Arc::new(Semaphore::new(2));
+        pending(&verifier, &semaphore, "errors");
+        pending(&verifier, &semaphore, "active");
+        let now = Instant::now();
+        for entry in verifier.0.pending.lock().unwrap().values_mut() {
+            entry.abandoned_at = now - Duration::from_secs(34);
+            entry.release_at = Some(now + Duration::from_secs(1));
+        }
+        let errors = vec!["errors".to_string()];
+        let active = vec!["active".to_string()];
+        let still_running = HashSet::from(["active".to_string()]);
+        // Probes error, or keep observing the query: no absence evidence at all.
+        for _ in 0..3 {
+            apply_observation(&verifier.0, &errors, None);
+            apply_observation(&verifier.0, &active, Some(&still_running));
+            assert_eq!(semaphore.available_permits(), 0);
+        }
+        assert!(verifier.0.pending.lock().unwrap()["errors"].unconfirmed);
+        // The execution limit plus margin has now passed.
+        for entry in verifier.0.pending.lock().unwrap().values_mut() {
+            entry.release_at = Some(Instant::now());
+        }
+        apply_observation(&verifier.0, &errors, None);
+        assert_eq!(semaphore.available_permits(), 2);
+        assert!(verifier.0.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_work_still_releases_on_confirmed_absence_before_the_limit() {
+        let verifier = verifier();
+        let semaphore = Arc::new(Semaphore::new(1));
+        pending(&verifier, &semaphore, "q");
+        verifier
+            .0
+            .pending
+            .lock()
+            .unwrap()
+            .get_mut("q")
+            .unwrap()
+            .release_at = Some(Instant::now() + Duration::from_secs(35));
+        let ids = vec!["q".to_string()];
+        apply_observation(&verifier.0, &ids, None);
+        apply_observation(&verifier.0, &ids, Some(&HashSet::new()));
+        assert_eq!(semaphore.available_permits(), 0);
+        apply_observation(&verifier.0, &ids, Some(&HashSet::new()));
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn bounded_release_deadline_is_rounded_execution_limit_plus_margin() {
+        let verifier = verifier();
+        let semaphore = Arc::new(Semaphore::new(2));
+        let before = Instant::now();
+        drop(bounded_guard(
+            &verifier,
+            &semaphore,
+            "bounded",
+            "primary",
+            Some(Duration::from_millis(29_001)),
+        ));
+        drop(bounded_guard(
+            &verifier,
+            &semaphore,
+            "unbounded",
+            "background",
+            None,
+        ));
+        let pending = verifier.0.pending.lock().unwrap();
+        let entry = &pending["bounded"];
+        assert_eq!(
+            entry.release_at,
+            Some(entry.abandoned_at + Duration::from_secs(30) + EXPIRY_MARGIN)
+        );
+        assert!(entry.abandoned_at >= before);
+        assert_eq!(pending["unbounded"].release_at, None);
+        assert_eq!(bounded_pending_cap(512), 128);
+        assert_eq!(bounded_pending_cap(3), 1);
+        assert_eq!(bounded_pending_cap(1), 1);
+    }
+
+    #[test]
+    fn pending_cap_releases_oldest_bounded_entries_only() {
+        let verifier = DisconnectVerifier::new(
+            HttpClient::default(),
+            None,
+            Default::default(),
+            PendingBudget::for_admission(8),
+        );
+        let semaphore = Arc::new(Semaphore::new(5));
+        let limit = Some(Duration::from_secs(30));
+        // Oldest entry is background work: never counted, never released by the cap.
+        drop(bounded_guard(
+            &verifier,
+            &semaphore,
+            "background",
+            "background",
+            None,
+        ));
+        for id in ["a", "b"] {
+            drop(bounded_guard(&verifier, &semaphore, id, "primary", limit));
+        }
+        assert_eq!(semaphore.available_permits(), 2);
+        drop(bounded_guard(&verifier, &semaphore, "c", "shard", limit));
+        assert_eq!(semaphore.available_permits(), 2);
+        let ids: Vec<String> = verifier.0.pending.lock().unwrap().keys().cloned().collect();
+        assert_eq!(ids, ["b", "background", "c"]);
+        drop(bounded_guard(&verifier, &semaphore, "d", "primary", limit));
+        let ids: Vec<String> = verifier.0.pending.lock().unwrap().keys().cloned().collect();
+        assert_eq!(ids, ["background", "c", "d"]);
+        assert_eq!(semaphore.available_permits(), 2);
+        drop(verifier);
+        assert_eq!(semaphore.available_permits(), 5);
+    }
+
+    #[test]
+    fn verifiers_sharing_a_budget_release_the_enqueuing_lanes_oldest() {
+        // Primary and per-replica shard verifiers share one budget, as their pending
+        // entries hold leases on the same HTTP semaphore.
+        let budget = PendingBudget::for_admission(8);
+        let primary = DisconnectVerifier::new(
+            HttpClient::default(),
+            None,
+            Default::default(),
+            budget.clone(),
+        );
+        let shard = DisconnectVerifier::new(
+            HttpClient::default(),
+            None,
+            Default::default(),
+            budget.clone(),
+        );
+        let semaphore = Arc::new(Semaphore::new(4));
+        let limit = Some(Duration::from_secs(30));
+        let keys = |verifier: &DisconnectVerifier| -> Vec<String> {
+            verifier.0.pending.lock().unwrap().keys().cloned().collect()
+        };
+        drop(bounded_guard(&primary, &semaphore, "a", "primary", limit));
+        drop(bounded_guard(&shard, &semaphore, "b", "shard", limit));
+        assert_eq!(budget.held.load(Ordering::SeqCst), 2);
+        assert_eq!(semaphore.available_permits(), 2);
+        drop(bounded_guard(&primary, &semaphore, "c", "primary", limit));
+        assert_eq!(keys(&primary), ["c"]);
+        assert_eq!(keys(&shard), ["b"]);
+        assert_eq!(budget.held.load(Ordering::SeqCst), 2);
+        assert_eq!(semaphore.available_permits(), 2);
+        // Each lane releases its own oldest; the other lane's entries are untouched.
+        drop(bounded_guard(&shard, &semaphore, "d", "shard", limit));
+        assert_eq!(keys(&shard), ["d"]);
+        assert_eq!(keys(&primary), ["c"]);
+        assert_eq!(budget.held.load(Ordering::SeqCst), 2);
+        assert_eq!(semaphore.available_permits(), 2);
+        drop(primary);
+        drop(shard);
+        assert_eq!(budget.held.load(Ordering::SeqCst), 0);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn worker_frees_every_permit_after_the_limit_when_probes_always_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let probes = Arc::new(AtomicUsize::new(0));
+        let counted = probes.clone();
+        let app = axum::Router::new().fallback(move || {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let verifier = DisconnectVerifier::new(
+            HttpClient::default()
+                .with_url(url)
+                .with_validation(false)
+                .with_compression(clickhouse::Compression::None),
+            None,
+            Default::default(),
+            PendingBudget::for_admission(usize::MAX),
+        );
+        verifier
+            .0
+            .topology
+            .set(Topology {
+                nodes: HashSet::from(["node1".into()]),
+                cluster: None,
+            })
+            .unwrap();
+        let semaphore = Arc::new(Semaphore::new(3));
+        for id in ["q1", "q2", "q3"] {
+            drop(bounded_guard(
+                &verifier,
+                &semaphore,
+                id,
+                "primary",
+                Some(Duration::from_secs(1)),
+            ));
+        }
+        // Stand in for a limit that is about to pass.
+        let release_at = Instant::now() + Duration::from_millis(1_500);
+        for entry in verifier.0.pending.lock().unwrap().values_mut() {
+            entry.release_at = Some(release_at);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(probes.load(Ordering::SeqCst) > 0);
+        assert_eq!(semaphore.available_permits(), 0);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while semaphore.available_permits() != 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("bounded permits released despite failing probes");
+        assert!(Instant::now() >= release_at);
+        assert!(verifier.0.pending.lock().unwrap().is_empty());
+        drop(verifier);
+        server.abort();
+    }
+
     #[test]
     fn missing_runtime_retains_admission_until_owner_shutdown() {
         let verifier = verifier();
@@ -819,6 +1232,8 @@ mod tests {
             operation: "signature_statuses",
             target: "primary",
             submitted: true,
+            retain_until_verified: true,
+            max_execution: None,
             additional: Vec::new(),
             workflow: Vec::new(),
         };
@@ -840,6 +1255,8 @@ mod tests {
             operation: "signature_statuses",
             target: "primary",
             submitted: true,
+            retain_until_verified: true,
+            max_execution: None,
             additional: Vec::new(),
             workflow: Vec::new(),
         };
@@ -881,6 +1298,7 @@ mod tests {
                 runtime: Duration::from_millis(100),
                 ..Default::default()
             },
+            PendingBudget::for_admission(usize::MAX),
         );
         verifier
             .0
@@ -1061,7 +1479,12 @@ mod tests {
             .with_url(url)
             .with_validation(false)
             .with_compression(clickhouse::Compression::None);
-        let verifier = DisconnectVerifier::new(client, None, Default::default());
+        let verifier = DisconnectVerifier::new(
+            client,
+            None,
+            Default::default(),
+            PendingBudget::for_admission(usize::MAX),
+        );
         let semaphore = Arc::new(Semaphore::new(2));
         let first = verifier
             .arm(

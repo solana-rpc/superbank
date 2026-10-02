@@ -32,3 +32,6 @@ solana-transaction-context = "4"
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
 url = "2"
+
+[dev-dependencies]
+solana-transaction = "4"

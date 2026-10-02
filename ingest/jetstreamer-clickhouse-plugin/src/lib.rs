@@ -189,11 +189,14 @@ fn env_bool(name: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClickhouseIngestConfig, ClickhouseIngestPlugin, EntryRow, apply_env_overrides,
-        versioned_message_fields,
+        ClickhouseIngestConfig, ClickhouseIngestPlugin, EntryRow, TransactionRow,
+        apply_env_overrides, map_rewards, versioned_message_fields,
     };
-    use jetstreamer_firehose::firehose::EntryData;
+    use jetstreamer_firehose::firehose::{EntryData, TransactionData};
+    use solana_message::v1::{Message, TransactionConfig};
     use solana_message::{Hash, VersionedMessage, v1};
+    use solana_transaction::versioned::VersionedTransaction;
+    use solana_transaction_status::Reward;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -350,6 +353,96 @@ mod tests {
         assert_eq!(row.transaction_count, 3);
         assert_eq!(row.num_hashes, 999);
         assert_eq!(row.hash, [0u8; 32]);
+    }
+
+    #[test]
+    fn transaction_rows_keep_version_and_config() {
+        let cases = [
+            (
+                VersionedMessage::Legacy(Default::default()),
+                None,
+                (None, None, None, None),
+            ),
+            (
+                VersionedMessage::V0(Default::default()),
+                Some(0),
+                (None, None, None, None),
+            ),
+            (
+                VersionedMessage::V1(Message::default()),
+                Some(1),
+                (None, None, None, None),
+            ),
+            (
+                VersionedMessage::V1(Message {
+                    config: TransactionConfig {
+                        priority_fee: Some(42),
+                        compute_unit_limit: Some(250_000),
+                        loaded_accounts_data_size_limit: Some(1024),
+                        heap_size: Some(32_768),
+                    },
+                    ..Default::default()
+                }),
+                Some(1),
+                (Some(42), Some(250_000), Some(1024), Some(32_768)),
+            ),
+            (
+                VersionedMessage::V1(Message {
+                    config: TransactionConfig {
+                        priority_fee: Some(u64::MAX),
+                        compute_unit_limit: None,
+                        loaded_accounts_data_size_limit: Some(0),
+                        heap_size: Some(u32::MAX),
+                    },
+                    ..Default::default()
+                }),
+                Some(1),
+                (Some(u64::MAX), None, Some(0), Some(u32::MAX)),
+            ),
+        ];
+
+        for (message, expected_version, expected_config) in cases {
+            let transaction = TransactionData {
+                slot: 123,
+                transaction_slot_index: 0,
+                signature: Default::default(),
+                message_hash: Default::default(),
+                is_vote: false,
+                transaction_status_meta: Default::default(),
+                transaction: VersionedTransaction {
+                    signatures: Vec::new(),
+                    message,
+                },
+            };
+
+            let row = TransactionRow::from_transaction(&transaction);
+            assert_eq!(row.tx_version, expected_version);
+            assert_eq!(
+                (
+                    row.tx_config_priority_fee,
+                    row.tx_config_compute_unit_limit,
+                    row.tx_config_loaded_accounts_data_size_limit,
+                    row.tx_config_heap_size,
+                ),
+                expected_config,
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_rewards_keep_basis_point_commission() {
+        let rewards = vec![Reward {
+            pubkey: String::new(),
+            lamports: 1,
+            post_balance: 2,
+            reward_type: None,
+            commission: None,
+            commission_bps: Some(725),
+        }];
+
+        let (_, _, _, _, _, legacy_commission, commission_bps) = map_rewards(Some(&rewards));
+        assert_eq!(legacy_commission, vec![None]);
+        assert_eq!(commission_bps, vec![Some(725)]);
     }
 }
 
@@ -1625,7 +1718,7 @@ fn map_rewards(rewards: Option<&Vec<solana_transaction_status::Reward>>) -> Rewa
             post_balance.push(reward.post_balance);
             reward_type.push(reward.reward_type.map(|t| t.to_string()));
             commission.push(reward.commission);
-            commission_bps.push(None);
+            commission_bps.push(reward.commission_bps);
         }
     }
 

@@ -4,14 +4,15 @@
  */
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     pin::Pin,
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use clickhouse::Client as ClickHouseClient;
 use futures::StreamExt;
+use prost::Message;
 use serde_big_array::Array;
 use serde_bytes::ByteBuf;
 use tokio::{
@@ -22,8 +23,7 @@ use tokio::{
 use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
-use yellowstone_grpc_client_43 as yellowstone_grpc_client;
-use yellowstone_grpc_proto_43::prelude::{
+use yellowstone_grpc_proto::prelude::{
     SlotStatus, SubscribeRequest, SubscribeRequestFilterBlockFooter, SubscribeRequestFilterBlocks,
     SubscribeRequestFilterSlots, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateBlockFooter,
     SubscribeUpdateEntry, SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
@@ -155,17 +155,110 @@ impl BufferedRows {
 }
 
 const FOOTER_JOIN_WINDOW_SLOTS: u64 = 8192;
+const PENDING_IDENTITY_MAX_BLOCKS: usize = 256;
+const PENDING_IDENTITY_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanonicalIdentity {
+    Unknown,
+    Legacy,
+    Bank(u64),
+}
+
+struct PreparedBlock {
+    metadata: BlockMetadataRow,
+    transactions: Vec<TransactionRow>,
+    entries: Vec<EntryRow>,
+}
+
+impl PreparedBlock {
+    fn append(
+        self,
+        transaction_rows: &mut Vec<TransactionRow>,
+        block_rows: &mut Vec<BlockMetadataRow>,
+        entry_rows: Option<&mut Vec<EntryRow>>,
+    ) {
+        transaction_rows.extend(self.transactions);
+        block_rows.push(self.metadata);
+        if let Some(entry_rows) = entry_rows {
+            entry_rows.extend(self.entries);
+        }
+    }
+}
 
 #[derive(Default)]
 struct FinalizedFooterJoin {
     pending: HashMap<(u64, u64), BlockFooterRow>,
     finalized: HashMap<u64, u64>,
     completed: HashSet<(u64, u64)>,
+    complete_blocks: HashSet<(u64, u64)>,
+    durable_blocks: HashSet<(u64, u64)>,
     first_footer_slot: Option<u64>,
     highest_slot: u64,
+    // These proofs and pending payloads belong only to this subscription.
+    known_banks: HashSet<(u64, u64)>,
+    legacy_slots: HashSet<u64>,
+    pending_identity: BTreeMap<u64, PreparedBlock>,
+    ready_footers: Vec<BlockFooterRow>,
+    pending_identity_bytes: usize,
 }
 
 impl FinalizedFooterJoin {
+    fn block_identity(&self, slot: u64, scalar_id: u64) -> Result<CanonicalIdentity> {
+        if self.legacy_slots.contains(&slot) {
+            ensure!(
+                scalar_id == 0,
+                "bank-aware block contradicts legacy status at slot {slot}"
+            );
+            return Ok(CanonicalIdentity::Legacy);
+        }
+        // Nonzero scalars cannot be protobuf's missing-field default. Zero needs
+        // optional-ID evidence for this exact slot on this same subscription.
+        if scalar_id != 0 || self.known_banks.contains(&(slot, scalar_id)) {
+            return Ok(CanonicalIdentity::Bank(scalar_id));
+        }
+        Ok(CanonicalIdentity::Unknown)
+    }
+
+    fn stage_identity_block(
+        &mut self,
+        prepared: PreparedBlock,
+        encoded_bytes: usize,
+    ) -> Result<()> {
+        let slot = prepared.metadata.slot;
+        ensure!(
+            !self.pending_identity.contains_key(&slot),
+            "duplicate unidentified block at slot {slot}"
+        );
+        let bytes = self
+            .pending_identity_bytes
+            .checked_add(encoded_bytes)
+            .context("pending gRPC identity bytes overflow")?;
+        ensure!(
+            self.pending_identity.len() < PENDING_IDENTITY_MAX_BLOCKS
+                && bytes <= PENDING_IDENTITY_MAX_BYTES,
+            "gRPC blocks lack same-subscription bank identity; pending identity limit exceeded"
+        );
+        self.highest_slot = self.highest_slot.max(slot);
+        self.pending_identity.insert(slot, prepared);
+        self.pending_identity_bytes = bytes;
+        self.prune()
+    }
+
+    fn take_ready_blocks(&mut self) -> Result<Vec<(PreparedBlock, CanonicalIdentity)>> {
+        let mut identities = Vec::with_capacity(self.pending_identity.len());
+        for (&slot, pending) in &self.pending_identity {
+            let identity = self.block_identity(slot, pending.metadata.bank_id.unwrap_or(0))?;
+            if identity == CanonicalIdentity::Unknown {
+                return Ok(Vec::new());
+            }
+            identities.push(identity);
+        }
+        let pending = std::mem::take(&mut self.pending_identity);
+        self.pending_identity_bytes = 0;
+        Ok(pending.into_values().zip(identities).collect())
+    }
+
     fn observe(&mut self, update: SubscribeUpdate) -> Result<Option<BlockFooterRow>> {
         let row = match update.update_oneof {
             Some(UpdateOneof::BlockFooter(footer)) => self.observe_footer(&footer)?,
@@ -180,34 +273,92 @@ impl FinalizedFooterJoin {
         &mut self,
         footer: &SubscribeUpdateBlockFooter,
     ) -> Result<Option<BlockFooterRow>> {
+        ensure!(
+            !self.legacy_slots.contains(&footer.slot),
+            "footer at slot {} lacks proven bank identity",
+            footer.slot
+        );
         let row = map_block_footer(footer)?;
         let key = (row.slot, row.bank_id);
         self.highest_slot = self.highest_slot.max(row.slot);
         self.first_footer_slot.get_or_insert(row.slot);
-        Ok(match self.finalized.get(&row.slot) {
-            Some(bank_id) if *bank_id == row.bank_id => {
-                if self.completed.insert(key) {
-                    Some(row)
-                } else {
-                    None
-                }
-            }
-            Some(_) => None,
-            None => {
-                self.pending.insert(key, row);
-                None
-            }
-        })
+        if self
+            .finalized
+            .get(&row.slot)
+            .is_some_and(|winner| *winner != row.bank_id)
+        {
+            return Ok(None);
+        }
+        if !self.completed.contains(&key) {
+            self.pending.insert(key, row);
+        }
+        Ok(self.take_ready(key))
+    }
+
+    fn observe_complete_block(
+        &mut self,
+        slot: u64,
+        bank_id: u64,
+    ) -> Result<Option<BlockFooterRow>> {
+        anyhow::ensure!(
+            self.finalized
+                .get(&slot)
+                .is_none_or(|winner| *winner == bank_id),
+            "complete finalized block conflicts with winning bank at slot {slot}"
+        );
+        self.highest_slot = self.highest_slot.max(slot);
+        self.complete_blocks.insert((slot, bank_id));
+        let row = self.take_ready((slot, bank_id));
+        self.prune()?;
+        Ok(row)
+    }
+
+    fn take_ready(&mut self, key: (u64, u64)) -> Option<BlockFooterRow> {
+        if self.finalized.get(&key.0) != Some(&key.1) || !self.complete_blocks.contains(&key) {
+            return None;
+        }
+        let row = self.pending.remove(&key)?;
+        self.completed.insert(key);
+        Some(row)
     }
 
     fn observe_slot(
         &mut self,
-        slot: &yellowstone_grpc_proto_43::prelude::SubscribeUpdateSlot,
+        slot: &yellowstone_grpc_proto::prelude::SubscribeUpdateSlot,
     ) -> Result<Option<BlockFooterRow>> {
         self.highest_slot = self.highest_slot.max(slot.slot);
         let Ok(status) = SlotStatus::try_from(slot.status) else {
             return Ok(None);
         };
+        if matches!(
+            status,
+            SlotStatus::SlotCreatedBank
+                | SlotStatus::SlotProcessed
+                | SlotStatus::SlotConfirmed
+                | SlotStatus::SlotFinalized
+        ) {
+            if let Some(bank_id) = slot.bank_id {
+                ensure!(
+                    !self.legacy_slots.contains(&slot.slot),
+                    "bank identity protocol changed within slot {}",
+                    slot.slot
+                );
+                self.known_banks.insert((slot.slot, bank_id));
+            } else if matches!(
+                status,
+                SlotStatus::SlotCreatedBank | SlotStatus::SlotFinalized
+            ) {
+                ensure!(
+                    !self
+                        .known_banks
+                        .iter()
+                        .any(|(candidate, _)| *candidate == slot.slot),
+                    "bank-aware slot {} lost optional bank identity",
+                    slot.slot
+                );
+                self.legacy_slots.insert(slot.slot);
+            }
+        }
         Ok(match status {
             SlotStatus::SlotFinalized => {
                 let Some(bank_id) = slot.bank_id else {
@@ -220,14 +371,17 @@ impl FinalizedFooterJoin {
                     return Ok(None);
                 };
                 let key = (slot.slot, bank_id);
+                anyhow::ensure!(
+                    self.finalized
+                        .get(&slot.slot)
+                        .is_none_or(|winner| *winner == key.1),
+                    "conflicting finalized banks at slot {}",
+                    slot.slot
+                );
                 self.finalized.insert(slot.slot, key.1);
                 self.pending
                     .retain(|(candidate, bank), _| *candidate != slot.slot || *bank == key.1);
-                let row = self.pending.remove(&key);
-                if row.is_some() {
-                    self.completed.insert(key);
-                }
-                row
+                self.take_ready(key)
             }
             SlotStatus::SlotDead => {
                 self.pending.retain(|(candidate, bank), _| {
@@ -253,6 +407,14 @@ impl FinalizedFooterJoin {
         self.pending.retain(|(slot, _), _| *slot >= oldest);
         self.finalized.retain(|slot, _| *slot >= oldest);
         self.completed.retain(|(slot, _)| *slot >= oldest);
+        ensure!(
+            !self.pending_identity.keys().any(|slot| *slot < oldest),
+            "finalized block lacks same-subscription bank identity within {FOOTER_JOIN_WINDOW_SLOTS} slots"
+        );
+        self.complete_blocks.retain(|(slot, _)| *slot >= oldest);
+        self.durable_blocks.retain(|(slot, _)| *slot >= oldest);
+        self.known_banks.retain(|(slot, _)| *slot >= oldest);
+        self.legacy_slots.retain(|slot| *slot >= oldest);
         Ok(())
     }
 }
@@ -312,15 +474,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
         initial_from_slot_mode,
         buffered_rows.last_durable_block_slot,
     );
-    let mut _footer_guard = AbortTaskGuard::default();
-    _footer_guard.set(start_footer_watch(
-        endpoint.to_string(),
-        args.clone(),
-        subscribe_from_slot,
-        subscribe_from_slot_mode,
-        clickhouse.clone(),
-        health_failure_tx.clone(),
-    ));
+    let mut footer_join = FinalizedFooterJoin::default();
     let (pending_update, mut stream) = connect_grpc_stream(
         endpoint,
         args,
@@ -348,13 +502,14 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
             last_processed_block_slot = Some(slot);
             metrics::set_last_processed_slot(slot);
         }
-        process_update(
+        process_canonical_update(
             update,
             args,
             &insert_tables,
             &clickhouse,
             &mut buffered_rows,
-            Some(&retry_config),
+            &retry_config,
+            &mut footer_join,
         )
         .await?;
     }
@@ -370,7 +525,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                 break;
             }
             _ = flush_timer.tick() => {
-                buffered_rows.flush_with_retry(&clickhouse, &insert_tables, &retry_config).await?;
+                flush_canonical_rows(&clickhouse, &insert_tables, &mut buffered_rows, Some(&retry_config), &mut footer_join).await?;
             }
             health_failure = health_failure_rx.recv() => {
                 let reason = health_failure
@@ -387,6 +542,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                     &insert_tables,
                     &mut buffered_rows,
                     &reason,
+                    &mut footer_join,
                 )
                 .await?;
                 return Err(anyhow!(reason));
@@ -408,6 +564,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                     &insert_tables,
                     &mut buffered_rows,
                     &reason,
+                    &mut footer_join,
                 )
                 .await?;
                 return Err(anyhow!(reason));
@@ -423,13 +580,14 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                         if let Some(UpdateOneof::Slot(slot_update)) = &update.update_oneof {
                             metrics::set_network_tip_slot(slot_update.slot);
                         }
-                        process_update(
+                        process_canonical_update(
                             update,
                             args,
                             &insert_tables,
                             &clickhouse,
                             &mut buffered_rows,
-                            Some(&retry_config),
+                            &retry_config,
+            &mut footer_join,
                         )
                         .await?;
                     }
@@ -462,6 +620,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                             &insert_tables,
                             &mut buffered_rows,
                             &reason,
+                            &mut footer_join,
                         )
                         .await?;
                         return Err(anyhow!(reason));
@@ -479,6 +638,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                             &insert_tables,
                             &mut buffered_rows,
                             &reason,
+                            &mut footer_join,
                         )
                         .await?;
                         return Err(anyhow!(reason));
@@ -489,8 +649,10 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     }
     let shutdown_count = *shutdown_rx.borrow();
     tokio::select! {
-        result = buffered_rows.flush_with_retry(&clickhouse, &insert_tables, &retry_config) => {
+        result = flush_canonical_rows(&clickhouse, &insert_tables, &mut buffered_rows, Some(&retry_config), &mut footer_join) => {
             result?;
+            ensure!(footer_join.pending_identity.is_empty(),
+                "gRPC shutdown with unidentified banks; replay from the last durable slot");
         }
         _ = shutdown_rx.changed() => {
             let new_count = *shutdown_rx.borrow();
@@ -512,76 +674,136 @@ fn grpc_auxiliary_source(reason: &str) -> &'static str {
     }
 }
 
-fn start_footer_watch(
-    endpoint: String,
-    args: Args,
-    from_slot: Option<u64>,
-    mode: Option<FromSlotMode>,
-    clickhouse: ClickHouseClient,
-    failure_tx: mpsc::UnboundedSender<String>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = run_footer_watch(&endpoint, &args, from_slot, mode, &clickhouse).await {
-            let _ = failure_tx.send(format!("footer stream: {err:#}"));
-        }
-    })
-}
-
-async fn run_footer_watch(
-    endpoint: &str,
-    args: &Args,
-    from_slot: Option<u64>,
-    mode: Option<FromSlotMode>,
-    clickhouse: &ClickHouseClient,
-) -> Result<()> {
-    let (first, mut stream) = connect_footer_stream(endpoint, args, from_slot, mode).await?;
-    let retry = RetryConfig {
-        max_retries: args.insert_max_retries,
-        base_ms: args.insert_retry_base_ms,
-        max_ms: args.insert_retry_max_ms,
-    };
-    let mut join = FinalizedFooterJoin::default();
-    if let Some(update) = first {
-        persist_finalized_footer(
-            update,
-            &mut join,
-            clickhouse,
-            &args.block_footers_table,
-            &retry,
-        )
-        .await?;
-    }
-    loop {
-        let update = tokio::time::timeout(
-            Duration::from_secs(args.grpc_idle_timeout_secs),
-            stream.next(),
-        )
-        .await
-        .context("footer stream idle timeout")?
-        .context("footer stream ended")?
-        .context("footer stream update error")?;
-        persist_finalized_footer(
-            update,
-            &mut join,
-            clickhouse,
-            &args.block_footers_table,
-            &retry,
-        )
-        .await?;
-    }
-}
-
-async fn persist_finalized_footer(
+async fn process_canonical_update(
     update: SubscribeUpdate,
-    join: &mut FinalizedFooterJoin,
+    args: &Args,
+    tables: &InsertTables,
     clickhouse: &ClickHouseClient,
-    table: &str,
+    rows: &mut BufferedRows,
     retry: &RetryConfig,
+    join: &mut FinalizedFooterJoin,
 ) -> Result<()> {
-    if let Some(row) = join.observe(update)? {
-        insert_footer_row(clickhouse, table, &row, Some(retry)).await?;
+    match update.update_oneof {
+        Some(UpdateOneof::Block(block)) => {
+            validate_block_bank(&block, args.source, args.fumarole_alpenglow_genesis_slot)?;
+            ensure!(
+                join.finalized
+                    .get(&block.slot)
+                    .is_none_or(|winner| *winner == block.bank_id),
+                "finalized block conflicts with winning bank at slot {}",
+                block.slot
+            );
+            join.block_identity(block.slot, block.bank_id)?;
+            // Decode and validate before touching pending identity or writer buffers.
+            let prepared = prepare_block(&block, args.entries_table.is_some())?;
+            join.stage_identity_block(prepared, block.encoded_len())?;
+        }
+        other => {
+            if let Some(footer) = join.observe(SubscribeUpdate {
+                update_oneof: other,
+                ..update
+            })? {
+                join.ready_footers.push(footer);
+            }
+        }
+    }
+    // Later complete blocks remain held behind any unidentified earlier block.
+    // Nothing can advance the metadata tip until every held identity is resolved.
+    for (prepared, identity) in join.take_ready_blocks()? {
+        if let Some(footer) = buffer_identified_block(prepared, identity, args, rows, join)? {
+            join.ready_footers.push(footer);
+        }
+    }
+    if join.pending_identity.is_empty() {
+        let pressure = args.flush_every_block
+            || rows.transaction_rows.len() >= args.transactions_flush_rows
+            || rows.block_rows.len() >= args.blocks_flush_rows
+            || rows.entry_rows.len() >= args.transactions_flush_rows;
+        let footer_needs_flush = join
+            .ready_footers
+            .iter()
+            .any(|footer| !join.durable_blocks.contains(&(footer.slot, footer.bank_id)));
+        if pressure || footer_needs_flush {
+            flush_canonical_rows(clickhouse, tables, rows, Some(retry), join).await?;
+        }
+    }
+    // A later unidentified block must not strand an earlier ready footer whose
+    // complete, matching bank data has already been durably flushed. Inserting
+    // this footer advances no metadata tip and never flushes the held payload.
+    let mut index = 0;
+    while index < join.ready_footers.len() {
+        let footer = &join.ready_footers[index];
+        if join.durable_blocks.contains(&(footer.slot, footer.bank_id)) {
+            let footer = join.ready_footers.remove(index);
+            insert_footer_row(clickhouse, &args.block_footers_table, &footer, Some(retry)).await?;
+        } else {
+            index += 1;
+        }
     }
     Ok(())
+}
+
+fn buffer_identified_block(
+    mut prepared: PreparedBlock,
+    identity: CanonicalIdentity,
+    args: &Args,
+    rows: &mut BufferedRows,
+    join: &mut FinalizedFooterJoin,
+) -> Result<Option<BlockFooterRow>> {
+    let bank_id = match identity {
+        CanonicalIdentity::Bank(bank_id) => Some(bank_id),
+        CanonicalIdentity::Legacy => None,
+        CanonicalIdentity::Unknown => return Err(anyhow!("cannot persist unidentified gRPC bank")),
+    };
+    let slot = prepared.metadata.slot;
+    ensure!(
+        bank_id.is_none_or(|id| join.finalized.get(&slot).is_none_or(|winner| *winner == id)),
+        "finalized block conflicts with winning bank at slot {slot}"
+    );
+    prepared.metadata.bank_id = bank_id;
+    prepared.append(
+        &mut rows.transaction_rows,
+        &mut rows.block_rows,
+        args.entries_table.as_ref().map(|_| &mut rows.entry_rows),
+    );
+    // Legacy finalized full blocks supply canonical historical data, not a
+    // node-local identity that could qualify a modern footer.
+    match bank_id {
+        Some(bank_id) => join.observe_complete_block(slot, bank_id),
+        None => Ok(None),
+    }
+}
+
+async fn flush_canonical_rows(
+    clickhouse: &ClickHouseClient,
+    tables: &InsertTables,
+    rows: &mut BufferedRows,
+    retry: Option<&RetryConfig>,
+    join: &mut FinalizedFooterJoin,
+) -> Result<bool> {
+    if !join.pending_identity.is_empty() {
+        warn!(
+            first_pending_slot = join
+                .pending_identity
+                .first_key_value()
+                .map(|(slot, _)| *slot),
+            pending_blocks = join.pending_identity.len(),
+            "gRPC bank identity unresolved; retaining buffered data for replay"
+        );
+        return Ok(false);
+    }
+    let banks: Vec<_> = rows
+        .block_rows
+        .iter()
+        .filter_map(|metadata| metadata.bank_id.map(|bank_id| (metadata.slot, bank_id)))
+        .collect();
+    match retry {
+        Some(retry) => rows.flush_with_retry(clickhouse, tables, retry).await?,
+        None => rows.flush(clickhouse, tables).await?,
+    }
+    // Mark only after the entire transaction/metadata/entry flush succeeds.
+    join.durable_blocks.extend(banks);
+    Ok(true)
 }
 
 async fn connect_grpc_stream(
@@ -676,61 +898,13 @@ async fn connect_grpc_stream(
     Ok((pending_update, stream))
 }
 
-async fn connect_footer_stream(
-    endpoint: &str,
-    args: &Args,
-    from_slot: Option<u64>,
-    mode: Option<FromSlotMode>,
-) -> Result<(
-    Option<SubscribeUpdate>,
-    impl futures::Stream<Item = Result<SubscribeUpdate, Status>>,
-)> {
-    let mut client = build_grpc_client(endpoint, args).await?;
-    let mut stream = client
-        .subscribe_once(build_footer_request(from_slot))
-        .await?;
-    let first = first_footer_update(&mut stream, args.grpc_idle_timeout_secs)
-        .await?
-        .context("footer stream ended before first update")?;
-    let first = match first {
-        Ok(update) => Some(update),
-        Err(status) => {
-            let available_slot = footer_resume_slot(&status, mode)?;
-            stream = client
-                .subscribe_once(build_footer_request(Some(available_slot)))
-                .await?;
-            None
-        }
-    };
-    Ok((first, stream))
-}
-
-fn footer_resume_slot(status: &Status, mode: Option<FromSlotMode>) -> Result<u64> {
-    if !matches!(mode, Some(FromSlotMode::Zero | FromSlotMode::LatestDb)) {
-        return Err(anyhow!("footer stream error: {status}"));
-    }
-    parse_available_slot_from_error(status.message())
-        .map(|available| available.slot)
-        .ok_or_else(|| anyhow!("footer stream could not parse available slot: {status}"))
-}
-
-async fn first_footer_update<S>(
-    stream: &mut S,
-    idle_timeout_secs: u64,
-) -> Result<Option<Result<SubscribeUpdate, Status>>>
-where
-    S: futures::Stream<Item = Result<SubscribeUpdate, Status>> + Unpin,
-{
-    tokio::time::timeout(Duration::from_secs(idle_timeout_secs), stream.next())
-        .await
-        .context("footer stream idle before first update")
-}
-
 fn build_footer_request(from_slot: Option<u64>) -> SubscribeRequest {
     let mut block_footer = HashMap::new();
     block_footer.insert(
         "block_footer".to_string(),
-        SubscribeRequestFilterBlockFooter {},
+        SubscribeRequestFilterBlockFooter {
+            include_certificates: Some(false),
+        },
     );
     let mut slots = HashMap::new();
     slots.insert(
@@ -833,7 +1007,11 @@ pub(crate) fn build_subscribe_request(
         );
     }
 
+    // Bank counters are local to this subscription: footer, status and data share it.
+    let footer = build_footer_request(from_slot);
+    slots.extend(footer.slots);
     SubscribeRequest {
+        block_footer: footer.block_footer,
         blocks,
         slots,
         commitment: Some(commitment),
@@ -843,7 +1021,7 @@ pub(crate) fn build_subscribe_request(
 }
 
 async fn build_grpc_client(endpoint: &str, args: &Args) -> Result<GeyserGrpcClient> {
-    let builder = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
+    let builder = GeyserGrpcClient::build_from_shared(endpoint.as_bytes().to_vec())?
         .x_token(args.x_token.clone())?
         .http2_adaptive_window(args.grpc_http2_adaptive_window)
         .max_decoding_message_size(args.grpc_max_decoding_bytes)
@@ -922,10 +1100,11 @@ async fn flush_after_fatal_condition(
     insert_tables: &InsertTables,
     buffered_rows: &mut BufferedRows,
     reason: &str,
+    join: &mut FinalizedFooterJoin,
 ) -> Result<()> {
-    buffered_rows
-        .flush(clickhouse, insert_tables)
+    flush_canonical_rows(clickhouse, insert_tables, buffered_rows, None, join)
         .await
+        .map(|_| ())
         .with_context(|| format!("flush buffered rows after fatal gRPC condition: {reason}"))
 }
 
@@ -1084,16 +1263,11 @@ fn validate_block_bank(
             ));
         }
     }
-    if source == IngestSource::Grpc && block.bank_id == 0 && block.slot > 0 {
-        return Err(anyhow!(
-            "gRPC block at slot {} is missing a bank ID; require an Agave 4.3 Yellowstone producer",
-            block.slot
-        ));
-    }
-    if block
-        .entries
-        .iter()
-        .any(|entry| entry.bank_id != block.bank_id)
+    if source == IngestSource::Grpc
+        && block
+            .entries
+            .iter()
+            .any(|entry| entry.bank_id != block.bank_id)
     {
         return Err(anyhow!(
             "gRPC block at slot {} contains entries from another bank",
@@ -1129,12 +1303,6 @@ async fn flush_block_if_needed(
 }
 
 fn map_block_footer(footer: &SubscribeUpdateBlockFooter) -> Result<BlockFooterRow> {
-    if footer.bank_id == 0 && footer.slot > 0 {
-        return Err(anyhow!(
-            "Alpenglow footer at slot {} has no bank ID",
-            footer.slot
-        ));
-    }
     Ok(BlockFooterRow {
         slot: footer.slot,
         bank_id: footer.bank_id,
@@ -1161,53 +1329,124 @@ fn handle_block_update(
     block_rows: &mut Vec<BlockMetadataRow>,
     entry_rows: Option<&mut Vec<EntryRow>>,
 ) -> Result<()> {
-    let slot = block.slot;
+    prepare_block(&block, entry_rows.is_some())?.append(transaction_rows, block_rows, entry_rows);
+    Ok(())
+}
+
+fn prepare_block(block: &SubscribeUpdateBlock, include_entries: bool) -> Result<PreparedBlock> {
+    validate_block_completeness(block, include_entries)?;
     let block_time = block.block_time.as_ref().map(|bt| bt.timestamp);
+    Ok(PreparedBlock {
+        metadata: map_block_metadata(block)?,
+        transactions: map_transactions(block.slot, block_time, &block.transactions)?,
+        entries: if include_entries {
+            map_entries(block.slot, block_time, &block.entries)?
+        } else {
+            Vec::new()
+        },
+    })
+}
 
-    let block_row = map_block_metadata(&block)?;
-    let tx_rows = map_transactions(slot, block_time, &block.transactions)?;
+/// Both subscriptions request all transactions. Entries are optional, so metadata
+/// counts for an omitted entry payload cannot be used to reject a block.
+pub(crate) fn validate_block_completeness(
+    block: &SubscribeUpdateBlock,
+    include_entries: bool,
+) -> Result<()> {
+    let slot = block.slot;
+    ensure!(
+        block.executed_transaction_count == block.transactions.len() as u64,
+        "block {slot} transaction count mismatch: expected {}, received {}",
+        block.executed_transaction_count,
+        block.transactions.len()
+    );
 
-    let expected = block.executed_transaction_count as usize;
-    let got = tx_rows.len();
-    if expected > 0 && got == 0 {
-        warn!(
-            slot,
-            executed_transaction_count = expected,
-            "block has executed_transaction_count but zero transactions"
+    // Unique indices in [0, count) plus count equality prove full coverage, even
+    // when updates arrive out of order. Allocate from received data, not metadata.
+    let mut transaction_indices = vec![false; block.transactions.len()];
+    let mut signatures = HashSet::with_capacity(block.transactions.len());
+    for transaction in &block.transactions {
+        let index = usize::try_from(transaction.index)
+            .ok()
+            .and_then(|index| transaction_indices.get_mut(index))
+            .with_context(|| {
+                format!(
+                    "block {slot} transaction index {} outside expected coverage",
+                    transaction.index
+                )
+            })?;
+        ensure!(
+            !*index,
+            "block {slot} duplicate transaction index {}",
+            transaction.index
         );
-    } else if expected > 0 && got != expected {
-        warn!(
-            slot,
-            executed_transaction_count = expected,
-            transactions = got,
-            "block transaction count mismatch"
+        *index = true;
+        ensure!(
+            signatures.insert(transaction.signature.as_slice()),
+            "block {slot} duplicate transaction signature at index {}",
+            transaction.index
         );
     }
 
-    if let Some(entry_rows) = entry_rows {
-        let mapped_entries = map_entries(slot, block_time, &block.entries)?;
-        let expected_entries = block.entries_count as usize;
-        let got_entries = mapped_entries.len();
-        if expected_entries > 0 && got_entries == 0 {
-            warn!(
-                slot,
-                entry_count = expected_entries,
-                "block has entry_count but zero entries"
-            );
-        } else if expected_entries != got_entries {
-            warn!(
-                slot,
-                entry_count = expected_entries,
-                entries = got_entries,
-                "block entry count mismatch"
-            );
-        }
-        entry_rows.extend(mapped_entries);
+    if !include_entries {
+        return Ok(());
+    }
+    ensure!(
+        block.entries_count == block.entries.len() as u64,
+        "block {slot} entry count mismatch: expected {}, received {}",
+        block.entries_count,
+        block.entries.len()
+    );
+    let mut entries_by_index = vec![None; block.entries.len()];
+    for entry in &block.entries {
+        ensure!(
+            entry.slot == slot,
+            "block {slot} entry slot mismatch: received {} at index {}",
+            entry.slot,
+            entry.index
+        );
+        let indexed_entry = usize::try_from(entry.index)
+            .ok()
+            .and_then(|index| entries_by_index.get_mut(index))
+            .with_context(|| {
+                format!(
+                    "block {slot} entry index {} outside expected coverage",
+                    entry.index
+                )
+            })?;
+        ensure!(
+            indexed_entry.is_none(),
+            "block {slot} duplicate entry index {}",
+            entry.index
+        );
+        *indexed_entry = Some(entry);
     }
 
-    block_rows.push(block_row);
-    transaction_rows.extend(tx_rows);
-
+    // Entry transaction ranges must partition the same transaction indices.
+    // No tick count or num_hashes assumption: this works for both TowerBFT and
+    // Alpenglow's terminal Alpentick.
+    let mut next_transaction_index = 0u64;
+    for entry in entries_by_index.into_iter().flatten() {
+        ensure!(
+            entry.starting_transaction_index == next_transaction_index,
+            "block {slot} entry {} transaction coverage mismatch: expected start {next_transaction_index}, received {}",
+            entry.index,
+            entry.starting_transaction_index
+        );
+        next_transaction_index = next_transaction_index
+            .checked_add(entry.executed_transaction_count)
+            .with_context(|| format!("block {slot} entry transaction count overflow"))?;
+        ensure!(
+            next_transaction_index <= block.executed_transaction_count,
+            "block {slot} entry {} transaction range exceeds block transaction count",
+            entry.index
+        );
+    }
+    ensure!(
+        next_transaction_index == block.executed_transaction_count,
+        "block {slot} entries cover {next_transaction_index} transactions, expected {}",
+        block.executed_transaction_count
+    );
     Ok(())
 }
 
@@ -1508,7 +1747,7 @@ fn map_transaction(
 }
 
 fn compute_message_hash(
-    message: &yellowstone_grpc_proto_43::prelude::Message,
+    message: &yellowstone_grpc_proto::prelude::Message,
 ) -> Result<Array<u8, 32>> {
     let versioned_message = create_versioned_message(message)?;
     let message_bytes = crate::message_wire::serialize_versioned_message(&versioned_message)
@@ -1523,7 +1762,7 @@ fn compute_message_hash(
 }
 
 fn create_versioned_message(
-    message: &yellowstone_grpc_proto_43::prelude::Message,
+    message: &yellowstone_grpc_proto::prelude::Message,
 ) -> Result<solana_message::VersionedMessage> {
     use solana_message::{
         Address, Hash, Message as LegacyMessage, MessageHeader, VersionedMessage,
@@ -1653,7 +1892,7 @@ type RewardsConversion = (
 );
 
 fn convert_instructions(
-    instructions: &[yellowstone_grpc_proto_43::prelude::CompiledInstruction],
+    instructions: &[yellowstone_grpc_proto::prelude::CompiledInstruction],
 ) -> Result<InstructionConversion> {
     let mut program_ids = Vec::with_capacity(instructions.len());
     let mut accounts = Vec::with_capacity(instructions.len());
@@ -1673,7 +1912,7 @@ fn convert_instructions(
 }
 
 fn convert_address_table_lookups(
-    lookups: &[yellowstone_grpc_proto_43::prelude::MessageAddressTableLookup],
+    lookups: &[yellowstone_grpc_proto::prelude::MessageAddressTableLookup],
 ) -> Result<AddressLookupConversion> {
     let mut account_keys = Vec::with_capacity(lookups.len());
     let mut writable_indexes = Vec::with_capacity(lookups.len());
@@ -1692,7 +1931,7 @@ fn convert_address_table_lookups(
 }
 
 fn convert_inner_instructions(
-    meta: &yellowstone_grpc_proto_43::prelude::TransactionStatusMeta,
+    meta: &yellowstone_grpc_proto::prelude::TransactionStatusMeta,
 ) -> Result<InnerInstructionsConversion> {
     if meta.inner_instructions_none {
         return Ok((
@@ -1746,7 +1985,7 @@ fn convert_inner_instructions(
 
 #[allow(clippy::type_complexity)]
 fn convert_token_balances(
-    balances: &[yellowstone_grpc_proto_43::prelude::TokenBalance],
+    balances: &[yellowstone_grpc_proto::prelude::TokenBalance],
 ) -> Result<(
     u8,
     Vec<u8>,
@@ -1809,7 +2048,7 @@ fn convert_token_balances(
     ))
 }
 
-fn convert_rewards(rewards: &[yellowstone_grpc_proto_43::prelude::Reward]) -> RewardsConversion {
+fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> RewardsConversion {
     let mut pubkeys = Vec::with_capacity(rewards.len());
     let mut lamports = Vec::with_capacity(rewards.len());
     let mut post_balances = Vec::with_capacity(rewards.len());
@@ -1851,7 +2090,7 @@ fn optional_pubkey(value: &str) -> Result<Option<Array<u8, 32>>> {
 }
 
 fn convert_return_data(
-    meta: &yellowstone_grpc_proto_43::prelude::TransactionStatusMeta,
+    meta: &yellowstone_grpc_proto::prelude::TransactionStatusMeta,
 ) -> Result<(u8, Option<Array<u8, 32>>, Option<ByteBuf>)> {
     if meta.return_data_none {
         return Ok((0, None, None));
@@ -1903,7 +2142,7 @@ fn parse_commission_bps(value: &str) -> Option<u16> {
 }
 
 fn decode_transaction_error(
-    err: Option<&yellowstone_grpc_proto_43::prelude::TransactionError>,
+    err: Option<&yellowstone_grpc_proto::prelude::TransactionError>,
 ) -> Result<(u8, Option<String>)> {
     let Some(err) = err else {
         return Ok((1, None));
@@ -1944,7 +2183,7 @@ mod tests {
         assert_eq!(parse_commission_bps("65536"), None);
     }
     use tonic::Status;
-    use yellowstone_grpc_proto_43::prelude::{
+    use yellowstone_grpc_proto::prelude::{
         CompiledInstruction, Message, MessageAddressTableLookup, MessageHeader, Reward, RewardType,
         SlotStatus, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateBlockFooter,
         SubscribeUpdateSlot, SubscribeUpdateTransactionInfo, Transaction, TransactionConfig,
@@ -1967,7 +2206,8 @@ mod tests {
         );
 
         let finalized = build_subscribe_request(2, Some(42), true, true);
-        assert!(finalized.block_footer.is_empty());
+        assert!(finalized.block_footer.contains_key("block_footer"));
+        assert!(finalized.slots.contains_key("footer_finality"));
         assert_eq!(finalized.commitment, Some(2));
     }
 
@@ -1979,6 +2219,7 @@ mod tests {
                 bank_hash: vec![bank_id as u8; 32],
                 block_producer_time_nanos: 123,
                 block_user_agent: b"agave".to_vec(),
+                ..Default::default()
             })),
             ..Default::default()
         }
@@ -2006,9 +2247,11 @@ mod tests {
                 .is_none()
         );
         assert!(!join.pending.contains_key(&(42, 7)));
-        let row = join.observe(footer_update(42, 8)).unwrap().unwrap();
+        assert!(join.observe(footer_update(42, 8)).unwrap().is_none());
+        let row = join.observe_complete_block(42, 8).unwrap().unwrap();
         assert_eq!((row.slot, row.bank_id), (42, 8));
 
+        assert!(join.observe_complete_block(43, 9).unwrap().is_none());
         assert!(join.observe(footer_update(43, 9)).unwrap().is_none());
         let row = join
             .observe(slot_update(43, 9, SlotStatus::SlotFinalized))
@@ -2025,6 +2268,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(join.observe_complete_block(9_001, 4).unwrap().is_none());
         assert!(join.observe(footer_update(9_001, 3)).unwrap().is_none());
         assert!(join.observe(footer_update(9_001, 4)).unwrap().is_none());
         assert!(
@@ -2068,6 +2312,7 @@ mod tests {
             bank_hash: vec![3; 32],
             block_producer_time_nanos: 123,
             block_user_agent: b"agave".to_vec(),
+            ..Default::default()
         };
         let row = map_block_footer(&footer).unwrap();
         assert_eq!(row.bank_hash.0, [3; 32]);
@@ -2084,11 +2329,13 @@ mod tests {
                 bank_id: 0,
                 ..footer
             })
-            .is_err()
+            .is_ok()
         );
     }
 
-    fn build_test_transaction_info(cost_units: Option<u64>) -> SubscribeUpdateTransactionInfo {
+    pub(super) fn build_test_transaction_info(
+        cost_units: Option<u64>,
+    ) -> SubscribeUpdateTransactionInfo {
         SubscribeUpdateTransactionInfo {
             signature: vec![9u8; 64],
             is_vote: false,
@@ -2344,7 +2591,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fumarole_stops_after_genesis_and_grpc_requires_bank_id() {
+    fn legacy_fumarole_stops_after_genesis_and_grpc_accepts_zero_bank_id() {
         let mut block = SubscribeUpdateBlock {
             slot: 100,
             ..Default::default()
@@ -2353,7 +2600,7 @@ mod tests {
         assert!(validate_block_bank(&block, IngestSource::Fumarole, Some(100)).is_ok());
         block.slot = 101;
         assert!(validate_block_bank(&block, IngestSource::Fumarole, Some(100)).is_err());
-        assert!(validate_block_bank(&block, IngestSource::Grpc, None).is_err());
+        assert!(validate_block_bank(&block, IngestSource::Grpc, None).is_ok());
         block.bank_id = 7;
         assert!(validate_block_bank(&block, IngestSource::Grpc, None).is_ok());
     }
@@ -2364,7 +2611,7 @@ mod tests {
             parent_slot: slot.saturating_sub(1),
             blockhash: Array([1u8; 32]),
             parent_blockhash: Array([2u8; 32]),
-            bank_id: None,
+            bank_id: Some(0),
             block_time: Some(1_700_000_000),
             block_height: Some(slot),
             executed_transaction_count: 1,
@@ -2380,3 +2627,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod completeness_tests;

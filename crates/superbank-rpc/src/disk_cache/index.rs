@@ -17,6 +17,34 @@ pub(crate) struct DiskSigStatus {
     pub(crate) err: Option<String>,
 }
 
+/// One signature's local status, separating a proven absence from a read that proved
+/// nothing (timeout, invalidation, no coverage, or a row outside coverage).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DiskStatusLookup {
+    Found(DiskSigStatus),
+    /// No row in any covered slot: the read completed under an unchanged index epoch
+    /// over one contiguous covered span.
+    Absent,
+    Unknown,
+}
+
+impl DiskStatusLookup {
+    pub(crate) fn found(self) -> Option<DiskSigStatus> {
+        match self {
+            Self::Found(status) => Some(status),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+}
+
+/// Per-signature local statuses and, when any absence was provable, the covered span
+/// `(floor, tip)` the read searched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiskStatusLookups {
+    pub(crate) statuses: Vec<DiskStatusLookup>,
+    pub(crate) span: Option<(u64, u64)>,
+}
+
 /// Disk-cache getTransactionsForAddress query. Signature-shaped bounds have
 /// already been resolved by the handler, so the local query never consults the
 /// primary cluster while executing the cache tier.

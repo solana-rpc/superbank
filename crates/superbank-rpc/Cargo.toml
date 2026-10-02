@@ -12,6 +12,7 @@ default = []
 # because it opens a separate live gRPC subscription.
 grpc-head-cache = [
     "dep:dashmap",
+    "dep:yellowstone-block-machine",
     "dep:yellowstone-grpc-client",
     "dep:yellowstone-grpc-proto",
 ]
@@ -90,8 +91,9 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 dashmap = { version = "6.1.0", optional = true }
 pyroscope = { version = "0.5.8", optional = true }
 pyroscope_pprofrs = { version = "0.2.10", optional = true }
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce", optional = true }
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", rev = "a8d88b17445e470f25cab6b72b8c742578e11cce", optional = true }
+yellowstone-block-machine = { version = "0.10.2", features = ["dragonsmouth"], optional = true }
+yellowstone-grpc-client = { version = "14.0.1", optional = true }
+yellowstone-grpc-proto = { version = "13.0.0", optional = true }
 
 [dev-dependencies]
 base64 = "0.22"

@@ -128,6 +128,20 @@ impl SignatureSlotCache {
         Self::new(ttl_found, ttl_missing, capacity)
     }
 
+    /// A ready, unexpired value for `key` without starting a lookup or waiting for one.
+    pub(crate) async fn peek(&self, key: &SignatureBytes) -> Option<Option<SignatureSlot>> {
+        let now = Instant::now();
+        match self.inner.lock().await.get(key) {
+            Some(Entry::Ready { value, expires_at }) if now < *expires_at => Some(*value),
+            _ => None,
+        }
+    }
+
+    #[cfg(all(test, feature = "disk-cache"))]
+    pub(crate) async fn clear_for_tests(&self) {
+        self.inner.lock().await.clear();
+    }
+
     pub(crate) async fn get_or_start(
         self: &Arc<Self>,
         key: SignatureBytes,
@@ -264,6 +278,16 @@ impl SignatureSlotCache {
             other => panic!("expected cache leader, got {other:?}"),
         };
         leader.finish(value).await;
+    }
+
+    /// Callers waiting on the in-flight leader for `key`. The entry and the leader each hold one
+    /// reference to its `Notify`, and every waiter's `OwnedNotified` holds another.
+    #[cfg(test)]
+    pub(crate) async fn in_flight_waiters_for_tests(&self, key: SignatureBytes) -> usize {
+        match self.inner.lock().await.get(&key) {
+            Some(Entry::InFlight { notify }) => Arc::strong_count(notify).saturating_sub(2),
+            _ => 0,
+        }
     }
 }
 

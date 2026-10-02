@@ -14,9 +14,11 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 
 use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::ClickHouseClient;
+use crate::get_transaction_primary_cache::PrimaryTransactionCache;
 use crate::metrics;
 use crate::processing::ProcessingError;
 use crate::request_filter::RpcParameterFilterSet;
+use crate::status_history_cache::StatusHistoryCache;
 use crate::util::{current_time_millis, ttl_millis};
 
 #[cfg(feature = "disk-cache")]
@@ -46,7 +48,16 @@ pub(crate) struct AppState {
     pub(crate) emit_http_errors: bool,
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
+    pub(crate) get_block_hydration_parallelism: usize,
     pub(crate) block_response_cache: BlockResponseCache,
+    pub(crate) get_transaction_primary_cache: PrimaryTransactionCache,
+    pub(crate) get_block_response_cache_share_confirmed: bool,
+    /// Primary no-row answers for history status searches (disabled unless sized).
+    #[cfg_attr(
+        not(all(feature = "disk-cache", feature = "grpc-head-cache")),
+        allow(dead_code)
+    )]
+    pub(crate) status_history_cache: StatusHistoryCache,
     pub(crate) epoch_schedule: EpochSchedule,
     #[cfg(feature = "grpc-head-cache")]
     pub(crate) head_cache: Option<Arc<HeadCache>>,
@@ -93,7 +104,7 @@ impl AppState {
     }
 }
 
-fn commitment_label(commitment: CommitmentLevel) -> &'static str {
+pub(crate) fn commitment_label(commitment: CommitmentLevel) -> &'static str {
     match commitment {
         CommitmentLevel::Processed => "processed",
         CommitmentLevel::Confirmed => "confirmed",
@@ -229,7 +240,10 @@ impl LatestSlotCache {
             match role {
                 CacheRefreshRole::Leader(leader) => {
                     let fetch_result = async {
-                        let slot_opt = clickhouse.get_latest_finalized_slot().await?;
+                        // The previous value bounds the scan; 0 means none observed yet.
+                        let hint =
+                            Some(self.value.load(Ordering::Relaxed)).filter(|slot| *slot > 0);
+                        let slot_opt = clickhouse.get_latest_finalized_slot_since(hint).await?;
                         slot_opt.ok_or_else(|| {
                             ProcessingError::database_msg(
                                 "no finalized slot in ClickHouse — node may not be synced yet",
