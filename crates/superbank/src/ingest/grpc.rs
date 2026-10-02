@@ -31,9 +31,9 @@ use yellowstone_grpc_proto::prelude::{
 
 use crate::cli::{Args, FromSlotSpec, IngestSource};
 use crate::clickhouse::{
-    BlockFooterRow, BlockMetadataRow, EntryRow, InsertTables, RetryConfig, TransactionRow,
-    build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers,
-    flush_buffers_with_retry, insert_footer_row, split_qualified_table,
+    BlockFooterRow, BlockMetadataRow, EntryRow, FooterWriter, InsertTables, RetryConfig,
+    TransactionRow, build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers,
+    flush_buffers_with_retry, split_qualified_table,
 };
 use crate::commitment::parse_durable_commitment;
 use crate::metrics;
@@ -154,6 +154,7 @@ impl BufferedRows {
     }
 }
 
+const FOOTER_BATCH_ROWS: usize = 256;
 const FOOTER_JOIN_WINDOW_SLOTS: u64 = 8192;
 const PENDING_IDENTITY_MAX_BLOCKS: usize = 256;
 const PENDING_IDENTITY_MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -194,6 +195,7 @@ struct FinalizedFooterJoin {
     complete_blocks: HashSet<(u64, u64)>,
     durable_blocks: HashSet<(u64, u64)>,
     footer_storage_available: Option<bool>,
+    footer_writer: Option<FooterWriter>,
     highest_slot: u64,
     // These proofs and pending payloads belong only to this subscription.
     known_banks: HashSet<(u64, u64)>,
@@ -753,6 +755,8 @@ async fn process_canonical_update_inner(
     retry: &RetryConfig,
     join: &mut FinalizedFooterJoin,
 ) -> Result<()> {
+    join.footer_writer
+        .get_or_insert_with(|| FooterWriter::new(clickhouse, &args.block_footers_table));
     match update.update_oneof {
         Some(UpdateOneof::Block(block)) => {
             validate_block_bank(
@@ -805,41 +809,13 @@ async fn process_canonical_update_inner(
             || rows.transaction_rows.len() >= args.transactions_flush_rows
             || rows.block_rows.len() >= args.blocks_flush_rows
             || rows.entry_rows.len() >= args.transactions_flush_rows;
-        let footer_needs_flush = join
-            .ready_footers
-            .iter()
-            .any(|footer| !join.durable_blocks.contains(&(footer.slot, footer.bank_id)));
-        if pressure || footer_needs_flush {
+        if pressure || join.ready_footers.len() >= FOOTER_BATCH_ROWS {
             flush_canonical_rows(clickhouse, tables, rows, Some(retry), join).await?;
         }
-    }
-    // A later unidentified block must not strand an earlier ready footer whose
-    // complete, matching bank data has already been durably flushed. Inserting
-    // this footer advances no metadata tip and never flushes the held payload.
-    let mut index = 0;
-    while index < join.ready_footers.len() {
-        let footer = &join.ready_footers[index];
-        if join.durable_blocks.contains(&(footer.slot, footer.bank_id)) {
-            if join.footer_storage_available == Some(false) {
-                metrics::observe_source_error("grpc_footer", "storage_disabled");
-                join.ready_footers.remove(index);
-                continue;
-            }
-            match insert_footer_row(clickhouse, &args.block_footers_table, footer, Some(retry))
-                .await
-            {
-                Ok(()) => {
-                    join.ready_footers.remove(index);
-                }
-                Err(error) => {
-                    metrics::observe_source_error("grpc_footer", "insert_failed");
-                    warn!(slot = footer.slot, %error, "footer insert exhausted retries; retaining bounded footer while canonical ingestion continues");
-                    index += 1;
-                }
-            }
-        } else {
-            index += 1;
-        }
+    } else {
+        // Durable earlier banks can bypass a later identity hold without
+        // flushing held block data or advancing the metadata resume tip.
+        flush_ready_footers(join, Some(retry)).await;
     }
     Ok(())
 }
@@ -875,6 +851,31 @@ fn buffer_identified_block(
     }
 }
 
+async fn flush_ready_footers(join: &mut FinalizedFooterJoin, retry: Option<&RetryConfig>) {
+    let (durable, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut join.ready_footers)
+        .into_iter()
+        .partition(|footer| join.durable_blocks.contains(&(footer.slot, footer.bank_id)));
+    join.ready_footers = waiting;
+    if durable.is_empty() {
+        return;
+    }
+    if join.footer_storage_available == Some(false) {
+        for _ in &durable {
+            metrics::observe_source_error("grpc_footer", "storage_disabled");
+        }
+        return;
+    }
+    let Some(writer) = &join.footer_writer else {
+        join.ready_footers.extend(durable);
+        return;
+    };
+    if let Err(error) = writer.insert(&durable, retry).await {
+        metrics::observe_source_error("grpc_footer", "insert_failed");
+        warn!(rows = durable.len(), %error, "footer batch exhausted retries; retaining bounded batch while canonical ingestion continues");
+        join.ready_footers.extend(durable);
+    }
+}
+
 async fn flush_canonical_rows(
     clickhouse: &ClickHouseClient,
     tables: &InsertTables,
@@ -883,6 +884,7 @@ async fn flush_canonical_rows(
     join: &mut FinalizedFooterJoin,
 ) -> Result<bool> {
     if !join.pending_identity.is_empty() {
+        flush_ready_footers(join, retry).await;
         warn!(
             first_pending_slot = join
                 .pending_identity
@@ -904,6 +906,7 @@ async fn flush_canonical_rows(
     }
     // Mark only after the entire transaction/metadata/entry flush succeeds.
     join.durable_blocks.extend(banks);
+    flush_ready_footers(join, retry).await;
     Ok(true)
 }
 

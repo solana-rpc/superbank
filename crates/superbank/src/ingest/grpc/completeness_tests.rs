@@ -383,6 +383,9 @@ async fn early_footer_and_winner_cannot_write_incomplete_data_or_a_losing_bank()
     )
     .await
     .unwrap();
+    flush_canonical_rows(&client, &tables, &mut rows, Some(&retry), &mut join)
+        .await
+        .unwrap();
     let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert_eq!(requests.len(), 4, "complete data precedes footer insert");
     assert!(requests.last().unwrap().contains("block_footers"));
@@ -578,6 +581,9 @@ async fn pending_identity_holds_later_banks_and_all_flush_paths_until_replay() {
     assert!(join.complete_blocks.contains(&(42, 0)));
     assert_eq!(rows.last_durable_block_slot, Some(43));
     assert!(join.completed.contains(&(43, 7)));
+    flush_canonical_rows(&client, &tables, &mut rows, Some(&retry), &mut join)
+        .await
+        .unwrap();
     let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert_eq!(
         requests.len(),
@@ -933,7 +939,9 @@ async fn absent_or_failed_footer_storage_cannot_stop_valid_canonical_data() {
         let bank_block = |slot, bank_id| {
             let mut block = complete_block(slot);
             block.bank_id = bank_id;
-            for entry in &mut block.entries { entry.bank_id = bank_id; }
+            for entry in &mut block.entries {
+                entry.bank_id = bank_id;
+            }
             canonical_envelope(UpdateOneof::Block(block))
         };
         for update in [
@@ -971,6 +979,91 @@ async fn absent_or_failed_footer_storage_cannot_stop_valid_canonical_data() {
 }
 
 #[tokio::test]
+async fn footer_batches_wait_for_complete_durable_data_and_combine_many_rows() {
+    use axum::{Router, body::Body, extract::Request};
+    use tokio::{net::TcpListener, sync::mpsc};
+    metrics::force_init("grpc", None);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let app = Router::new().fallback(move |request: Request<Body>| {
+        let tx = tx.clone();
+        async move {
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            tx.send((query, body.len())).unwrap();
+            "Ok"
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClickHouseClient::default()
+        .with_url(format!("http://{addr}"))
+        .with_validation(false)
+        .with_compression(clickhouse::Compression::None);
+    let mut args = crate::cli::test_args();
+    args.entries_table = None;
+    let tables = InsertTables::from_args(&args);
+    let retry = RetryConfig {
+        max_retries: 0,
+        base_ms: 1,
+        max_ms: 1,
+    };
+    let mut join = FinalizedFooterJoin::default();
+    let mut rows = buffered_rows();
+    for slot in 1..=FOOTER_BATCH_ROWS as u64 * 2 {
+        let block = SubscribeUpdateBlock {
+            slot,
+            parent_slot: slot - 1,
+            bank_id: slot,
+            blockhash: bs58::encode([1; 32]).into_string(),
+            parent_blockhash: bs58::encode([2; 32]).into_string(),
+            ..Default::default()
+        };
+        for update in [
+            identity_status(slot, Some(slot), SlotStatus::SlotFinalized),
+            canonical_envelope(UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+                slot,
+                bank_id: slot,
+                bank_hash: vec![9; 32],
+                ..Default::default()
+            })),
+            canonical_envelope(UpdateOneof::Block(block)),
+        ] {
+            process_canonical_update(
+                update, &args, &tables, &client, &mut rows, &retry, &mut join,
+            )
+            .await
+            .unwrap();
+        }
+        if slot < FOOTER_BATCH_ROWS as u64 {
+            assert!(
+                rx.is_empty(),
+                "footer arrivals must not force one-row data flushes"
+            );
+        }
+    }
+    let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(
+        requests.len(),
+        4,
+        "two data batches followed by two footer batches"
+    );
+    for chunk in requests.chunks(2) {
+        assert!(chunk[0].0.contains("blocks_metadata"));
+        assert!(chunk[1].0.contains("block_footers"));
+        assert_eq!(chunk[1].1, FOOTER_BATCH_ROWS * 57);
+    }
+    assert!(join.ready_footers.is_empty());
+    assert_eq!(
+        rows.last_durable_block_slot,
+        Some(FOOTER_BATCH_ROWS as u64 * 2)
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn native_footer_startup_qualifies_fqn_and_rejects_absent_table() {
     let Ok(url) = std::env::var("DISK_CACHE_TEST_URL") else {
         return;
@@ -994,4 +1087,3 @@ async fn native_footer_startup_qualifies_fqn_and_rejects_absent_table() {
         .await
         .unwrap();
 }
-

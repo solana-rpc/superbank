@@ -509,3 +509,11 @@ blocks and status evidence without historical footers. Archive/report the gap;
 never fabricate bank hashes or join a stored node-local bank ID to a new session.
 New footer tables deduplicate by finalized slot across reconnects; existing
 `(slot, bank_id)` tables need the planned rebuild in [DDL migration notes](../../ddl/README.md#finalized-footer-identity-and-existing-table-migration).
+
+Footer rows buffer until a normal data flush (timer, row pressure or shutdown) or
+256 ready footers. Each batch uses a persistent table-specific ClickHouse client,
+reusing its schema metadata cache. Complete bank data is flushed and marked durable
+before any footer in that batch; retries retain the batch on failure. Already
+durable earlier footers may flush during a later unresolved identity hold without
+advancing the metadata tip. This can add up to the configured flush interval to
+footer latency; account for it before archiving a range.
