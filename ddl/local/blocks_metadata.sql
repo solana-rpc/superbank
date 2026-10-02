@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS default.blocks_metadata
     parent_slot                  UInt64,
     blockhash                    FixedString(32),
     parent_blockhash             FixedString(32),
-    bank_id                      Nullable(UInt64),
+    bank_id                      Nullable(UInt64) DEFAULT NULL,
     block_time                   Nullable(Int64),
     block_height                 Nullable(UInt64),
     executed_transaction_count   UInt64,
@@ -33,4 +33,8 @@ ALTER TABLE default.blocks_metadata
     AFTER rewards_commission;
 
 ALTER TABLE default.blocks_metadata
-    ADD COLUMN IF NOT EXISTS bank_id Nullable(UInt64) AFTER parent_blockhash;
+    ADD COLUMN IF NOT EXISTS bank_id Nullable(UInt64) DEFAULT NULL AFTER parent_blockhash;
+
+-- Repair columns added by earlier releases without an explicit default.
+ALTER TABLE default.blocks_metadata
+    MODIFY COLUMN bank_id Nullable(UInt64) DEFAULT NULL;

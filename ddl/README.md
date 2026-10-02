@@ -30,8 +30,12 @@ not exist yet.
 from Old Faithful / Jetstreamer. RPC and Bigtable sources do not populate `entries`.
 `block_footers.sql` stores the Alpenglow bank hash, producer time, and user agent
 from an Agave 4.3 Yellowstone gRPC source. Apply it before deploying a gRPC ingestor.
-Existing block metadata tables must also receive the `bank_id` column through the
-idempotent `blocks_metadata.sql` ALTER statements.
+Every writer, including RPC and Bigtable backfills, requires the updated
+`blocks_metadata.sql` before upgrading. Its CREATE/ALTER statements give `bank_id`
+an explicit `DEFAULT NULL`, allowing older writers to omit the column during a
+rolling deployment. Reapply the file even if the column already exists: the
+`MODIFY COLUMN` repairs previously installed no-default columns on both shard-local
+and Distributed tables. Historical rows retain NULL identity.
 
 Agave 4.2 adds nullable v1 transaction-config columns. Apply `transactions.sql` before upgrading
 the RPC or ingestor binaries; old rows and Parquet archives naturally read as `NULL`. Reapply the

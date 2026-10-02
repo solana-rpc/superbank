@@ -18,6 +18,10 @@ that JSON-key correction as a compatibility break.
 
 ## Prereqs
 
+Apply the updated `blocks_metadata.sql` before upgrading **any** source, including
+RPC and Bigtable. Reapply it to repair an existing `bank_id` column to
+`Nullable(UInt64) DEFAULT NULL`; old writers can then omit that column during rollout.
+
 - ClickHouse with the matching schema set under `ddl/`: use `ddl/local/transactions.sql` +
   `ddl/local/blocks_metadata.sql` for single-node development, plus `ddl/local/entries.sql`
   for the default Fumarole/gRPC source configuration. Use `ddl/cluster/transactions.sql` +
