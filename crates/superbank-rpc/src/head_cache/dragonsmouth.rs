@@ -844,4 +844,160 @@ mod tests {
         assert_eq!(row.rewards_post_balance, vec![90]);
         assert_eq!(row.rewards_commission_bps, vec![Some(725)]);
     }
+    #[tokio::test]
+    async fn uncached_root_and_bank_blind_dead_event_discard_cached_processed_branch() {
+        use yellowstone_grpc_proto::prelude::{
+            SlotStatus, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        };
+        for dead in [false, true] {
+            let cache = Arc::new(HeadCache::new(32, 64));
+            let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+            let mut events = coverage_events(42, 41);
+            events.retain(|event| !matches!(event.update_oneof.as_ref(), Some(UpdateOneof::Slot(slot))
+                if slot.status == SlotStatus::SlotConfirmed as i32 || slot.status == SlotStatus::SlotFinalized as i32));
+            let status = |slot, parent, bank_id, status| SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    parent,
+                    bank_id,
+                    status: status as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            if dead {
+                events.push(status(42, Some(41), None, SlotStatus::SlotDead));
+            } else {
+                // The new root's content is absent, but its confirmed parent
+                // skips the cached branch and must still invalidate that branch.
+                events.push(status(43, Some(41), Some(43), SlotStatus::SlotCreatedBank));
+                events.push(status(43, Some(41), Some(43), SlotStatus::SlotConfirmed));
+                events.push(status(43, Some(41), Some(43), SlotStatus::SlotFinalized));
+            }
+            let source =
+                futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
+                    .inspect(|event| {
+                        observe_bank_metadata(&cache, session.id, event.as_ref().unwrap())
+                    });
+            let mut stream = BlockStream::<_, SubscribeUpdate, _>::new(
+                source,
+                DragonsmouthBlockCumulator::default(),
+                CommitmentLevel::Processed,
+            );
+            let mut saw_processed = false;
+            while let Some(output) = stream.next().await {
+                handle_output(&cache, session.id, output.unwrap());
+                saw_processed |= cache
+                    .get_block(
+                        42,
+                        CommitmentLevel::Processed,
+                        solana_transaction_status::TransactionDetails::None,
+                    )
+                    .is_some();
+            }
+            assert!(
+                saw_processed,
+                "test must exercise an exposed abandoned branch"
+            );
+            assert!(
+                cache
+                    .get_block(
+                        42,
+                        CommitmentLevel::Processed,
+                        solana_transaction_status::TransactionDetails::None
+                    )
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .get_block(
+                        43,
+                        CommitmentLevel::Finalized,
+                        solana_transaction_status::TransactionDetails::None
+                    )
+                    .is_none()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn uncached_old_root_and_bank_blind_minority_dead_preserve_winning_branch() {
+        use yellowstone_grpc_proto::prelude::{
+            SlotStatus, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        };
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let mut events = coverage_events(42, 41);
+        events.retain(|event| !matches!(event.update_oneof.as_ref(), Some(UpdateOneof::Slot(slot))
+            if slot.status == SlotStatus::SlotConfirmed as i32 || slot.status == SlotStatus::SlotFinalized as i32));
+        events.extend(coverage_events(43, 41));
+        for (slot, parent, bank_id, status) in [
+            (40, Some(39), Some(40), SlotStatus::SlotCreatedBank),
+            (40, Some(39), Some(40), SlotStatus::SlotFinalized),
+            (42, Some(41), None, SlotStatus::SlotDead),
+        ] {
+            events.push(SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    parent,
+                    bank_id,
+                    status: status as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        let source = futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
+            .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+        );
+        let mut saw_winner = false;
+        while let Some(output) = stream.next().await {
+            handle_output(&cache, session.id, output.unwrap());
+            let winner = cache.get_block(
+                43,
+                CommitmentLevel::Finalized,
+                solana_transaction_status::TransactionDetails::None,
+            );
+            if let Some(block) = winner {
+                assert_eq!(block.metadata().blockhash, [43; 32]);
+                saw_winner = true;
+            } else {
+                assert!(
+                    !saw_winner,
+                    "late old-root or minority Dead must preserve winning branch"
+                );
+            }
+        }
+        assert!(saw_winner);
+        assert!(
+            cache
+                .get_block(
+                    40,
+                    CommitmentLevel::Processed,
+                    solana_transaction_status::TransactionDetails::None
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_block(
+                    42,
+                    CommitmentLevel::Processed,
+                    solana_transaction_status::TransactionDetails::None
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_block(
+                    43,
+                    CommitmentLevel::Finalized,
+                    solana_transaction_status::TransactionDetails::None
+                )
+                .is_some()
+        );
+    }
 }

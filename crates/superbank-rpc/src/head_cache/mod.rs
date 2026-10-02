@@ -551,8 +551,14 @@ impl HeadCache {
 
         if let Some((_, sigs)) = self.sigs_by_slot.remove(&slot) {
             for sig in sigs {
-                self.tx_by_signature.remove(&sig);
-                self.meta_by_signature.remove(&sig);
+                if self
+                    .meta_by_signature
+                    .get(&sig)
+                    .is_some_and(|meta| meta.pos.slot == slot)
+                {
+                    self.tx_by_signature.remove(&sig);
+                    self.meta_by_signature.remove(&sig);
+                }
             }
         }
 
@@ -636,13 +642,42 @@ impl HeadCache {
             block_time,
         });
 
-        // Insert meta first; if this races, keep the first writer and skip indexing.
-        match self.meta_by_signature.entry(signature) {
-            Entry::Occupied(_) => return,
-            Entry::Vacant(v) => {
-                v.insert(meta.clone());
+        // Bank publication is serialized by the bank write lock. A canonical
+        // winner may reclaim a signature from a processed abandoned slot; it
+        // cannot replace an already confirmed/finalized projection.
+        let old_slot = match self.meta_by_signature.entry(signature) {
+            Entry::Occupied(occ) => {
+                let old = occ.get();
+                let new_rank = meta
+                    .bank_commitment
+                    .as_ref()
+                    .map_or(0, |token| token.load(Ordering::Acquire));
+                let old_rank = old
+                    .bank_commitment
+                    .as_ref()
+                    .map_or(0, |token| token.load(Ordering::Acquire));
+                if old.pos.slot == slot || new_rank == 0 || old_rank != 0 {
+                    return;
+                }
+                let old_slot = old.pos.slot;
+                occ.remove();
+                Some(old_slot)
+            }
+            Entry::Vacant(_) => None,
+        };
+        if let Some(old_slot) = old_slot {
+            if let Some(mut signatures) = self.sigs_by_slot.get_mut(&old_slot) {
+                signatures.retain(|candidate| *candidate != signature);
+            }
+            if let Some(addresses) = self.addrs_by_slot.get(&old_slot) {
+                for address in addresses.iter() {
+                    if let Some(mut keys) = self.sigs_by_address.get_mut(address) {
+                        keys.retain(|key| key.signature != signature || key.pos.slot != old_slot);
+                    }
+                }
             }
         }
+        self.meta_by_signature.insert(signature, meta.clone());
 
         let record = Arc::new(record);
         self.tx_by_signature.insert(signature, record.clone());

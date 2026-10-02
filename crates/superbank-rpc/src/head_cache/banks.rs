@@ -287,6 +287,12 @@ impl HeadCache {
             return;
         }
         if current == Some(key.1) {
+            // A signature may have first appeared on an abandoned slot. Repair
+            // the winner's projection after discard, or transfer a processed
+            // projection when this bank gains canonical commitment.
+            for tx in transactions {
+                self.ingest_bank_transaction(key.0, tx, Some(bank.commitment.clone()));
+            }
             self.note_slot_commitment(key.0, commitment);
             return;
         }

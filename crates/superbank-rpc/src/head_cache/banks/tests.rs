@@ -478,3 +478,72 @@ fn frozen_bank_cannot_expose_processed_data_below_session_minimum_to_concurrent_
         assert!(cache.get_tx(&Signature::from([1; 64]), minimum).is_some());
     }
 }
+
+#[test]
+fn repeated_signature_on_processed_winner_is_reprojected_when_abandoned_slot_is_discarded() {
+    for discard_first in [false, true] {
+        let cache = HeadCache::new(32, 64);
+        let session = cache.start_bank_session(CommitmentLevel::Processed);
+        freeze(&cache, session, 42, 1, 1);
+        let old = cache
+            .get_meta(&Signature::from([1; 64]), CommitmentLevel::Processed)
+            .unwrap();
+        cache.stage_bank_metadata(session, 2, metadata(43, 2));
+        stage_entry(&cache, session, 43, 2, 1);
+        cache.freeze_bank(session, 43, 2, [2; 32], vec![transaction(1)]);
+        assert_eq!(
+            cache
+                .signature_position(&Signature::from([1; 64]))
+                .unwrap()
+                .slot,
+            42
+        );
+        if discard_first {
+            cache.discard_bank(session, 42, 1);
+        }
+        cache.commit_bank(session, 43, 2, CommitmentLevel::Confirmed, Some(41));
+        if !discard_first {
+            cache.discard_bank(session, 42, 1);
+        }
+        let winning = cache
+            .get_tx(&Signature::from([1; 64]), CommitmentLevel::Confirmed)
+            .unwrap();
+        assert_eq!(winning.slot, 43);
+        assert_eq!(winning.block_time, Some(2));
+        assert_eq!(
+            cache
+                .signature_position(&Signature::from([1; 64]))
+                .unwrap()
+                .slot,
+            43
+        );
+        assert_eq!(
+            cache
+                .signatures_for_address(
+                    &Pubkey::from([1; 32]),
+                    None,
+                    None,
+                    10,
+                    CommitmentLevel::Processed
+                )
+                .len(),
+            1
+        );
+        assert!(
+            cache
+                .get_block(
+                    43,
+                    CommitmentLevel::Confirmed,
+                    solana_transaction_status::TransactionDetails::Full
+                )
+                .is_some()
+        );
+        assert_eq!(cache.confirmation_status_string(&old), "processed");
+        cache.commit_bank(session, 42, 1, CommitmentLevel::Finalized, Some(41));
+        assert_eq!(
+            cache.confirmation_status_string(&old),
+            "processed",
+            "discarded records never borrow the winner's token"
+        );
+    }
+}
