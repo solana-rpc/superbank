@@ -10,6 +10,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
 if [[ $# -gt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "usage: scripts/dev/run-jetstreamer-entries-smoke.sh [epoch|start:end]" >&2
+  echo "set one historical bound (ALPENGLOW_GENESIS_SLOT or PREACTIVATION_THROUGH_SLOT) and one independent commission era (BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT or BLOCK_REWARD_COMMISSION_PERCENT=true), all prefixed JETSTREAMER_; see plugin README" >&2
   exit 1
 fi
 
@@ -30,6 +31,11 @@ if [[ -n "${JETSTREAMER_ALPENGLOW_GENESIS_SLOT:-}" && -n "${JETSTREAMER_PREACTIV
   exit 1
 fi
 export JETSTREAMER_ALPENGLOW_GENESIS_SLOT JETSTREAMER_PREACTIVATION_THROUGH_SLOT
+if [[ -n "${JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT:-}" && "${JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT:-false}" == "true" ]] ||
+   [[ -z "${JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT:-}" && "${JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT:-false}" != "true" ]]; then
+  echo "qualify the independent SIMD-0291 reward era before running (see plugin README)" >&2
+  exit 1
+fi
 threads="${JETSTREAMER_THREADS:-4}"
 container="clickhouse"
 image="clickhouse/clickhouse-server:26.1.2.11"

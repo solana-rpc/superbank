@@ -352,6 +352,88 @@ mod tests {
     }
 
     #[test]
+    fn runner_range_is_clamped_before_upstream_can_continue_after_callback_errors() {
+        let plugin = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(
+            plugin.historical_slot_range(90, 200).is_err(),
+            "era preflight must precede runner start"
+        );
+        let plugin = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                block_reward_commission_percent: true,
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(plugin.historical_slot_range(90, 200).unwrap(), 90..101);
+        assert_eq!(plugin.historical_slot_range(100, 100).unwrap(), 100..101);
+        assert!(plugin.historical_slot_range(101, 200).is_err());
+        assert!(plugin.historical_slot_range(100, 99).is_err());
+        let max = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(u64::MAX),
+                block_reward_commission_percent: true,
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(max.historical_slot_range(0, u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_postboundary_callbacks_do_not_allocate_pending_rows_or_writers() {
+        use jetstreamer_plugin::Plugin;
+        let plugin = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        let db = Some(std::sync::Arc::new(clickhouse::Client::default()));
+        let entry = EntryData {
+            slot: 101,
+            entry_index: 0,
+            transaction_indexes: 0..0,
+            num_hashes: 1,
+            hash: Default::default(),
+        };
+        let transaction = TransactionData {
+            slot: 101,
+            transaction_slot_index: 0,
+            signature: Default::default(),
+            message_hash: Default::default(),
+            is_vote: false,
+            transaction_status_meta: Default::default(),
+            transaction: VersionedTransaction {
+                signatures: Vec::new(),
+                message: VersionedMessage::Legacy(Default::default()),
+            },
+        };
+        for _ in 0..1000 {
+            assert!(plugin.on_entry(0, db.clone(), &entry).await.is_err());
+            assert!(
+                plugin
+                    .on_transaction(0, db.clone(), &transaction)
+                    .await
+                    .is_err()
+            );
+        }
+        let state = plugin.threads[0].lock();
+        assert!(state.pending_transactions.is_empty());
+        assert!(state.pending_entries.is_empty());
+        assert!(state.pending_slot.is_none());
+        assert!(state.writer.is_none());
+    }
+
+    #[test]
     fn v1_message_fields_preserve_lifetime_and_config() {
         let message = VersionedMessage::V1(v1::Message {
             lifetime_specifier: Hash::new_from_array([7; 32]),
@@ -571,6 +653,39 @@ impl ClickhouseIngestPlugin {
         }
     }
 
+    /// Clamp a runner's inclusive range to the explicitly qualified history.
+    /// Upstream logs callback errors and continues, so embedding callers must
+    /// apply this bound before invoking JetstreamerRunner::run.
+    pub fn historical_slot_range(
+        &self,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<std::ops::Range<u64>, PluginError> {
+        if start > end_inclusive {
+            return Err(PluginError::new("start slot must be <= end slot".into()));
+        }
+        self.ensure_legacy_slot(start)?;
+        if self.config.block_reward_commission_percent
+            == self.config.block_reward_commission_bps_from_slot.is_some()
+        {
+            return Err(PluginError::new(
+                "runner requires exactly one qualified block reward commission era before starting"
+                    .into(),
+            ));
+        }
+        let bound = self
+            .config
+            .alpenglow_genesis_slot
+            .or(self.config.preactivation_through_slot)
+            .expect("validated historical bound");
+        let end = end_inclusive.min(bound).checked_add(1).ok_or_else(|| {
+            PluginError::new(
+                "exclusive runner end overflows u64; choose an end below u64::MAX".into(),
+            )
+        })?;
+        Ok(start..end)
+    }
+
     fn resolve_db(&self, fallback: Option<Arc<Client>>) -> Option<Arc<Client>> {
         if let Some(client) = self.ingest_client.lock().clone() {
             Some(client)
@@ -698,6 +813,7 @@ impl Plugin for ClickhouseIngestPlugin {
             let Some(db) = self.resolve_db(db) else {
                 return Ok(());
             };
+            self.ensure_legacy_slot(transaction.slot)?;
             let row = TransactionRow::from_transaction(transaction);
             let _sender = self.ensure_writer(thread_id, db)?;
 
@@ -738,6 +854,7 @@ impl Plugin for ClickhouseIngestPlugin {
             let Some(db) = self.resolve_db(db) else {
                 return Ok(());
             };
+            self.ensure_legacy_slot(entry.slot)?;
             let row = EntryRow::from_entry(entry);
             let _sender = self.ensure_writer(thread_id, db)?;
 
@@ -977,7 +1094,7 @@ struct WorkerHandle {
 }
 
 #[derive(Debug)]
-struct PluginError(String);
+pub struct PluginError(String);
 
 impl PluginError {
     fn new(msg: String) -> Self {

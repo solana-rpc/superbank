@@ -2,8 +2,8 @@
 
 High-throughput ingestion plugin for Jetstreamer 0.7 (Agave 4) that writes Solana blocks,
 transactions, and PoH entries into the `blocks_metadata`, `transactions`, and `entries` tables.
-Jetstreamer's block callback has no bank ID or Alpenglow footer, so this plugin stops after
-the trusted Alpenglow genesis slot. Use a qualified source for later blocks.
+Jetstreamer's block callback has no bank ID or Alpenglow footer, so this plugin rejects data after
+its trusted historical bound. The standalone runner clamps its range before starting. Use a qualified source for later blocks.
 
 ## Usage
 
@@ -14,9 +14,11 @@ use jetstreamer_clickhouse_plugin::{ClickhouseIngestConfig, ClickhouseIngestPlug
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recorded_finalized_slot: u64 = std::env::var("JETSTREAMER_PREACTIVATION_THROUGH_SLOT")?.parse()?;
+    let commission_activation: u64 = std::env::var("JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT")?.parse()?;
     let threads = 4;
     let config = ClickhouseIngestConfig {
         single_node: false,
+        block_reward_commission_bps_from_slot: Some(commission_activation),
         preactivation_through_slot: Some(recorded_finalized_slot), // offline attestation described below
         ..Default::default()
     };
@@ -24,9 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (start, _) = epochs::epoch_to_slot_range(800);
     let (_, end_inclusive) = epochs::epoch_to_slot_range(805);
 
+    let range = plugin.historical_slot_range(start, end_inclusive)?;
+
     JetstreamerRunner::default()
         .with_threads(threads)
-        .with_slot_range(start..(end_inclusive + 1))
+        .with_slot_range(range)
         .with_plugin(Box::new(plugin))
         .run()?;
 
@@ -83,16 +87,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 This crate ships a minimal runner binary so you can copy just this folder and run the plugin:
 
 ```bash
+JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
 JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> cargo run --release --bin jetstreamer-clickhouse -- 800
 # or a slot range:
+JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
 JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> cargo run --release --bin jetstreamer-clickhouse -- 358560000:367631999
 ```
 
 From the Superbank repo root, you can also run the end-to-end local smoke test helper:
 
 ```bash
+JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
 JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh
 # or override the default range:
+JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
 JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh 358560000:358560099
 ```
 
@@ -111,6 +119,7 @@ The finite bound never advances automatically; requalify evidence for a later ru
 When a certificate exists, use its trusted slot instead, and do not set both bounds.
 
 ```sh
+JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
 JETSTREAMER_PREACTIVATION_THROUGH_SLOT=<recorded-finalized-slot> \
 cargo run --release --bin jetstreamer-clickhouse -- <historical-start>:<historical-end>
 ```
@@ -131,3 +140,23 @@ feature activation ledger or archived source-field evidence; values, divisibilit
 dates, binary versions and the Alpenglow genesis slot cannot determine this era.
 For example, historical 7% remains 7 with NULL bps, while actual 725 bps remains
 725 with NULL percent. Transaction rewards retain upstream's explicit source fields.
+
+### Runner bounds and callback errors
+
+Jetstreamer logs plugin callback errors and continues its runner. A rejected
+`on_block` does **not** stop upstream, so embedding callers must apply
+`plugin.historical_slot_range(start, end_inclusive)?` before `run()` as above.
+The standalone binary does this automatically: a crossing range is clamped to
+the inclusive trusted historical bound, a start beyond it is rejected before
+running, and an unrepresentable exclusive end is rejected. Transactions and
+entries after the bound are rejected before allocating rows or starting writers,
+so continued upstream callbacks cannot accumulate rejected payloads. Other callback
+failures are still logged by upstream; inspect logs and verify completeness after
+any run, including missing commission-era qualification.
+
+The standalone runner also requires exactly one qualified block reward commission
+era before starting, even if its requested blocks might have no commission. Set
+`JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot>` or
+attest the entire bounded range with `JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT=true`.
+This prevents missing era configuration from merely logging errors and skipping
+commission-bearing blocks after the runner has started.

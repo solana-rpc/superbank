@@ -110,6 +110,7 @@ required local schemas, replays a small Old Faithful range through the Jetstream
 plugin, and prints verification queries, run:
 
 ```bash
+JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
 JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh
 ```
 
