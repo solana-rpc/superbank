@@ -237,6 +237,28 @@ pub struct RpcConfig {
     #[arg(long, env = "GENESIS_PATH")]
     pub(crate) genesis_path: Option<String>,
 
+    /// Trusted same-cluster RPC endpoint supporting getAgGenesisCert (Agave 4.3+).
+    #[arg(long, env = "AG_GENESIS_CERT_RPC_URL")]
+    pub(crate) ag_genesis_cert_rpc_url: Option<String>,
+
+    /// Total getAgGenesisCert source budget, including refresh admission (milliseconds).
+    #[arg(
+        long,
+        env = "AG_GENESIS_CERT_RPC_TIMEOUT_MS",
+        default_value_t = 2_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) ag_genesis_cert_rpc_timeout_ms: u64,
+
+    /// Seconds an authoritative pre-migration null may be reused before refreshing.
+    #[arg(
+        long,
+        env = "AG_GENESIS_CERT_REFRESH_INTERVAL_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..=300)
+    )]
+    pub(crate) ag_genesis_cert_refresh_interval_secs: u64,
+
     // --- Optional Superbank gRPC streaming API ---
     #[cfg(feature = "grpc-streaming")]
     /// Enable the Superbank gRPC streaming API.

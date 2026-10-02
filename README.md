@@ -183,6 +183,16 @@ curl -sS http://localhost:8899 \
 
 ## Configuration
 
+`superbank-rpc` serves `getAgGenesisCert` from an explicitly trusted, same-cluster
+Agave 4.3+ RPC endpoint configured by `AG_GENESIS_CERT_RPC_URL` (or
+`--ag-genesis-cert-rpc-url`). Its bounded lazy fetch caches authoritative `null` for
+`AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` (default 5 seconds), failures for one second,
+and the immutable certificate for the process lifetime. Set
+`AG_GENESIS_CERT_RPC_TIMEOUT_MS` (default 2000 ms) below `RPC_REQUEST_TIMEOUT_MS`.
+A missing, unsupported, malformed, or unavailable source returns an error, never
+an inferred pre-migration `null`. Configuration is optional for existing deployments;
+see the [certificate source and trust boundary](crates/superbank-rpc/README.md#alpenglow-genesis-certificate-source).
+
 Address history requests share a separate `DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` cache budget
 (default `100` ms) across signature bounds, address scans, and transaction hydration. Expiry
 falls back to primary ClickHouse; the general cache and maintenance deadlines remain independent.

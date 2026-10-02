@@ -10,6 +10,15 @@
 # DISK_CACHE_GET_TX_UNKNOWN_TIMEOUT_MS=150 replaces it while the signature index is
 # being rebuilt (more than 4 unknown partitions, e.g. after a restart).
 #
+# RPC certificate source options are CLI/env settings, not YAML fields:
+# AG_GENESIS_CERT_RPC_URL=https://your-cluster-rpc.example must be a trusted
+# same-cluster Agave 4.3+ endpoint supporting getAgGenesisCert (never this server).
+# AG_GENESIS_CERT_RPC_TIMEOUT_MS=2000 is the total source budget, including admission;
+# it must be below RPC_REQUEST_TIMEOUT_MS when a source is configured.
+# AG_GENESIS_CERT_REFRESH_INTERVAL_SECS=5 caches authoritative null before migration.
+# Certificates stay cached until restart; failures are cached for one second.
+# Unconfigured/unsupported/unavailable evidence returns an error, never null.
+#
 # Optional superbank-rpc exact request filters. Pass this same file to
 # superbank-rpc with --config / SUPERBANK_CONFIG. Each entry contains the
 # method followed by its complete params array. Matching calls return HTTP 405

@@ -35,6 +35,7 @@ mod solana_sdk {
     }
 }
 
+mod ag_genesis_cert;
 mod block_response_cache;
 mod clickhouse;
 mod get_transaction_primary_cache;

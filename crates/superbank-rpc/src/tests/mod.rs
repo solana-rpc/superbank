@@ -168,6 +168,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
     clickhouse.set_token_owner_activity_available_for_tests(available);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -278,6 +279,7 @@ pub(crate) fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppSta
     clickhouse.set_token_owner_activity_available_for_tests(true);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -342,6 +344,7 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         .await;
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -398,6 +401,7 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
     clickhouse.set_token_owner_activity_available_for_tests(true);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -456,6 +460,7 @@ fn test_state_with_head_cache_and_clickhouse_url(
     clickhouse.set_token_owner_activity_available_for_tests(true);
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,
@@ -521,6 +526,7 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         .await;
 
     Arc::new(AppState {
+        ag_genesis_cert: Default::default(),
         clickhouse,
         rpc_parameter_filters: Default::default(),
         max_signatures_limit: TEST_MAX_LIMIT,

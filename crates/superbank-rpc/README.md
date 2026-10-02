@@ -26,6 +26,7 @@ Build with the pinned Rust 1.97.1 toolchain.
 - `minimumLedgerSlot`
 - `getInflationReward`
 - `getEpochSchedule`
+- `getAgGenesisCert`
 - `getTransactionsForAddress` (custom)
 
 Notes:
@@ -366,6 +367,55 @@ docker run --rm \
 This setting controls both `getEpochSchedule` responses and internal `getInflationReward`
 epoch math. For testnet, supply its exact current genesis file: testnet uses warmup epochs,
 so the no-warmup fallback is incorrect even for recent payout boundaries.
+
+### Alpenglow genesis certificate source
+
+[`getAgGenesisCert`](https://solana.com/docs/rpc/http/getaggenesiscert) accepts no
+parameters (omitted, `null`, or `[]`). It returns an authoritative `null` before
+migration and the certificate afterward, preserving `block.slot` as a JSON `u64`,
+`block.blockId` as 32 byte values, `signature.signature` as 192 byte values, and
+`signature.bitmap` as a variable-length byte array. There is no commitment parameter
+or context wrapper. The certificate slot is passed through exactly as supplied.
+
+Set `AG_GENESIS_CERT_RPC_URL` to an operator-trusted HTTP(S) RPC endpoint on the
+**same cluster as the ClickHouse data**, supporting the Agave 4.3+ method. This
+endpoint is the authority for migration evidence: Superbank validates the response
+shape but does not independently verify the aggregate BLS signature or cluster
+identity. Do not point it back at this Superbank instance or through a route that
+forwards the call back here. Store credentialed URLs in the environment, outside git.
+For example, run with `--ag-genesis-cert-rpc-url https://your-cluster-rpc.example`.
+
+The first request bootstraps the source lazily; startup requires valid configuration
+but does not require a reachable provider. Requests share one in-flight fetch with a
+total `AG_GENESIS_CERT_RPC_TIMEOUT_MS` budget (default 2000 ms) covering admission,
+connection, and response body. There are no automatic retries or redirects, and
+responses are capped at 64 KiB, including streamed bodies. A successful `null` is
+cached for `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` (default 5 seconds, range 1–300);
+the next request after expiry refreshes it. Expired evidence is never served when
+refresh fails. Failures, including unsupported upstream methods, are cached for one
+second before retrying on demand. Once obtained, the immutable finalized-bank
+certificate is cached for the process lifetime and remains available during provider
+outages. A restart bootstraps again; there is no durable certificate copy or background
+polling. Changing cluster/source requires restarting with the correct endpoint.
+
+An unconfigured, unavailable, timed-out, malformed, or unsupported source returns
+JSON-RPC `-32019` with `error.data.reason` equal to `source_not_configured`,
+`upstream_unavailable`, `source_timeout`, `invalid_upstream_response`, or
+`upstream_unsupported`, respectively. Other upstream RPC errors use `upstream_error`.
+Upstream RPC errors include `upstreamCode` but do not expose provider messages or URLs.
+These errors never become `null`; a pre-4.3 upstream's `-32601` means unsupported
+evidence, not TowerBFT. With `--emit-http-errors`, source failures return HTTP 503;
+otherwise they return HTTP 200 with the JSON-RPC error body. Nonempty or named
+parameters return `-32602` without fetching the source.
+
+This source is independent of `GENESIS_PATH`, which controls epoch schedules, and
+of finalized block storage and speculative head buffering. The existing ClickHouse
+schemas hold no genesis certificate, and the compatibility-reference Yellowstone
+[footer message](https://github.com/rpcpool/yellowstone-grpc/blob/v16.0.0-rc10%2Bsolana.4.3.0/yellowstone-grpc-proto/proto/geyser.proto)
+omits certificates. Dates, validator versions, local latest slots, and missing footer
+fields are not used to infer migration. Agave's
+[implementation](https://github.com/anza-xyz/agave/blob/v4.3.0/rpc/src/rpc.rs)
+reads the certificate from its finalized bank.
 
 ## Exact method and parameter filters
 
@@ -997,6 +1047,9 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
 | `--genesis-path` | `GENESIS_PATH` | unset | Path to the target cluster's mounted `genesis.bin`. The server fails startup if a configured file cannot be read or decoded. Leave unset only for the no-warmup fallback. |
+| `--ag-genesis-cert-rpc-url` | `AG_GENESIS_CERT_RPC_URL` | unset | Trusted same-cluster Agave 4.3+ certificate RPC source. Unset keeps startup optional but `getAgGenesisCert` returns an unavailable-source error. |
+| `--ag-genesis-cert-rpc-timeout-ms` | `AG_GENESIS_CERT_RPC_TIMEOUT_MS` | `2000` | Positive total source budget, including admission; must be below `RPC_REQUEST_TIMEOUT_MS` when a source is configured. |
+| `--ag-genesis-cert-refresh-interval-secs` | `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` | `5` | Authoritative null TTL (1–300 seconds); certificates stay cached until restart, failures for 1 second. |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |
 | `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Only available with `--features grpc-streaming`; enables the gRPC endpoint at runtime. |
 | `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Only available with `--features grpc-streaming`. |
