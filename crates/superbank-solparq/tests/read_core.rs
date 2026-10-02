@@ -437,3 +437,72 @@ fn write_archive_with_invalid_utf8_column() -> (TempDir, std::path::PathBuf) {
     writer.close().expect("close parquet writer");
     (dir, archive_path)
 }
+
+#[tokio::test]
+async fn footer_bundle_schema_and_scan_use_manifest_and_inclusive_slot_filter() {
+    let (_dir, bundle) = write_test_bundle();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slot", DataType::UInt64, false),
+        Field::new("bank_id", DataType::UInt64, false),
+        Field::new("block_producer_time_nanos", DataType::UInt64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 11, 12])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![0, 7, 9])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![100, 110, 120])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        File::create(bundle.join("block_footers.parquet")).unwrap(),
+        schema,
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let path = bundle.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["tables"].as_array_mut().unwrap().push(json!({
+        "kind": "block_footers", "file_name": "block_footers.parquet",
+        "table_name": "block_footers", "row_count": 3, "required": false
+    }));
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let cli = Cli::try_parse_from([
+        "reader",
+        "schema",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "block_footers",
+    ])
+    .unwrap();
+    assert!(
+        render(cli)
+            .await
+            .unwrap()
+            .contains("block_producer_time_nanos")
+    );
+    let cli = Cli::try_parse_from([
+        "reader",
+        "scan",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "block_footers",
+        "--slot-range",
+        "10-11",
+        "--columns",
+        "slot,bank_id",
+        "--format",
+        "json",
+    ])
+    .unwrap();
+    let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
+    assert_eq!(
+        rows,
+        json!([{"slot": 10, "bank_id": 0}, {"slot": 11, "bank_id": 7}])
+    );
+}

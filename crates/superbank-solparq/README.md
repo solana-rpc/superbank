@@ -305,7 +305,15 @@ cargo run -p superbank-solparq --bin superbank-solparq-read -- scan \
 ```
 
 Use `--table` to read a non-transaction table from a bundle, for example
-`--table blocks_metadata` or `--table entries`.
+`--table blocks_metadata`, `--table block_footers`, or `--table entries`.
+The footer table supports `schema` and slot-filtered `scan`, including binary
+`bank_hash` and `block_user_agent` columns. For example:
+
+```sh
+superbank-solparq-read scan --archive ./archives/custom_0_10-12 \
+  --table block_footers --slot-range 10-11 \
+  --columns slot,bank_id,block_producer_time_nanos --format json
+```
 
 S3 reads use the same endpoint, bucket, path, and credentials model as
 `superbank-solparq`. In S3 mode, `--archive` is the object key relative to
