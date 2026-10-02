@@ -45,15 +45,22 @@ pub(crate) struct JobDescriptor {
 }
 
 impl JobDescriptor {
-    fn matches_resume(&self, current: &Self, moving_tip: bool) -> bool {
+    fn matches_resume(&self, current: &Self, moving_tip: bool, next_start: u64) -> bool {
         if self == current {
             return true;
         }
-        if !moving_tip || current.range_end < self.range_end {
-            return false;
-        }
         let mut saved = self.clone();
-        saved.range_end = current.range_end;
+        if moving_tip && current.range_end >= self.range_end {
+            saved.range_end = current.range_end;
+        }
+        // Windows account slots strictly below next_start. Handoff is safe
+        // only before any post-genesis slot could have used historical rules.
+        if saved.alpenglow_genesis_block.is_none()
+            && let Some((genesis, _)) = current.alpenglow_genesis_block
+            && next_start <= genesis.saturating_add(1)
+        {
+            saved.alpenglow_genesis_block = current.alpenglow_genesis_block;
+        }
         saved == *current
     }
 }
@@ -104,10 +111,13 @@ pub(crate) fn load_for_resume(
     descriptor: &JobDescriptor,
     moving_tip: bool,
 ) -> Result<Option<Checkpoint>> {
-    let Some(checkpoint) = load(path)? else {
+    let Some(mut checkpoint) = load(path)? else {
         return Ok(None);
     };
-    if !checkpoint.descriptor.matches_resume(descriptor, moving_tip) {
+    if !checkpoint
+        .descriptor
+        .matches_resume(descriptor, moving_tip, checkpoint.next_start)
+    {
         bail!(
             "checkpoint {} was written by a different job (stored: {:?}, current: {:?}); \
              delete the file or use a different --checkpoint-file to start fresh",
@@ -115,6 +125,12 @@ pub(crate) fn load_for_resume(
             checkpoint.descriptor,
             descriptor
         );
+    }
+    // Persist the qualified boundary even if this run has no remaining window.
+    if checkpoint.descriptor.alpenglow_genesis_block != descriptor.alpenglow_genesis_block {
+        checkpoint.descriptor.alpenglow_genesis_block = descriptor.alpenglow_genesis_block;
+        checkpoint.updated_unix = now_unix();
+        save(path, &checkpoint)?;
     }
     Ok(Some(checkpoint))
 }
@@ -265,7 +281,70 @@ mod tests {
     }
 
     #[test]
-    fn legacy_checkpoint_is_poh_only_and_rejects_a_new_boundary() {
+    fn trusted_boundary_handoff_is_safe_only_through_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        for cursor in [99, 100, 101, 102] {
+            for moving_tip in [false, true] {
+                let checkpoint = Checkpoint {
+                    descriptor: descriptor(),
+                    next_start: cursor,
+                    counters: RunCounters {
+                        slots_ok: 42,
+                        ..RunCounters::default()
+                    },
+                    checked_anchors: BTreeSet::from([7]),
+                    genesis_checked: true,
+                    updated_unix: now_unix(),
+                };
+                save(&path, &checkpoint).unwrap();
+                let mut current = descriptor();
+                current.alpenglow_genesis_block = Some((100, [8; 32]));
+                if moving_tip {
+                    current.range_end += 100;
+                }
+                if cursor == 102 {
+                    assert!(load_for_resume(&path, &current, moving_tip).is_err());
+                    continue;
+                }
+                // All other identity fields remain strict during handoff.
+                for changed in ["mode", "anchor", "start", "tip", "pin", "table"] {
+                    let mut wrong = current.clone();
+                    match changed {
+                        "mode" => wrong.mode = "structural".into(),
+                        "anchor" => wrong.anchors.push((10, [9; 32])),
+                        "start" => wrong.range_start += 1,
+                        "tip" => wrong.range_end = 999,
+                        "pin" => wrong.expected_genesis_hash = None,
+                        _ => wrong.blocks_table = "other".into(),
+                    }
+                    assert!(load_for_resume(&path, &wrong, moving_tip).is_err());
+                }
+                let resumed = load_for_resume(&path, &current, moving_tip)
+                    .unwrap()
+                    .unwrap();
+                let mut persisted = descriptor();
+                persisted.alpenglow_genesis_block = current.alpenglow_genesis_block;
+                assert_eq!(resumed.descriptor, persisted);
+                assert_eq!(load(&path).unwrap().unwrap().descriptor, persisted);
+                assert_eq!(resumed.next_start, cursor);
+                assert_eq!(resumed.counters.slots_ok, 42);
+                assert_eq!(resumed.checked_anchors, BTreeSet::from([7]));
+                assert!(resumed.genesis_checked);
+                assert!(load_for_resume(&path, &descriptor(), moving_tip).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_genesis_slot_handoff_does_not_overflow() {
+        let mut current = descriptor();
+        current.alpenglow_genesis_block = Some((u64::MAX, [8; 32]));
+        assert!(descriptor().matches_resume(&current, false, u64::MAX));
+    }
+
+    #[test]
+    fn legacy_checkpoint_rejects_handoff_after_postboundary_progress() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint.json");
         let checkpoint = Checkpoint {

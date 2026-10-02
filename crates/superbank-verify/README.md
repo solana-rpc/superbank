@@ -122,7 +122,10 @@ block is reported as unverifiable, not silently ignored).
 
 `--checkpoint-file` saves progress after every window (atomic rename);
 `--resume` continues an interrupted run as long as the job parameters (range
-start, mode, tables, era schedule, trusted Alpenglow genesis block, genesis pin, and anchors) are identical.
+start, mode, tables, era schedule, genesis pin, and anchors) are identical.
+A trusted Alpenglow boundary may be added once while the saved `next_start` is
+at most `G + 1`, before any postboundary slot was verified with historical rules.
+The updated descriptor is persisted immediately; removing or changing it is rejected.
 For `--full`, the upper bound is a live tip: resume accepts a later tip and
 continues from the saved cursor. It rejects a regressed tip or a changed range
 start. Checkpoints retain already checked anchors and the genesis-pin check, so
@@ -190,6 +193,9 @@ seconds and 64 KiB, rejects redirects, and does not include upstream URLs/messag
 errors. Wire validation establishes shape only; no BLS or stake verification is claimed.
 
 The resolved slot and consensus block ID are part of checkpoint identity. Legacy
-checkpoints without this field resume with historical rules; adding, removing or
-changing either component rejects resume even after the boundary is behind the cursor.
+checkpoints without this field resume with historical rules. A `None` to trusted
+`Some(G, ID)` handoff is allowed only with `next_start <= G + 1`; later progress
+requires starting a fresh verification job. Removing or changing either component
+rejects resume even after the boundary is behind the cursor. The comparison handles
+`G = UInt64::MAX` without wrapping.
 The consensus block ID is distinct from the entry blockhash; use `--anchor` separately.
