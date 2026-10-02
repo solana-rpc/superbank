@@ -28,7 +28,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Archive Superbank ClickHouse table bundles to Parquet (`crates/superbank-solparq`)
 - Inspect and read superbank-solparq Parquet archives from local files or S3 (`superbank-solparq-read` binary in `crates/superbank-solparq`)
 - Restore superbank-solparq Parquet archives (local or S3) back into ClickHouse (`source: solparq`)
-- Validate Proof-of-History over the stored data (`crates/superbank-verify`)
+- Validate historical Proof-of-History and post-genesis Alpenglow entry chains over stored data (`crates/superbank-verify`), using trusted same-cluster `getAgGenesisCert` or an offline genesis block pair
 - Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 

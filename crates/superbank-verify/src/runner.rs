@@ -670,4 +670,73 @@ mod tests {
                 .any(|f| f.code == FindingCode::TickCountMismatch)
         );
     }
+    #[test]
+    fn mixed_window_applies_boundary_per_block_and_keeps_skipped_slot_linkage() {
+        let mut window = WindowData {
+            end: 13,
+            blocks: Vec::new(),
+            entries: BTreeMap::new(),
+            tx_signatures: TxSignaturesBySlot::new(),
+            duplicate_findings: Vec::new(),
+            parent_seed: None,
+        };
+        let mut parent_slot = 7;
+        let mut parent_hash = [1; 32];
+        for (slot, layout) in [
+            (8, vec![(25, 0); 4]),
+            (9, vec![(10, 2), (15, 0), (25, 0), (25, 0), (25, 0)]),
+            (13, vec![(1, 1), (1, 0)]),
+        ] {
+            let (block, entries, signatures) = build_block(slot, parent_slot, parent_hash, &layout);
+            parent_slot = slot;
+            parent_hash = block.blockhash;
+            window.blocks.push(block);
+            window.entries.insert(slot, entries);
+            window.tx_signatures.insert(slot, signatures);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let schedule = crate::eras::HashesPerTickSchedule::parse("0:25,10:62500").unwrap();
+        for mode in [VerifyMode::Structural, VerifyMode::Full] {
+            let outcomes = verify_window(&window, &pool, mode, 4, &schedule, Some(9));
+            assert_eq!(outcomes.len(), 3);
+            for outcome in outcomes {
+                assert!(outcome.findings.is_empty(), "{:?}", outcome.findings);
+            }
+            let mut walk = ChainWalk::new(8, None, HashMap::from([(13, parent_hash)]));
+            walk.seed(7, [1; 32]);
+            for block in &window.blocks {
+                assert!(walk.observe_block(block).findings.is_empty());
+            }
+            assert_eq!(walk.last_present(), Some(13));
+        }
+
+        // Without a trusted boundary, the historical default still rejects
+        // the short terminal-only stream rather than guessing from the data.
+        let outcomes = verify_window(&window, &pool, VerifyMode::Structural, 4, &schedule, None);
+        assert!(
+            outcomes[2]
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickCountMismatch)
+        );
+        assert!(
+            outcomes[2]
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickHashCountMismatch)
+        );
+
+        window.blocks[2].parent_blockhash[0] ^= 1;
+        let mut walk = ChainWalk::new(13, None, HashMap::new());
+        walk.seed(9, window.blocks[1].blockhash);
+        assert!(
+            walk.observe_block(&window.blocks[2])
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::ChainBreak)
+        );
+    }
 }

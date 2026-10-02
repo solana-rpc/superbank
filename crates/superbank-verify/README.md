@@ -122,7 +122,7 @@ block is reported as unverifiable, not silently ignored).
 
 `--checkpoint-file` saves progress after every window (atomic rename);
 `--resume` continues an interrupted run as long as the job parameters (range
-start, mode, tables, era schedule, genesis pin, and anchors) are identical.
+start, mode, tables, era schedule, trusted Alpenglow genesis block, genesis pin, and anchors) are identical.
 For `--full`, the upper bound is a live tip: resume accepts a later tip and
 continues from the saved cursor. It rejects a regressed tip or a changed range
 start. Checkpoints retain already checked anchors and the genesis-pin check, so
@@ -175,3 +175,21 @@ golden vectors.
 - `getEpochSchedule` in superbank-rpc ignores mainnet's warmup epochs; this
   crate carries its own epoch math (`src/epoch.rs`) instead of sharing that
   code.
+
+### Trusted migration evidence
+
+Configure `--alpenglow-rpc-url` / `SUPERBANK_VERIFY_ALPENGLOW_RPC_URL` /
+`alpenglow-rpc-url` with a trusted endpoint for the same cluster as the stored data,
+or `--alpenglow-genesis-block` / `SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK` /
+`alpenglow-genesis-block` with its certificate's `<slot>:<base58-block-id>` pair.
+CLI overrides env, which overrides YAML. The certificate slot is the last historical
+PoH slot; new entry rules apply strictly after it. A missing boundary retains PoH rules.
+An authoritative successful null means no certificate; unsupported, unavailable and
+malformed responses are operational errors, never null. Discovery is bounded to ten
+seconds and 64 KiB, rejects redirects, and does not include upstream URLs/messages in
+errors. Wire validation establishes shape only; no BLS or stake verification is claimed.
+
+The resolved slot and consensus block ID are part of checkpoint identity. Legacy
+checkpoints without this field resume with historical rules; adding, removing or
+changing either component rejects resume even after the boundary is behind the cursor.
+The consensus block ID is distinct from the entry blockhash; use `--anchor` separately.

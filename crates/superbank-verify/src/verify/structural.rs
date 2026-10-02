@@ -445,4 +445,35 @@ mod tests {
                 .any(|finding| finding.code == FindingCode::TxIndexMismatch)
         );
     }
+    #[test]
+    fn every_post_genesis_entry_requires_one_hash_independent_of_historical_schedule() {
+        for schedule in [None, Some(0), Some(62_500)] {
+            for index in [0, 1] {
+                for count in [0, 2, u64::MAX] {
+                    let (block, mut entries, _) = build_block(13, 9, [1; 32], &[(1, 1), (1, 0)]);
+                    entries[index].num_hashes = count;
+                    let findings = check_structure_in_era(&block, &entries, 64, schedule, true);
+                    assert_eq!(findings.len(), 1);
+                    assert_eq!(findings[0].code, FindingCode::TickHashCountMismatch);
+                    assert_eq!(findings[0].entry_index, Some(index as u32));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_genesis_empty_and_skipped_blocks_require_one_terminal_tick() {
+        for slot in [10, 13] {
+            for layout in [vec![(1, 0)], vec![(1, 2), (1, 1), (1, 0)]] {
+                let (block, entries, _) = build_block(slot, 9, [1; 32], &layout);
+                assert!(
+                    check_structure_in_era(&block, &entries, 64, Some(62_500), true).is_empty()
+                );
+            }
+        }
+        for layout in [vec![(1, 1)], vec![(1, 0), (1, 0)], vec![(1, 0), (1, 1)]] {
+            let (block, entries, _) = build_block(13, 9, [1; 32], &layout);
+            assert!(!check_structure_in_era(&block, &entries, 64, None, true).is_empty());
+        }
+    }
 }

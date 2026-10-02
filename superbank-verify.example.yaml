@@ -24,10 +24,14 @@ expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 # era). Default: built-in mainnet history — only override for other clusters.
 # hashes-per-tick-schedule: "0:12500"
 
-# Trusted Agave 4.3+ RPC resolves the finalized getAgGenesisCert boundary.
+# Trusted same-cluster Agave RPC resolves getAgGenesisCert. Null is pre-migration;
+# unsupported/unavailable/malformed responses fail. No independent BLS validation.
 # alpenglow-rpc-url: "https://your-trusted-agave-rpc"
 # Offline alternative: the genesis certificate block slot and consensus block ID pair.
 # alpenglow-genesis-block: "<slot>:<base58-block-id>"
+# This slot still uses historical PoH; new rules apply strictly after it.
+# Resolved slot + consensus block ID must match on checkpoint resume.
+# Without either trusted setting, all slots use historical PoH rules.
 
 # External trust anchors, checked against recorded blockhashes.
 # anchor:

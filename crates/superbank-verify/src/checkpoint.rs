@@ -222,4 +222,75 @@ mod tests {
         regressed_tip.range_end = 999;
         assert!(load_for_resume(&path, &regressed_tip, true).is_err());
     }
+    #[test]
+    fn resume_keeps_the_same_boundary_even_after_the_cursor_passes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let mut job = descriptor();
+        job.alpenglow_genesis_block = Some((100, [7; 32]));
+        let mut checkpoint = Checkpoint {
+            descriptor: job.clone(),
+            next_start: 99,
+            counters: RunCounters::default(),
+            checked_anchors: BTreeSet::new(),
+            genesis_checked: false,
+            updated_unix: now_unix(),
+        };
+        for cursor in [99, 100, 101, 512] {
+            checkpoint.next_start = cursor;
+            save(&path, &checkpoint).unwrap();
+            for moving_tip in [false, true] {
+                let mut current = job.clone();
+                if moving_tip {
+                    current.range_end += 100;
+                }
+                assert_eq!(
+                    load_for_resume(&path, &current, moving_tip)
+                        .unwrap()
+                        .unwrap()
+                        .next_start,
+                    cursor
+                );
+                for changed_boundary in [
+                    None,
+                    Some((99, [7; 32])),
+                    Some((101, [7; 32])),
+                    Some((100, [8; 32])),
+                ] {
+                    current.alpenglow_genesis_block = changed_boundary;
+                    assert!(load_for_resume(&path, &current, moving_tip).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_checkpoint_is_poh_only_and_rejects_a_new_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let checkpoint = Checkpoint {
+            descriptor: descriptor(),
+            next_start: 512,
+            counters: RunCounters::default(),
+            checked_anchors: BTreeSet::new(),
+            genesis_checked: false,
+            updated_unix: now_unix(),
+        };
+        let mut legacy = serde_json::to_value(checkpoint).unwrap();
+        legacy["descriptor"]
+            .as_object_mut()
+            .unwrap()
+            .remove("alpenglow_genesis_block");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            load_for_resume(&path, &descriptor(), false)
+                .unwrap()
+                .is_some()
+        );
+        let mut migrated = descriptor();
+        migrated.alpenglow_genesis_block = Some((100, [7; 32]));
+        assert!(load_for_resume(&path, &migrated, false).is_err());
+        migrated.range_end += 100;
+        assert!(load_for_resume(&path, &migrated, true).is_err());
+    }
 }
