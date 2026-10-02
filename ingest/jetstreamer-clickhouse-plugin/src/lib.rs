@@ -34,6 +34,9 @@ pub struct ClickhouseIngestConfig {
     pub entries_table: String,
     /// Trusted Alpenglow genesis slot; this producer can only write through it.
     pub alpenglow_genesis_slot: Option<u64>,
+    /// Offline attestation: finalized slot observed before trusted same-cluster
+    /// getAgGenesisCert returned authoritative null. Never an unbounded mode.
+    pub preactivation_through_slot: Option<u64>,
     /// Max rows per ClickHouse insert batch.
     pub flush_max_rows: u64,
     /// Max bytes per ClickHouse insert batch.
@@ -70,6 +73,7 @@ impl Default for ClickhouseIngestConfig {
             blocks_metadata_table: "blocks_metadata".to_string(),
             entries_table: "entries".to_string(),
             alpenglow_genesis_slot: None,
+            preactivation_through_slot: None,
             flush_max_rows: 100_000,
             flush_max_bytes: 64 * 1024 * 1024,
             flush_interval_ms: 10_000,
@@ -138,6 +142,9 @@ fn apply_env_overrides(config: &mut ClickhouseIngestConfig) {
 }
 
 fn apply_era_env_override(config: &mut ClickhouseIngestConfig) {
+    if let Some(value) = env_u64("JETSTREAMER_PREACTIVATION_THROUGH_SLOT") {
+        config.preactivation_through_slot = Some(value);
+    }
     if let Some(value) = env_u64("JETSTREAMER_ALPENGLOW_GENESIS_SLOT") {
         config.alpenglow_genesis_slot = Some(value);
     }
@@ -307,6 +314,28 @@ mod tests {
         );
         assert!(bounded.ensure_legacy_slot(100).is_ok());
         assert!(bounded.ensure_legacy_slot(101).is_err());
+    }
+
+    #[test]
+    fn trusted_null_fixture_allows_only_an_explicit_finalized_history_bound() {
+        let bounded = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                preactivation_through_slot: Some(42),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(bounded.ensure_legacy_slot(42).is_ok());
+        assert!(bounded.ensure_legacy_slot(43).is_err());
+        let conflicting = ClickhouseIngestPlugin::new(
+            ClickhouseIngestConfig {
+                preactivation_through_slot: Some(42),
+                alpenglow_genesis_slot: Some(100),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(conflicting.ensure_legacy_slot(42).is_err());
     }
 
     #[test]
@@ -506,10 +535,19 @@ impl ClickhouseIngestPlugin {
     }
 
     fn ensure_legacy_slot(&self, slot: u64) -> Result<(), PluginError> {
-        match self.config.alpenglow_genesis_slot {
+        if self.config.alpenglow_genesis_slot.is_some()
+            == self.config.preactivation_through_slot.is_some()
+        {
+            return Err(PluginError::new("exactly one trusted historical bound is required: Alpenglow genesis or preactivation through-slot".into()));
+        }
+        match self
+            .config
+            .alpenglow_genesis_slot
+            .or(self.config.preactivation_through_slot)
+        {
             Some(genesis_slot) if slot <= genesis_slot => Ok(()),
             Some(_) => Err(PluginError::new(format!(
-                "Jetstreamer block {slot} is after the Alpenglow genesis slot; bank ID and footer provenance are unavailable"
+                "Jetstreamer block {slot} exceeds the trusted historical bound; bank ID and footer provenance are unavailable"
             ))),
             None => Err(PluginError::new(
                 "JETSTREAMER_ALPENGLOW_GENESIS_SLOT is required to bound the legacy backfill"

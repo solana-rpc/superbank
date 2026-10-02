@@ -132,7 +132,7 @@ cp superbank.example.yaml superbank.yaml
 Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
-- The legacy Fumarole source also requires `fumarole-alpenglow-genesis-slot` from a trusted genesis certificate and stops after that slot. Use a bank-tagged Yellowstone gRPC producer for Alpenglow blocks.
+- The legacy Fumarole source requires either `fumarole-alpenglow-genesis-slot` from a trusted genesis certificate or an explicit `fumarole-preactivation-through-slot` attestation and stops after that historical bound. Use a bank-tagged Yellowstone gRPC producer for Alpenglow blocks.
 - Live gRPC/Fumarole canonical writers require finalized commitment; complete bank data is validated before inserts and source offset acknowledgment. gRPC scalar zero requires matching subscription-local status evidence: legacy data retains a NULL bank ID, and unresolved identity holds later blocks and all flushes for replay.
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
@@ -182,6 +182,20 @@ curl -sS http://localhost:8899 \
 ```
 
 ## Configuration
+
+Before activation, a trusted same-cluster `getAgGenesisCert` can successfully return
+`null`. For a bounded historical Fumarole or Jetstreamer run, first record the same
+endpoint's `getSlot` with finalized commitment, then obtain its authoritative null
+certificate response. Keep both responses as operational evidence and set
+`FUMAROLE_PREACTIVATION_THROUGH_SLOT` or `JETSTREAMER_PREACTIVATION_THROUGH_SLOT`
+to that recorded finalized slot (or an earlier slot). These settings are explicit
+offline attestations by the operator; neither binary discovers or validates that
+external evidence. A missing, unsupported, failed or malformed certificate response
+cannot qualify this mode. The bound never advances automatically; qualify a new
+snapshot for further historical work, or use the trusted certificate slot once
+one exists. Do not configure both genesis and preactivation bounds. Slot zero is
+valid only when actually evidenced, never a placeholder for an unknown boundary.
+
 
 `superbank-rpc` serves `getAgGenesisCert` from an explicitly trusted, same-cluster
 Agave 4.3+ RPC endpoint configured by `AG_GENESIS_CERT_RPC_URL` (or

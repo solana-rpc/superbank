@@ -24,7 +24,12 @@ command -v cargo >/dev/null 2>&1 || {
 }
 
 range="${1:-358560000:358560099}"
-genesis_slot="${JETSTREAMER_ALPENGLOW_GENESIS_SLOT:?set JETSTREAMER_ALPENGLOW_GENESIS_SLOT from a trusted genesis certificate}"
+if [[ -n "${JETSTREAMER_ALPENGLOW_GENESIS_SLOT:-}" && -n "${JETSTREAMER_PREACTIVATION_THROUGH_SLOT:-}" ]] ||
+   [[ -z "${JETSTREAMER_ALPENGLOW_GENESIS_SLOT:-}" && -z "${JETSTREAMER_PREACTIVATION_THROUGH_SLOT:-}" ]]; then
+  echo "set exactly one evidenced bound: JETSTREAMER_ALPENGLOW_GENESIS_SLOT or JETSTREAMER_PREACTIVATION_THROUGH_SLOT (see plugin README)" >&2
+  exit 1
+fi
+export JETSTREAMER_ALPENGLOW_GENESIS_SLOT JETSTREAMER_PREACTIVATION_THROUGH_SLOT
 threads="${JETSTREAMER_THREADS:-4}"
 container="clickhouse"
 image="clickhouse/clickhouse-server:26.1.2.11"
@@ -93,7 +98,6 @@ SQL
   JETSTREAMER_CLICKHOUSE_MODE=remote \
   JETSTREAMER_CLICKHOUSE_DSN="${dsn}" \
   JETSTREAMER_THREADS="${threads}" \
-  JETSTREAMER_ALPENGLOW_GENESIS_SLOT="${genesis_slot}" \
   RUST_LOG="${RUST_LOG:-info,clickhouse_rs=warn}" \
   cargo run --release --bin jetstreamer-clickhouse -- "${range}"
 )

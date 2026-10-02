@@ -162,6 +162,10 @@ struct CliArgs {
     #[arg(long, env = "FUMAROLE_ALPENGLOW_GENESIS_SLOT")]
     fumarole_alpenglow_genesis_slot: Option<u64>,
 
+    /// Offline preactivation attestation: finalized slot observed before trusted same-cluster getAgGenesisCert returned null
+    #[arg(long, env = "FUMAROLE_PREACTIVATION_THROUGH_SLOT")]
+    fumarole_preactivation_through_slot: Option<u64>,
+
     /// Create the Fumarole consumer group before subscribing
     #[arg(
         long,
@@ -569,6 +573,7 @@ pub(crate) struct Args {
     pub(crate) fumarole_x_token: Option<String>,
     pub(crate) fumarole_consumer_group: Option<String>,
     pub(crate) fumarole_alpenglow_genesis_slot: Option<u64>,
+    pub(crate) fumarole_preactivation_through_slot: Option<u64>,
     pub(crate) fumarole_create_consumer_group: bool,
     pub(crate) fumarole_data_plane_tcp_connections: u8,
     pub(crate) fumarole_concurrent_download_limit_per_tcp: usize,
@@ -662,6 +667,8 @@ struct FileConfig {
     fumarole_consumer_group: Option<String>,
     #[serde(alias = "fumarole_alpenglow_genesis_slot")]
     fumarole_alpenglow_genesis_slot: Option<u64>,
+    #[serde(alias = "fumarole_preactivation_through_slot")]
+    fumarole_preactivation_through_slot: Option<u64>,
     #[serde(alias = "fumarole_create_consumer_group")]
     fumarole_create_consumer_group: Option<bool>,
     #[serde(alias = "fumarole_data_plane_tcp_connections")]
@@ -851,6 +858,12 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "fumarole_alpenglow_genesis_slot",
             cli.fumarole_alpenglow_genesis_slot,
             file_config.fumarole_alpenglow_genesis_slot,
+        ),
+        fumarole_preactivation_through_slot: merge_option(
+            &matches,
+            "fumarole_preactivation_through_slot",
+            cli.fumarole_preactivation_through_slot,
+            file_config.fumarole_preactivation_through_slot,
         ),
         fumarole_create_consumer_group: merge_value(
             &matches,
@@ -1532,9 +1545,11 @@ fn validate_fumarole_options(args: &Args) -> Result<()> {
 }
 
 fn require_fumarole_era_bound(args: &Args) -> Result<()> {
-    if args.fumarole_alpenglow_genesis_slot.is_none() {
+    if args.fumarole_alpenglow_genesis_slot.is_some()
+        == args.fumarole_preactivation_through_slot.is_some()
+    {
         return Err(anyhow!(
-            "fumarole source requires --fumarole-alpenglow-genesis-slot / FUMAROLE_ALPENGLOW_GENESIS_SLOT to bound the legacy stream"
+            "fumarole source requires exactly one trusted historical bound: --fumarole-alpenglow-genesis-slot or --fumarole-preactivation-through-slot"
         ));
     }
     Ok(())
@@ -2157,6 +2172,21 @@ rpc-from-slot: 456
         );
     }
 
+    #[test]
+    fn preactivation_attestation_is_explicit_exclusive_and_bounded() {
+        let mut args = fumarole_args();
+        args.fumarole_alpenglow_genesis_slot = None;
+        assert!(require_fumarole_era_bound(&args).is_err());
+        // Trusted fixture: finalized tip 42 was observed before an authoritative null.
+        args.fumarole_preactivation_through_slot = Some(42);
+        assert!(require_fumarole_era_bound(&args).is_ok());
+        args.fumarole_alpenglow_genesis_slot = Some(100);
+        assert!(require_fumarole_era_bound(&args).is_err());
+        let config: FileConfig =
+            serde_yaml::from_str("fumarole-preactivation-through-slot: 42").unwrap();
+        assert_eq!(config.fumarole_preactivation_through_slot, Some(42));
+    }
+
     pub(super) fn fumarole_args() -> Args {
         Args {
             source: IngestSource::Fumarole,
@@ -2166,6 +2196,7 @@ rpc-from-slot: 456
             fumarole_x_token: Some("secret".to_string()),
             fumarole_consumer_group: Some("superbank-mainnet".to_string()),
             fumarole_alpenglow_genesis_slot: Some(1000),
+            fumarole_preactivation_through_slot: None,
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP,

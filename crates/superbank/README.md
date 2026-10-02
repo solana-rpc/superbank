@@ -263,6 +263,8 @@ clickhouse-url: "http://localhost:8123"
 clickhouse-database: "default"
 transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
+# Choose one evidenced bound; replace the placeholder before running:
+fumarole-preactivation-through-slot: <recorded-finalized-slot>
 block-footers-table: "default.block_footers"
 entries-table: "default.entries"
 ```
@@ -281,6 +283,8 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--source` / `SUPERBANK_SOURCE` (required: `fumarole`, `grpc`, `rpc`, `bigtable`, or `solparq`)
 - `--fumarole-endpoint` / `FUMAROLE_ENDPOINT` (required for fumarole source)
 - `--fumarole-x-token` / `FUMAROLE_X_TOKEN` (optional)
+- `--fumarole-alpenglow-genesis-slot` / `FUMAROLE_ALPENGLOW_GENESIS_SLOT` (trusted certificate slot; mutually exclusive with preactivation attestation)
+- `--fumarole-preactivation-through-slot` / `FUMAROLE_PREACTIVATION_THROUGH_SLOT` (explicit offline attestation of a finalized slot recorded before trusted same-cluster authoritative null; see below)
 - `--fumarole-consumer-group` / `FUMAROLE_CONSUMER_GROUP` (required for fumarole source)
 - `--fumarole-create-consumer-group[=true|false]` / `FUMAROLE_CREATE_CONSUMER_GROUP` (default: false)
 - `--fumarole-data-plane-tcp-connections` / `FUMAROLE_DATA_PLANE_TCP_CONNECTIONS` (default: 4; maximum: 20)
@@ -375,7 +379,9 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
 - For gRPC ingest, apply `block_footers.sql` and the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; a footer is written only after its proven winning bank has complete durable data. Fumarole 0.8 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
-- Fumarole requires `--fumarole-alpenglow-genesis-slot` / `FUMAROLE_ALPENGLOW_GENESIS_SLOT` from a trusted genesis certificate. It accepts the genesis block and stops before the next slot; use bank-tagged gRPC for later blocks.
+- Fumarole requires exactly one evidenced historical bound: the certificate's
+  genesis slot or `--fumarole-preactivation-through-slot`. It accepts the bound
+  slot and rejects later blocks; use bank-tagged gRPC for later blocks.
 - `/metrics` includes Fumarole backpressure gauges/counters such as
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
   `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
@@ -426,8 +432,8 @@ reference is deterministic test data; it does not qualify a live Agave producer.
 
 Canonical gRPC and Fumarole writers require `commitment: finalized`. The head cache
 serves speculative banks. Fumarole 0.8 assembles by `(slot, sealed blockhash)`; a
-legacy envelope without a hash permits only one local bank identity. The existing
-trusted `fumarole-alpenglow-genesis-slot` bound remains required: Fumarole does not
+legacy envelope without a hash permits only one local bank identity. An evidenced
+`fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound is required: Fumarole does not
 supply the footer evidence needed for postmigration qualification.
 
 Full blocks are validated before buffering or inserts: exact transaction counts
@@ -460,3 +466,16 @@ for historical replay as well as live traffic.
 A footer is written only after complete winning block data is durable.
 Connection-local counters cannot be joined across subscriptions; sealed
 blockhashes identify Fumarole banks across connections.
+
+### Bounded preactivation runs
+
+When trusted same-cluster `getAgGenesisCert` returns authoritative null, first
+record `getSlot` at finalized commitment from that endpoint, **then** its null
+certificate response. Keep both responses and attest a slot at or below that
+finalized tip with `--fumarole-preactivation-through-slot` /
+`FUMAROLE_PREACTIVATION_THROUGH_SLOT` / `fumarole-preactivation-through-slot`.
+This is operator-supplied offline evidence; Superbank does not fetch it itself.
+Failures, missing evidence and unsupported RPC methods never mean preactivation.
+The run remains bounded and cannot follow future activation. A subsequent run
+requires newly qualified evidence or the certificate's genesis slot; never set
+both bounds. A numeric zero is usable only if actually evidenced.

@@ -561,6 +561,7 @@ mod tests {
             fumarole_x_token: None,
             fumarole_consumer_group: None,
             fumarole_alpenglow_genesis_slot: None,
+            fumarole_preactivation_through_slot: None,
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: 2,

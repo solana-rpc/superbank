@@ -13,10 +13,11 @@ use jetstreamer::JetstreamerRunner;
 use jetstreamer_clickhouse_plugin::{ClickhouseIngestConfig, ClickhouseIngestPlugin};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let recorded_finalized_slot: u64 = std::env::var("JETSTREAMER_PREACTIVATION_THROUGH_SLOT")?.parse()?;
     let threads = 4;
     let config = ClickhouseIngestConfig {
         single_node: false,
-        alpenglow_genesis_slot: Some(0), // replace with the trusted genesis slot
+        preactivation_through_slot: Some(recorded_finalized_slot), // offline attestation described below
         ..Default::default()
     };
     let plugin = ClickhouseIngestPlugin::new(config, threads);
@@ -43,7 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   those entry notifications to populate the `entries` table alongside blocks and transactions.
 - The default configuration writes to `default.entries`, so apply the matching schema set under
   `../../ddl/` and include `entries.sql` before running the plugin.
-- `alpenglow_genesis_slot` or `JETSTREAMER_ALPENGLOW_GENESIS_SLOT` is required.
+- Exactly one of `alpenglow_genesis_slot` / `JETSTREAMER_ALPENGLOW_GENESIS_SLOT` or
+  `preactivation_through_slot` / `JETSTREAMER_PREACTIVATION_THROUGH_SLOT` is required.
   The plugin preserves v1 transaction configuration and basis-point reward commission,
   but rejects later blocks because upstream Jetstreamer does not expose their bank/footer data.
 - The `single_node` toggle defaults to clustered mode. In single-node deployments, keep it
@@ -95,3 +97,19 @@ JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstr
 
 For the stock local Docker ClickHouse setup, that helper also updates the container's
 `default-user.xml` so the host-side Jetstreamer HTTP client can reach `localhost:8123`.
+
+### Preactivation evidence
+
+For a preactivation backfill, record trusted same-cluster `getSlot` at finalized
+commitment **before** an authoritative successful null `getAgGenesisCert` response.
+Retain both responses and attest a slot at or below that finalized tip with
+`preactivation_through_slot` / `JETSTREAMER_PREACTIVATION_THROUGH_SLOT`. The plugin
+trusts this explicit offline attestation and does not discover evidence itself.
+Missing, unsupported, failed or malformed RPC responses cannot qualify this mode.
+The finite bound never advances automatically; requalify evidence for a later run.
+When a certificate exists, use its trusted slot instead, and do not set both bounds.
+
+```sh
+JETSTREAMER_PREACTIVATION_THROUGH_SLOT=<recorded-finalized-slot> \
+cargo run --release --bin jetstreamer-clickhouse -- <historical-start>:<historical-end>
+```

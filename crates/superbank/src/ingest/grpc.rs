@@ -685,7 +685,12 @@ async fn process_canonical_update(
 ) -> Result<()> {
     match update.update_oneof {
         Some(UpdateOneof::Block(block)) => {
-            validate_block_bank(&block, args.source, args.fumarole_alpenglow_genesis_slot)?;
+            validate_block_bank(
+                &block,
+                args.source,
+                args.fumarole_alpenglow_genesis_slot
+                    .or(args.fumarole_preactivation_through_slot),
+            )?;
             ensure!(
                 join.finalized
                     .get(&block.slot)
@@ -1233,7 +1238,12 @@ async fn process_block_update(
     buffered_rows: &mut BufferedRows,
     retry: Option<&RetryConfig>,
 ) -> Result<bool> {
-    validate_block_bank(&block, args.source, args.fumarole_alpenglow_genesis_slot)?;
+    validate_block_bank(
+        &block,
+        args.source,
+        args.fumarole_alpenglow_genesis_slot
+            .or(args.fumarole_preactivation_through_slot),
+    )?;
     let entry_rows = if args.entries_table.is_some() {
         Some(&mut buffered_rows.entry_rows)
     } else {
@@ -1255,10 +1265,10 @@ fn validate_block_bank(
 ) -> Result<()> {
     if source == IngestSource::Fumarole {
         let genesis_slot = fumarole_alpenglow_genesis_slot
-            .context("Fumarole requires its Alpenglow genesis slot bound")?;
+            .context("Fumarole requires an evidenced historical slot bound")?;
         if block.slot > genesis_slot {
             return Err(anyhow!(
-                "legacy Fumarole stream reached Alpenglow slot {}; use the bank-tagged gRPC source",
+                "legacy Fumarole stream exceeded its trusted historical bound at slot {}; qualify a new bound or use the bank-tagged gRPC source",
                 block.slot
             ));
         }
