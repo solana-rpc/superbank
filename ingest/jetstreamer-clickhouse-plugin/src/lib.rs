@@ -37,6 +37,11 @@ pub struct ClickhouseIngestConfig {
     /// Offline attestation: finalized slot observed before trusted same-cluster
     /// getAgGenesisCert returned authoritative null. Never an unbounded mode.
     pub preactivation_through_slot: Option<u64>,
+    /// Trusted same-cluster SIMD-0291 activation slot, independent of Alpenglow.
+    /// Required for commission-bearing block rewards unless whole-percent is attested.
+    pub block_reward_commission_bps_from_slot: Option<u64>,
+    /// Explicit attestation that the entire bounded backfill predates SIMD-0291.
+    pub block_reward_commission_percent: bool,
     /// Max rows per ClickHouse insert batch.
     pub flush_max_rows: u64,
     /// Max bytes per ClickHouse insert batch.
@@ -74,6 +79,8 @@ impl Default for ClickhouseIngestConfig {
             entries_table: "entries".to_string(),
             alpenglow_genesis_slot: None,
             preactivation_through_slot: None,
+            block_reward_commission_bps_from_slot: None,
+            block_reward_commission_percent: false,
             flush_max_rows: 100_000,
             flush_max_bytes: 64 * 1024 * 1024,
             flush_interval_ms: 10_000,
@@ -106,6 +113,12 @@ impl ClickhouseIngestConfig {
 
 fn apply_env_overrides(config: &mut ClickhouseIngestConfig) {
     apply_era_env_override(config);
+    if let Some(value) = env_u64("JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT") {
+        config.block_reward_commission_bps_from_slot = Some(value);
+    }
+    if let Some(value) = env_bool("JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT") {
+        config.block_reward_commission_percent = value;
+    }
     if let Some(value) = env_u64("JETSTREAMER_CLICKHOUSE_FLUSH_MAX_ROWS") {
         config.flush_max_rows = value;
     }
@@ -459,6 +472,44 @@ mod tests {
     }
 
     #[test]
+    fn block_rewards_restore_historical_percent_only_with_qualified_era() {
+        let config = ClickhouseIngestConfig {
+            block_reward_commission_bps_from_slot: Some(100),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::block_reward_commission(&config, 99, Some(700)).unwrap(),
+            (Some(7), None)
+        );
+        assert_eq!(
+            super::block_reward_commission(&config, 100, Some(725)).unwrap(),
+            (None, Some(725))
+        );
+        assert_eq!(
+            super::block_reward_commission(&config, 100, Some(700)).unwrap(),
+            (None, Some(700))
+        );
+        assert!(super::block_reward_commission(&config, 99, Some(725)).is_err());
+        assert!(
+            super::block_reward_commission(&ClickhouseIngestConfig::default(), 99, Some(700))
+                .is_err()
+        );
+        let percent = ClickhouseIngestConfig {
+            block_reward_commission_percent: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::block_reward_commission(&percent, 99, Some(700)).unwrap(),
+            (Some(7), None)
+        );
+        let conflicting = ClickhouseIngestConfig {
+            block_reward_commission_percent: true,
+            ..config
+        };
+        assert!(super::block_reward_commission(&conflicting, 99, Some(700)).is_err());
+    }
+
+    #[test]
     fn transaction_rewards_keep_basis_point_commission() {
         let rewards = vec![Reward {
             pubkey: String::new(),
@@ -735,7 +786,7 @@ impl Plugin for ClickhouseIngestPlugin {
                 return Ok(());
             }
 
-            let block_row = match BlocksMetadataRow::from_block(block) {
+            let block_row = match BlocksMetadataRow::from_block(block, &self.config)? {
                 Some(row) => row,
                 None => return Ok(()),
             };
@@ -1253,8 +1304,47 @@ struct BlocksMetadataRow {
     rewards_num_partitions: Option<u64>,
 }
 
+// The pinned firehose normalizes legacy percent into the runtime bps field.
+// BlockData loses its source-era flag, so only operator-qualified SIMD-0291
+// evidence can decide which archive/RPC column to populate.
+fn block_reward_commission(
+    config: &ClickhouseIngestConfig,
+    slot: u64,
+    normalized_bps: Option<u16>,
+) -> Result<(Option<u8>, Option<u16>), PluginError> {
+    let Some(value) = normalized_bps else {
+        return Ok((None, None));
+    };
+    if config.block_reward_commission_percent
+        == config.block_reward_commission_bps_from_slot.is_some()
+    {
+        return Err(PluginError::new(
+            "commission-bearing block rewards require exactly one qualified SIMD-0291 era setting"
+                .into(),
+        ));
+    }
+    let historical = config.block_reward_commission_percent
+        || config
+            .block_reward_commission_bps_from_slot
+            .is_some_and(|activation| slot < activation);
+    if historical {
+        // Validation of upstream's percent*100 conversion, never era inference.
+        if value > 10_000 || value % 100 != 0 {
+            return Err(PluginError::new(
+                "block reward contradicts the qualified historical percent era".into(),
+            ));
+        }
+        Ok((Some((value / 100) as u8), None))
+    } else {
+        Ok((None, Some(value)))
+    }
+}
+
 impl BlocksMetadataRow {
-    fn from_block(block: &BlockData) -> Option<Self> {
+    fn from_block(
+        block: &BlockData,
+        config: &ClickhouseIngestConfig,
+    ) -> Result<Option<Self>, PluginError> {
         match block {
             BlockData::Block {
                 parent_slot,
@@ -1279,14 +1369,16 @@ impl BlocksMetadataRow {
                     rewards_lamports.push(reward.lamports);
                     rewards_post_balance.push(reward.post_balance);
                     rewards_type.push(Some(reward.reward_type.to_string()));
-                    rewards_commission.push(None);
-                    rewards_commission_bps.push(reward.commission_bps);
+                    let (percent, bps) =
+                        block_reward_commission(config, *slot, reward.commission_bps)?;
+                    rewards_commission.push(percent);
+                    rewards_commission_bps.push(bps);
                 }
 
                 let rewards_present =
                     (!rewards_pubkey.is_empty() || rewards.num_partitions.is_some()) as u8;
 
-                Some(Self {
+                Ok(Some(Self {
                     slot: *slot,
                     parent_slot: *parent_slot,
                     blockhash: blockhash.to_bytes(),
@@ -1303,9 +1395,9 @@ impl BlocksMetadataRow {
                     rewards_commission,
                     rewards_commission_bps,
                     rewards_num_partitions: rewards.num_partitions,
-                })
+                }))
             }
-            BlockData::PossibleLeaderSkipped { .. } => None,
+            BlockData::PossibleLeaderSkipped { .. } => Ok(None),
         }
     }
 }

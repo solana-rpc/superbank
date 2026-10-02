@@ -113,6 +113,10 @@ plugin, and prints verification queries, run:
 JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh
 ```
 
+For commission-bearing Jetstreamer block rewards, separately qualify the
+SIMD-0291 activation or attest a whole-percent historical range; see the
+[plugin commission configuration](ingest/jetstreamer-clickhouse-plugin/README.md#block-reward-commission-era).
+
 That helper also adjusts the local Docker ClickHouse `default` user so the host-side Jetstreamer
 HTTP client can connect to `localhost:8123`.
 

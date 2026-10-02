@@ -39,7 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Transactions and entries are buffered per slot and flushed when the corresponding `on_block`
   arrives so `block_time` is populated from the block metadata.
 - Jetstreamer 0.7 / Agave 4.2 transaction-v1 messages populate the transaction version and
-  transaction config columns. Reward commission basis points are preserved when supplied.
+  transaction config columns. Transaction reward commission fields are preserved as supplied. Block rewards
+  require separate SIMD-0291 era qualification below.
 - Jetstreamer already parses PoH entries while reconstructing blockhashes; this plugin consumes
   those entry notifications to populate the `entries` table alongside blocks and transactions.
 - The default configuration writes to `default.entries`, so apply the matching schema set under
@@ -113,3 +114,20 @@ When a certificate exists, use its trusted slot instead, and do not set both bou
 JETSTREAMER_PREACTIVATION_THROUGH_SLOT=<recorded-finalized-slot> \
 cargo run --release --bin jetstreamer-clickhouse -- <historical-start>:<historical-end>
 ```
+
+### Block reward commission era
+
+The pinned Jetstreamer firehose normalizes a legacy percent commission to runtime
+basis points (`percent * 100`) before emitting `BlockData`; the callback drops the
+source-era flag. Configure `block_reward_commission_bps_from_slot` /
+`JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT` with an evidenced same-cluster
+SIMD-0291 (`commission_rate_in_basis_points`) activation slot. Earlier block rewards
+restore the original percent in `rewards_commission` and leave bps NULL; later
+rewards retain actual bps and leave percent NULL. Alternatively attest that the
+entire bounded range predates that feature with `block_reward_commission_percent`
+/ `JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT=true`. Missing or conflicting era
+settings reject commission-bearing block rewards. Qualify from the cluster's
+feature activation ledger or archived source-field evidence; values, divisibility,
+dates, binary versions and the Alpenglow genesis slot cannot determine this era.
+For example, historical 7% remains 7 with NULL bps, while actual 725 bps remains
+725 with NULL percent. Transaction rewards retain upstream's explicit source fields.
