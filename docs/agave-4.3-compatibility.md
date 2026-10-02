@@ -190,6 +190,14 @@ the current state of a public network or the producer's binary version.
    `processed` readers. A signature retried on a winning slot must acquire that
    slot's projection and token after its abandoned branch is removed. Stored
    finalized data remains slot-keyed and is never treated as a session ID registry.
+   The head subscriber uses ordinary `subscribe_with_request` plus its outer
+   retry loop, not `subscribe_with_reconnect`/`DiscardBanks`. Interruption clears
+   all cached slots, including finalized content, and rebuilds the protocol,
+   block machine and proof chain. Old returned records retain their old bank
+   token and cannot be promoted by reused IDs. Plan for ClickHouse fallback and
+   a temporary loss of head-only data during recovery. Retaining finalized cache
+   content would require generation-aware replacement/discard handling before
+   the metadata and block-machine taps; that continuity is not implemented.
 7. Configure the verifier boundary before postmigration work. Resume can add a
    trusted `None -> Some(G, ID)` boundary only when `next_start <= G + 1`, before
    postboundary slots were verified with historical rules; it persists that

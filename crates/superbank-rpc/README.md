@@ -1527,3 +1527,22 @@ its commitment token reaches the session's configured minimum; the subsequent
 block-machine status event initializes that token before indexes are exposed.
 Reconnect resets the bank session and never carries node-local IDs or proofs
 from the previous subscription.
+
+
+The head subscriber currently uses the pinned client's ordinary
+`subscribe_with_request` and an outer retry loop. A transport interruption drops
+its `CoverageSession`, clears all cached slots (including finalized slots), and
+starts a fresh protocol adapter, block machine and proof chain. Old returned
+records keep their original immutable content and bank token; replacement status
+cannot promote them, even if the node reuses the same bank ID. Requests use the
+configured ClickHouse fallback while the head rebuilds; recent data not yet in
+ClickHouse can temporarily be unavailable.
+
+The client's `subscribe_with_reconnect`/`DiscardBanks` API is not integrated.
+Preserving cached results with that API requires handling connection generations
+and replacement finality/discard decisions before both the metadata tap and
+block machine, resetting legacy protocol evidence and invalidating range proofs
+at each boundary. Feeding only its replacement updates into the existing adapter
+would join unrelated node-local banks. The current full reset deliberately trades
+cache continuity for this explicit session fence; it does not provide retained
+finalized results or seamless replay across reconnects.

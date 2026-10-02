@@ -164,6 +164,35 @@ fn reconnect_reusing_bank_ids_cannot_promote_old_transactions_or_accept_old_even
     let cache = HeadCache::new(32, 64);
     let first = cache.start_bank_session(CommitmentLevel::Processed);
     freeze(&cache, first, 42, 7, 1);
+    let old_meta = cache
+        .get_meta(&Signature::from([1; 64]), CommitmentLevel::Processed)
+        .unwrap();
+    let old_block = cache
+        .get_block(
+            42,
+            CommitmentLevel::Processed,
+            solana_transaction_status::TransactionDetails::Full,
+        )
+        .unwrap();
+    cache.end_bank_session(first);
+    assert!(
+        cache
+            .get_tx(&Signature::from([1; 64]), CommitmentLevel::Processed)
+            .is_none()
+    );
+    assert!(
+        cache
+            .coverage
+            .read()
+            .unwrap()
+            .snapshot(
+                42,
+                None,
+                CommitmentLevel::Processed,
+                std::time::Instant::now()
+            )
+            .is_err()
+    );
     let second = cache.start_bank_session(CommitmentLevel::Processed);
     cache.commit_bank(second, 42, 7, CommitmentLevel::Finalized, Some(41));
     assert!(
@@ -184,6 +213,20 @@ fn reconnect_reusing_bank_ids_cannot_promote_old_transactions_or_accept_old_even
         cache
             .get_tx(&Signature::from([3; 64]), CommitmentLevel::Processed)
             .is_none()
+    );
+    assert_eq!(cache.confirmation_status_string(&old_meta), "processed");
+    assert_eq!(old_block.metadata().blockhash, [1; 32]);
+    assert_eq!(
+        cache
+            .get_block(
+                42,
+                CommitmentLevel::Finalized,
+                solana_transaction_status::TransactionDetails::Full
+            )
+            .unwrap()
+            .metadata()
+            .blockhash,
+        [2; 32]
     );
 }
 
