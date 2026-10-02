@@ -317,21 +317,9 @@ fn convert_rewards(rewards: &[yellowstone_grpc_proto::prelude::Reward]) -> Rewar
 }
 
 pub(super) fn reward_type_to_string(value: i32) -> Option<String> {
-    // Agave 4.3 assigns VATDebit wire value 6. Yellowstone's published enum
-    // stops at 5, but prost preserves the raw i32, including across Fumarole.
-    const NAMES: [&str; 7] = [
-        "",
-        "Fee",
-        "Rent",
-        "Staking",
-        "Voting",
-        "DeactivatedStake",
-        "VATDebit",
-    ];
-    NAMES
-        .get(usize::try_from(value).ok()?)
-        .filter(|name| !name.is_empty())
-        .map(|name| (*name).to_owned())
+    use yellowstone_grpc_proto::prelude::RewardType;
+    let reward_type = RewardType::try_from(value).ok()?;
+    (reward_type != RewardType::Unspecified).then(|| reward_type.as_str_name().to_owned())
 }
 
 fn parse_commission(value: &str) -> Option<u8> {
@@ -657,6 +645,26 @@ mod tests {
 #[cfg(test)]
 mod agave_43_tests {
     use super::*;
+
+    #[test]
+    fn generated_reward_types_preserve_storage_names_and_reject_unknown_values() {
+        for (wire, expected) in [
+            (1, "Fee"),
+            (2, "Rent"),
+            (3, "Staking"),
+            (4, "Voting"),
+            (5, "DeactivatedStake"),
+            (6, "VATDebit"),
+        ] {
+            assert_eq!(
+                super::reward_type_to_string(wire).as_deref(),
+                Some(expected)
+            );
+        }
+        for wire in [i32::MIN, -1, 0, 7, i32::MAX] {
+            assert_eq!(super::reward_type_to_string(wire), None);
+        }
+    }
 
     #[test]
     fn raw_vat_debit_survives_head_cache_reward_conversion() {
