@@ -383,7 +383,7 @@ endpoint is the authority for migration evidence: Superbank validates the respon
 shape but does not independently verify the aggregate BLS signature or cluster
 identity. Do not point it back at this Superbank instance or through a route that
 forwards the call back here. Store credentialed URLs in the environment, outside git.
-For example, run with `--ag-genesis-cert-rpc-url https://your-cluster-rpc.example`.
+For example, run with `--ag-genesis-cert-rpc-url https://your-cluster-rpc.example`. An empty value counts as unset. While the source is unset, the method returns `-32019` with reason `source_not_configured`. Under `--emit-http-errors` that is HTTP 503, so keep health checks and load balancers away from this method on deployments without a source.
 
 The first request bootstraps the source lazily; startup requires valid configuration
 but does not require a reachable provider. Requests share one in-flight fetch with a
@@ -1047,7 +1047,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
 | `--genesis-path` | `GENESIS_PATH` | unset | Path to the target cluster's mounted `genesis.bin`. The server fails startup if a configured file cannot be read or decoded. Leave unset only for the no-warmup fallback. |
-| `--ag-genesis-cert-rpc-url` | `AG_GENESIS_CERT_RPC_URL` | unset | Trusted same-cluster Agave 4.3+ certificate RPC source. Unset keeps startup optional but `getAgGenesisCert` returns an unavailable-source error. |
+| `--ag-genesis-cert-rpc-url` | `AG_GENESIS_CERT_RPC_URL` | unset | Trusted same-cluster Agave 4.3+ certificate RPC source. Unset or empty keeps startup optional but `getAgGenesisCert` returns an unavailable-source error. |
 | `--ag-genesis-cert-rpc-timeout-ms` | `AG_GENESIS_CERT_RPC_TIMEOUT_MS` | `2000` | Positive total source budget, including admission; must be below `RPC_REQUEST_TIMEOUT_MS` when a source is configured. |
 | `--ag-genesis-cert-refresh-interval-secs` | `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` | `5` | Authoritative null TTL (1–300 seconds); certificates stay cached until restart, failures for 1 second. |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |

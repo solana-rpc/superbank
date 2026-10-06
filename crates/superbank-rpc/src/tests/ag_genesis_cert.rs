@@ -489,8 +489,16 @@ fn get_ag_genesis_cert_configuration_validates_source_and_bounds() {
             .upstream
             .is_none()
     );
+    for blank in ["", "  "] {
+        config.ag_genesis_cert_rpc_url = Some(blank.to_string());
+        assert!(
+            AgGenesisCertSource::from_config(&config)
+                .unwrap()
+                .upstream
+                .is_none()
+        );
+    }
     for url in [
-        "",
         "not a URL",
         "ftp://example.com",
         "https://example.com/#fragment",

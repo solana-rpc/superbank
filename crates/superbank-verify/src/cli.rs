@@ -487,12 +487,12 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
         None => HashesPerTickSchedule::mainnet(),
     };
 
-    let alpenglow_genesis_block = parse_optional_alpenglow_genesis(merge_option(
+    let alpenglow_genesis_block = parse_optional_alpenglow_genesis(non_blank(merge_option(
         matches,
         "alpenglow_genesis_block",
         cli.alpenglow_genesis_block,
         config.alpenglow_genesis_block,
-    ))?;
+    )))?;
 
     let anchor_specs = if matches
         .value_source("anchor")
@@ -533,12 +533,12 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
         ),
         expected_genesis_hash,
         hashes_per_tick_schedule,
-        alpenglow_rpc_url: merge_option(
+        alpenglow_rpc_url: non_blank(merge_option(
             matches,
             "alpenglow_rpc_url",
             cli.alpenglow_rpc_url,
             config.alpenglow_rpc_url,
-        ),
+        )),
         alpenglow_genesis_block,
         window_slots: merge_value(
             matches,
@@ -657,6 +657,12 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
 
     validate_args(&args)?;
     Ok(args)
+}
+
+fn non_blank(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_optional_alpenglow_genesis(spec: Option<String>) -> Result<Option<(u64, [u8; 32])>> {

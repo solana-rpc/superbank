@@ -86,13 +86,18 @@ pub(crate) struct AgGenesisCertSource {
 
 impl AgGenesisCertSource {
     pub(crate) fn from_config(config: &RpcConfig) -> Result<Self, &'static str> {
-        let Some(url) = config.ag_genesis_cert_rpc_url.as_deref() else {
+        let Some(url) = config
+            .ag_genesis_cert_rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        else {
             return Ok(Self::default());
         };
         if config.ag_genesis_cert_rpc_timeout_ms >= config.rpc_request_timeout_ms {
             return Err("AG_GENESIS_CERT_RPC_TIMEOUT_MS must be below RPC_REQUEST_TIMEOUT_MS");
         }
-        let url = Url::parse(url.trim()).map_err(|_| "Invalid AG_GENESIS_CERT_RPC_URL")?;
+        let url = Url::parse(url).map_err(|_| "Invalid AG_GENESIS_CERT_RPC_URL")?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
             || url.fragment().is_some()
