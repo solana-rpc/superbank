@@ -89,12 +89,22 @@ impl HeadCoverage {
     }
 
     pub(crate) fn invalidate_branch(&mut self, slot: u64) {
+        // Only children that name the invalidated bank's hash descend from it.
+        let old_hash = self
+            .nodes
+            .get(&slot)
+            .and_then(|node| node.link)
+            .map(|link| link.hash);
         self.invalidate(slot);
-        let mut invalid = std::collections::BTreeSet::from([slot]);
+        let mut invalid = BTreeMap::from([(slot, old_hash)]);
         for (&slot, node) in self.nodes.range_mut(slot..) {
-            if node.link.is_some_and(|link| invalid.contains(&link.parent)) {
+            let Some(link) = node.link else { continue };
+            if invalid
+                .get(&link.parent)
+                .is_some_and(|hash| hash.is_none_or(|hash| hash == link.parent_hash))
+            {
                 node.invalid = true;
-                invalid.insert(slot);
+                invalid.insert(slot, Some(link.hash));
             }
         }
     }
@@ -516,5 +526,35 @@ mod tests {
         let (end, proof, clamped) = state.snapshot_clamped(10, 20, finalized, now);
         assert_eq!((end, clamped), (20, false));
         assert!(proof.intervals.is_empty());
+    }
+
+    #[test]
+    fn replacing_a_bank_keeps_children_built_on_the_winner() {
+        let now = Instant::now();
+        let mut state = HeadCoverage::default();
+        state.connect();
+        add(&mut state, 10, 9, now);
+        add(&mut state, 11, 10, now);
+        let winner = Link {
+            hash: [99; 32],
+            ..link(11, 10)
+        };
+        let child = Link {
+            parent_hash: [99; 32],
+            ..link(12, 11)
+        };
+        let orphan_child = link(13, 12);
+        state.metadata(child);
+        state.metadata(orphan_child);
+        state.observe(13, CommitmentLevel::Finalized, now);
+        state.publish(12, CommitmentLevel::Finalized);
+        state.publish(13, CommitmentLevel::Finalized);
+        state.invalidate_branch(11);
+        state.select_bank(winner);
+        state.publish(11, CommitmentLevel::Finalized);
+        let (_, proof) = state
+            .snapshot(10, None, CommitmentLevel::Finalized, now)
+            .unwrap();
+        assert_eq!(proof.slots, vec![10, 11, 12, 13]);
     }
 }
