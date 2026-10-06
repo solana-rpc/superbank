@@ -35,6 +35,6 @@ ALTER TABLE default.blocks_metadata
 ALTER TABLE default.blocks_metadata
     ADD COLUMN IF NOT EXISTS bank_id Nullable(UInt64) DEFAULT NULL AFTER parent_blockhash;
 
--- Repair columns added by earlier releases without an explicit default.
+-- Give these columns an explicit default.
 ALTER TABLE default.blocks_metadata
     MODIFY COLUMN bank_id Nullable(UInt64) DEFAULT NULL;

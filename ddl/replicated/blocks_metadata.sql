@@ -60,10 +60,10 @@ ALTER TABLE default.blocks_metadata_local ON CLUSTER '{cluster}'
 ALTER TABLE default.blocks_metadata ON CLUSTER '{cluster}'
     ADD COLUMN IF NOT EXISTS bank_id Nullable(UInt64) DEFAULT NULL AFTER parent_blockhash;
 
--- Repair columns added by earlier releases without an explicit default.
+-- Give these columns an explicit default.
 ALTER TABLE default.blocks_metadata_local ON CLUSTER '{cluster}'
     MODIFY COLUMN bank_id Nullable(UInt64) DEFAULT NULL;
 
--- Repair columns added by earlier releases without an explicit default.
+-- Give these columns an explicit default.
 ALTER TABLE default.blocks_metadata ON CLUSTER '{cluster}'
     MODIFY COLUMN bank_id Nullable(UInt64) DEFAULT NULL;
