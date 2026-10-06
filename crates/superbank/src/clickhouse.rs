@@ -278,6 +278,17 @@ impl FooterWriter {
         }
     }
 
+    pub(crate) async fn probe(&self) -> Result<()> {
+        let query = self.client.query(
+            "SELECT slot, bank_id, bank_hash, block_producer_time_nanos, block_user_agent FROM ? LIMIT 0",
+        );
+        let query = query.bind(clickhouse::sql::Identifier(&self.table));
+        tokio::time::timeout(Duration::from_secs(5), query.execute())
+            .await
+            .context("footer storage probe timed out")??;
+        Ok(())
+    }
+
     pub(crate) async fn insert(
         &self,
         rows: &[BlockFooterRow],

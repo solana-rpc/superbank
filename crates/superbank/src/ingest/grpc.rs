@@ -24,16 +24,17 @@ use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
-    SlotStatus, SubscribeRequest, SubscribeRequestFilterBlockFooter, SubscribeRequestFilterBlocks,
-    SubscribeRequestFilterSlots, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateBlockFooter,
-    SubscribeUpdateEntry, SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
+    CommitmentLevel, SlotStatus, SubscribeRequest, SubscribeRequestFilterBlockFooter,
+    SubscribeRequestFilterBlocks, SubscribeRequestFilterSlots, SubscribeUpdate,
+    SubscribeUpdateBlock, SubscribeUpdateBlockFooter, SubscribeUpdateEntry,
+    SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
 };
 
 use crate::cli::{Args, FromSlotSpec, IngestSource};
 use crate::clickhouse::{
     BlockFooterRow, BlockMetadataRow, EntryRow, FooterWriter, InsertTables, RetryConfig,
     TransactionRow, build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers,
-    flush_buffers_with_retry, split_qualified_table,
+    flush_buffers_with_retry,
 };
 use crate::commitment::parse_durable_commitment;
 use crate::metrics;
@@ -156,6 +157,7 @@ impl BufferedRows {
 
 const FOOTER_BATCH_ROWS: usize = 256;
 const FOOTER_JOIN_WINDOW_SLOTS: u64 = 8192;
+const FOOTER_REQUALIFY_INTERVAL: Duration = Duration::from_secs(30);
 const PENDING_IDENTITY_MAX_BLOCKS: usize = 256;
 const PENDING_IDENTITY_MAX_BYTES: usize = 128 * 1024 * 1024;
 
@@ -194,6 +196,8 @@ struct FinalizedFooterJoin {
     completed: HashSet<(u64, u64)>,
     complete_blocks: HashSet<(u64, u64)>,
     durable_blocks: HashSet<(u64, u64)>,
+    footer_requalify_at: Option<tokio::time::Instant>,
+    footer_seen: bool,
     footer_storage_available: Option<bool>,
     footer_writer: Option<FooterWriter>,
     highest_slot: u64,
@@ -282,6 +286,7 @@ impl FinalizedFooterJoin {
         );
         let row = map_block_footer(footer)?;
         let key = (row.slot, row.bank_id);
+        self.footer_seen = true;
         self.highest_slot = self.highest_slot.max(row.slot);
         if self
             .finalized
@@ -388,17 +393,29 @@ impl FinalizedFooterJoin {
         })
     }
 
+    // Before the first footer arrives the cluster may not emit footers, so nothing is missing.
+    fn missing_footers(&self, oldest: u64) -> Vec<(u64, u64)> {
+        if !self.footer_seen {
+            return Vec::new();
+        }
+        self.finalized
+            .iter()
+            .filter(|&(&slot, &bank_id)| {
+                slot < oldest && !self.completed.contains(&(slot, bank_id))
+            })
+            .map(|(&slot, &bank_id)| (slot, bank_id))
+            .collect()
+    }
+
     fn prune(&mut self) -> Result<()> {
         let oldest = self.highest_slot.saturating_sub(FOOTER_JOIN_WINDOW_SLOTS);
-        for (&slot, &bank_id) in &self.finalized {
-            if slot < oldest && !self.completed.contains(&(slot, bank_id)) {
-                metrics::observe_source_error("grpc_footer", "missing");
-                warn!(
-                    slot,
-                    bank_id,
-                    "footer unavailable in join window; canonical data remains valid, replay may not supply footers"
-                );
-            }
+        for (slot, bank_id) in self.missing_footers(oldest) {
+            metrics::observe_source_error("grpc_footer", "missing");
+            warn!(
+                slot,
+                bank_id,
+                "footer unavailable in join window; canonical data remains valid, replay may not supply footers"
+            );
         }
         self.ready_footers.retain(|footer| {
             if footer.slot < oldest {
@@ -427,30 +444,22 @@ impl FinalizedFooterJoin {
     }
 }
 
-// Ancillary footer persistence uses a fixed best-effort policy. Startup must
-// qualify the table's columns; it never qualifies identity or replay availability.
+// Ancillary footer persistence is best-effort. Qualification checks the table columns only.
 async fn qualify_footer_storage(client: &ClickHouseClient, table: &str) -> bool {
-    let (client, table) = match split_qualified_table(table) {
-        Some((database, name)) => (client.clone().with_database(database), name),
-        None => (client.clone(), table),
-    };
-    let result = tokio::time::timeout(Duration::from_secs(5), client.query(
-        "SELECT slot, bank_id, bank_hash, block_producer_time_nanos, block_user_agent FROM ? LIMIT 0"
-    ).bind(clickhouse::sql::Identifier(table)).execute()).await;
-    match result {
-        Ok(Ok(())) => {
+    match FooterWriter::new(client, table).probe().await {
+        Ok(()) => {
             info!(
                 table,
                 "footer storage qualified; using best-effort ancillary persistence"
             );
             true
         }
-        error => {
+        Err(error) => {
             metrics::observe_source_error("grpc_footer", "startup_unavailable");
             warn!(
                 table,
-                ?error,
-                "footer storage unqualified; disabling ancillary footer writes for this session, canonical ingestion remains enabled"
+                %error,
+                "footer storage unqualified; retaining footers and re-probing, canonical ingestion remains enabled"
             );
             false
         }
@@ -495,16 +504,13 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     let mut shutdown_rx = spawn_shutdown_watch();
     let mut last_processed_block_slot = None;
     let (health_failure_tx, mut health_failure_rx) = mpsc::unbounded_channel();
+    let mut _health_watch_guard = AbortTaskGuard::default();
     let _health_failure_guard = if args.grpc_health_watch_enabled {
+        _health_watch_guard.set(start_grpc_health_watch(endpoint, args, health_failure_tx).await?);
         None
     } else {
-        Some(health_failure_tx.clone())
+        Some(health_failure_tx)
     };
-    let mut _health_watch_guard = AbortTaskGuard::default();
-    if args.grpc_health_watch_enabled {
-        _health_watch_guard
-            .set(start_grpc_health_watch(endpoint, args, health_failure_tx.clone()).await?);
-    }
 
     let subscribe_from_slot =
         next_subscribe_from_slot(initial_from_slot, buffered_rows.last_durable_block_slot)?;
@@ -512,10 +518,12 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
         initial_from_slot_mode,
         buffered_rows.last_durable_block_slot,
     );
+    let footer_storage_available =
+        qualify_footer_storage(&clickhouse, &args.block_footers_table).await;
     let mut footer_join = FinalizedFooterJoin {
-        footer_storage_available: Some(
-            qualify_footer_storage(&clickhouse, &args.block_footers_table).await,
-        ),
+        footer_requalify_at: (!footer_storage_available)
+            .then(|| tokio::time::Instant::now() + FOOTER_REQUALIFY_INTERVAL),
+        footer_storage_available: Some(footer_storage_available),
         ..Default::default()
     };
     let (pending_update, mut stream) = connect_grpc_stream(
@@ -620,7 +628,9 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                             last_processed_block_slot = Some(slot);
                             metrics::set_last_processed_slot(slot);
                         }
-                        if let Some(UpdateOneof::Slot(slot_update)) = &update.update_oneof {
+                        if let Some(UpdateOneof::Slot(slot_update)) = &update.update_oneof
+                            && Some(slot_update.status) == commitment_slot_status(commitment)
+                        {
                             metrics::set_network_tip_slot(slot_update.slot);
                         }
                         process_canonical_update(
@@ -707,6 +717,14 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn commitment_slot_status(commitment: i32) -> Option<i32> {
+    match CommitmentLevel::try_from(commitment).ok()? {
+        CommitmentLevel::Processed => Some(SlotStatus::SlotProcessed as i32),
+        CommitmentLevel::Confirmed => Some(SlotStatus::SlotConfirmed as i32),
+        CommitmentLevel::Finalized => Some(SlotStatus::SlotFinalized as i32),
+    }
 }
 
 fn grpc_auxiliary_source(reason: &str) -> &'static str {
@@ -815,7 +833,7 @@ async fn process_canonical_update_inner(
     } else {
         // Durable earlier banks can bypass a later identity hold without
         // flushing held block data or advancing the metadata resume tip.
-        flush_ready_footers(join, Some(retry)).await;
+        flush_ready_footers(join).await;
     }
     Ok(())
 }
@@ -851,7 +869,7 @@ fn buffer_identified_block(
     }
 }
 
-async fn flush_ready_footers(join: &mut FinalizedFooterJoin, retry: Option<&RetryConfig>) {
+async fn flush_ready_footers(join: &mut FinalizedFooterJoin) {
     let (durable, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut join.ready_footers)
         .into_iter()
         .partition(|footer| join.durable_blocks.contains(&(footer.slot, footer.bank_id)));
@@ -859,19 +877,30 @@ async fn flush_ready_footers(join: &mut FinalizedFooterJoin, retry: Option<&Retr
     if durable.is_empty() {
         return;
     }
-    if join.footer_storage_available == Some(false) {
-        for _ in &durable {
-            metrics::observe_source_error("grpc_footer", "storage_disabled");
-        }
-        return;
-    }
     let Some(writer) = &join.footer_writer else {
         join.ready_footers.extend(durable);
         return;
     };
-    if let Err(error) = writer.insert(&durable, retry).await {
+    if join.footer_storage_available == Some(false) {
+        let now = tokio::time::Instant::now();
+        if join.footer_requalify_at.is_some_and(|at| now < at) {
+            join.ready_footers.extend(durable);
+            return;
+        }
+        if let Err(error) = writer.probe().await {
+            metrics::observe_source_error("grpc_footer", "storage_disabled");
+            warn!(%error, "footer storage still unavailable; retaining footers within the join window");
+            join.footer_requalify_at = Some(now + FOOTER_REQUALIFY_INTERVAL);
+            join.ready_footers.extend(durable);
+            return;
+        }
+        join.footer_storage_available = Some(true);
+        join.footer_requalify_at = None;
+    }
+    // A single attempt keeps a footer-only outage from stalling canonical ingestion.
+    if let Err(error) = writer.insert(&durable, None).await {
         metrics::observe_source_error("grpc_footer", "insert_failed");
-        warn!(rows = durable.len(), %error, "footer batch exhausted retries; retaining bounded batch while canonical ingestion continues");
+        warn!(rows = durable.len(), %error, "footer batch insert failed; retaining bounded batch while canonical ingestion continues");
         join.ready_footers.extend(durable);
     }
 }
@@ -884,7 +913,7 @@ async fn flush_canonical_rows(
     join: &mut FinalizedFooterJoin,
 ) -> Result<bool> {
     if !join.pending_identity.is_empty() {
-        flush_ready_footers(join, retry).await;
+        flush_ready_footers(join).await;
         warn!(
             first_pending_slot = join
                 .pending_identity
@@ -906,7 +935,7 @@ async fn flush_canonical_rows(
     }
     // Mark only after the entire transaction/metadata/entry flush succeeds.
     join.durable_blocks.extend(banks);
-    flush_ready_footers(join, retry).await;
+    flush_ready_footers(join).await;
     Ok(true)
 }
 
@@ -2413,6 +2442,30 @@ mod tests {
                 .is_ok()
         );
         assert!(!join.finalized.contains_key(&42));
+    }
+
+    #[test]
+    fn missing_footers_are_reported_only_after_footers_have_started() {
+        let mut join = FinalizedFooterJoin::default();
+        join.observe(slot_update(1, 7, SlotStatus::SlotFinalized))
+            .unwrap();
+        assert!(join.missing_footers(100).is_empty());
+        join.observe(footer_update(50, 8)).unwrap();
+        assert_eq!(join.missing_footers(100), vec![(1, 7)]);
+        assert!(join.missing_footers(1).is_empty());
+    }
+
+    #[test]
+    fn commitment_slot_status_matches_the_durable_commitment() {
+        assert_eq!(
+            super::commitment_slot_status(super::CommitmentLevel::Finalized as i32),
+            Some(SlotStatus::SlotFinalized as i32)
+        );
+        assert_eq!(
+            super::commitment_slot_status(super::CommitmentLevel::Processed as i32),
+            Some(SlotStatus::SlotProcessed as i32)
+        );
+        assert_eq!(super::commitment_slot_status(99), None);
     }
 
     #[test]

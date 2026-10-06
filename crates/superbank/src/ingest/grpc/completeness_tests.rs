@@ -962,10 +962,7 @@ async fn absent_or_failed_footer_storage_cannot_stop_valid_canonical_data() {
             .unwrap();
         }
         assert_eq!(rows.last_durable_block_slot, Some(43));
-        assert_eq!(
-            join.ready_footers.len(),
-            usize::from(availability == Some(true))
-        );
+        assert_eq!(join.ready_footers.len(), 1);
     }
     let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(
@@ -1086,4 +1083,80 @@ async fn native_footer_startup_qualifies_fqn_and_rejects_absent_table() {
         .execute()
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn footer_outage_makes_one_attempt_and_storage_recovers_lazily() {
+    use axum::{Router, body::Body, extract::Request, http::StatusCode};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    metrics::force_init("grpc", None);
+    let healthy = std::sync::Arc::new(AtomicBool::new(false));
+    let requests = std::sync::Arc::new(AtomicUsize::new(0));
+    let app = Router::new().fallback({
+        let (healthy, requests) = (healthy.clone(), requests.clone());
+        move |_request: Request<Body>| {
+            let (healthy, requests) = (healthy.clone(), requests.clone());
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                if healthy.load(Ordering::SeqCst) {
+                    (StatusCode::OK, "Ok")
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "footer table unavailable",
+                    )
+                }
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClickHouseClient::default()
+        .with_url(format!("http://{addr}"))
+        .with_validation(false)
+        .with_compression(clickhouse::Compression::None);
+    let row = map_block_footer(&SubscribeUpdateBlockFooter {
+        slot: 42,
+        bank_id: 7,
+        bank_hash: vec![9; 32],
+        ..Default::default()
+    })
+    .unwrap();
+    let new_join = |available| {
+        let mut join = FinalizedFooterJoin {
+            footer_storage_available: available,
+            footer_writer: Some(FooterWriter::new(&client, "block_footers")),
+            ..Default::default()
+        };
+        join.durable_blocks.insert((42, 7));
+        join.ready_footers.push(row.clone());
+        join
+    };
+
+    let mut join = new_join(Some(true));
+    flush_ready_footers(&mut join).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "no inline retries");
+    assert_eq!(join.ready_footers.len(), 1);
+
+    requests.store(0, Ordering::SeqCst);
+    let mut join = new_join(Some(false));
+    flush_ready_footers(&mut join).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "one probe, no insert");
+    assert!(join.footer_requalify_at.is_some());
+    flush_ready_footers(&mut join).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "probes are rate limited"
+    );
+    assert_eq!(join.ready_footers.len(), 1);
+
+    healthy.store(true, Ordering::SeqCst);
+    join.footer_requalify_at = Some(tokio::time::Instant::now());
+    flush_ready_footers(&mut join).await;
+    assert_eq!(join.footer_storage_available, Some(true));
+    assert!(join.ready_footers.is_empty());
+    server.abort();
 }
