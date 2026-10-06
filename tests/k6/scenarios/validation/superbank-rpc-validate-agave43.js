@@ -19,7 +19,13 @@ function rpc(endpoint, method, params) {
   });
   if (!check(response, { 'HTTP 200': (r) => r.status === 200 })) fail('RPC HTTP failure');
   let body;
-  try { body = response.json(); } catch (_) { fail('RPC returned invalid JSON'); }
+  try {
+    body = response.json();
+  } catch (_) {
+    // A recorded failed check makes the checks threshold fail; fail() alone ends the iteration with exit 0.
+    check(response, { 'JSON body': () => false });
+    fail('RPC returned invalid JSON');
+  }
   if (!check(body, { 'JSON-RPC object': (b) => b !== null && typeof b === 'object' && !Array.isArray(b) })) {
     fail('RPC returned an invalid envelope');
   }
