@@ -195,7 +195,7 @@ the current state of a public network or the producer's binary version.
    all cached slots, including finalized content, and rebuilds the protocol,
    block machine and proof chain. Old returned records retain their old bank
    token and cannot be promoted by reused IDs. Plan for ClickHouse fallback and
-   a temporary loss of head-only data during recovery. Retaining finalized cache
+   a temporary loss of head-only data during recovery. Until ClickHouse ingestion catches up, `isBlockhashValid` at `processed`/`confirmed` can return `false` for a recent blockhash, the latest-slot methods regress to the finalized tip, and head-only paging and `getBlocks` without `endSlot` can error. Retaining finalized cache
    content would require generation-aware replacement/discard handling before
    the metadata and block-machine taps; that continuity is not implemented.
 7. Configure the verifier boundary before postmigration work. Resume can add a

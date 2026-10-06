@@ -609,9 +609,8 @@ Configuration:
 | `--grpc-max-decoding-bytes` | `GRPC_MAX_DECODING_BYTES` | `67108864` | Max gRPC decoding message size. |
 
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
-The optional `grpc-head-cache` feature pulls in Yellowstone gRPC client and protobuf crates
-(also AGPL-3.0). A 4.3 producer must supply bank IDs; bank replacement evicts the
-replaced slot and its cached descendants.
+The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (AGPL-3.0) and the Yellowstone gRPC client and protobuf crates (Apache-2.0).
+A 4.3 producer must supply bank IDs. Bank replacement evicts the replaced slot and invalidates the coverage proof of descendants that name the replaced bank's hash as their parent. Descendants built on the winning bank keep their proof.
 
 ## Optional local ClickHouse forward cache (`disk-cache`)
 
@@ -1537,6 +1536,8 @@ records keep their original immutable content and bank token; replacement status
 cannot promote them, even if the node reuses the same bank ID. Requests use the
 configured ClickHouse fallback while the head rebuilds; recent data not yet in
 ClickHouse can temporarily be unavailable.
+
+Until ClickHouse ingestion passes the slots the head held before the drop, usually tens of seconds on TowerBFT, clients can see more than missing data. `isBlockhashValid` at `processed` or `confirmed` returns `false` for a blockhash newer than the ClickHouse finalized tip. `getSlot`, `getBlockHeight`, `getTransactionCount` and `getLatestBlockhash` regress to the finalized tip, and `minContextSlot` callers can get -32016. Head-only `getSignaturesForAddress` cursors return an error, and `getBlocks` without `endSlot` returns -32603. Watch `superbank_head_cache_reconnects_total` and retry these calls during that window.
 
 The client's `subscribe_with_reconnect`/`DiscardBanks` API is not integrated.
 Preserving cached results with that API requires handling connection generations
