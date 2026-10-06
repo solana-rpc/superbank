@@ -1161,16 +1161,6 @@ concurrent coverage publication, absent signatures, skipped slots, and stale pos
 
 ### Agave 4.3 request parity
 
-The standard runner always runs the Agave 4.3 request-contract scenario. Set
-`INFLATION_REWARD_MAX_ADDRESSES` to the target's effective limit (default 100;
-zero skips the target limit check). The scenario accepts integers 0–100000 to
-bound its generated request size; larger configured limits need separate testing.
-Set `AGAVE43_REFERENCE_RPC_URL` explicitly to also check the standard methods
-against a reference. The scenario checks `getVersion` and rejects versions outside
-4.3.x; a reported version does not independently certify the deployment.
+The standard runner always runs the Agave 4.3 request-contract scenario. Set `INFLATION_REWARD_MAX_ADDRESSES` to the target's effective limit (default 100; zero skips the target limit check). The scenario accepts integers 0–100000 to bound its generated request size; larger configured limits need separate testing. Set `AGAVE43_REFERENCE_RPC_URL` explicitly to also check the standard methods against a reference. The scenario checks `getVersion` and rejects versions outside 4.3.x; a reported version does not independently certify the deployment.
 
-The reference uses Agave's 32-address limit; the target uses its configured limit.
-`getTransactionsForAddress` is tested only on Superbank. These are request-level
-error checks and do not establish stored-data, successful-response, or producer
-parity. Existing method comparison scenarios cover successful responses when
-appropriate shared fixtures and endpoints are available.
+The reference uses Agave's 32-address limit; the target uses its configured limit. `getTransactionsForAddress` is tested only on Superbank. These are request-level error checks and do not establish stored-data, successful-response, or producer parity. Existing method comparison scenarios cover successful responses when appropriate shared fixtures and endpoints are available.

@@ -114,9 +114,7 @@ JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
 JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh
 ```
 
-For commission-bearing Jetstreamer block rewards, separately qualify the
-SIMD-0291 activation or attest a whole-percent historical range; see the
-[plugin commission configuration](ingest/jetstreamer-clickhouse-plugin/README.md#block-reward-commission-era).
+For commission-bearing Jetstreamer block rewards, separately qualify the SIMD-0291 activation or attest a whole-percent historical range; see the [plugin commission configuration](ingest/jetstreamer-clickhouse-plugin/README.md#block-reward-commission-era).
 
 That helper also adjusts the local Docker ClickHouse `default` user so the host-side Jetstreamer
 HTTP client can connect to `localhost:8123`.
@@ -188,29 +186,10 @@ curl -sS http://localhost:8899 \
 
 ## Configuration
 
-Before activation, a trusted same-cluster `getAgGenesisCert` can successfully return
-`null`. For a bounded historical Fumarole or Jetstreamer run, first record the same
-endpoint's `getSlot` with finalized commitment, then obtain its authoritative null
-certificate response. Keep both responses as operational evidence and set
-`FUMAROLE_PREACTIVATION_THROUGH_SLOT` or `JETSTREAMER_PREACTIVATION_THROUGH_SLOT`
-to that recorded finalized slot (or an earlier slot). These settings are explicit
-offline attestations by the operator; neither binary discovers or validates that
-external evidence. A missing, unsupported, failed or malformed certificate response
-cannot qualify this mode. The bound never advances automatically; qualify a new
-snapshot for further historical work, or use the trusted certificate slot once
-one exists. Do not configure both genesis and preactivation bounds. Slot zero is
-valid only when actually evidenced, never a placeholder for an unknown boundary.
+Before activation, a trusted same-cluster `getAgGenesisCert` can successfully return `null`. For a bounded historical Fumarole or Jetstreamer run, first record the same endpoint's `getSlot` with finalized commitment, then obtain its authoritative null certificate response. Keep both responses as operational evidence and set `FUMAROLE_PREACTIVATION_THROUGH_SLOT` or `JETSTREAMER_PREACTIVATION_THROUGH_SLOT` to that recorded finalized slot (or an earlier slot). These settings are explicit offline attestations by the operator; neither binary discovers or validates that external evidence. A missing, unsupported, failed or malformed certificate response cannot qualify this mode. The bound never advances automatically; qualify a new snapshot for further historical work, or use the trusted certificate slot once one exists. Do not configure both genesis and preactivation bounds. Slot zero is valid only when actually evidenced, never a placeholder for an unknown boundary.
 
 
-`superbank-rpc` serves `getAgGenesisCert` from an explicitly trusted, same-cluster
-Agave 4.3+ RPC endpoint configured by `AG_GENESIS_CERT_RPC_URL` (or
-`--ag-genesis-cert-rpc-url`). Its bounded lazy fetch caches authoritative `null` for
-`AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` (default 5 seconds), failures for one second,
-and the immutable certificate for the process lifetime. Set
-`AG_GENESIS_CERT_RPC_TIMEOUT_MS` (default 2000 ms) below `RPC_REQUEST_TIMEOUT_MS`.
-A missing, unsupported, malformed, or unavailable source returns an error, never
-an inferred pre-migration `null`. Configuration is optional for existing deployments;
-see the [certificate source and trust boundary](crates/superbank-rpc/README.md#alpenglow-genesis-certificate-source).
+`superbank-rpc` serves `getAgGenesisCert` from an explicitly trusted, same-cluster Agave 4.3+ RPC endpoint configured by `AG_GENESIS_CERT_RPC_URL` (or `--ag-genesis-cert-rpc-url`). Its bounded lazy fetch caches authoritative `null` for `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` (default 5 seconds), failures for one second, and the immutable certificate for the process lifetime. Set `AG_GENESIS_CERT_RPC_TIMEOUT_MS` (default 2000 ms) below `RPC_REQUEST_TIMEOUT_MS`. A missing, unsupported, malformed, or unavailable source returns an error, never an inferred pre-migration `null`. Configuration is optional for existing deployments; see the [certificate source and trust boundary](crates/superbank-rpc/README.md#alpenglow-genesis-certificate-source).
 
 Address history requests share a separate `DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` cache budget
 (default `100` ms) across signature bounds, address scans, and transaction hydration. Expiry
@@ -243,12 +222,7 @@ their existing behavior. Use `rbx2` for RBX2 or an empty value for standalone Cl
   It can also read RPC parameter filters from the shared YAML file when started
   with `--config superbank.yaml` / `SUPERBANK_CONFIG=superbank.yaml`.
   See `crates/superbank-rpc/README.md`.
-- `superbank-solparq` hourly archives use a nominal cluster slot cadence:
-  `--hourly-slot-duration-ms` / `SOLPARQ_HOURLY_SLOT_DURATION_MS` defaults to
-  `400` (9000 slots); set `200` for 18000-slot hourly windows on a 200 ms cluster.
-  Cadence changes separately from Alpenglow activation. Epoch/custom ranges and
-  existing archive names remain compatible. See the
-  [hourly archive cadence and transition guidance](crates/superbank-solparq/README.md#hourly-slot-cadence).
+- `superbank-solparq` hourly archives use a nominal cluster slot cadence: `--hourly-slot-duration-ms` / `SOLPARQ_HOURLY_SLOT_DURATION_MS` defaults to `400` (9000 slots); set `200` for 18000-slot hourly windows on a 200 ms cluster. Cadence changes separately from Alpenglow activation. Epoch/custom ranges and existing archive names remain compatible. See the [hourly archive cadence and transition guidance](crates/superbank-solparq/README.md#hourly-slot-cadence).
 
 ## Docker local development
 
@@ -426,8 +400,7 @@ rows already present on the target by exact table key instead of failing the run
 
 ## Development
 
-Build with Rust **1.97.1**, pinned in `rust-toolchain.toml`. See the
-[Agave 4.3 compatibility and rollout notes](docs/agave-4.3-compatibility.md).
+Build with Rust **1.97.1**, pinned in `rust-toolchain.toml`. See the [Agave 4.3 compatibility and rollout notes](docs/agave-4.3-compatibility.md).
 
 ```bash
 cargo build -p superbank -p superbank-rpc -p superbank-solparq -p superbank-verify
@@ -448,9 +421,7 @@ scripts/dev/run-local-rpc.sh
 ### Nix (flakes)
 
 This repo includes a Nix flake with a dev shell that provides `tilt`, `docker`, `kubectl`, `kind`,
-Rust tooling, `k6`, and common CLI utilities. The locked `rust-overlay` reads
-`rust-toolchain.toml`, including `rustfmt` and `clippy`, so the shell uses the same
-exact compiler as non-Nix builds rather than the compiler bundled with nixpkgs.
+Rust tooling, `k6`, and common CLI utilities. The locked `rust-overlay` reads `rust-toolchain.toml`, including `rustfmt` and `clippy`, so the shell uses the same exact compiler as non-Nix builds rather than the compiler bundled with nixpkgs.
 
 Enable flakes (if needed):
 
