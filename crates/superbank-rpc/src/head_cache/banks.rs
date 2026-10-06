@@ -167,7 +167,16 @@ impl HeadCache {
             return;
         }
         if !complete_bank(bank, slot, &transactions) {
-            tracing::warn!(slot, bank_id, "head cache: incomplete or malformed bank");
+            tracing::warn!(
+                slot,
+                bank_id,
+                expected_transactions = bank
+                    .metadata
+                    .as_ref()
+                    .map(|meta| meta.executed_transaction_count),
+                received_transactions = transactions.len(),
+                "head cache: incomplete or malformed bank"
+            );
             return;
         }
         bank.sealed_hash = Some(hash);
