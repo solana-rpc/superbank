@@ -609,7 +609,7 @@ Configuration:
 | `--grpc-max-decoding-bytes` | `GRPC_MAX_DECODING_BYTES` | `67108864` | Max gRPC decoding message size. |
 
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
-The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (AGPL-3.0) and the Yellowstone gRPC client and protobuf crates (Apache-2.0).
+The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine`, which is AGPL-3.0. The Yellowstone gRPC client and protobuf crates it also uses are Apache-2.0.
 A 4.3 producer must supply bank IDs. Bank replacement evicts the replaced slot and invalidates the coverage proof of descendants that name the replaced bank's hash as their parent. Descendants built on the winning bank keep their proof.
 
 ## Optional local ClickHouse forward cache (`disk-cache`)

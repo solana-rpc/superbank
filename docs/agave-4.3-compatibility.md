@@ -60,14 +60,11 @@ Run the basic k6 scenario and affected method comparisons described in
 and a version-verified Agave 4.3 reference. Record missing external coverage;
 passing unit tests does not establish live parity.
 
-## Local acceptance (2026-09-18)
+## Local acceptance
 
-Implemented on `feat/agave-4.3` after pulling main to `382acdd`. The ten commits
-separate request errors, encoding validation, dependency/VAT support, Bigtable
-fixtures, confidential parsers, cached encoding matrices, disk reward preservation,
-archive preservation, inflation exclusion, and acceptance tooling/documentation.
+The checks below cover the Agave 4.3 contract. They need a disposable ClickHouse **26.1.2.11**. ClickHouse 25.6 cannot create the existing reverse-key disk-cache schema. Local throughput from these runs is a smoke test, not a capacity measure or a live Agave comparison.
 
-| Planned acceptance | Evidence |
+| Area | Covered by |
 | --- | --- |
 | gIR configuration/error contract | Limits 32/100, boundaries, duplicate counting, disabled limit, exact HTTP/code/message/data assertions; configuration remains unchanged. |
 | Encoding across supported cache paths | Head and real disk cache fixtures cover legacy, v0, populated v1 and empty-config v1; all five encodings, omitted/0/1/255 maxima and all block projections. Successful reads use an unavailable source endpoint. Missing-data rejection remains covered separately. |
@@ -77,19 +74,6 @@ archive preservation, inflation exclusion, and acceptance tooling/documentation.
 | Disk-cache preservation | Production Native fill and cache reopen preserve raw reward arrays and canonical transaction/block responses for both stored VAT spellings. |
 | Archive preservation | Production Solparq local-bundle export and ingestor restore preserve raw columns and hydrated blocks, including historical absent basis points. |
 | Inflation exclusion | Real query and RPC handler retain staking/voting rewards when the same address also has VAT; a VAT-only address returns null. |
-
-Workspace tests passed (718 passed, 4 ignored); all-feature RPC tests passed
-(612 passed, 11 ignored). Separately executed and passed the three new ClickHouse
-integrations, existing key-routing integration, and isolated final-HTTP logging
-test. The other ignored diagnostics are not claimed as executed.
-
-Both Clippy configurations, formatting, the streaming-only build and the
-complexity gate passed (75 changed Rust functions). Basic batch k6 passed 7,765
-checks over 1,553 requests; the request-error scenario passed all 96 checks over
-12 requests. These used disposable ClickHouse **26.1.2.11**. ClickHouse 25.6 could
-not create the existing reverse-key disk-cache schema and is unsuitable for these
-integration tests. The local throughput figures are smoke-test results, not
-capacity measurements or live Agave endpoint comparisons.
 
 Reproduce the integration checks against a disposable loopback server:
 
