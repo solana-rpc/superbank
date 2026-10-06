@@ -110,6 +110,7 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
 
     let mut shutdown_rx = spawn_shutdown_watch();
     let mut last_processed_block_slot = None;
+    let mut bound_exceeded = false;
     let idle_timeout = Duration::from_secs(args.grpc_idle_timeout_secs);
     let idle_timer = sleep_until(Instant::now() + idle_timeout);
     tokio::pin!(idle_timer);
@@ -165,8 +166,11 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                         let event_slot = match &event {
                             FumaroleEvent::Data { slot, .. } | FumaroleEvent::SlotEnded { slot, .. } => *slot,
                         };
-                        if stop_at_historical_bound(event_slot, args, &clickhouse, &insert_tables, &mut buffered_rows).await? {
+                        if stop_at_historical_bound(event_slot, args, &block_assembler, &mut bound_exceeded, &clickhouse, &insert_tables, &mut buffered_rows).await? {
                             return Err(anyhow!("Fumarole reached slot {event_slot} beyond its qualified historical bound; prior valid rows flushed without acknowledging rejected progress"));
+                        }
+                        if bound_exceeded && event_slot > historical_bound(args)? {
+                            continue;
                         }
                         match event {
                             FumaroleEvent::Data { slot, blockhash, update } => {
@@ -221,6 +225,9 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
                                 }
                                 observe_processed_slot(&mut last_processed_block_slot, slot);
                             }
+                        }
+                        if stop_at_historical_bound(event_slot, args, &block_assembler, &mut bound_exceeded, &clickhouse, &insert_tables, &mut buffered_rows).await? {
+                            return Err(anyhow!("Fumarole completed every bank at or below its qualified historical bound; prior valid rows flushed without acknowledging rejected progress"));
                         }
                         maybe_flush_for_pressure(
                             &clickhouse,
@@ -518,6 +525,10 @@ impl FumaroleBlockAssembler {
         self.blocks.len()
     }
 
+    fn has_pending_at_or_below(&self, slot: u64) -> bool {
+        self.blocks.keys().any(|(pending, _)| *pending <= slot)
+    }
+
     fn handle_update(
         &mut self,
         key: FumaroleBankKey,
@@ -806,24 +817,31 @@ async fn resolve_create_consumer_group_from_slot(
     }
 }
 
+fn historical_bound(args: &Args) -> Result<u64> {
+    args.fumarole_alpenglow_genesis_slot
+        .or(args.fumarole_preactivation_through_slot)
+        .context("Fumarole requires an evidenced historical bound")
+}
+
 async fn stop_at_historical_bound(
     event_slot: u64,
     args: &Args,
+    block_assembler: &FumaroleBlockAssembler,
+    bound_exceeded: &mut bool,
     clickhouse: &ClickHouseClient,
     tables: &InsertTables,
     rows: &mut BufferedRows,
 ) -> Result<bool> {
-    let bound = args
-        .fumarole_alpenglow_genesis_slot
-        .or(args.fumarole_preactivation_through_slot)
-        .context("Fumarole requires an evidenced historical bound")?;
-    if event_slot <= bound {
+    let bound = historical_bound(args)?;
+    if event_slot > bound {
+        *bound_exceeded = true;
+    }
+    // Banks at or below the bound can still complete after a later slot's data arrives.
+    if !*bound_exceeded || block_assembler.has_pending_at_or_below(bound) {
         return Ok(false);
     }
     metrics::observe_source_error("fumarole_stream", "historical_bound");
-    // Reject before assembly and flush only previously validated complete blocks.
-    // FumaroleStream::commit drains every offset, including newly consumed
-    // progress, so no acknowledgment is safe here. Restart replays the prefix.
+    // Flush only validated complete blocks. Offsets stay unacknowledged, so restart replays the prefix.
     rows.flush(clickhouse, tables).await?;
     warn!(
         event_slot,

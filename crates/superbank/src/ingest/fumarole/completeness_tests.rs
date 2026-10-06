@@ -335,33 +335,75 @@ async fn boundary_stop_flushes_buffered_genesis_before_timer_without_acknowledgi
         rx.try_recv().is_err(),
         "genesis remains buffered before timer"
     );
+    let mut exceeded = false;
     assert!(
-        !stop_at_historical_bound(42, &args, &client, &tables, &mut rows)
-            .await
-            .unwrap()
+        !stop_at_historical_bound(
+            42,
+            &args,
+            &assembler,
+            &mut exceeded,
+            &client,
+            &tables,
+            &mut rows
+        )
+        .await
+        .unwrap()
     );
     assert!(
-        stop_at_historical_bound(43, &args, &client, &tables, &mut rows)
-            .await
-            .unwrap()
+        !stop_at_historical_bound(
+            43,
+            &args,
+            &assembler,
+            &mut exceeded,
+            &client,
+            &tables,
+            &mut rows
+        )
+        .await
+        .unwrap(),
+        "a later slot must not stop ingestion while a bank at or below the bound is in flight"
+    );
+    assert!(exceeded);
+    assert!(!rows.is_empty());
+    assert!(rx.try_recv().is_err(), "nothing flushes while deferring");
+    let mut acknowledgments = 0;
+    commit_if_assembled(&assembler, || acknowledgments += 1);
+    assert_eq!(acknowledgments, 0);
+    assert_eq!(assembler.pending_slots(), 1);
+    assembler.blocks.clear();
+    assert!(
+        stop_at_historical_bound(
+            43,
+            &args,
+            &assembler,
+            &mut exceeded,
+            &client,
+            &tables,
+            &mut rows
+        )
+        .await
+        .unwrap()
     );
     assert!(rows.is_empty());
     let (query, body) = rx.try_recv().unwrap();
     assert!(query.contains("blocks_metadata"));
     assert_eq!(u64::from_le_bytes(body[..8].try_into().unwrap()), 42);
     assert!(rx.try_recv().is_err(), "no rejected block can be inserted");
-    let mut acknowledgments = 0;
-    commit_if_assembled(&assembler, || acknowledgments += 1);
-    assert_eq!(acknowledgments, 0);
-    assert_eq!(assembler.pending_slots(), 1);
-    // No offsets were acknowledged: replay of the valid prefix is harmless and
-    // uses the same slot-keyed metadata row, never the rejected successor.
+    // Replay of the valid prefix reuses the same slot-keyed metadata row.
     process_update(envelope(block), &args, &tables, &client, &mut rows, None)
         .await
         .unwrap();
-    stop_at_historical_bound(43, &args, &client, &tables, &mut rows)
-        .await
-        .unwrap();
+    stop_at_historical_bound(
+        43,
+        &args,
+        &assembler,
+        &mut exceeded,
+        &client,
+        &tables,
+        &mut rows,
+    )
+    .await
+    .unwrap();
     assert_eq!(rx.try_recv().unwrap().1, body);
     server.abort();
 }
