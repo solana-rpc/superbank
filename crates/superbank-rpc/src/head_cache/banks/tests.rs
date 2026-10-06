@@ -590,3 +590,25 @@ fn repeated_signature_on_processed_winner_is_reprojected_when_abandoned_slot_is_
         );
     }
 }
+
+#[test]
+fn republishing_a_projected_bank_skips_record_conversion() {
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    let signature = Signature::from([1; 64]);
+    let token = cache.banks.read().unwrap().banks[&(42, 1)]
+        .commitment
+        .clone();
+    assert!(cache.keeps_existing_projection(&signature, 42, Some(&token)));
+    assert!(!cache.keeps_existing_projection(&Signature::from([2; 64]), 42, Some(&token)));
+    // A malformed payload for an already-projected signature is never converted.
+    let mut malformed = transaction(1);
+    malformed.transaction = None;
+    cache.ingest_bank_transaction(42, &malformed, Some(token));
+    assert!(
+        cache
+            .get_tx(&signature, CommitmentLevel::Processed)
+            .is_some()
+    );
+}

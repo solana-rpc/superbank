@@ -583,6 +583,31 @@ impl HeadCache {
         }
     }
 
+    fn projection_wins(
+        old: &HeadTxMeta,
+        slot: u64,
+        bank_commitment: Option<&Arc<std::sync::atomic::AtomicU8>>,
+    ) -> bool {
+        let rank_of = |token: Option<&Arc<std::sync::atomic::AtomicU8>>| {
+            token.map_or(0, |token| token.load(Ordering::Acquire))
+        };
+        old.pos.slot == slot
+            || rank_of(bank_commitment) == 0
+            || rank_of(old.bank_commitment.as_ref()) != 0
+    }
+
+    // Cheap probe that runs before the costly record conversion.
+    fn keeps_existing_projection(
+        &self,
+        signature: &Signature,
+        slot: u64,
+        bank_commitment: Option<&Arc<std::sync::atomic::AtomicU8>>,
+    ) -> bool {
+        self.meta_by_signature
+            .get(signature)
+            .is_some_and(|old| Self::projection_wins(&old, slot, bank_commitment))
+    }
+
     fn ingest_bank_transaction(
         &self,
         slot: u64,
@@ -606,6 +631,10 @@ impl HeadCache {
             }
         };
         let signature = Signature::from(signature_bytes);
+
+        if self.keeps_existing_projection(&signature, slot, bank_commitment.as_ref()) {
+            return;
+        }
 
         let mut record = match convert::stored_record_from_transaction_info(slot, tx_info) {
             Ok(record) => record,
@@ -648,15 +677,7 @@ impl HeadCache {
         let old_slot = match self.meta_by_signature.entry(signature) {
             Entry::Occupied(occ) => {
                 let old = occ.get();
-                let new_rank = meta
-                    .bank_commitment
-                    .as_ref()
-                    .map_or(0, |token| token.load(Ordering::Acquire));
-                let old_rank = old
-                    .bank_commitment
-                    .as_ref()
-                    .map_or(0, |token| token.load(Ordering::Acquire));
-                if old.pos.slot == slot || new_rank == 0 || old_rank != 0 {
+                if Self::projection_wins(old, slot, meta.bank_commitment.as_ref()) {
                     return;
                 }
                 let old_slot = old.pos.slot;
