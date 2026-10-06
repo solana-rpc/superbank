@@ -25,15 +25,32 @@ command -v cargo >/dev/null 2>&1 || {
 }
 
 range="${1:-358560000:358560099}"
-if [[ -n "${JETSTREAMER_ALPENGLOW_GENESIS_SLOT:-}" && -n "${JETSTREAMER_PREACTIVATION_THROUGH_SLOT:-}" ]] ||
-   [[ -z "${JETSTREAMER_ALPENGLOW_GENESIS_SLOT:-}" && -z "${JETSTREAMER_PREACTIVATION_THROUGH_SLOT:-}" ]]; then
-  echo "set exactly one evidenced bound: JETSTREAMER_ALPENGLOW_GENESIS_SLOT or JETSTREAMER_PREACTIVATION_THROUGH_SLOT (see plugin README)" >&2
+
+# Mirror the plugin's env parsing: unsigned integers, and 1/true/yes/on or 0/false/no/off.
+env_u64() {
+  local value="${!1:-}"
+  [[ "${value}" =~ ^\+?[0-9]+$ ]] && echo "${value}"
+}
+env_bool() {
+  local value="${!1:-}"
+  case "${value,,}" in
+    1 | true | yes | on) echo true ;;
+    0 | false | no | off) echo false ;;
+  esac
+}
+
+genesis_slot="$(env_u64 JETSTREAMER_ALPENGLOW_GENESIS_SLOT || true)"
+preactivation_slot="$(env_u64 JETSTREAMER_PREACTIVATION_THROUGH_SLOT || true)"
+if [[ -n "${genesis_slot}" && -n "${preactivation_slot}" ]] ||
+   [[ -z "${genesis_slot}" && -z "${preactivation_slot}" ]]; then
+  echo "set exactly one evidenced numeric bound: JETSTREAMER_ALPENGLOW_GENESIS_SLOT or JETSTREAMER_PREACTIVATION_THROUGH_SLOT (see plugin README)" >&2
   exit 1
 fi
-export JETSTREAMER_ALPENGLOW_GENESIS_SLOT JETSTREAMER_PREACTIVATION_THROUGH_SLOT
-if [[ -n "${JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT:-}" && "${JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT:-false}" == "true" ]] ||
-   [[ -z "${JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT:-}" && "${JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT:-false}" != "true" ]]; then
-  echo "qualify the independent SIMD-0291 reward era before running (see plugin README)" >&2
+bps_slot="$(env_u64 JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT || true)"
+percent_era="$(env_bool JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT || true)"
+if [[ -n "${bps_slot}" && "${percent_era}" == "true" ]] ||
+   [[ -z "${bps_slot}" && "${percent_era}" != "true" ]]; then
+  echo "qualify exactly one independent SIMD-0291 reward era with a numeric slot or a true percent flag (see plugin README)" >&2
   exit 1
 fi
 threads="${JETSTREAMER_THREADS:-4}"

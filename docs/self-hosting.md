@@ -260,9 +260,9 @@ For **historical backfill**, there are two approaches depending on scale:
 
 **Historical backfill through the Alpenglow genesis slot: Jetstreamer + Old Faithful**
 
-The standalone Jetstreamer plugin uses upstream Agave 4 and preserves v1 transaction configuration. Set `JETSTREAMER_ALPENGLOW_GENESIS_SLOT` from a trusted certificate; the plugin rejects later blocks because Jetstreamer does not expose bank ID or footer provenance. Use the root ingestor’s qualified gRPC, RPC, or Bigtable source for later history; see the [ingestor compatibility notes](../crates/superbank/README.md).
+The standalone Jetstreamer plugin uses upstream Agave 4 and preserves v1 transaction configuration. Set `JETSTREAMER_ALPENGLOW_GENESIS_SLOT` from a trusted certificate, or `JETSTREAMER_PREACTIVATION_THROUGH_SLOT` for a cluster whose trusted `getAgGenesisCert` is still null, and exactly one commission era (`JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT` or `JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT=true`). The plugin rejects later blocks because Jetstreamer does not expose bank ID or footer provenance. Use the root ingestor’s qualified gRPC, RPC, or Bigtable source for later history; see the [ingestor compatibility notes](../crates/superbank/README.md).
 
-For ingesting months or years of history, use the [Jetstreamer adapter](../ingest/jetstreamer-clickhouse-plugin/) pointed at Triton's [Old Faithful](https://docs.triton.one/project-yellowstone/old-faithful-historical-archive) archival backend. Old Faithful has full history back to genesis and serves data at wire speed — far faster than polling `getBlock` over HTTP. Bound the range with the epoch or slot arguments; see the [Filtering section](#filtering-to-your-own-transactions) for trade-offs if you also want a program filter.
+For ingesting months or years of history, use the [Jetstreamer adapter](../ingest/jetstreamer-clickhouse-plugin/) pointed at Triton's [Old Faithful](https://docs.triton.one/project-yellowstone/old-faithful-historical-archive) archival backend. Old Faithful has full history back to genesis and serves data at wire speed — far faster than polling `getBlock` over HTTP. Bound the range with the epoch or slot arguments, and set the trusted bound and commission era described below; see the [Filtering section](#filtering-to-your-own-transactions) for trade-offs if you also want a program filter.
 
 **Small-to-medium backfill: JSON-RPC source**
 
@@ -504,12 +504,22 @@ cd ingest/jetstreamer-clickhouse-plugin
 # Rebuild
 cargo build --release
 
+# Required: exactly one trusted historical bound
+export JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot>
+# or, before activation: JETSTREAMER_PREACTIVATION_THROUGH_SLOT=<recorded-finalized-slot>
+
+# Required: exactly one block reward commission era
+export JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot>
+# or, for percent-only history: JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT=true
+
 # Run for a specific epoch
 ./target/release/jetstreamer-clickhouse 800
 
 # Or for a specific slot range
 ./target/release/jetstreamer-clickhouse 424000000:424100000
 ```
+
+The runner exits at startup if either choice is missing or ambiguous. See the [plugin README](../ingest/jetstreamer-clickhouse-plugin/README.md) for the evidence each setting needs.
 
 ---
 
