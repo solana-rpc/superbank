@@ -12,6 +12,9 @@ use std::{
 };
 use yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo;
 
+// Extra slots a buffered bank survives while it waits for a Confirmed/Finalized status.
+const PENDING_COMMITMENT_SLOTS: u64 = 64;
+
 type BankKey = (u64, u64); // (slot, node-local bank ID), within BankState::session
 
 #[derive(Default)]
@@ -256,11 +259,7 @@ impl HeadCache {
 
     fn accept_bank(&self, state: &BankState, session: u64, key: BankKey) -> bool {
         state.session == session
-            && key.0
-                >= state
-                    .highest
-                    .max(self.latest_slot())
-                    .saturating_sub(self.retain_slots.saturating_sub(1))
+            && key.0 >= self.bank_floor(state)
             && !state.discarded.contains(&key)
             && state
                 .canonical
@@ -318,11 +317,20 @@ impl HeadCache {
         }
     }
 
-    fn retain_banks(&self, state: &mut BankState) {
-        let floor = state
+    fn bank_floor(&self, state: &BankState) -> u64 {
+        let pending = if state.minimum_commitment > 0 {
+            PENDING_COMMITMENT_SLOTS
+        } else {
+            0
+        };
+        state
             .highest
             .max(self.latest_slot())
-            .saturating_sub(self.retain_slots.saturating_sub(1));
+            .saturating_sub(self.retain_slots.saturating_sub(1) + pending)
+    }
+
+    fn retain_banks(&self, state: &mut BankState) {
+        let floor = self.bank_floor(state);
         state.banks.retain(|key, _| key.0 >= floor);
         state.selected.retain(|slot, _| *slot >= floor);
         state.canonical.retain(|slot, _| *slot >= floor);

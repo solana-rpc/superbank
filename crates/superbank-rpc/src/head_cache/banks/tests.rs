@@ -645,3 +645,19 @@ fn reclaimed_signature_keeps_address_index_newest_first() {
         .collect();
     assert_eq!(slots, vec![103, 102, 101], "{slots:?}");
 }
+
+#[test]
+fn finalized_minimum_publishes_banks_older_than_the_retention_window() {
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Finalized);
+    freeze(&cache, session, 10, 1, 1);
+    for slot in 11..=45 {
+        cache.stage_bank_metadata(session, slot, metadata(slot, slot as u8));
+    }
+    cache.commit_bank(session, 10, 1, CommitmentLevel::Finalized, Some(9));
+    assert!(
+        cache
+            .get_tx(&Signature::from([1; 64]), CommitmentLevel::Finalized)
+            .is_some()
+    );
+}
