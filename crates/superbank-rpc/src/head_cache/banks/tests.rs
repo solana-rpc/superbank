@@ -612,3 +612,36 @@ fn republishing_a_projected_bank_skips_record_conversion() {
             .is_some()
     );
 }
+
+#[test]
+fn reclaimed_signature_keeps_address_index_newest_first() {
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    let address = Pubkey::from([1; 32]);
+    freeze(&cache, session, 100, 1, 1);
+    cache.stage_bank_metadata(session, 2, metadata(101, 2));
+    stage_entry(&cache, session, 101, 2, 1);
+    cache.freeze_bank(session, 101, 2, [2; 32], vec![transaction(1)]);
+    for (slot, bank, marker) in [(102, 3, 3), (103, 4, 4)] {
+        let mut tx = transaction(marker);
+        tx.transaction
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .account_keys
+            .push(vec![1; 32]);
+        cache.stage_bank_metadata(session, bank, metadata(slot, marker));
+        stage_entry(&cache, session, slot, bank, 1);
+        cache.freeze_bank(session, slot, bank, [marker; 32], vec![tx]);
+    }
+    cache.discard_bank(session, 100, 1);
+    cache.commit_bank(session, 101, 2, CommitmentLevel::Confirmed, Some(100));
+    let slots: Vec<_> = cache
+        .signatures_for_address(&address, None, None, 10, CommitmentLevel::Processed)
+        .iter()
+        .map(|meta| meta.pos.slot)
+        .collect();
+    assert_eq!(slots, vec![103, 102, 101], "{slots:?}");
+}

@@ -812,7 +812,10 @@ impl HeadCache {
 
     fn index_address(&self, address: Pubkey, key: HeadSigKey, min_slot: u64) {
         let mut entry = self.sigs_by_address.entry(address).or_default();
-        entry.push_front(key);
+        // Keep newest-first by (slot, idx) even when an older slot is reclaimed late.
+        let order = |k: &HeadSigKey| (k.pos.slot, k.pos.idx);
+        let at = entry.partition_point(|k| order(k) > order(&key));
+        entry.insert(at, key);
         while let Some(back) = entry.back()
             && back.pos.slot < min_slot
         {
