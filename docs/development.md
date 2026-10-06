@@ -53,6 +53,7 @@ for f in \
   ddl/local/transactions.sql \
   ddl/local/blocks_metadata.sql \
   ddl/local/entries.sql \
+  ddl/local/block_footers.sql \
   ddl/local/gsfa.sql \
   ddl/local/signatures.sql \
   ddl/local/token_owner_activity.sql
@@ -72,6 +73,7 @@ for f in \
   ddl/local/transactions.sql \
   ddl/local/blocks_metadata.sql \
   ddl/local/entries.sql \
+  ddl/local/block_footers.sql \
   ddl/local/gsfa_nohot.sql \
   ddl/local/gsfa_hot.sql \
   ddl/local/signatures.sql \

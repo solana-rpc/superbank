@@ -172,17 +172,7 @@ the current state of a public network or the producer's binary version.
    holds later data and every metadata flush for replay. Never move those proofs
    across reconnects. At a Fumarole cutoff, valid prior rows flush without the
    client's all-offset acknowledgment, so a restart may replay the valid prefix.
-5. Monitor footer availability separately from canonical progress. Startup has a
-   five-second table/column qualification and an explicit best-effort footer
-   policy; a missing table disables ancillary writes until restart. Batch inserts
-   follow complete durable bank data, reuse metadata and retry within a bounded
-   window. Insert failures, gaps and expired footers produce warnings and
-   `superbank_ingest_source_errors_total` with `stage="grpc_footer"`; they do not
-   disable canonical validation or bypass an unresolved identity hold. First-shred
-   turbine telemetry cannot advance that window. Replay may never supply historical
-   footers: record gaps without fabricating a hash or joining stored node-local IDs.
-   Wait for batch flushes and independently audit footer completeness before
-   archiving; a complete block archive alone does not prove footer coverage.
+5. Monitor footer availability separately from canonical progress. Startup runs a five-second table and column probe. If it fails, ancillary writes pause, durable footers stay in the bounded join window, and a probe every 30 seconds resumes them. Batch inserts follow complete durable bank data, reuse metadata, make one attempt per flush and never delay canonical ingestion. Insert failures, gaps and expired footers produce warnings and `superbank_ingest_source_errors_total_total` with `stage="grpc_footer"`. The `missing` kind starts only after the first footer arrives. These signals do not disable canonical validation or bypass an unresolved identity hold. First-shred turbine telemetry cannot advance that window. Replay may never supply historical footers: record gaps without fabricating a hash or joining stored node-local IDs. Wait for batch flushes and independently audit footer completeness before archiving; a complete block archive alone does not prove footer coverage.
 6. Qualify speculative serving separately. The head cache scopes bank counters and
    commitment tokens to a subscription/session, retains competing banks until a
    winner is proven, discards dead/skipped branches, and clears proofs on reconnect.

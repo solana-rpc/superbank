@@ -29,7 +29,7 @@ EOF
 clickhouse server --config-file="$SUPERBANK_LOCAL_DIR/clickhouse/config.xml" \
   --pid-file="$SUPERBANK_LOCAL_DIR/clickhouse/server.pid" --daemon
 clickhouse client --query 'SELECT version()'
-for schema in transactions blocks_metadata entries gsfa signatures token_owner_activity; do
+for schema in transactions blocks_metadata entries block_footers gsfa signatures token_owner_activity; do
   clickhouse client --multiquery < "ddl/local/$schema.sql" || break
 done
 ```

@@ -439,7 +439,7 @@ supply the footer evidence needed for postmigration qualification.
 Full blocks are validated before buffering or inserts: exact transaction counts
 (including zero), unique contiguous indices and signatures, and, when entries are
 requested, exact entry counts, indices, slot identity and transaction range tiling.
-Omitting `entries-table` permits an omitted entry payload. Malformed payloads never enter writer buffers or acknowledge source offsets.
+`--entries-table` always carries a value (default `default.entries`), so entry payloads are always requested and validated. Malformed payloads never enter writer buffers or acknowledge source offsets.
 A rejected later gRPC update flushes an already complete, qualified earlier
 prefix before exiting. Same-slot contradictions and unresolved bank identity
 retain buffered data without advancing restart progress. Complete Fumarole banks may flush while
@@ -492,17 +492,9 @@ same cutoff, rather than consume postmigration data.
 
 ### Footer availability policy
 
-At gRPC startup Superbank qualifies the configured footer table and columns with
-a five-second bounded query. Failure disables ancillary footer writes for that
-session, with a warning and `superbank_ingest_source_errors_total` labels
-`stage="grpc_footer", kind="startup_unavailable"`; restart after repairing DDL.
-Canonical block validation and same-subscription identity qualification remain
-mandatory. Footer inserts retry, then retain the failed row within the bounded
-join window while canonical ingestion continues. Missing/replay-unavailable
-footers and expired failed inserts emit warnings and `missing`, `insert_failed`,
-`expired_insert` or `storage_disabled` kinds, rather than crash-looping the data
-writer. `invalid` footers are discarded, never repaired with guessed identities.
-First-shred turbine telemetry cannot advance the footer join window.
+At gRPC startup Superbank qualifies the configured footer table and columns with a five-second bounded query. If the query fails, Superbank logs a warning, counts `superbank_ingest_source_errors_total_total` with `stage="grpc_footer", kind="startup_unavailable"`, and keeps durable footers in the bounded join window. It probes the table again every 30 seconds and resumes footer writes when the probe succeeds. Canonical block validation and same-subscription identity qualification remain mandatory.
+
+Each footer batch insert makes one attempt, so a footer-only outage never delays canonical ingestion. A failed batch stays in the bounded join window and the next flush tries again. Failures emit warnings and the `insert_failed`, `storage_disabled` or `expired_insert` kinds. The `missing` kind counts finalized slots with no footer, and it starts only after the first footer arrives, because a cluster before Alpenglow activation sends none. `invalid` footers are discarded, never repaired with guessed identities. First-shred turbine telemetry cannot advance the footer join window.
 
 A footer gap may be permanent: upstream replay may provide complete finalized
 blocks and status evidence without historical footers. Archive/report the gap;
