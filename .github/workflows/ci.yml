@@ -96,3 +96,43 @@ jobs:
 
       - name: Test final HTTP status logs in isolation
         run: cargo test -p superbank-rpc --all-features --locked http_response_logs_match_final_status -- --ignored --test-threads=1
+
+  test-jetstreamer-plugin:
+    name: Test Jetstreamer plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          submodules: true
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: 1.97.1
+          components: clippy
+
+      - name: Install libclang (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev pkg-config libudev-dev libusb-1.0-0-dev
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          version: "25.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: ci-jetstreamer-plugin
+          workspaces: ingest/jetstreamer-clickhouse-plugin
+
+      - name: cargo clippy
+        working-directory: ingest/jetstreamer-clickhouse-plugin
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        working-directory: ingest/jetstreamer-clickhouse-plugin
+        run: cargo test --locked

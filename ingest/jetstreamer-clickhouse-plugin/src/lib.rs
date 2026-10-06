@@ -255,6 +255,24 @@ mod tests {
         }
     }
 
+    // The constructor reads JETSTREAMER_* overrides, so build it with the era variables cleared.
+    fn isolated_plugin(
+        config: ClickhouseIngestConfig,
+        worker_threads: usize,
+    ) -> ClickhouseIngestPlugin {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let mut guard = EnvGuard::new();
+        for key in [
+            "JETSTREAMER_ALPENGLOW_GENESIS_SLOT",
+            "JETSTREAMER_PREACTIVATION_THROUGH_SLOT",
+            "JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT",
+            "JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT",
+        ] {
+            guard.unset(key);
+        }
+        ClickhouseIngestPlugin::new(config, worker_threads)
+    }
+
     #[test]
     fn env_overrides_apply() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -315,10 +333,10 @@ mod tests {
 
     #[test]
     fn legacy_backfill_requires_boundary_and_stops_after_genesis() {
-        let unbounded = ClickhouseIngestPlugin::new(ClickhouseIngestConfig::default(), 1);
+        let unbounded = isolated_plugin(ClickhouseIngestConfig::default(), 1);
         assert!(unbounded.ensure_legacy_slot(1).is_err());
 
-        let bounded = ClickhouseIngestPlugin::new(
+        let bounded = isolated_plugin(
             ClickhouseIngestConfig {
                 alpenglow_genesis_slot: Some(100),
                 ..Default::default()
@@ -331,7 +349,7 @@ mod tests {
 
     #[test]
     fn trusted_null_fixture_allows_only_an_explicit_finalized_history_bound() {
-        let bounded = ClickhouseIngestPlugin::new(
+        let bounded = isolated_plugin(
             ClickhouseIngestConfig {
                 preactivation_through_slot: Some(42),
                 ..Default::default()
@@ -340,7 +358,7 @@ mod tests {
         );
         assert!(bounded.ensure_legacy_slot(42).is_ok());
         assert!(bounded.ensure_legacy_slot(43).is_err());
-        let conflicting = ClickhouseIngestPlugin::new(
+        let conflicting = isolated_plugin(
             ClickhouseIngestConfig {
                 preactivation_through_slot: Some(42),
                 alpenglow_genesis_slot: Some(100),
@@ -353,7 +371,7 @@ mod tests {
 
     #[test]
     fn runner_range_is_clamped_before_upstream_can_continue_after_callback_errors() {
-        let plugin = ClickhouseIngestPlugin::new(
+        let plugin = isolated_plugin(
             ClickhouseIngestConfig {
                 alpenglow_genesis_slot: Some(100),
                 ..Default::default()
@@ -364,7 +382,7 @@ mod tests {
             plugin.historical_slot_range(90, 200).is_err(),
             "era preflight must precede runner start"
         );
-        let plugin = ClickhouseIngestPlugin::new(
+        let plugin = isolated_plugin(
             ClickhouseIngestConfig {
                 alpenglow_genesis_slot: Some(100),
                 block_reward_commission_percent: true,
@@ -376,7 +394,7 @@ mod tests {
         assert_eq!(plugin.historical_slot_range(100, 100).unwrap(), 100..101);
         assert!(plugin.historical_slot_range(101, 200).is_err());
         assert!(plugin.historical_slot_range(100, 99).is_err());
-        let max = ClickhouseIngestPlugin::new(
+        let max = isolated_plugin(
             ClickhouseIngestConfig {
                 alpenglow_genesis_slot: Some(u64::MAX),
                 block_reward_commission_percent: true,
@@ -390,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_postboundary_callbacks_do_not_allocate_pending_rows_or_writers() {
         use jetstreamer_plugin::Plugin;
-        let plugin = ClickhouseIngestPlugin::new(
+        let plugin = isolated_plugin(
             ClickhouseIngestConfig {
                 alpenglow_genesis_slot: Some(100),
                 ..Default::default()
