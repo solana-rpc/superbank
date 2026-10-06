@@ -243,9 +243,8 @@ pub fn plan_next_archive(
     )
 }
 
-/// Plan nominal hourly windows using the configured cluster slot cadence.
-/// Existing archive names provide the continuation boundary regardless of the
-/// cadence used to write them. Epoch and custom slot spans remain unchanged.
+/// Plan nominal hourly windows from the configured slot cadence. Existing archive
+/// names set the continuation boundary; epoch and custom slot spans are unchanged.
 pub fn plan_next_archive_with_hourly_slot_duration(
     kind: ArchiveKind,
     bounds: ClickHouseBounds,

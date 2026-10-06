@@ -29,9 +29,8 @@ expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 # alpenglow-rpc-url: "https://your-trusted-agave-rpc"
 # Offline alternative: the genesis certificate block slot and consensus block ID pair.
 # alpenglow-genesis-block: "<slot>:<base58-block-id>"
-# This slot still uses historical PoH; new rules apply strictly after it.
-# Resolved slot + consensus block ID must match on checkpoint resume.
-# Without either trusted setting, all slots use historical PoH rules.
+# This slot still uses historical PoH; new rules apply strictly after it. The pair
+# must match on checkpoint resume. Without either setting, all slots use historical PoH.
 
 # External trust anchors, checked against recorded blockhashes.
 # anchor:

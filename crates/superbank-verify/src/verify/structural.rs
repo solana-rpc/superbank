@@ -84,10 +84,8 @@ pub(crate) fn check_structure_in_era(
 
     check_last_entry(block, entries, &mut findings);
 
-    // Replica of Agave `verify_tick_hash_count`: the running num_hashes sum
-    // between consecutive ticks must equal hashes_per_tick exactly, and no
-    // tick may claim zero hashes. Skipped when hashes_per_tick is unknown for
-    // the era or hashing is disabled (value 0).
+    // Replica of Agave `verify_tick_hash_count`: num_hashes between ticks must equal
+    // hashes_per_tick, and no tick may claim zero hashes. Skipped when unknown or 0.
     check_hash_counts(block, entries, hashes_per_tick, alpenglow, &mut findings);
 
     // Entry transaction ranges must exactly tile [0, executed_transaction_count).

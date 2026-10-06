@@ -671,9 +671,8 @@ impl ClickhouseIngestPlugin {
         }
     }
 
-    /// Clamp a runner's inclusive range to the explicitly qualified history.
-    /// Upstream logs callback errors and continues, so embedding callers must
-    /// apply this bound before invoking JetstreamerRunner::run.
+    /// Clamp a runner's inclusive range to the qualified history. Callers must apply it
+    /// before JetstreamerRunner::run, because upstream continues after callback errors.
     pub fn historical_slot_range(
         &self,
         start: u64,
@@ -1439,9 +1438,8 @@ struct BlocksMetadataRow {
     rewards_num_partitions: Option<u64>,
 }
 
-// The pinned firehose normalizes legacy percent into the runtime bps field.
-// BlockData loses its source-era flag, so only operator-qualified SIMD-0291
-// evidence can decide which archive/RPC column to populate.
+// The firehose normalizes legacy percent into bps and drops the source-era flag.
+// Only operator-qualified SIMD-0291 evidence decides which column to populate.
 fn block_reward_commission(
     config: &ClickhouseIngestConfig,
     slot: u64,

@@ -396,9 +396,8 @@ struct Cli {
     )]
     archive_range_type: Vec<String>,
 
-    /// Nominal cluster slot duration for hourly archives (400 ms = 9000 slots;
-    /// 200 ms = 18000). Must be positive and divide 3600000 ms exactly. Set for
-    /// the archived cluster/history; Alpenglow does not select it automatically.
+    /// Nominal slot duration for hourly archives (400 ms = 9000 slots; 200 ms = 18000).
+    /// Must be positive and divide 3600000 ms exactly. Alpenglow does not change it.
     #[arg(
         long = "hourly-slot-duration-ms",
         env = "SOLPARQ_HOURLY_SLOT_DURATION_MS",
