@@ -46,6 +46,7 @@ fn buffered_rows() -> BufferedRows {
         block_rows: Vec::new(),
         entry_rows: Vec::new(),
         last_durable_block_slot: Some(40),
+        footer_merge_ceiling: None,
     }
 }
 
@@ -355,7 +356,6 @@ async fn early_footer_and_winner_cannot_write_incomplete_data_or_a_losing_bank()
     );
     assert!(rx.try_recv().is_err());
     assert!(rows.is_empty());
-    assert!(!join.complete_blocks.contains(&(42, 0)));
     let mut losing = complete_block(42);
     losing.bank_id = 9;
     assert!(
@@ -383,12 +383,23 @@ async fn early_footer_and_winner_cannot_write_incomplete_data_or_a_losing_bank()
     )
     .await
     .unwrap();
-    flush_canonical_rows(&client, &tables, &mut rows, Some(&retry), &mut join)
-        .await
-        .unwrap();
+    assert_eq!(
+        rows.block_rows[0].bank_hash.as_ref().map(|hash| hash.0),
+        Some([7; 32]),
+        "the early footer of the winning bank joins the block row"
+    );
+    flush_canonical_rows(
+        &client,
+        &tables,
+        &mut rows,
+        Some(&retry),
+        &mut join,
+        FooterRelease::Due,
+    )
+    .await
+    .unwrap();
     let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert_eq!(requests.len(), 4, "complete data precedes footer insert");
-    assert!(requests.last().unwrap().contains("block_footers"));
+    assert_eq!(requests.len(), 3, "transactions, blocks and entries");
     assert_eq!(rows.last_durable_block_slot, Some(42));
     server.abort();
 }
@@ -441,12 +452,10 @@ async fn canonical_legacy_missing_id_and_modern_zero_are_distinct_in_both_orders
                 if data_first && index == 0 {
                     assert!(rows.is_empty());
                     assert_eq!(join.pending_identity.len(), 1);
-                    assert!(!join.complete_blocks.contains(&(42, 0)));
                 }
             }
             assert_eq!(rows.block_rows.len(), 1);
             assert_eq!(rows.block_rows[0].bank_id, bank_id);
-            assert_eq!(join.complete_blocks.contains(&(42, 0)), bank_id.is_some());
             assert!(join.pending_identity.is_empty());
         }
     }
@@ -529,13 +538,27 @@ async fn pending_identity_holds_later_banks_and_all_flush_paths_until_replay() {
     assert!(rx.try_recv().is_err());
     // These are the shared timer, shutdown, and fatal transport/health guards.
     assert!(
-        !flush_canonical_rows(&client, &tables, &mut rows, Some(&retry), &mut join)
-            .await
-            .unwrap()
-    );
-    flush_after_fatal_condition(&client, &tables, &mut rows, "disconnect", &mut join)
+        !flush_canonical_rows(
+            &client,
+            &tables,
+            &mut rows,
+            Some(&retry),
+            &mut join,
+            FooterRelease::Due
+        )
         .await
-        .unwrap();
+        .unwrap()
+    );
+    flush_after_fatal_condition(
+        &client,
+        &tables,
+        &mut rows,
+        "disconnect",
+        &mut join,
+        FooterRelease::Drain,
+    )
+    .await
+    .unwrap();
     assert!(rx.try_recv().is_err());
     assert_eq!(rows.last_durable_block_slot, Some(40));
     assert_eq!(
@@ -578,19 +601,19 @@ async fn pending_identity_holds_later_banks_and_all_flush_paths_until_replay() {
         .await
         .unwrap();
     }
-    assert!(join.complete_blocks.contains(&(42, 0)));
     assert_eq!(rows.last_durable_block_slot, Some(43));
-    assert!(join.completed.contains(&(43, 7)));
-    flush_canonical_rows(&client, &tables, &mut rows, Some(&retry), &mut join)
-        .await
-        .unwrap();
+    flush_canonical_rows(
+        &client,
+        &tables,
+        &mut rows,
+        Some(&retry),
+        &mut join,
+        FooterRelease::Due,
+    )
+    .await
+    .unwrap();
     let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert_eq!(
-        requests.len(),
-        7,
-        "both complete banks persist before the winner footer"
-    );
-    assert!(requests.last().unwrap().contains("block_footers"));
+    assert_eq!(requests.len(), 6, "both complete banks persist");
     server.abort();
 }
 
@@ -654,7 +677,6 @@ async fn canonical_optional_zero_proof_is_not_reused_after_reconnect() {
     .await
     .unwrap();
     assert!(rows.is_empty());
-    assert!(!reconnect.complete_blocks.contains(&(42, 0)));
     process_canonical_update(
         identity_status(42, None, SlotStatus::SlotFinalized),
         &args,
@@ -670,7 +692,7 @@ async fn canonical_optional_zero_proof_is_not_reused_after_reconnect() {
 }
 
 #[tokio::test]
-async fn ready_earlier_footer_persists_while_later_identity_holds_restart_progress() {
+async fn earlier_banks_stay_durable_while_later_identity_holds_restart_progress() {
     use axum::{Router, body::Body, extract::Request};
     use tokio::{net::TcpListener, sync::mpsc};
     metrics::force_init("grpc", None);
@@ -745,28 +767,38 @@ async fn ready_earlier_footer_persists_while_later_identity_holds_restart_progre
             .unwrap();
         }
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(
-            requests.len(),
-            usize::from(flush_earlier),
-            "only durable complete bank 42's footer may bypass the bank 43 hold"
+        assert!(
+            requests.is_empty(),
+            "a footer that arrives after its block is durable is never written on its own"
         );
         if flush_earlier {
-            assert!(requests[0].contains("block_footers"));
             assert!(rows.is_empty());
-            assert!(join.durable_blocks.contains(&(42, 7)));
         } else {
             assert_eq!(rows.block_rows.len(), 1);
-            assert!(!join.durable_blocks.contains(&(42, 7)));
         }
         assert_eq!(join.pending_identity.len(), 1);
         assert!(
-            !flush_canonical_rows(&client, &tables, &mut rows, Some(&retry), &mut join)
-                .await
-                .unwrap()
-        );
-        flush_after_fatal_condition(&client, &tables, &mut rows, "disconnect", &mut join)
+            !flush_canonical_rows(
+                &client,
+                &tables,
+                &mut rows,
+                Some(&retry),
+                &mut join,
+                FooterRelease::Due
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
+        flush_after_fatal_condition(
+            &client,
+            &tables,
+            &mut rows,
+            "disconnect",
+            &mut join,
+            FooterRelease::Drain,
+        )
+        .await
+        .unwrap();
         assert!(rx.try_recv().is_err());
         assert_eq!(
             rows.last_durable_block_slot,
@@ -889,29 +921,30 @@ async fn validation_exit_flushes_only_an_earlier_qualified_prefix_and_replays_sa
 }
 
 #[tokio::test]
-async fn absent_or_failed_footer_storage_cannot_stop_valid_canonical_data() {
-    use axum::{Router, body::Body, extract::Request, http::StatusCode};
+async fn replayed_rows_keep_stored_footer_fields_up_to_the_ceiling() {
+    use axum::{Router, body::Body, extract::Request};
     use tokio::{net::TcpListener, sync::mpsc};
     metrics::force_init("grpc", None);
+    let mut stored = Vec::new();
+    stored.extend_from_slice(&42u64.to_le_bytes());
+    stored.extend_from_slice(&[0, 64]);
+    stored.extend_from_slice("ab".repeat(32).as_bytes());
+    stored.push(0);
+    stored.extend_from_slice(&777u64.to_le_bytes());
+    stored.extend_from_slice(&[0, 10]);
+    stored.extend_from_slice(b"6167656e74");
     let (tx, mut rx) = mpsc::unbounded_channel();
     let app = Router::new().fallback(move |request: Request<Body>| {
         let tx = tx.clone();
+        let stored = stored.clone();
         async move {
             let query = request.uri().query().unwrap_or_default().to_string();
             let body = axum::body::to_bytes(request.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            let footer = query.contains("block_footers")
-                || String::from_utf8_lossy(&body).contains("block_footers");
-            tx.send(query).unwrap();
-            if footer {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "footer table unavailable",
-                )
-            } else {
-                (StatusCode::OK, "Ok")
-            }
+            let select = String::from_utf8_lossy(&body).contains("SELECT");
+            tx.send((query, body.to_vec())).unwrap();
+            if select { stored } else { b"Ok".to_vec() }
         }
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -921,242 +954,93 @@ async fn absent_or_failed_footer_storage_cannot_stop_valid_canonical_data() {
         .with_url(format!("http://{addr}"))
         .with_validation(false)
         .with_compression(clickhouse::Compression::None);
-    let mut args = crate::cli::test_args();
-    args.flush_every_block = true;
+    let args = crate::cli::test_args();
     let tables = InsertTables::from_args(&args);
-    let retry = RetryConfig {
-        max_retries: 0,
-        base_ms: 1,
-        max_ms: 1,
-    };
-    assert!(!qualify_footer_storage(&client, &args.block_footers_table).await);
-    for availability in [Some(false), Some(true)] {
-        let mut join = FinalizedFooterJoin {
-            footer_storage_available: availability,
-            ..Default::default()
-        };
-        let mut rows = buffered_rows();
-        let bank_block = |slot, bank_id| {
-            let mut block = complete_block(slot);
-            block.bank_id = bank_id;
-            for entry in &mut block.entries {
-                entry.bank_id = bank_id;
-            }
-            canonical_envelope(UpdateOneof::Block(block))
-        };
-        for update in [
-            identity_status(42, Some(7), SlotStatus::SlotFinalized),
-            canonical_envelope(UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
-                slot: 42,
-                bank_id: 7,
-                bank_hash: vec![9; 32],
-                ..Default::default()
-            })),
-            bank_block(42, 7),
-            bank_block(43, 8),
-        ] {
-            process_canonical_update(
-                update, &args, &tables, &client, &mut rows, &retry, &mut join,
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(rows.last_durable_block_slot, Some(43));
-        assert_eq!(join.ready_footers.len(), 1);
-    }
+
+    let mut rows = buffered_rows().with_footer_merge_ceiling(Some(42));
+    buffer_block(&mut rows, complete_block(42)).unwrap();
+    buffer_block(&mut rows, complete_block(43)).unwrap();
+    rows.flush(&client, &tables).await.unwrap();
+    let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let select = String::from_utf8_lossy(&requests[0].1).to_string();
+    assert!(select.contains(&args.blocks_table), "{select}");
+    assert!(select.contains("has([42], slot)"), "{select}");
+    let blocks_insert = requests
+        .iter()
+        .find(|(query, _)| query.contains("INSERT") && query.contains("blocks_metadata"))
+        .expect("blocks insert");
+    assert!(
+        blocks_insert
+            .1
+            .windows(32)
+            .any(|window| window == [0xab; 32]),
+        "stored bank hash must reach the replayed row"
+    );
+
+    let mut rows = buffered_rows();
+    buffer_block(&mut rows, complete_block(42)).unwrap();
+    rows.flush(&client, &tables).await.unwrap();
     let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(
         requests
             .iter()
-            .filter(|query| query.contains("blocks_metadata"))
-            .count()
-            >= 4
+            .all(|(_, body)| !String::from_utf8_lossy(body).contains("SELECT")),
+        "no lookup without a merge ceiling"
     );
     server.abort();
 }
 
 #[tokio::test]
-async fn footer_batches_wait_for_complete_durable_data_and_combine_many_rows() {
-    use axum::{Router, body::Body, extract::Request};
-    use tokio::{net::TcpListener, sync::mpsc};
+async fn canonical_block_waits_for_its_footer_and_flushes_it_in_the_same_row() {
     metrics::force_init("grpc", None);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let app = Router::new().fallback(move |request: Request<Body>| {
-        let tx = tx.clone();
-        async move {
-            let query = request.uri().query().unwrap_or_default().to_string();
-            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            tx.send((query, body.len())).unwrap();
-            "Ok"
-        }
-    });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = ClickHouseClient::default()
-        .with_url(format!("http://{addr}"))
-        .with_validation(false)
-        .with_compression(clickhouse::Compression::None);
-    let mut args = crate::cli::test_args();
-    args.entries_table = None;
+    let args = crate::cli::test_args();
     let tables = InsertTables::from_args(&args);
+    let client = ClickHouseClient::default().with_url("http://127.0.0.1:1");
     let retry = RetryConfig {
         max_retries: 0,
         base_ms: 1,
         max_ms: 1,
     };
-    let mut join = FinalizedFooterJoin::default();
     let mut rows = buffered_rows();
-    for slot in 1..=FOOTER_BATCH_ROWS as u64 * 2 {
-        let block = SubscribeUpdateBlock {
-            slot,
-            parent_slot: slot - 1,
-            bank_id: slot,
-            blockhash: bs58::encode([1; 32]).into_string(),
-            parent_blockhash: bs58::encode([2; 32]).into_string(),
-            ..Default::default()
-        };
-        for update in [
-            identity_status(slot, Some(slot), SlotStatus::SlotFinalized),
-            canonical_envelope(UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
-                slot,
-                bank_id: slot,
-                bank_hash: vec![9; 32],
-                ..Default::default()
-            })),
-            canonical_envelope(UpdateOneof::Block(block)),
-        ] {
-            process_canonical_update(
-                update, &args, &tables, &client, &mut rows, &retry, &mut join,
-            )
-            .await
-            .unwrap();
-        }
-        if slot < FOOTER_BATCH_ROWS as u64 {
-            assert!(
-                rx.is_empty(),
-                "footer arrivals must not force one-row data flushes"
-            );
-        }
+    let mut join = FinalizedFooterJoin::new();
+    let mut block = complete_block(42);
+    block.bank_id = 7;
+    for entry in &mut block.entries {
+        entry.bank_id = 7;
     }
-    let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-    assert_eq!(
-        requests.len(),
-        4,
-        "two data batches followed by two footer batches"
-    );
-    for chunk in requests.chunks(2) {
-        assert!(chunk[0].0.contains("blocks_metadata"));
-        assert!(chunk[1].0.contains("block_footers"));
-        assert_eq!(chunk[1].1, FOOTER_BATCH_ROWS * 57);
-    }
-    assert!(join.ready_footers.is_empty());
-    assert_eq!(
-        rows.last_durable_block_slot,
-        Some(FOOTER_BATCH_ROWS as u64 * 2)
-    );
-    server.abort();
-}
-
-#[tokio::test]
-async fn native_footer_startup_qualifies_fqn_and_rejects_absent_table() {
-    let Ok(url) = std::env::var("DISK_CACHE_TEST_URL") else {
-        return;
-    };
-    assert!(url.starts_with("http://127.0.0.1:"));
-    metrics::force_init("grpc", None);
-    let client = ClickHouseClient::default().with_url(url);
-    let table = format!(
-        "review_footer_qualification_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    client.query(&format!("CREATE TABLE default.{table} (slot UInt64, bank_id UInt64, bank_hash FixedString(32), block_producer_time_nanos UInt64, block_user_agent String) ENGINE=ReplacingMergeTree ORDER BY slot")).execute().await.unwrap();
-    assert!(qualify_footer_storage(&client, &format!("default.{table}")).await);
-    assert!(!qualify_footer_storage(&client, &format!("default.{table}_absent")).await);
-    client
-        .query(&format!("DROP TABLE default.{table}"))
-        .execute()
+    for update in [
+        canonical_envelope(UpdateOneof::Block(block)),
+        identity_status(42, Some(7), SlotStatus::SlotFinalized),
+    ] {
+        process_canonical_update(
+            update, &args, &tables, &client, &mut rows, &retry, &mut join,
+        )
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn footer_outage_makes_one_attempt_and_storage_recovers_lazily() {
-    use axum::{Router, body::Body, extract::Request, http::StatusCode};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use tokio::net::TcpListener;
-    metrics::force_init("grpc", None);
-    let healthy = std::sync::Arc::new(AtomicBool::new(false));
-    let requests = std::sync::Arc::new(AtomicUsize::new(0));
-    let app = Router::new().fallback({
-        let (healthy, requests) = (healthy.clone(), requests.clone());
-        move |_request: Request<Body>| {
-            let (healthy, requests) = (healthy.clone(), requests.clone());
-            async move {
-                requests.fetch_add(1, Ordering::SeqCst);
-                if healthy.load(Ordering::SeqCst) {
-                    (StatusCode::OK, "Ok")
-                } else {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "footer table unavailable",
-                    )
-                }
-            }
-        }
-    });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = ClickHouseClient::default()
-        .with_url(format!("http://{addr}"))
-        .with_validation(false)
-        .with_compression(clickhouse::Compression::None);
-    let row = map_block_footer(&SubscribeUpdateBlockFooter {
-        slot: 42,
-        bank_id: 7,
-        bank_hash: vec![9; 32],
-        ..Default::default()
-    })
-    .unwrap();
-    let new_join = |available| {
-        let mut join = FinalizedFooterJoin {
-            footer_storage_available: available,
-            footer_writer: Some(FooterWriter::new(&client, "block_footers")),
+    }
+    assert!(rows.is_empty(), "the block waits for its footer");
+    process_canonical_update(
+        canonical_envelope(UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+            slot: 42,
+            bank_id: 7,
+            bank_hash: vec![7; 32],
+            block_producer_time_nanos: 55,
+            block_user_agent: b"agave".to_vec(),
             ..Default::default()
-        };
-        join.durable_blocks.insert((42, 7));
-        join.ready_footers.push(row.clone());
-        join
-    };
-
-    let mut join = new_join(Some(true));
-    flush_ready_footers(&mut join).await;
-    assert_eq!(requests.load(Ordering::SeqCst), 1, "no inline retries");
-    assert_eq!(join.ready_footers.len(), 1);
-
-    requests.store(0, Ordering::SeqCst);
-    let mut join = new_join(Some(false));
-    flush_ready_footers(&mut join).await;
-    assert_eq!(requests.load(Ordering::SeqCst), 1, "one probe, no insert");
-    assert!(join.footer_requalify_at.is_some());
-    flush_ready_footers(&mut join).await;
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        1,
-        "probes are rate limited"
-    );
-    assert_eq!(join.ready_footers.len(), 1);
-
-    healthy.store(true, Ordering::SeqCst);
-    join.footer_requalify_at = Some(tokio::time::Instant::now());
-    flush_ready_footers(&mut join).await;
-    assert_eq!(join.footer_storage_available, Some(true));
-    assert!(join.ready_footers.is_empty());
-    server.abort();
+        })),
+        &args,
+        &tables,
+        &client,
+        &mut rows,
+        &retry,
+        &mut join,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.block_rows.len(), 1);
+    let row = &rows.block_rows[0];
+    assert_eq!(row.bank_hash.as_ref().map(|hash| hash.0), Some([7; 32]));
+    assert_eq!(row.block_producer_time_nanos, Some(55));
+    assert_eq!(row.block_user_agent.as_deref(), Some(&b"agave".to_vec()));
+    assert_eq!(rows.transaction_rows.len(), 2);
 }

@@ -8,6 +8,7 @@ use clickhouse::{Client as ClickHouseClient, Row, RowOwned, RowWrite};
 use serde::{Deserialize, Serialize};
 use serde_big_array::Array;
 use serde_bytes::ByteBuf;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -95,6 +96,9 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) blockhash: Array<u8, 32>,
     pub(crate) parent_blockhash: Array<u8, 32>,
     pub(crate) bank_id: Option<u64>,
+    pub(crate) bank_hash: Option<Array<u8, 32>>,
+    pub(crate) block_producer_time_nanos: Option<u64>,
+    pub(crate) block_user_agent: Option<ByteBuf>,
     pub(crate) block_time: Option<i64>,
     pub(crate) block_height: Option<u64>,
     pub(crate) executed_transaction_count: u64,
@@ -109,13 +113,19 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_num_partitions: Option<u64>,
 }
 
-#[derive(Row, Serialize, Clone)]
-pub(crate) struct BlockFooterRow {
-    pub(crate) slot: u64,
-    pub(crate) bank_id: u64,
-    pub(crate) bank_hash: Array<u8, 32>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FooterFields {
+    pub(crate) bank_hash: [u8; 32],
     pub(crate) block_producer_time_nanos: u64,
-    pub(crate) block_user_agent: ByteBuf,
+    pub(crate) block_user_agent: Vec<u8>,
+}
+
+impl FooterFields {
+    pub(crate) fn apply(&self, row: &mut BlockMetadataRow) {
+        row.bank_hash = Some(Array(self.bank_hash));
+        row.block_producer_time_nanos = Some(self.block_producer_time_nanos);
+        row.block_user_agent = Some(ByteBuf::from(self.block_user_agent.clone()));
+    }
 }
 
 #[derive(Row, Serialize)]
@@ -223,6 +233,90 @@ pub(crate) async fn fetch_present_slots_in_range(
         })
 }
 
+/// Footer fields already stored for `slots`. Rows without a complete footer are skipped.
+pub(crate) async fn fetch_stored_footers(
+    clickhouse: &ClickHouseClient,
+    blocks_table: &str,
+    slots: &[u64],
+) -> Result<HashMap<u64, FooterFields>> {
+    #[derive(Debug, Deserialize, Row)]
+    struct StoredFooterRow {
+        slot: u64,
+        bank_hash: Option<String>,
+        block_producer_time_nanos: Option<u64>,
+        block_user_agent: Option<String>,
+    }
+
+    let (Some(&first), Some(&last)) = (slots.iter().min(), slots.iter().max()) else {
+        return Ok(HashMap::new());
+    };
+    let query = format!(
+        "SELECT slot, lower(hex(any(bank_hash))) AS bank_hash, \
+         any(block_producer_time_nanos) AS block_producer_time_nanos, \
+         lower(hex(any(block_user_agent))) AS block_user_agent \
+         FROM {blocks_table} \
+         WHERE slot BETWEEN ? AND ? AND has(?, slot) AND bank_hash IS NOT NULL \
+         AND block_producer_time_nanos IS NOT NULL AND block_user_agent IS NOT NULL \
+         GROUP BY slot"
+    );
+    let rows = clickhouse
+        .query(&query)
+        .bind(first)
+        .bind(last)
+        .bind(slots)
+        .fetch_all::<StoredFooterRow>()
+        .await
+        .with_context(|| format!("query stored footers from {blocks_table}"))?;
+    let mut stored = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let (Some(hash), Some(nanos), Some(agent)) = (
+            row.bank_hash,
+            row.block_producer_time_nanos,
+            row.block_user_agent,
+        ) else {
+            continue;
+        };
+        let (Ok(bank_hash), Ok(block_user_agent)) = (
+            hex::decode(&hash).map(<[u8; 32]>::try_from),
+            hex::decode(&agent),
+        ) else {
+            warn!(slot = row.slot, "ignoring undecodable stored footer fields");
+            continue;
+        };
+        let Ok(bank_hash) = bank_hash else {
+            warn!(
+                slot = row.slot,
+                "ignoring stored footer with a short bank hash"
+            );
+            continue;
+        };
+        stored.insert(
+            row.slot,
+            FooterFields {
+                bank_hash,
+                block_producer_time_nanos: nanos,
+                block_user_agent,
+            },
+        );
+    }
+    Ok(stored)
+}
+
+/// Fills footer fields that a replayed row lacks from the stored copy of the same slot.
+pub(crate) fn merge_stored_footers(
+    rows: &mut [BlockMetadataRow],
+    stored: &HashMap<u64, FooterFields>,
+) -> usize {
+    let mut merged = 0;
+    for row in rows.iter_mut().filter(|row| row.bank_hash.is_none()) {
+        if let Some(footer) = stored.get(&row.slot) {
+            footer.apply(row);
+            merged += 1;
+        }
+    }
+    merged
+}
+
 pub(crate) async fn flush_buffers(
     client: &ClickHouseClient,
     tables: &InsertTables,
@@ -258,69 +352,6 @@ pub(crate) struct RetryConfig {
     pub(crate) max_retries: u32,
     pub(crate) base_ms: u64,
     pub(crate) max_ms: u64,
-}
-
-pub(crate) struct FooterWriter {
-    client: ClickHouseClient,
-    table: String,
-}
-
-impl FooterWriter {
-    pub(crate) fn new(client: &ClickHouseClient, table: &str) -> Self {
-        // Normalize once: with_database invalidates clickhouse-rs metadata.
-        let (client, table) = match split_qualified_table(table) {
-            Some((db, name)) => (client.clone().with_database(db), name),
-            None => (client.clone(), table),
-        };
-        Self {
-            client,
-            table: table.to_owned(),
-        }
-    }
-
-    pub(crate) async fn probe(&self) -> Result<()> {
-        let query = self.client.query(
-            "SELECT slot, bank_id, bank_hash, block_producer_time_nanos, block_user_agent FROM ? LIMIT 0",
-        );
-        let query = query.bind(clickhouse::sql::Identifier(&self.table));
-        tokio::time::timeout(Duration::from_secs(5), query.execute())
-            .await
-            .context("footer storage probe timed out")??;
-        Ok(())
-    }
-
-    pub(crate) async fn insert(
-        &self,
-        rows: &[BlockFooterRow],
-        retry: Option<&RetryConfig>,
-    ) -> Result<()> {
-        let mut attempt = 0u32;
-        loop {
-            let result: Result<()> = async {
-                let mut insert = self.client.insert::<BlockFooterRow>(&self.table).await?;
-                for row in rows {
-                    insert.write(row).await?;
-                }
-                insert.end().await?;
-                Ok(())
-            }
-            .await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) if retry.is_some_and(|config| attempt < config.max_retries) => {
-                    let config = retry.expect("checked above");
-                    attempt += 1;
-                    let delay_ms = config
-                        .base_ms
-                        .saturating_mul(1u64 << (attempt - 1).min(62))
-                        .min(config.max_ms);
-                    warn!(attempt, delay_ms, %error, "footer batch insert failed; retrying");
-                    sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Err(error) => return Err(error).context("insert block footer batch"),
-            }
-        }
-    }
 }
 
 pub(crate) async fn flush_buffers_with_retry(
@@ -663,7 +694,6 @@ mod tests {
             clickhouse_async_insert: false,
             transactions_table: "default.transactions".to_string(),
             blocks_table: "default.blocks_metadata".to_string(),
-            block_footers_table: "default.block_footers".to_string(),
             entries_table: None,
             transactions_flush_rows: 25_000,
             blocks_flush_rows: 2_000,
@@ -708,75 +738,54 @@ mod tests {
         assert_eq!(split_qualified_table("a.b.c"), None);
         assert_eq!(split_qualified_table(""), None);
     }
-}
 
-#[cfg(test)]
-mod footer_native_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn native_footer_writer_reuses_metadata_and_replaces_reconnect_bank_ids_by_slot() {
-        let Ok(url) = std::env::var("DISK_CACHE_TEST_URL") else {
-            return;
-        };
-        assert!(
-            url.starts_with("http://127.0.0.1:"),
-            "disposable loopback fixture only"
-        );
-        let client = ClickHouseClient::default()
-            .with_url(url)
-            .with_database("default");
-        let name = format!(
-            "review_footer_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        client.query(&format!("CREATE TABLE {name} (slot UInt64, bank_id UInt64, bank_hash FixedString(32), block_producer_time_nanos UInt64, block_user_agent String) ENGINE=ReplacingMergeTree ORDER BY (slot)")).execute().await.unwrap();
-        let writer = FooterWriter::new(&client, &format!("default.{name}"));
-        let row = |slot, bank_id| BlockFooterRow {
+    fn block_row(slot: u64) -> BlockMetadataRow {
+        BlockMetadataRow {
             slot,
-            bank_id,
-            bank_hash: Array([9; 32]),
-            block_producer_time_nanos: 100,
-            block_user_agent: ByteBuf::from(b"fixture".to_vec()),
-        };
-        writer
-            .insert(&[row(42, 7), row(43, 8)], None)
-            .await
-            .unwrap();
-        writer.insert(&[row(42, 0)], None).await.unwrap();
-        let count: u64 = client
-            .query(&format!("SELECT count() FROM {name} FINAL"))
-            .fetch_one()
-            .await
-            .unwrap();
-        assert_eq!(
-            count, 2,
-            "node-local IDs cannot duplicate a finalized row on reconnect"
-        );
-        let bank_id: u64 = client
-            .query(&format!("SELECT bank_id FROM {name} FINAL WHERE slot=42"))
-            .fetch_one()
-            .await
-            .unwrap();
-        assert_eq!(bank_id, 0);
-        client.query("SYSTEM FLUSH LOGS").execute().await.unwrap();
-        let describes: u64 = client
-            .query("SELECT count() FROM system.query_log WHERE type='QueryFinish' AND query LIKE ?")
-            .bind(format!("DESCRIBE TABLE %{name}%"))
-            .fetch_one()
-            .await
-            .unwrap();
-        assert_eq!(
-            describes, 1,
-            "both batches must reuse one clickhouse-rs metadata cache"
-        );
-        client
-            .query(&format!("DROP TABLE {name}"))
-            .execute()
-            .await
-            .unwrap();
+            parent_slot: slot.saturating_sub(1),
+            blockhash: Array([1; 32]),
+            parent_blockhash: Array([2; 32]),
+            bank_id: Some(7),
+            bank_hash: None,
+            block_producer_time_nanos: None,
+            block_user_agent: None,
+            block_time: None,
+            block_height: None,
+            executed_transaction_count: 0,
+            entry_count: 0,
+            rewards_present: 0,
+            rewards_pubkey: Vec::new(),
+            rewards_lamports: Vec::new(),
+            rewards_post_balance: Vec::new(),
+            rewards_type: Vec::new(),
+            rewards_commission: Vec::new(),
+            rewards_commission_bps: Vec::new(),
+            rewards_num_partitions: None,
+        }
+    }
+
+    fn footer(tag: u8) -> FooterFields {
+        FooterFields {
+            bank_hash: [tag; 32],
+            block_producer_time_nanos: 100 + u64::from(tag),
+            block_user_agent: vec![tag; 3],
+        }
+    }
+
+    #[test]
+    fn stored_footers_fill_only_replayed_rows_without_a_footer() {
+        let mut live = block_row(11);
+        footer(9).apply(&mut live);
+        let mut rows = vec![block_row(10), live, block_row(12)];
+        let stored = HashMap::from([(10, footer(1)), (11, footer(2))]);
+
+        assert_eq!(merge_stored_footers(&mut rows, &stored), 1);
+
+        assert_eq!(rows[0].bank_hash.as_ref().map(|hash| hash.0), Some([1; 32]));
+        assert_eq!(rows[0].block_producer_time_nanos, Some(101));
+        assert_eq!(rows[0].block_user_agent.as_deref(), Some(&vec![1u8; 3]));
+        assert_eq!(rows[0].bank_id, Some(7));
+        assert_eq!(rows[1].bank_hash.as_ref().map(|hash| hash.0), Some([9; 32]));
+        assert!(rows[2].bank_hash.is_none());
     }
 }

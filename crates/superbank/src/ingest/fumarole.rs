@@ -103,7 +103,9 @@ pub(crate) async fn run_fumarole_ingest(args: &Args) -> Result<()> {
     let mut pressure_guard = FumarolePressureGuard::new(args.fumarole_memory_soft_limit_bytes);
     pressure_guard.observe(&block_assembler);
 
-    let mut buffered_rows = BufferedRows::new(args);
+    let mut buffered_rows = BufferedRows::new(args).with_footer_merge_ceiling(
+        fetch_latest_slot_from_blocks(&clickhouse, &args.blocks_table).await?,
+    );
     let insert_tables = InsertTables::from_args(args);
     let mut flush_timer = interval(Duration::from_secs(args.flush_interval_secs));
     flush_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);

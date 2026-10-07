@@ -32,9 +32,9 @@ use yellowstone_grpc_proto::prelude::{
 
 use crate::cli::{Args, FromSlotSpec, IngestSource};
 use crate::clickhouse::{
-    BlockFooterRow, BlockMetadataRow, EntryRow, FooterWriter, InsertTables, RetryConfig,
-    TransactionRow, build_clickhouse_client, fetch_latest_slot_from_blocks, flush_buffers,
-    flush_buffers_with_retry,
+    BlockMetadataRow, EntryRow, FooterFields, InsertTables, RetryConfig, TransactionRow,
+    build_clickhouse_client, fetch_latest_slot_from_blocks, fetch_stored_footers, flush_buffers,
+    flush_buffers_with_retry, merge_stored_footers,
 };
 use crate::commitment::parse_durable_commitment;
 use crate::metrics;
@@ -88,6 +88,8 @@ pub(crate) struct BufferedRows {
     block_rows: Vec<BlockMetadataRow>,
     entry_rows: Vec<EntryRow>,
     last_durable_block_slot: Option<u64>,
+    // Replayed rows at or below this slot may already have stored footer fields.
+    footer_merge_ceiling: Option<u64>,
 }
 
 impl BufferedRows {
@@ -97,7 +99,41 @@ impl BufferedRows {
             block_rows: Vec::with_capacity(args.blocks_flush_rows),
             entry_rows: Vec::with_capacity(args.transactions_flush_rows),
             last_durable_block_slot: None,
+            footer_merge_ceiling: None,
         }
+    }
+
+    pub(crate) fn with_footer_merge_ceiling(mut self, ceiling: Option<u64>) -> Self {
+        self.footer_merge_ceiling = ceiling;
+        self
+    }
+
+    // Replay carries no footers, so keep the fields a stored row already has.
+    async fn merge_stored_footers(
+        &mut self,
+        clickhouse: &ClickHouseClient,
+        insert_tables: &InsertTables,
+    ) -> Result<()> {
+        let Some(ceiling) = self.footer_merge_ceiling else {
+            return Ok(());
+        };
+        let mut slots: Vec<u64> = self
+            .block_rows
+            .iter()
+            .filter(|row| row.bank_hash.is_none() && row.slot <= ceiling)
+            .map(|row| row.slot)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let stored = fetch_stored_footers(clickhouse, &insert_tables.blocks_table, &slots).await?;
+        let merged = merge_stored_footers(&mut self.block_rows, &stored);
+        if merged > 0 {
+            info!(merged, "kept stored footer fields on replayed blocks");
+        }
+        Ok(())
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -109,6 +145,7 @@ impl BufferedRows {
         clickhouse: &ClickHouseClient,
         insert_tables: &InsertTables,
     ) -> Result<()> {
+        self.merge_stored_footers(clickhouse, insert_tables).await?;
         let flushed_block_slot = max_block_slot(&self.block_rows);
         flush_buffers(
             clickhouse,
@@ -134,6 +171,7 @@ impl BufferedRows {
         insert_tables: &InsertTables,
         retry: &RetryConfig,
     ) -> Result<()> {
+        self.merge_stored_footers(clickhouse, insert_tables).await?;
         let flushed_block_slot = max_block_slot(&self.block_rows);
         flush_buffers_with_retry(
             clickhouse,
@@ -155,9 +193,9 @@ impl BufferedRows {
     }
 }
 
-const FOOTER_BATCH_ROWS: usize = 256;
 const FOOTER_JOIN_WINDOW_SLOTS: u64 = 8192;
-const FOOTER_REQUALIFY_INTERVAL: Duration = Duration::from_secs(30);
+const FOOTER_WAIT: Duration = Duration::from_secs(2);
+const FOOTER_AWAIT_MAX_BLOCKS: usize = 64;
 const PENDING_IDENTITY_MAX_BLOCKS: usize = 256;
 const PENDING_IDENTITY_MAX_BYTES: usize = 128 * 1024 * 1024;
 
@@ -168,10 +206,18 @@ enum CanonicalIdentity {
     Bank(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterRelease {
+    Due,
+    Drain,
+    Skip,
+}
+
 struct PreparedBlock {
     metadata: BlockMetadataRow,
     transactions: Vec<TransactionRow>,
     entries: Vec<EntryRow>,
+    encoded_bytes: usize,
 }
 
 impl PreparedBlock {
@@ -189,27 +235,40 @@ impl PreparedBlock {
     }
 }
 
+struct AwaitingFooter {
+    prepared: PreparedBlock,
+    bank_id: Option<u64>,
+    deadline: Instant,
+}
+
 #[derive(Default)]
 struct FinalizedFooterJoin {
-    pending: HashMap<(u64, u64), BlockFooterRow>,
+    // How long an identified block waits for its footer before it is written without one.
+    footer_wait: Duration,
+    pending: HashMap<(u64, u64), FooterFields>,
     finalized: HashMap<u64, u64>,
-    completed: HashSet<(u64, u64)>,
-    complete_blocks: HashSet<(u64, u64)>,
-    durable_blocks: HashSet<(u64, u64)>,
-    footer_requalify_at: Option<tokio::time::Instant>,
     footer_seen: bool,
-    footer_storage_available: Option<bool>,
-    footer_writer: Option<FooterWriter>,
+    min_footer_slot: Option<u64>,
     highest_slot: u64,
     // These proofs and pending payloads belong only to this subscription.
     known_banks: HashSet<(u64, u64)>,
     legacy_slots: HashSet<u64>,
     pending_identity: BTreeMap<u64, PreparedBlock>,
-    ready_footers: Vec<BlockFooterRow>,
     pending_identity_bytes: usize,
+    // Identified blocks wait here in slot order for their footer.
+    awaiting: BTreeMap<(u64, u64), AwaitingFooter>,
+    awaiting_bytes: usize,
+    awaiting_seq: u64,
 }
 
 impl FinalizedFooterJoin {
+    fn new() -> Self {
+        Self {
+            footer_wait: FOOTER_WAIT,
+            ..Default::default()
+        }
+    }
+
     fn block_identity(&self, slot: u64, scalar_id: u64) -> Result<CanonicalIdentity> {
         if self.legacy_slots.contains(&slot) {
             ensure!(
@@ -228,7 +287,7 @@ impl FinalizedFooterJoin {
 
     fn stage_identity_block(
         &mut self,
-        prepared: PreparedBlock,
+        mut prepared: PreparedBlock,
         encoded_bytes: usize,
     ) -> Result<()> {
         let slot = prepared.metadata.slot;
@@ -246,6 +305,7 @@ impl FinalizedFooterJoin {
             "gRPC blocks lack same-subscription bank identity; pending identity limit exceeded"
         );
         self.highest_slot = self.highest_slot.max(slot);
+        prepared.encoded_bytes = encoded_bytes;
         self.pending_identity.insert(slot, prepared);
         self.pending_identity_bytes = bytes;
         self.prune()
@@ -265,75 +325,45 @@ impl FinalizedFooterJoin {
         Ok(pending.into_values().zip(identities).collect())
     }
 
-    fn observe(&mut self, update: SubscribeUpdate) -> Result<Option<BlockFooterRow>> {
-        let row = match update.update_oneof {
+    fn observe(&mut self, update: SubscribeUpdate) -> Result<()> {
+        match update.update_oneof {
             Some(UpdateOneof::BlockFooter(footer)) => self.observe_footer(&footer)?,
             Some(UpdateOneof::Slot(slot)) => self.observe_slot(&slot)?,
-            _ => None,
-        };
-        self.prune()?;
-        Ok(row)
+            _ => {}
+        }
+        self.prune()
     }
 
-    fn observe_footer(
-        &mut self,
-        footer: &SubscribeUpdateBlockFooter,
-    ) -> Result<Option<BlockFooterRow>> {
+    fn observe_footer(&mut self, footer: &SubscribeUpdateBlockFooter) -> Result<()> {
         ensure!(
             !self.legacy_slots.contains(&footer.slot),
             "footer at slot {} lacks proven bank identity",
             footer.slot
         );
-        let row = map_block_footer(footer)?;
-        let key = (row.slot, row.bank_id);
+        let fields = map_block_footer(footer)?;
         self.footer_seen = true;
-        self.highest_slot = self.highest_slot.max(row.slot);
+        self.min_footer_slot = Some(
+            self.min_footer_slot
+                .map_or(footer.slot, |min| min.min(footer.slot)),
+        );
+        self.highest_slot = self.highest_slot.max(footer.slot);
         if self
             .finalized
-            .get(&row.slot)
-            .is_some_and(|winner| *winner != row.bank_id)
+            .get(&footer.slot)
+            .is_some_and(|winner| *winner != footer.bank_id)
         {
-            return Ok(None);
+            return Ok(());
         }
-        if !self.completed.contains(&key) {
-            self.pending.insert(key, row);
-        }
-        Ok(self.take_ready(key))
-    }
-
-    fn observe_complete_block(
-        &mut self,
-        slot: u64,
-        bank_id: u64,
-    ) -> Result<Option<BlockFooterRow>> {
-        anyhow::ensure!(
-            self.finalized
-                .get(&slot)
-                .is_none_or(|winner| *winner == bank_id),
-            "complete finalized block conflicts with winning bank at slot {slot}"
-        );
-        self.highest_slot = self.highest_slot.max(slot);
-        self.complete_blocks.insert((slot, bank_id));
-        let row = self.take_ready((slot, bank_id));
-        self.prune()?;
-        Ok(row)
-    }
-
-    fn take_ready(&mut self, key: (u64, u64)) -> Option<BlockFooterRow> {
-        if self.finalized.get(&key.0) != Some(&key.1) || !self.complete_blocks.contains(&key) {
-            return None;
-        }
-        let row = self.pending.remove(&key)?;
-        self.completed.insert(key);
-        Some(row)
+        self.pending.insert((footer.slot, footer.bank_id), fields);
+        Ok(())
     }
 
     fn observe_slot(
         &mut self,
         slot: &yellowstone_grpc_proto::prelude::SubscribeUpdateSlot,
-    ) -> Result<Option<BlockFooterRow>> {
+    ) -> Result<()> {
         let Ok(status) = SlotStatus::try_from(slot.status) else {
-            return Ok(None);
+            return Ok(());
         };
         if matches!(
             status,
@@ -365,104 +395,138 @@ impl FinalizedFooterJoin {
                 self.legacy_slots.insert(slot.slot);
             }
         }
-        Ok(match status {
+        match status {
             SlotStatus::SlotFinalized => {
                 let Some(bank_id) = slot.bank_id else {
-                    return Ok(None);
+                    return Ok(());
                 };
-                let key = (slot.slot, bank_id);
-                anyhow::ensure!(
+                ensure!(
                     self.finalized
                         .get(&slot.slot)
-                        .is_none_or(|winner| *winner == key.1),
+                        .is_none_or(|winner| *winner == bank_id),
                     "conflicting finalized banks at slot {}",
                     slot.slot
                 );
-                self.finalized.insert(slot.slot, key.1);
+                self.finalized.insert(slot.slot, bank_id);
                 self.pending
-                    .retain(|(candidate, bank), _| *candidate != slot.slot || *bank == key.1);
-                self.take_ready(key)
+                    .retain(|(candidate, bank), _| *candidate != slot.slot || *bank == bank_id);
             }
             SlotStatus::SlotDead => {
                 self.pending.retain(|(candidate, bank), _| {
                     *candidate != slot.slot || slot.bank_id.is_some_and(|id| *bank != id)
                 });
-                None
             }
-            _ => None,
-        })
+            _ => {}
+        }
+        Ok(())
     }
 
-    // Before the first footer arrives the cluster may not emit footers, so nothing is missing.
-    fn missing_footers(&self, oldest: u64) -> Vec<(u64, u64)> {
-        if !self.footer_seen {
-            return Vec::new();
+    // Footers are not replayed, so slots below this subscription's first footer never get one.
+    fn footer_expected(&self, slot: u64) -> bool {
+        !(self.footer_seen && self.min_footer_slot.is_some_and(|min| slot < min))
+    }
+
+    fn await_footer(
+        &mut self,
+        mut prepared: PreparedBlock,
+        identity: CanonicalIdentity,
+        now: Instant,
+    ) -> Result<()> {
+        let bank_id = match identity {
+            CanonicalIdentity::Bank(bank_id) => Some(bank_id),
+            CanonicalIdentity::Legacy => None,
+            CanonicalIdentity::Unknown => {
+                return Err(anyhow!("cannot persist unidentified gRPC bank"));
+            }
+        };
+        let slot = prepared.metadata.slot;
+        ensure!(
+            bank_id.is_none_or(|id| self.finalized.get(&slot).is_none_or(|winner| *winner == id)),
+            "finalized block conflicts with winning bank at slot {slot}"
+        );
+        prepared.metadata.bank_id = bank_id;
+        self.awaiting_bytes = self.awaiting_bytes.saturating_add(prepared.encoded_bytes);
+        self.awaiting_seq += 1;
+        self.awaiting.insert(
+            (slot, self.awaiting_seq),
+            AwaitingFooter {
+                prepared,
+                bank_id,
+                deadline: now + self.footer_wait,
+            },
+        );
+        Ok(())
+    }
+
+    // Releases blocks in slot order once their footer joins or the wait ends.
+    fn release_awaiting(
+        &mut self,
+        now: Instant,
+        mode: FooterRelease,
+        include_entries: bool,
+        rows: &mut BufferedRows,
+    ) {
+        if mode == FooterRelease::Skip {
+            return;
         }
-        self.finalized
-            .iter()
-            .filter(|&(&slot, &bank_id)| {
-                slot < oldest && !self.completed.contains(&(slot, bank_id))
-            })
-            .map(|(&slot, &bank_id)| (slot, bank_id))
-            .collect()
+        while let Some((&(slot, _), entry)) = self.awaiting.first_key_value() {
+            let bank_id = entry.bank_id;
+            let usable = bank_id.is_some_and(|id| {
+                self.finalized.get(&slot) == Some(&id) && self.pending.contains_key(&(slot, id))
+            });
+            let overflow = self.awaiting.len() > FOOTER_AWAIT_MAX_BLOCKS
+                || self.awaiting_bytes > PENDING_IDENTITY_MAX_BYTES;
+            let due = mode == FooterRelease::Drain
+                || overflow
+                || bank_id.is_none()
+                || now >= entry.deadline
+                || !self.footer_expected(slot);
+            if !usable && !due {
+                break;
+            }
+            let Some((_, mut entry)) = self.awaiting.pop_first() else {
+                break;
+            };
+            self.awaiting_bytes = self
+                .awaiting_bytes
+                .saturating_sub(entry.prepared.encoded_bytes);
+            let footer = bank_id
+                .filter(|_| usable)
+                .and_then(|id| self.pending.remove(&(slot, id)));
+            match footer {
+                Some(footer) => footer.apply(&mut entry.prepared.metadata),
+                None if mode == FooterRelease::Due
+                    && bank_id.is_some()
+                    && self.footer_seen
+                    && self.footer_expected(slot) =>
+                {
+                    metrics::observe_source_error("grpc_footer", "missing");
+                    warn!(
+                        slot,
+                        "footer unavailable for finalized block; footer columns stay NULL"
+                    );
+                }
+                None => {}
+            }
+            entry.prepared.append(
+                &mut rows.transaction_rows,
+                &mut rows.block_rows,
+                include_entries.then_some(&mut rows.entry_rows),
+            );
+        }
     }
 
     fn prune(&mut self) -> Result<()> {
         let oldest = self.highest_slot.saturating_sub(FOOTER_JOIN_WINDOW_SLOTS);
-        for (slot, bank_id) in self.missing_footers(oldest) {
-            metrics::observe_source_error("grpc_footer", "missing");
-            warn!(
-                slot,
-                bank_id,
-                "footer unavailable in join window; canonical data remains valid, replay may not supply footers"
-            );
-        }
-        self.ready_footers.retain(|footer| {
-            if footer.slot < oldest {
-                metrics::observe_source_error("grpc_footer", "expired_insert");
-                warn!(
-                    slot = footer.slot,
-                    "unwritten footer expired from bounded retry window"
-                );
-                false
-            } else {
-                true
-            }
-        });
         self.pending.retain(|(slot, _), _| *slot >= oldest);
         self.finalized.retain(|slot, _| *slot >= oldest);
-        self.completed.retain(|(slot, _)| *slot >= oldest);
         ensure!(
             !self.pending_identity.keys().any(|slot| *slot < oldest),
             "finalized block lacks same-subscription bank identity within {FOOTER_JOIN_WINDOW_SLOTS} slots"
         );
-        self.complete_blocks.retain(|(slot, _)| *slot >= oldest);
-        self.durable_blocks.retain(|(slot, _)| *slot >= oldest);
         self.known_banks.retain(|(slot, _)| *slot >= oldest);
         self.legacy_slots.retain(|slot| *slot >= oldest);
         Ok(())
-    }
-}
-
-// Ancillary footer persistence is best-effort. Qualification checks the table columns only.
-async fn qualify_footer_storage(client: &ClickHouseClient, table: &str) -> bool {
-    match FooterWriter::new(client, table).probe().await {
-        Ok(()) => {
-            info!(
-                table,
-                "footer storage qualified; using best-effort ancillary persistence"
-            );
-            true
-        }
-        Err(error) => {
-            metrics::observe_source_error("grpc_footer", "startup_unavailable");
-            warn!(
-                table,
-                %error,
-                "footer storage unqualified; retaining footers and re-probing, canonical ingestion remains enabled"
-            );
-            false
-        }
     }
 }
 
@@ -489,7 +553,9 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     let (initial_from_slot, initial_from_slot_mode) =
         resolve_initial_from_slot(args, &clickhouse).await?;
 
-    let mut buffered_rows = BufferedRows::new(args);
+    let mut buffered_rows = BufferedRows::new(args).with_footer_merge_ceiling(
+        fetch_latest_slot_from_blocks(&clickhouse, &args.blocks_table).await?,
+    );
     let insert_tables = InsertTables::from_args(args);
     let retry_config = RetryConfig {
         max_retries: args.insert_max_retries,
@@ -518,14 +584,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
         initial_from_slot_mode,
         buffered_rows.last_durable_block_slot,
     );
-    let footer_storage_available =
-        qualify_footer_storage(&clickhouse, &args.block_footers_table).await;
-    let mut footer_join = FinalizedFooterJoin {
-        footer_requalify_at: (!footer_storage_available)
-            .then(|| tokio::time::Instant::now() + FOOTER_REQUALIFY_INTERVAL),
-        footer_storage_available: Some(footer_storage_available),
-        ..Default::default()
-    };
+    let mut footer_join = FinalizedFooterJoin::new();
     let (pending_update, mut stream) = connect_grpc_stream(
         endpoint,
         args,
@@ -576,7 +635,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                 break;
             }
             _ = flush_timer.tick() => {
-                flush_canonical_rows(&clickhouse, &insert_tables, &mut buffered_rows, Some(&retry_config), &mut footer_join).await?;
+                flush_canonical_rows(&clickhouse, &insert_tables, &mut buffered_rows, Some(&retry_config), &mut footer_join, FooterRelease::Due).await?;
             }
             health_failure = health_failure_rx.recv() => {
                 let reason = health_failure
@@ -594,6 +653,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                     &mut buffered_rows,
                     &reason,
                     &mut footer_join,
+                    FooterRelease::Drain,
                 )
                 .await?;
                 return Err(anyhow!(reason));
@@ -616,6 +676,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                     &mut buffered_rows,
                     &reason,
                     &mut footer_join,
+                    FooterRelease::Drain,
                 )
                 .await?;
                 return Err(anyhow!(reason));
@@ -674,6 +735,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                             &mut buffered_rows,
                             &reason,
                             &mut footer_join,
+                            FooterRelease::Drain,
                         )
                         .await?;
                         return Err(anyhow!(reason));
@@ -692,6 +754,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
                             &mut buffered_rows,
                             &reason,
                             &mut footer_join,
+                            FooterRelease::Drain,
                         )
                         .await?;
                         return Err(anyhow!(reason));
@@ -702,7 +765,7 @@ pub(crate) async fn run_grpc_ingest(args: &Args) -> Result<()> {
     }
     let shutdown_count = *shutdown_rx.borrow();
     tokio::select! {
-        result = flush_canonical_rows(&clickhouse, &insert_tables, &mut buffered_rows, Some(&retry_config), &mut footer_join) => {
+        result = flush_canonical_rows(&clickhouse, &insert_tables, &mut buffered_rows, Some(&retry_config), &mut footer_join, FooterRelease::Drain) => {
             result?;
             ensure!(footer_join.pending_identity.is_empty(),
                 "gRPC shutdown with unidentified banks; replay from the last durable slot");
@@ -758,7 +821,15 @@ async fn process_canonical_update(
         // and unresolved identities retain the existing all-data progress hold.
         if affected_slot.is_some_and(|slot| rows.block_rows.iter().all(|row| row.slot < slot)) {
             warn!(%error, affected_slot, "canonical update rejected; flushing only complete earlier qualified data");
-            flush_after_fatal_condition(clickhouse, tables, rows, &error.to_string(), join).await?;
+            flush_after_fatal_condition(
+                clickhouse,
+                tables,
+                rows,
+                &error.to_string(),
+                join,
+                FooterRelease::Skip,
+            )
+            .await?;
         }
     }
     result
@@ -773,8 +844,6 @@ async fn process_canonical_update_inner(
     retry: &RetryConfig,
     join: &mut FinalizedFooterJoin,
 ) -> Result<()> {
-    join.footer_writer
-        .get_or_insert_with(|| FooterWriter::new(clickhouse, &args.block_footers_table));
     match update.update_oneof {
         Some(UpdateOneof::Block(block)) => {
             validate_block_bank(
@@ -796,113 +865,44 @@ async fn process_canonical_update_inner(
             join.stage_identity_block(prepared, block.encoded_len())?;
         }
         Some(UpdateOneof::BlockFooter(footer)) => {
-            match join.observe_footer(&footer) {
-                Ok(Some(footer)) => join.ready_footers.push(footer),
-                Ok(None) => {}
-                Err(error) => {
-                    metrics::observe_source_error("grpc_footer", "invalid");
-                    warn!(slot = footer.slot, %error, "discarding unqualified footer; canonical identity checks remain required");
-                }
+            if let Err(error) = join.observe_footer(&footer) {
+                metrics::observe_source_error("grpc_footer", "invalid");
+                warn!(slot = footer.slot, %error, "discarding unqualified footer; canonical identity checks remain required");
             }
             join.prune()?;
         }
         other => {
-            if let Some(footer) = join.observe(SubscribeUpdate {
+            join.observe(SubscribeUpdate {
                 update_oneof: other,
                 ..update
-            })? {
-                join.ready_footers.push(footer);
-            }
+            })?;
         }
     }
     // Later complete blocks remain held behind any unidentified earlier block.
     // Nothing can advance the metadata tip until every held identity is resolved.
+    let now = Instant::now();
     for (prepared, identity) in join.take_ready_blocks()? {
-        if let Some(footer) = buffer_identified_block(prepared, identity, args, rows, join)? {
-            join.ready_footers.push(footer);
-        }
+        join.await_footer(prepared, identity, now)?;
     }
+    join.release_awaiting(now, FooterRelease::Due, args.entries_table.is_some(), rows);
     if join.pending_identity.is_empty() {
         let pressure = args.flush_every_block
             || rows.transaction_rows.len() >= args.transactions_flush_rows
             || rows.block_rows.len() >= args.blocks_flush_rows
             || rows.entry_rows.len() >= args.transactions_flush_rows;
-        if pressure || join.ready_footers.len() >= FOOTER_BATCH_ROWS {
-            flush_canonical_rows(clickhouse, tables, rows, Some(retry), join).await?;
+        if pressure {
+            flush_canonical_rows(
+                clickhouse,
+                tables,
+                rows,
+                Some(retry),
+                join,
+                FooterRelease::Skip,
+            )
+            .await?;
         }
-    } else {
-        // Durable earlier banks can bypass a later identity hold without
-        // flushing held block data or advancing the metadata resume tip.
-        flush_ready_footers(join).await;
     }
     Ok(())
-}
-
-fn buffer_identified_block(
-    mut prepared: PreparedBlock,
-    identity: CanonicalIdentity,
-    args: &Args,
-    rows: &mut BufferedRows,
-    join: &mut FinalizedFooterJoin,
-) -> Result<Option<BlockFooterRow>> {
-    let bank_id = match identity {
-        CanonicalIdentity::Bank(bank_id) => Some(bank_id),
-        CanonicalIdentity::Legacy => None,
-        CanonicalIdentity::Unknown => return Err(anyhow!("cannot persist unidentified gRPC bank")),
-    };
-    let slot = prepared.metadata.slot;
-    ensure!(
-        bank_id.is_none_or(|id| join.finalized.get(&slot).is_none_or(|winner| *winner == id)),
-        "finalized block conflicts with winning bank at slot {slot}"
-    );
-    prepared.metadata.bank_id = bank_id;
-    prepared.append(
-        &mut rows.transaction_rows,
-        &mut rows.block_rows,
-        args.entries_table.as_ref().map(|_| &mut rows.entry_rows),
-    );
-    // Legacy finalized full blocks supply canonical historical data, not a
-    // node-local identity that could qualify a modern footer.
-    match bank_id {
-        Some(bank_id) => join.observe_complete_block(slot, bank_id),
-        None => Ok(None),
-    }
-}
-
-async fn flush_ready_footers(join: &mut FinalizedFooterJoin) {
-    let (durable, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut join.ready_footers)
-        .into_iter()
-        .partition(|footer| join.durable_blocks.contains(&(footer.slot, footer.bank_id)));
-    join.ready_footers = waiting;
-    if durable.is_empty() {
-        return;
-    }
-    let Some(writer) = &join.footer_writer else {
-        join.ready_footers.extend(durable);
-        return;
-    };
-    if join.footer_storage_available == Some(false) {
-        let now = tokio::time::Instant::now();
-        if join.footer_requalify_at.is_some_and(|at| now < at) {
-            join.ready_footers.extend(durable);
-            return;
-        }
-        if let Err(error) = writer.probe().await {
-            metrics::observe_source_error("grpc_footer", "storage_disabled");
-            warn!(%error, "footer storage still unavailable; retaining footers within the join window");
-            join.footer_requalify_at = Some(now + FOOTER_REQUALIFY_INTERVAL);
-            join.ready_footers.extend(durable);
-            return;
-        }
-        join.footer_storage_available = Some(true);
-        join.footer_requalify_at = None;
-    }
-    // A single attempt keeps a footer-only outage from stalling canonical ingestion.
-    if let Err(error) = writer.insert(&durable, None).await {
-        metrics::observe_source_error("grpc_footer", "insert_failed");
-        warn!(rows = durable.len(), %error, "footer batch insert failed; retaining bounded batch while canonical ingestion continues");
-        join.ready_footers.extend(durable);
-    }
 }
 
 async fn flush_canonical_rows(
@@ -911,9 +911,15 @@ async fn flush_canonical_rows(
     rows: &mut BufferedRows,
     retry: Option<&RetryConfig>,
     join: &mut FinalizedFooterJoin,
+    release: FooterRelease,
 ) -> Result<bool> {
+    join.release_awaiting(
+        Instant::now(),
+        release,
+        tables.entries_table.is_some(),
+        rows,
+    );
     if !join.pending_identity.is_empty() {
-        flush_ready_footers(join).await;
         warn!(
             first_pending_slot = join
                 .pending_identity
@@ -924,18 +930,10 @@ async fn flush_canonical_rows(
         );
         return Ok(false);
     }
-    let banks: Vec<_> = rows
-        .block_rows
-        .iter()
-        .filter_map(|metadata| metadata.bank_id.map(|bank_id| (metadata.slot, bank_id)))
-        .collect();
     match retry {
         Some(retry) => rows.flush_with_retry(clickhouse, tables, retry).await?,
         None => rows.flush(clickhouse, tables).await?,
     }
-    // Mark only after the entire transaction/metadata/entry flush succeeds.
-    join.durable_blocks.extend(banks);
-    flush_ready_footers(join).await;
     Ok(true)
 }
 
@@ -1234,11 +1232,19 @@ async fn flush_after_fatal_condition(
     buffered_rows: &mut BufferedRows,
     reason: &str,
     join: &mut FinalizedFooterJoin,
+    release: FooterRelease,
 ) -> Result<()> {
-    flush_canonical_rows(clickhouse, insert_tables, buffered_rows, None, join)
-        .await
-        .map(|_| ())
-        .with_context(|| format!("flush buffered rows after fatal gRPC condition: {reason}"))
+    flush_canonical_rows(
+        clickhouse,
+        insert_tables,
+        buffered_rows,
+        None,
+        join,
+        release,
+    )
+    .await
+    .map(|_| ())
+    .with_context(|| format!("flush buffered rows after fatal gRPC condition: {reason}"))
 }
 
 fn reset_idle_timer(idle_timer: Pin<&mut Sleep>, idle_timeout: Duration) {
@@ -1440,13 +1446,13 @@ async fn flush_block_if_needed(
     Ok(false)
 }
 
-fn map_block_footer(footer: &SubscribeUpdateBlockFooter) -> Result<BlockFooterRow> {
-    Ok(BlockFooterRow {
-        slot: footer.slot,
-        bank_id: footer.bank_id,
-        bank_hash: bytes_to_array(&footer.bank_hash).context("decode footer bank hash")?,
+fn map_block_footer(footer: &SubscribeUpdateBlockFooter) -> Result<FooterFields> {
+    Ok(FooterFields {
+        bank_hash: bytes_to_array::<32>(&footer.bank_hash)
+            .context("decode footer bank hash")?
+            .0,
         block_producer_time_nanos: footer.block_producer_time_nanos,
-        block_user_agent: ByteBuf::from(footer.block_user_agent.clone()),
+        block_user_agent: footer.block_user_agent.clone(),
     })
 }
 
@@ -1482,6 +1488,7 @@ fn prepare_block(block: &SubscribeUpdateBlock, include_entries: bool) -> Result<
         } else {
             Vec::new()
         },
+        encoded_bytes: 0,
     })
 }
 
@@ -1624,6 +1631,9 @@ fn map_block_metadata(block: &SubscribeUpdateBlock) -> Result<BlockMetadataRow> 
         blockhash,
         parent_blockhash,
         bank_id: (block.bank_id != 0).then_some(block.bank_id),
+        bank_hash: None,
+        block_producer_time_nanos: None,
+        block_user_agent: None,
         block_time,
         block_height,
         executed_transaction_count: block.executed_transaction_count,
@@ -2291,14 +2301,16 @@ fn decode_transaction_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockMetadataRow, FinalizedFooterJoin, FromSlotMode, build_footer_request,
-        build_subscribe_request, grpc_health_status_is_serving, grpc_health_status_label,
-        grpc_status_summary, is_oversized_grpc_message, map_block_footer, map_transaction,
-        max_block_slot, next_subscribe_from_slot, next_subscribe_from_slot_mode,
-        parse_commission_bps, validate_block_bank,
+        BlockMetadataRow, BufferedRows, CanonicalIdentity, FinalizedFooterJoin, FooterRelease,
+        FromSlotMode, PreparedBlock, build_footer_request, build_subscribe_request,
+        grpc_health_status_is_serving, grpc_health_status_label, grpc_status_summary,
+        is_oversized_grpc_message, map_block_footer, map_transaction, max_block_slot,
+        next_subscribe_from_slot, next_subscribe_from_slot_mode, parse_commission_bps,
+        validate_block_bank,
     };
     use crate::cli::IngestSource;
     use serde_big_array::Array;
+    use tokio::time::Instant;
 
     #[test]
     fn generated_reward_types_preserve_storage_names_and_reject_unknown_values() {
@@ -2383,76 +2395,198 @@ mod tests {
         }
     }
 
-    #[test]
-    fn footer_persists_only_for_finalized_bank_in_either_arrival_order() {
-        let mut join = FinalizedFooterJoin::default();
-        assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
-        assert!(
-            join.observe(slot_update(42, 8, SlotStatus::SlotFinalized))
-                .unwrap()
-                .is_none()
-        );
-        assert!(!join.pending.contains_key(&(42, 7)));
-        assert!(join.observe(footer_update(42, 8)).unwrap().is_none());
-        let row = join.observe_complete_block(42, 8).unwrap().unwrap();
-        assert_eq!((row.slot, row.bank_id), (42, 8));
+    fn rows() -> BufferedRows {
+        BufferedRows {
+            transaction_rows: Vec::new(),
+            block_rows: Vec::new(),
+            entry_rows: Vec::new(),
+            last_durable_block_slot: None,
+            footer_merge_ceiling: None,
+        }
+    }
 
-        assert!(join.observe_complete_block(43, 9).unwrap().is_none());
-        assert!(join.observe(footer_update(43, 9)).unwrap().is_none());
-        let row = join
-            .observe(slot_update(43, 9, SlotStatus::SlotFinalized))
-            .unwrap()
-            .unwrap();
-        assert_eq!((row.slot, row.bank_id), (43, 9));
+    fn prepared(slot: u64) -> PreparedBlock {
+        PreparedBlock {
+            metadata: build_block_metadata_row(slot),
+            transactions: Vec::new(),
+            entries: Vec::new(),
+            encoded_bytes: 10,
+        }
+    }
+
+    fn row_slots(rows: &BufferedRows) -> Vec<u64> {
+        rows.block_rows.iter().map(|row| row.slot).collect()
+    }
+
+    fn row_hash(rows: &BufferedRows, slot: u64) -> Option<[u8; 32]> {
+        let row = rows.block_rows.iter().find(|row| row.slot == slot).unwrap();
+        row.bank_hash.as_ref().map(|hash| hash.0)
     }
 
     #[test]
-    fn footer_join_discards_losing_banks_and_pre_activation_slots() {
+    fn footer_merges_into_the_block_row_in_either_arrival_order() {
+        let now = Instant::now();
+        let mut join = FinalizedFooterJoin::new();
+        let mut rows = rows();
+        join.observe(footer_update(42, 8)).unwrap();
+        join.observe(slot_update(42, 8, SlotStatus::SlotFinalized))
+            .unwrap();
+        join.await_footer(prepared(42), CanonicalIdentity::Bank(8), now)
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_hash(&rows, 42), Some([8; 32]));
+        let row = &rows.block_rows[0];
+        assert_eq!(row.block_producer_time_nanos, Some(123));
+        assert_eq!(row.block_user_agent.as_deref(), Some(&b"agave".to_vec()));
+        assert_eq!(row.bank_id, Some(8));
+
+        join.await_footer(prepared(43), CanonicalIdentity::Bank(9), now)
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![42]);
+        join.observe(slot_update(43, 9, SlotStatus::SlotFinalized))
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![42]);
+        join.observe(footer_update(43, 9)).unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![42, 43]);
+        assert_eq!(row_hash(&rows, 43), Some([9; 32]));
+        assert!(join.awaiting.is_empty() && join.pending.is_empty());
+    }
+
+    #[test]
+    fn footer_join_discards_losing_banks() {
+        let now = Instant::now();
+        let mut join = FinalizedFooterJoin::new();
+        let mut rows = rows();
+        join.observe(slot_update(42, 8, SlotStatus::SlotFinalized))
+            .unwrap();
+        join.observe(footer_update(42, 7)).unwrap();
+        join.observe(footer_update(42, 8)).unwrap();
+        assert!(!join.pending.contains_key(&(42, 7)));
+        assert!(
+            join.await_footer(prepared(42), CanonicalIdentity::Bank(7), now)
+                .is_err()
+        );
+        join.await_footer(prepared(42), CanonicalIdentity::Bank(8), now)
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_hash(&rows, 42), Some([8; 32]));
+    }
+
+    #[test]
+    fn block_is_written_without_footer_columns_once_the_wait_ends() {
         crate::metrics::force_init("grpc", None);
-        let mut join = FinalizedFooterJoin::default();
-        assert!(
-            join.observe(slot_update(1, 1, SlotStatus::SlotFinalized))
-                .unwrap()
-                .is_none()
+        let now = Instant::now();
+        let mut join = FinalizedFooterJoin::new();
+        let mut rows = rows();
+        join.observe(footer_update(40, 5)).unwrap();
+        join.observe(slot_update(42, 7, SlotStatus::SlotFinalized))
+            .unwrap();
+        join.await_footer(prepared(42), CanonicalIdentity::Bank(7), now)
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert!(rows.block_rows.is_empty());
+        join.release_awaiting(
+            now + super::FOOTER_WAIT,
+            FooterRelease::Due,
+            true,
+            &mut rows,
         );
-        assert!(join.observe_complete_block(9_001, 4).unwrap().is_none());
-        assert!(join.observe(footer_update(9_001, 3)).unwrap().is_none());
-        assert!(join.observe(footer_update(9_001, 4)).unwrap().is_none());
-        assert!(
-            join.observe(slot_update(9_001, 4, SlotStatus::SlotFinalized))
-                .unwrap()
-                .is_some()
+        assert_eq!(row_slots(&rows), vec![42]);
+        assert_eq!(row_hash(&rows, 42), None);
+        assert!(rows.block_rows[0].block_producer_time_nanos.is_none());
+        assert!(rows.block_rows[0].block_user_agent.is_none());
+        assert!(join.awaiting.is_empty());
+    }
+
+    #[test]
+    fn blocks_below_the_first_footer_never_wait() {
+        let now = Instant::now();
+        let mut join = FinalizedFooterJoin::new();
+        let mut rows = rows();
+        join.await_footer(prepared(10), CanonicalIdentity::Bank(4), now)
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert!(rows.block_rows.is_empty(), "no footer seen yet, so wait");
+        join.observe(footer_update(100, 5)).unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![10]);
+        assert!(!join.footer_expected(99));
+        assert!(join.footer_expected(100));
+    }
+
+    #[test]
+    fn blocks_leave_the_wait_in_slot_order() {
+        let now = Instant::now();
+        let mut join = FinalizedFooterJoin::new();
+        let mut rows = rows();
+        join.observe(footer_update(40, 5)).unwrap();
+        join.observe(slot_update(43, 9, SlotStatus::SlotFinalized))
+            .unwrap();
+        join.observe(footer_update(43, 9)).unwrap();
+        join.await_footer(prepared(42), CanonicalIdentity::Bank(7), now)
+            .unwrap();
+        join.await_footer(prepared(43), CanonicalIdentity::Bank(9), now)
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert!(rows.block_rows.is_empty(), "slot 43 stays behind slot 42");
+        join.release_awaiting(
+            now + super::FOOTER_WAIT,
+            FooterRelease::Due,
+            true,
+            &mut rows,
         );
-        assert!(join.observe(footer_update(18_000, 5)).unwrap().is_none());
-        assert!(!join.pending.contains_key(&(9_001, 3)));
+        assert_eq!(row_slots(&rows), vec![42, 43]);
+        assert_eq!(row_hash(&rows, 42), None);
+        assert_eq!(row_hash(&rows, 43), Some([9; 32]));
+    }
+
+    #[test]
+    fn legacy_blocks_skip_the_wait_and_drain_releases_everything() {
+        let now = Instant::now();
+        let mut join = FinalizedFooterJoin::new();
+        let mut rows = rows();
+        join.await_footer(prepared(41), CanonicalIdentity::Legacy, now)
+            .unwrap();
+        join.await_footer(prepared(42), CanonicalIdentity::Bank(7), now)
+            .unwrap();
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![41]);
+        assert_eq!(rows.block_rows[0].bank_id, None);
+        join.release_awaiting(now, FooterRelease::Skip, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![41]);
+        join.release_awaiting(now, FooterRelease::Drain, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![41, 42]);
+    }
+
+    #[test]
+    fn wait_queue_is_bounded_without_failing_ingestion() {
+        let now = Instant::now();
+        let mut join = FinalizedFooterJoin::new();
+        let mut rows = rows();
+        for slot in 1..=(super::FOOTER_AWAIT_MAX_BLOCKS as u64 + 1) {
+            join.await_footer(prepared(slot), CanonicalIdentity::Bank(slot), now)
+                .unwrap();
+        }
+        join.release_awaiting(now, FooterRelease::Due, true, &mut rows);
+        assert_eq!(row_slots(&rows), vec![1]);
+        assert_eq!(join.awaiting.len(), super::FOOTER_AWAIT_MAX_BLOCKS);
     }
 
     #[test]
     fn footer_gap_expires_without_blocking_canonical_ingestion() {
-        crate::metrics::force_init("grpc", None);
-        let mut join = FinalizedFooterJoin::default();
-        assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
-        assert!(
-            join.observe(slot_update(42, 8, SlotStatus::SlotFinalized))
-                .unwrap()
-                .is_none()
-        );
+        let mut join = FinalizedFooterJoin::new();
+        join.observe(footer_update(42, 7)).unwrap();
+        join.observe(slot_update(42, 8, SlotStatus::SlotFinalized))
+            .unwrap();
         assert!(
             join.observe(footer_update(42 + super::FOOTER_JOIN_WINDOW_SLOTS + 1, 9))
                 .is_ok()
         );
         assert!(!join.finalized.contains_key(&42));
-    }
-
-    #[test]
-    fn missing_footers_are_reported_only_after_footers_have_started() {
-        let mut join = FinalizedFooterJoin::default();
-        join.observe(slot_update(1, 7, SlotStatus::SlotFinalized))
-            .unwrap();
-        assert!(join.missing_footers(100).is_empty());
-        join.observe(footer_update(50, 8)).unwrap();
-        assert_eq!(join.missing_footers(100), vec![(1, 7)]);
-        assert!(join.missing_footers(1).is_empty());
+        assert!(!join.pending.contains_key(&(42, 7)));
     }
 
     #[test]
@@ -2471,12 +2605,12 @@ mod tests {
     #[test]
     fn footer_cannot_establish_identity_for_a_bank_blind_status() {
         let mut join = FinalizedFooterJoin::default();
-        assert!(join.observe(footer_update(42, 7)).unwrap().is_none());
+        join.observe(footer_update(42, 7)).unwrap();
         let mut finalized = slot_update(42, 7, SlotStatus::SlotFinalized);
         if let Some(UpdateOneof::Slot(slot)) = &mut finalized.update_oneof {
             slot.bank_id = None;
         }
-        assert!(join.observe(finalized).unwrap().is_none());
+        join.observe(finalized).unwrap();
         assert_eq!(
             join.block_identity(42, 0).unwrap(),
             super::CanonicalIdentity::Legacy
@@ -2495,7 +2629,6 @@ mod tests {
         assert_eq!(join.highest_slot, 42);
         assert!(join.pending.contains_key(&(42, 7)));
         assert!(join.known_banks.contains(&(42, 7)));
-        assert!(join.observe_complete_block(42, 7).unwrap().is_some());
     }
 
     #[test]
@@ -2509,8 +2642,8 @@ mod tests {
             ..Default::default()
         };
         let row = map_block_footer(&footer).unwrap();
-        assert_eq!(row.bank_hash.0, [3; 32]);
-        assert_eq!(row.block_user_agent.as_ref(), b"agave");
+        assert_eq!(row.bank_hash, [3; 32]);
+        assert_eq!(row.block_user_agent, b"agave");
         assert!(
             map_block_footer(&SubscribeUpdateBlockFooter {
                 bank_hash: vec![3; 31],
@@ -2806,6 +2939,9 @@ mod tests {
             blockhash: Array([1u8; 32]),
             parent_blockhash: Array([2u8; 32]),
             bank_id: Some(0),
+            bank_hash: None,
+            block_producer_time_nanos: None,
+            block_user_agent: None,
             block_time: Some(1_700_000_000),
             block_height: Some(slot),
             executed_transaction_count: 1,

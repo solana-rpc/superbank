@@ -519,14 +519,6 @@ struct CliArgs {
     )]
     blocks_table: String,
 
-    /// Internal Alpenglow block footer table (gRPC source)
-    #[arg(
-        long,
-        env = "CLICKHOUSE_BLOCK_FOOTERS_TABLE",
-        default_value = "default.block_footers"
-    )]
-    block_footers_table: String,
-
     /// Optional ClickHouse PoH entries table (Fumarole/gRPC live ingest only)
     #[arg(
         long,
@@ -639,7 +631,6 @@ pub(crate) struct Args {
     pub(crate) clickhouse_async_insert: bool,
     pub(crate) transactions_table: String,
     pub(crate) blocks_table: String,
-    pub(crate) block_footers_table: String,
     pub(crate) entries_table: Option<String>,
     pub(crate) transactions_flush_rows: usize,
     pub(crate) blocks_flush_rows: usize,
@@ -800,8 +791,6 @@ struct FileConfig {
     transactions_table: Option<String>,
     #[serde(alias = "blocks_table")]
     blocks_table: Option<String>,
-    #[serde(alias = "block_footers_table")]
-    block_footers_table: Option<String>,
     #[serde(alias = "entries_table")]
     entries_table: Option<String>,
     #[serde(alias = "transactions_flush_rows")]
@@ -1249,12 +1238,6 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "blocks_table",
             cli.blocks_table,
             file_config.blocks_table,
-        ),
-        block_footers_table: merge_value(
-            &matches,
-            "block_footers_table",
-            cli.block_footers_table,
-            file_config.block_footers_table,
         ),
         entries_table: merge_option(
             &matches,
@@ -2262,7 +2245,6 @@ rpc-from-slot: 456
             clickhouse_async_insert: false,
             transactions_table: "default.transactions".to_string(),
             blocks_table: "default.blocks_metadata".to_string(),
-            block_footers_table: "default.block_footers".to_string(),
             entries_table: Some("default.entries".to_string()),
             transactions_flush_rows: 25_000,
             blocks_flush_rows: 2_000,
