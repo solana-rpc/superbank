@@ -3,7 +3,7 @@
 Solana-compatible JSON-RPC server backed by ClickHouse tables produced by `superbank` (or any
 writer that matches the same schemas).
 
-See the [Agave 4.3 compatibility and rollout notes](../../docs/agave-4.3-compatibility.md) for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries. Build with the pinned Rust 1.97.1 toolchain.
+See the [Agave 4.3 compatibility and rollout notes](../../docs/agave-4.3-compatibility.md) for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries. Build with the pinned Rust 1.98.1 toolchain.
 
 ## Supported methods
 

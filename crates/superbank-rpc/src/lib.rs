@@ -14,8 +14,8 @@ mod solana_sdk {
         pub use solana_hash::*;
     }
     pub mod instruction {
-        pub use solana_instruction::error::InstructionError;
         pub use solana_instruction::*;
+        pub use solana_instruction_error::InstructionError;
     }
     pub mod message {
         pub use solana_message::*;

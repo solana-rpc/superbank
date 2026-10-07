@@ -7,7 +7,7 @@ Fumarole or gRPC, Superbank writes live PoH entries to an `entries` table by
 default. The `solparq` source runs in reverse: it restores `superbank-solparq`
 Parquet archive bundles (local or S3) back into ClickHouse.
 
-The main ingestor and RPC server target Agave 4.3 with Rust 1.97.1. See the [compatibility and rollout notes](../../docs/agave-4.3-compatibility.md). The standalone Jetstreamer plugin under `ingest/` has a separate build and qualification gate for Alpenglow backfills.
+The main ingestor and RPC server build on the Agave 4.4.0-beta.0 crates with Rust 1.98.1. See the [compatibility and rollout notes](../../docs/agave-4.3-compatibility.md). The standalone Jetstreamer plugin under `ingest/` has a separate build and qualification gate for Alpenglow backfills.
 
 Agave 4.2 also adds the `DeactivatedStake` reward type and changes confidential-transfer parsed
 JSON from `source`/`destination` keys to `account`; consumers of parsed RPC responses should treat

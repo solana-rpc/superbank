@@ -1,6 +1,6 @@
 # Agave 4.3 compatibility
 
-The main ingestor and RPC server target Agave **v4.3.0** and Rust **1.97.1**. The reference is the tagged [Agave source](https://github.com/anza-xyz/agave/tree/v4.3.0), not whichever version happens to serve a public endpoint. This is compatibility for Superbank's existing methods, not an implementation of every validator RPC.
+The main ingestor and RPC server build on the Agave **4.4.0-beta.0** crates with Rust **1.98.1**. The behavior reference is the tagged [Agave v4.3.0 source](https://github.com/anza-xyz/agave/tree/v4.3.0), not whichever version happens to serve a public endpoint. This is compatibility for Superbank's existing methods, not an implementation of every validator RPC.
 
 ## Behavior changes
 
