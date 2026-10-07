@@ -134,7 +134,6 @@ clickhouse-password: ""
 # clickhouse-async-insert: false
 transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
-block-footers-table: "default.block_footers"
 entries-table: "default.entries"
 
 transactions-flush-rows: 25000
