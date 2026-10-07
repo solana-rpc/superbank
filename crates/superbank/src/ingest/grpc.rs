@@ -1331,6 +1331,7 @@ fn parse_slot_after_label(message: &str, label: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+#[cfg(test)]
 pub(crate) async fn process_update(
     update: SubscribeUpdate,
     args: &Args,
@@ -1339,9 +1340,40 @@ pub(crate) async fn process_update(
     buffered_rows: &mut BufferedRows,
     retry: Option<&RetryConfig>,
 ) -> Result<bool> {
+    process_update_with_footer(
+        update,
+        None,
+        args,
+        insert_tables,
+        clickhouse,
+        buffered_rows,
+        retry,
+    )
+    .await
+}
+
+/// Processes an assembled update, storing footer fields on a block row when given.
+pub(crate) async fn process_update_with_footer(
+    update: SubscribeUpdate,
+    footer: Option<FooterFields>,
+    args: &Args,
+    insert_tables: &InsertTables,
+    clickhouse: &ClickHouseClient,
+    buffered_rows: &mut BufferedRows,
+    retry: Option<&RetryConfig>,
+) -> Result<bool> {
     match update.update_oneof {
         Some(UpdateOneof::Block(block)) => {
-            process_block_update(block, args, insert_tables, clickhouse, buffered_rows, retry).await
+            process_block_update(
+                block,
+                footer,
+                args,
+                insert_tables,
+                clickhouse,
+                buffered_rows,
+                retry,
+            )
+            .await
         }
         Some(UpdateOneof::BlockMeta(meta)) => {
             if meta.executed_transaction_count > 0 {
@@ -1366,6 +1398,7 @@ pub(crate) async fn process_update(
 
 async fn process_block_update(
     block: SubscribeUpdateBlock,
+    footer: Option<FooterFields>,
     args: &Args,
     insert_tables: &InsertTables,
     clickhouse: &ClickHouseClient,
@@ -1383,12 +1416,15 @@ async fn process_block_update(
     } else {
         None
     };
-    handle_block_update(
-        block,
+    let mut prepared = prepare_block(&block, entry_rows.is_some())?;
+    if let Some(footer) = footer {
+        footer.apply(&mut prepared.metadata);
+    }
+    prepared.append(
         &mut buffered_rows.transaction_rows,
         &mut buffered_rows.block_rows,
         entry_rows,
-    )?;
+    );
     flush_block_if_needed(args, insert_tables, clickhouse, buffered_rows, retry).await
 }
 
@@ -1397,15 +1433,14 @@ fn validate_block_bank(
     source: IngestSource,
     fumarole_alpenglow_genesis_slot: Option<u64>,
 ) -> Result<()> {
-    if source == IngestSource::Fumarole {
-        let genesis_slot = fumarole_alpenglow_genesis_slot
-            .context("Fumarole requires an evidenced historical slot bound")?;
-        if block.slot > genesis_slot {
-            return Err(anyhow!(
-                "legacy Fumarole stream exceeded its trusted historical bound at slot {}; qualify a new bound or use the bank-tagged gRPC source",
-                block.slot
-            ));
-        }
+    if source == IngestSource::Fumarole
+        && let Some(bound) = fumarole_alpenglow_genesis_slot
+        && block.slot > bound
+    {
+        return Err(anyhow!(
+            "Fumarole stream exceeded its configured historical bound at slot {}; qualify a new bound or remove it",
+            block.slot
+        ));
     }
     if source == IngestSource::Grpc
         && block
@@ -1467,6 +1502,7 @@ fn max_block_slot(rows: &[BlockMetadataRow]) -> Option<u64> {
     rows.iter().map(|row| row.slot).max()
 }
 
+#[cfg(test)]
 fn handle_block_update(
     block: SubscribeUpdateBlock,
     transaction_rows: &mut Vec<TransactionRow>,
@@ -2300,6 +2336,64 @@ fn decode_transaction_error(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn footer_fields_reach_the_buffered_block_row() {
+        use crate::clickhouse::{FooterFields, InsertTables};
+        use clickhouse::Client as ClickHouseClient;
+
+        let mut args = crate::cli::test_args();
+        args.source = IngestSource::Fumarole;
+        args.entries_table = None;
+        args.blocks_flush_rows = 1000;
+        args.transactions_flush_rows = 1000;
+        let tables = InsertTables::from_args(&args);
+        let client = ClickHouseClient::default();
+        let mut rows = BufferedRows::new(&args);
+        let update = |block| SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Block(block)),
+            ..Default::default()
+        };
+        let block = SubscribeUpdateBlock {
+            slot: 7,
+            blockhash: bs58::encode([1; 32]).into_string(),
+            parent_blockhash: bs58::encode([2; 32]).into_string(),
+            ..Default::default()
+        };
+        let footer = FooterFields {
+            bank_hash: [9; 32],
+            block_producer_time_nanos: 11,
+            block_user_agent: b"ua".to_vec(),
+        };
+        super::process_update_with_footer(
+            update(block.clone()),
+            Some(footer),
+            &args,
+            &tables,
+            &client,
+            &mut rows,
+            None,
+        )
+        .await
+        .unwrap();
+        super::process_update_with_footer(
+            update(block),
+            None,
+            &args,
+            &tables,
+            &client,
+            &mut rows,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.block_rows[0].bank_hash.as_ref().map(|h| h.0),
+            Some([9; 32])
+        );
+        assert_eq!(rows.block_rows[0].block_producer_time_nanos, Some(11));
+        assert!(rows.block_rows[1].bank_hash.is_none());
+    }
+
     use super::{
         BlockMetadataRow, BufferedRows, CanonicalIdentity, FinalizedFooterJoin, FooterRelease,
         FromSlotMode, PreparedBlock, build_footer_request, build_subscribe_request,
@@ -2918,12 +3012,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fumarole_stops_after_genesis_and_grpc_accepts_zero_bank_id() {
+    fn fumarole_stops_after_a_set_bound_and_grpc_accepts_zero_bank_id() {
         let mut block = SubscribeUpdateBlock {
             slot: 100,
             ..Default::default()
         };
-        assert!(validate_block_bank(&block, IngestSource::Fumarole, None).is_err());
+        assert!(validate_block_bank(&block, IngestSource::Fumarole, None).is_ok());
         assert!(validate_block_bank(&block, IngestSource::Fumarole, Some(100)).is_ok());
         block.slot = 101;
         assert!(validate_block_bank(&block, IngestSource::Fumarole, Some(100)).is_err());

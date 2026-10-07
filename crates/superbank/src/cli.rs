@@ -158,11 +158,11 @@ struct CliArgs {
     #[arg(long, env = "FUMAROLE_CONSUMER_GROUP")]
     fumarole_consumer_group: Option<String>,
 
-    /// Trusted Alpenglow genesis slot; the legacy Fumarole stream stops after this slot
+    /// Optional trusted Alpenglow genesis slot; when set, the Fumarole stream stops after this slot
     #[arg(long, env = "FUMAROLE_ALPENGLOW_GENESIS_SLOT")]
     fumarole_alpenglow_genesis_slot: Option<u64>,
 
-    /// Offline preactivation attestation: finalized slot observed before trusted same-cluster getAgGenesisCert returned null
+    /// Optional preactivation attestation: finalized slot observed before a trusted getAgGenesisCert returned null; when set, the Fumarole stream stops after this slot
     #[arg(long, env = "FUMAROLE_PREACTIVATION_THROUGH_SLOT")]
     fumarole_preactivation_through_slot: Option<u64>,
 
@@ -1298,7 +1298,7 @@ fn validate_args(args: &Args) -> Result<()> {
 
     match args.source {
         IngestSource::Fumarole => {
-            require_fumarole_era_bound(args)?;
+            validate_fumarole_era_bound(args)?;
             validate_fumarole_options(args)?;
         }
         IngestSource::Grpc => {
@@ -1527,12 +1527,12 @@ fn validate_fumarole_options(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn require_fumarole_era_bound(args: &Args) -> Result<()> {
+fn validate_fumarole_era_bound(args: &Args) -> Result<()> {
     if args.fumarole_alpenglow_genesis_slot.is_some()
-        == args.fumarole_preactivation_through_slot.is_some()
+        && args.fumarole_preactivation_through_slot.is_some()
     {
         return Err(anyhow!(
-            "fumarole source requires exactly one trusted historical bound: --fumarole-alpenglow-genesis-slot or --fumarole-preactivation-through-slot"
+            "fumarole source accepts at most one historical bound: --fumarole-alpenglow-genesis-slot or --fumarole-preactivation-through-slot"
         ));
     }
     Ok(())
@@ -2156,15 +2156,15 @@ rpc-from-slot: 456
     }
 
     #[test]
-    fn preactivation_attestation_is_explicit_exclusive_and_bounded() {
+    fn historical_bound_is_optional_and_exclusive() {
         let mut args = fumarole_args();
         args.fumarole_alpenglow_genesis_slot = None;
-        assert!(require_fumarole_era_bound(&args).is_err());
+        assert!(validate_fumarole_era_bound(&args).is_ok());
         // Trusted fixture: finalized tip 42 was observed before an authoritative null.
         args.fumarole_preactivation_through_slot = Some(42);
-        assert!(require_fumarole_era_bound(&args).is_ok());
+        assert!(validate_fumarole_era_bound(&args).is_ok());
         args.fumarole_alpenglow_genesis_slot = Some(100);
-        assert!(require_fumarole_era_bound(&args).is_err());
+        assert!(validate_fumarole_era_bound(&args).is_err());
         let config: FileConfig =
             serde_yaml::from_str("fumarole-preactivation-through-slot: 42").unwrap();
         assert_eq!(config.fumarole_preactivation_through_slot, Some(42));

@@ -41,7 +41,7 @@ grpc-slot-notifications: true
 # fumarole-endpoint: "https://your.fumarole.endpoint:443"
 # fumarole-x-token: "your-token"
 # fumarole-consumer-group: "superbank-mainnet"
-# Configure exactly one evidenced historical bound (no zero placeholder):
+# Optionally configure one evidenced historical bound (no zero placeholder); the stream stops after it:
 # fumarole-alpenglow-genesis-slot: <trusted-certificate-slot>
 # Before activation, record trusted same-cluster finalized getSlot BEFORE an
 # authoritative null getAgGenesisCert, then attest that finalized slot here:

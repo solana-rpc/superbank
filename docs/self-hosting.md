@@ -253,7 +253,7 @@ INFO superbank::clickhouse: clickhouse insert committed table="default.entries" 
 
 After the first run, set `fumarole-create-consumer-group: false` — the group persists on the server and resumes from its last committed position on restart.
 
-Fumarole's persistent consumer group is useful for pre-Alpenglow production ingestion and populates the `entries` table. Its legacy envelope cannot provide bank IDs or footers, so switch to a qualified Dragon's Mouth gRPC producer for slots after the trusted genesis boundary.
+Fumarole's persistent consumer group is useful for production ingestion and populates the `entries` table. A Fumarole server that supports the footer filter also carries the Alpenglow footers; an older server yields `NULL` footers.
 
 For **historical backfill**, there are two approaches depending on scale:
 
@@ -688,14 +688,14 @@ Note: the replicated tables will fail to create if ClickHouse Keeper or ZooKeepe
 
 ### Use Fumarole as the ingestion source
 
-Fumarole can ingest legacy slots through one explicitly evidenced finite bound:
+Fumarole can tail live, with an optional evidenced finite bound:
 - Persistent consumer groups survive ingestor restarts
 - At-least-once delivery with commit checkpoints
 - Lower reconnect risk than raw gRPC streaming
 
-Set `source: fumarole` and `fumarole-consumer-group`, then configure exactly one bound. For a trusted same-cluster non-null `getAgGenesisCert`, set `fumarole-alpenglow-genesis-slot` to its certified slot. For preactivation, record a trusted finalized `getSlot` response **before** a successful authoritative same-cluster null `getAgGenesisCert`, retain both responses and endpoint/cluster evidence, then explicitly attest that finite slot with `fumarole-preactivation-through-slot`. Missing responses, failed requests and untrusted nulls do not establish preactivation. Do not use zero as a placeholder or automatically move an attested bound forward. The two settings are mutually exclusive; leaving both unset fails startup. See the [operational rollout](agave-4.3-compatibility.md#alpenglow-operational-rollout) for evidence and migration requirements.
+Set `source: fumarole` and `fumarole-consumer-group`, then optionally configure one bound. For a trusted same-cluster non-null `getAgGenesisCert`, set `fumarole-alpenglow-genesis-slot` to its certified slot. For preactivation, record a trusted finalized `getSlot` response **before** a successful authoritative same-cluster null `getAgGenesisCert`, retain both responses and endpoint/cluster evidence, then explicitly attest that finite slot with `fumarole-preactivation-through-slot`. Missing responses, failed requests and untrusted nulls do not establish preactivation. Do not use zero as a placeholder or automatically move an attested bound forward. The two settings are mutually exclusive; leaving both unset tails without a stop. See the [operational rollout](agave-4.3-compatibility.md#alpenglow-operational-rollout) for evidence and migration requirements.
 
-After the first run, set `fumarole-create-consumer-group: false`. Fumarole stops at its selected bound; valid prior rows flush without committing pending/rejected offsets. Use a qualified finalized bank-tagged Yellowstone gRPC producer for later slots.
+After the first run, set `fumarole-create-consumer-group: false`. When a bound is set, Fumarole stops at it; valid prior rows flush without committing pending/rejected offsets.
 
 ### Metrics
 

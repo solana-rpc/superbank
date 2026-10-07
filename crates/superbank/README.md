@@ -258,8 +258,8 @@ clickhouse-url: "http://localhost:8123"
 clickhouse-database: "default"
 transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
-# Choose one evidenced bound; replace the placeholder before running:
-fumarole-preactivation-through-slot: <recorded-finalized-slot>
+# Optional evidenced bound; the stream stops after this slot. Omit it to tail live:
+# fumarole-preactivation-through-slot: <recorded-finalized-slot>
 entries-table: "default.entries"
 ```
 
@@ -277,8 +277,8 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--source` / `SUPERBANK_SOURCE` (required: `fumarole`, `grpc`, `rpc`, `bigtable`, or `solparq`)
 - `--fumarole-endpoint` / `FUMAROLE_ENDPOINT` (required for fumarole source)
 - `--fumarole-x-token` / `FUMAROLE_X_TOKEN` (optional)
-- `--fumarole-alpenglow-genesis-slot` / `FUMAROLE_ALPENGLOW_GENESIS_SLOT` (trusted certificate slot; mutually exclusive with preactivation attestation)
-- `--fumarole-preactivation-through-slot` / `FUMAROLE_PREACTIVATION_THROUGH_SLOT` (explicit offline attestation of a finalized slot recorded before trusted same-cluster authoritative null; see below)
+- `--fumarole-alpenglow-genesis-slot` / `FUMAROLE_ALPENGLOW_GENESIS_SLOT` (optional trusted certificate slot; the stream stops after it; mutually exclusive with preactivation attestation)
+- `--fumarole-preactivation-through-slot` / `FUMAROLE_PREACTIVATION_THROUGH_SLOT` (optional offline attestation of a finalized slot recorded before trusted same-cluster authoritative null; the stream stops after it; see below)
 - `--fumarole-consumer-group` / `FUMAROLE_CONSUMER_GROUP` (required for fumarole source)
 - `--fumarole-create-consumer-group[=true|false]` / `FUMAROLE_CREATE_CONSUMER_GROUP` (default: false)
 - `--fumarole-data-plane-tcp-connections` / `FUMAROLE_DATA_PLANE_TCP_CONNECTIONS` (default: 4; maximum: 20)
@@ -370,7 +370,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
 - For gRPC ingest, apply the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; the footer fields of the proven winning bank are written in the block's own `blocks_metadata` row. Fumarole 0.9 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
-- Fumarole requires exactly one evidenced historical bound: the certificate's genesis slot or `--fumarole-preactivation-through-slot`. It accepts the bound slot and rejects later blocks; use bank-tagged gRPC for later blocks.
+- Fumarole accepts at most one evidenced historical bound: the certificate's genesis slot or `--fumarole-preactivation-through-slot`. With a bound it accepts the bound slot and rejects later blocks. Without one it tails live and stores footers from its `block_footer` filter.
 - `/metrics` includes Fumarole backpressure gauges/counters such as
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
   `superbank_ingest_fumarole_buffered_bytes`, `superbank_ingest_fumarole_pending_slots`,
@@ -416,7 +416,7 @@ This exercises local bundle export, manifest discovery, ingestor restore and RPC
 
 ### Live stream integrity
 
-Canonical gRPC and Fumarole writers require `commitment: finalized`. The head cache serves speculative banks. Fumarole 0.9 assembles by `(slot, sealed blockhash)`; a legacy envelope without a hash permits only one local bank identity. An evidenced `fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound is required: Fumarole does not supply the footer evidence needed for postmigration qualification.
+Canonical gRPC and Fumarole writers require `commitment: finalized`. The head cache serves speculative banks. Fumarole 0.9 assembles by `(slot, sealed blockhash)`; a legacy envelope without a hash permits only one local bank identity. Fumarole subscribes to the `block_footer` filter and joins each footer to its bank by the same `(slot, sealed blockhash)` key. The Fumarole server must support that filter; an older server sends none, and the footer columns stay `NULL`. An evidenced `fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound is optional.
 
 Full blocks are validated before buffering or inserts: exact transaction counts (including zero), unique contiguous indices and signatures, and, when entries are requested, exact entry counts, indices, slot identity and transaction range tiling. `--entries-table` always carries a value (default `default.entries`), so entry payloads are always requested and validated. Malformed payloads never enter writer buffers or acknowledge source offsets. A rejected later gRPC update flushes an already complete, qualified earlier prefix before exiting. Same-slot contradictions and unresolved bank identity retain buffered data without advancing restart progress. Complete Fumarole banks may flush while other banks are assembling, but Fumarole commits no pending offsets until every pending bank has completed. Restart replays unacknowledged data.
 
@@ -430,7 +430,7 @@ Connection-local counters cannot be joined across subscriptions; sealed blockhas
 
 When trusted same-cluster `getAgGenesisCert` returns authoritative null, first record `getSlot` at finalized commitment from that endpoint, **then** its null certificate response. Keep both responses and attest a slot at or below that finalized tip with `--fumarole-preactivation-through-slot` / `FUMAROLE_PREACTIVATION_THROUGH_SLOT` / `fumarole-preactivation-through-slot`. This is operator-supplied offline evidence; Superbank does not fetch it itself. Failures, missing evidence and unsupported RPC methods never mean preactivation. The run remains bounded and cannot follow future activation. A subsequent run requires newly qualified evidence or the certificate's genesis slot; never set both bounds. A numeric zero is usable only if actually evidenced.
 
-At a Fumarole historical cutoff, the first out-of-bound event flushes prior validated complete rows before returning an error. It never assembles or writes the rejected payload and never calls the client's all-offset `commit()`: Fumarole 0.9 has no safe-prefix acknowledgment API. Pending siblings remain unacknowledged. Restart replays the valid prefix idempotently. Retire the bounded consumer or qualify a new historical run; repeated restart with the same bound will reach the same cutoff, rather than consume postmigration data.
+When a bound is set, at a Fumarole historical cutoff the first out-of-bound event flushes prior validated complete rows before returning an error. It never assembles or writes the rejected payload and never calls the client's all-offset `commit()`: Fumarole 0.9 has no safe-prefix acknowledgment API. Pending siblings remain unacknowledged. Restart replays the valid prefix idempotently. Retire the bounded consumer or qualify a new historical run; repeated restart with the same bound will reach the same cutoff, rather than consume postmigration data.
 
 ### Footer columns
 
@@ -439,6 +439,8 @@ At a Fumarole historical cutoff, the first out-of-bound event flushes prior vali
 An identified gRPC block waits in slot order for its footer for up to two seconds. If the footer joins first, its fields go into the row. If the wait ends, the row is written with `NULL` footer columns and the footer is not written later. Blocks below the first footer seen on the subscription do not wait, because replay carries no footers. A bounded wait queue of 64 blocks cannot fail ingestion: the oldest block is written without a footer when the queue is full. Shutdown and fatal-condition flushes write every waiting block.
 
 The `missing` kind of `superbank_ingest_source_errors_total_total{stage="grpc_footer"}` counts blocks written without a footer after the first footer arrived, because a cluster before Alpenglow activation sends none. `invalid` footers are discarded, never repaired with guessed identities. First-shred turbine telemetry cannot advance the footer join window.
+
+The Fumarole source counts the same `missing` and `invalid` kinds under `stage="fumarole_footer"`. An invalid footer (wrong slot, a bank hash that is not 32 bytes, a different bank ID, or a conflicting duplicate) is dropped, the footer columns stay `NULL`, and canonical ingestion continues.
 
 `NULL` footer columns mean no footer is stored. They cover blocks before activation, replayed blocks and any gap. Never fabricate bank hashes or join a stored node-local bank ID to a new session.
 

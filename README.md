@@ -134,7 +134,7 @@ cp superbank.example.yaml superbank.yaml
 Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
-- The legacy Fumarole source requires either `fumarole-alpenglow-genesis-slot` from a trusted genesis certificate or an explicit `fumarole-preactivation-through-slot` attestation and stops after that historical bound. Use a bank-tagged Yellowstone gRPC producer for Alpenglow blocks.
+- The Fumarole source tails live and stores the Alpenglow footer fields when the Fumarole server supports the footer filter; an older server yields `NULL` footers. An optional `fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound makes the stream stop after that slot.
 - Live gRPC/Fumarole canonical writers require finalized commitment; complete bank data is validated before inserts and source offset acknowledgment. gRPC scalar zero requires matching subscription-local status evidence: legacy data retains a NULL bank ID, and unresolved identity holds later blocks and all flushes for replay.
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`

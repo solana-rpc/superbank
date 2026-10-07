@@ -4,7 +4,8 @@
  */
 
 use super::*;
-use yellowstone_grpc_proto::prelude::SubscribeUpdateTransaction;
+use crate::ingest::grpc::process_update;
+use yellowstone_grpc_proto::prelude::{SubscribeUpdateBlockFooter, SubscribeUpdateTransaction};
 
 fn complete_block(slot: u64) -> SubscribeUpdateBlock {
     SubscribeUpdateBlock {
@@ -114,7 +115,7 @@ fn slot_end_rejects_missing_overfull_duplicate_and_zero_count_payloads_and_allow
         assert_eq!(assembler.estimated_buffered_bytes(), other_slot_bytes);
 
         assemble(&mut assembler, complete_block(42)).unwrap();
-        let update = assembler.finish_slot((42, None)).unwrap().unwrap();
+        let update = assembler.finish_slot((42, None)).unwrap().unwrap().update;
         let Some(UpdateOneof::Block(block)) = update.update_oneof else {
             panic!("expected complete replayed block");
         };
@@ -406,4 +407,142 @@ async fn boundary_stop_flushes_buffered_genesis_before_timer_without_acknowledgi
     .unwrap();
     assert_eq!(rx.try_recv().unwrap().1, body);
     server.abort();
+}
+
+fn footer_update(slot: u64, bank_id: u64, hash_len: usize) -> UpdateOneof {
+    UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+        slot,
+        bank_id,
+        bank_hash: vec![7; hash_len],
+        block_producer_time_nanos: 5,
+        block_user_agent: b"agave".to_vec(),
+        ..Default::default()
+    })
+}
+
+fn finish(assembler: &mut FumaroleBlockAssembler, slot: u64) -> FinishedBank {
+    assembler.finish_slot((slot, None)).unwrap().unwrap()
+}
+
+#[test]
+fn footer_before_the_block_data_is_attached() {
+    let mut assembler = FumaroleBlockAssembler::new(false, true);
+    submit(&mut assembler, 42, footer_update(42, 0, 32)).unwrap();
+    assemble(&mut assembler, complete_block(42)).unwrap();
+    let finished = finish(&mut assembler, 42);
+    let footer = finished.footer.expect("footer");
+    assert_eq!(footer.bank_hash, [7; 32]);
+    assert_eq!(footer.block_producer_time_nanos, 5);
+    assert_eq!(footer.block_user_agent, b"agave".to_vec());
+    assert!(!finished.footer_missing);
+}
+
+#[test]
+fn footer_after_the_block_data_and_before_slot_end_is_attached() {
+    let mut assembler = FumaroleBlockAssembler::new(false, true);
+    assemble(&mut assembler, complete_block(42)).unwrap();
+    submit(&mut assembler, 42, footer_update(42, 0, 32)).unwrap();
+    assert!(finish(&mut assembler, 42).footer.is_some());
+}
+
+#[test]
+fn no_footer_before_activation_is_null_and_not_counted() {
+    let mut assembler = FumaroleBlockAssembler::new(false, true);
+    assemble(&mut assembler, complete_block(42)).unwrap();
+    let finished = finish(&mut assembler, 42);
+    assert!(finished.footer.is_none());
+    assert!(!finished.footer_missing);
+}
+
+#[test]
+fn a_bank_without_a_footer_after_footers_started_is_counted() {
+    let mut assembler = FumaroleBlockAssembler::new(false, true);
+    assemble(&mut assembler, complete_block(41)).unwrap();
+    submit(&mut assembler, 42, footer_update(42, 0, 32)).unwrap();
+    assemble(&mut assembler, complete_block(42)).unwrap();
+    assemble(&mut assembler, complete_block(43)).unwrap();
+    assert!(
+        !finish(&mut assembler, 41).footer_missing,
+        "below the first footer slot"
+    );
+    assert!(!finish(&mut assembler, 42).footer_missing);
+    let missing = finish(&mut assembler, 43);
+    assert!(missing.footer.is_none());
+    assert!(missing.footer_missing);
+}
+
+#[test]
+fn invalid_or_conflicting_footers_are_dropped_without_failing_ingestion() {
+    metrics::force_init("fumarole", None);
+    let cases: Vec<Vec<UpdateOneof>> = vec![
+        vec![footer_update(42, 0, 32), {
+            let UpdateOneof::BlockFooter(mut other) = footer_update(42, 0, 32) else {
+                unreachable!()
+            };
+            other.bank_hash = vec![8; 32];
+            UpdateOneof::BlockFooter(other)
+        }],
+        vec![footer_update(99, 0, 32)],
+        vec![footer_update(42, 0, 31)],
+        vec![footer_update(42, 5, 32)],
+    ];
+    for footers in cases {
+        let mut assembler = FumaroleBlockAssembler::new(false, true);
+        for footer in footers {
+            submit(&mut assembler, 42, footer).unwrap();
+        }
+        assemble(&mut assembler, complete_block(42)).unwrap();
+        let finished = finish(&mut assembler, 42);
+        assert!(finished.footer.is_none());
+        assert!(
+            !finished.footer_missing,
+            "an invalid footer is not a missing one"
+        );
+    }
+}
+
+#[test]
+fn an_identical_duplicate_footer_is_kept() {
+    let mut assembler = FumaroleBlockAssembler::new(false, true);
+    submit(&mut assembler, 42, footer_update(42, 0, 32)).unwrap();
+    submit(&mut assembler, 42, footer_update(42, 0, 32)).unwrap();
+    assemble(&mut assembler, complete_block(42)).unwrap();
+    assert!(finish(&mut assembler, 42).footer.is_some());
+}
+
+#[test]
+fn the_subscribe_request_asks_for_footers_without_certificates() {
+    let request = build_fumarole_subscribe_request(2, true);
+    let filter = request.block_footer.values().next().expect("footer filter");
+    assert_eq!(filter.include_certificates, Some(false));
+}
+
+#[tokio::test]
+async fn an_unset_bound_never_stops_ingestion() {
+    let mut args = crate::cli::test_args();
+    args.source = crate::cli::IngestSource::Fumarole;
+    args.fumarole_alpenglow_genesis_slot = None;
+    args.fumarole_preactivation_through_slot = None;
+    assert_eq!(historical_bound(&args), None);
+    let client = ClickHouseClient::default().with_url("http://127.0.0.1:1");
+    let tables = InsertTables::from_args(&args);
+    let assembler = FumaroleBlockAssembler::new(false, false);
+    let mut rows = BufferedRows::new(&args);
+    let mut exceeded = false;
+    assert!(
+        !stop_at_historical_bound(
+            u64::MAX,
+            &args,
+            &assembler,
+            &mut exceeded,
+            &client,
+            &tables,
+            &mut rows
+        )
+        .await
+        .unwrap()
+    );
+    assert!(!exceeded);
+    args.fumarole_preactivation_through_slot = Some(10);
+    assert_eq!(historical_bound(&args), Some(10));
 }
