@@ -183,6 +183,7 @@ pub(super) fn parse_block_meta(
         rewards_commission,
         rewards_commission_bps,
         rewards_num_partitions,
+        footer: None,
     })
 }
 

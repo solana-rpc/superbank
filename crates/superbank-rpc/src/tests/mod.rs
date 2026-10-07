@@ -1085,6 +1085,7 @@ fn base_block_record(slot: u64) -> StoredBlockRecord {
             rewards_commission: Vec::new(),
             rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
+            footer: None,
         },
         transactions: Vec::new(),
     }
@@ -8052,6 +8053,8 @@ mod agave_43;
 
 #[cfg(feature = "grpc-head-cache")]
 mod agave43_cached_encoding;
+#[cfg(feature = "grpc-head-cache")]
+mod get_block_footer;
 #[cfg(feature = "disk-cache")]
 mod gsfa_race {
     //! getSignaturesForAddress races the local page against the primary's full page.

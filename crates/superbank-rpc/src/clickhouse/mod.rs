@@ -31,10 +31,11 @@ pub(crate) use rows::BlockTimeRangeRow;
 #[allow(unused_imports)]
 pub use types::TransactionsForAddressRecord;
 pub use types::{
-    BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings, SignatureFilter,
-    SignatureRecord, SignatureStatusRecord, SortOrder, StoredAccountsTransactionRecord,
-    StoredBlockPayload, StoredBlockRecord, StoredTransactionRecord, TokenAccountsFilter,
-    TransactionStatusFilter, TransactionsForAddressQuery,
+    BlockFooterRecord, BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings,
+    SignatureFilter, SignatureRecord, SignatureStatusRecord, SortOrder,
+    StoredAccountsTransactionRecord, StoredBlockPayload, StoredBlockRecord,
+    StoredTransactionRecord, TokenAccountsFilter, TransactionStatusFilter,
+    TransactionsForAddressQuery,
 };
 
 pub(crate) use types::{

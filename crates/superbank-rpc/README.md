@@ -486,6 +486,8 @@ qualifying slot.
 
 `getBlock` still requires `confirmed`/`finalized` commitment.
 
+`getBlock` accepts the boolean `footer` option from [SIMD-0307](https://simd.live/simd/0307-add-block-footer). The default is `false`, which deliberately differs from the SIMD's default of including footer fields, so existing callers see the previous response. With `footer: true` the response carries a `footer` object with `blockProducerTimeNanos` (a JSON number) and `blockUserAgent` (a string). The value is `null` for a block with no complete stored footer, such as a block before Alpenglow activation, a gap in footer ingestion, or a partly stored footer. An omitted option and `footer: false` return the same response. The fields come from `blocks_metadata` and are untrusted producer data. A non-boolean value returns `-32602`. The head cache has no footer data, so a block it serves returns `footer: null`, and that response is never inserted into the `getBlock` response cache. The response cache key includes the `footer` flag.
+
 When the head cache is disabled (or not compiled), requests with `commitment=processed` are
 rejected with JSON-RPC error `-32602` and include `requestedCommitment` in the error `data`.
 

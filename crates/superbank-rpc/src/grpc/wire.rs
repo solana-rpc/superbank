@@ -636,6 +636,7 @@ mod tests {
                 rewards_commission: vec![None, Some(7)],
                 rewards_commission_bps: vec![None, Some(725)],
                 rewards_num_partitions: Some(4),
+                footer: None,
             };
             let bytes = encode_rewards(&metadata).unwrap();
             let decoded = storage_proto::Rewards::decode(bytes.as_slice()).unwrap();

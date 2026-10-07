@@ -96,6 +96,8 @@ pub(crate) const BLOCK_METADATA_BASE_COLUMNS: &[&str] = &[
     "executed_transaction_count",
     "entry_count",
     "rewards_num_partitions",
+    "block_producer_time_nanos",
+    "block_user_agent",
 ];
 
 pub(crate) const BLOCK_METADATA_REWARD_COLUMNS: &[&str] = &[
