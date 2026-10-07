@@ -260,7 +260,6 @@ transactions-table: "default.transactions"
 blocks-table: "default.blocks_metadata"
 # Choose one evidenced bound; replace the placeholder before running:
 fumarole-preactivation-through-slot: <recorded-finalized-slot>
-block-footers-table: "default.block_footers"
 entries-table: "default.entries"
 ```
 
@@ -357,7 +356,6 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 - `--clickhouse-async-insert` / `CLICKHOUSE_ASYNC_INSERT` (default: `false`)
 - `--transactions-table` / `CLICKHOUSE_TRANSACTIONS_TABLE` (default: `default.transactions`)
 - `--blocks-table` / `CLICKHOUSE_BLOCKS_TABLE` (default: `default.blocks_metadata`)
-- `--block-footers-table` / `CLICKHOUSE_BLOCK_FOOTERS_TABLE` (default: `default.block_footers`; gRPC Alpenglow footer stream)
 - `--entries-table` / `CLICKHOUSE_ENTRIES_TABLE` (default: `default.entries`; Fumarole and gRPC ingest write live PoH entries to this table)
 - `--transactions-flush-rows` / `TRANSACTIONS_FLUSH_ROWS` (default: 25000)
 - `--blocks-flush-rows` / `BLOCKS_FLUSH_ROWS` (default: 2000)
@@ -371,7 +369,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
-- For gRPC ingest, apply `block_footers.sql` and the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; a footer is written only after its proven winning bank has complete durable data. Fumarole 0.8 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
+- For gRPC ingest, apply the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; the footer fields of the proven winning bank are written in the block's own `blocks_metadata` row. Fumarole 0.8 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
 - Fumarole requires exactly one evidenced historical bound: the certificate's genesis slot or `--fumarole-preactivation-through-slot`. It accepts the bound slot and rejects later blocks; use bank-tagged gRPC for later blocks.
 - `/metrics` includes Fumarole backpressure gauges/counters such as
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
@@ -424,9 +422,9 @@ Full blocks are validated before buffering or inserts: exact transaction counts 
 
 gRPC joins footers, winner status and complete blocks on the same subscription's `(slot, bank_id)`. Nonzero scalar IDs supply actual identity; scalar zero also represents a missing protobuf field, so a zero block waits for a matching status on that subscription. An optional `Some(0)` establishes modern bank zero. A CreatedBank or finalized status without an ID permits complete historical data under the trusted finalized full-block contract, with metadata `bank_id: NULL`; that data cannot qualify a modern footer. No migration boundary is inferred from entry shape or dates.
 
-Data arriving before status is validated and held with later blocks, bounded to 256 blocks and 128 MiB of encoded payload. Timer, pressure, shutdown and transport-error flushes cannot advance the durable metadata tip while identity is unresolved. Ready footers for earlier proven banks whose complete data is already durable can still be inserted without flushing held data or advancing the metadata tip; other footers wait for their own data to become durable. Missing evidence fails at the hold/window limit or shutdown; restart replays from the previous durable slot. Identity proofs never carry over to a new subscription. Producers must supply the requested bank-status events for historical replay as well as live traffic.
+Data arriving before status is validated and held with later blocks, bounded to 256 blocks and 128 MiB of encoded payload. Timer, pressure, shutdown and transport-error flushes cannot advance the durable metadata tip while identity is unresolved. Missing evidence fails at the hold/window limit or shutdown; restart replays from the previous durable slot. Identity proofs never carry over to a new subscription. Producers must supply the requested bank-status events for historical replay as well as live traffic.
 
-A footer is written only after complete winning block data is durable. Connection-local counters cannot be joined across subscriptions; sealed blockhashes identify Fumarole banks across connections.
+Connection-local counters cannot be joined across subscriptions; sealed blockhashes identify Fumarole banks across connections.
 
 ### Bounded preactivation runs
 
@@ -434,12 +432,14 @@ When trusted same-cluster `getAgGenesisCert` returns authoritative null, first r
 
 At a Fumarole historical cutoff, the first out-of-bound event flushes prior validated complete rows before returning an error. It never assembles or writes the rejected payload and never calls the client's all-offset `commit()`: Fumarole 0.8 has no safe-prefix acknowledgment API. Pending siblings remain unacknowledged. Restart replays the valid prefix idempotently. Retire the bounded consumer or qualify a new historical run; repeated restart with the same bound will reach the same cutoff, rather than consume postmigration data.
 
-### Footer availability policy
+### Footer columns
 
-At gRPC startup Superbank qualifies the configured footer table and columns with a five-second bounded query. If the query fails, Superbank logs a warning, counts `superbank_ingest_source_errors_total_total` with `stage="grpc_footer", kind="startup_unavailable"`, and keeps durable footers in the bounded join window. It probes the table again every 30 seconds and resumes footer writes when the probe succeeds. Canonical block validation and same-subscription identity qualification remain mandatory.
+`blocks_metadata` carries `bank_hash`, `block_producer_time_nanos` and `block_user_agent` next to `bank_id`. All are nullable. Only the footer of the finalized winning bank is used. A losing bank's footer is discarded.
 
-Each footer batch insert makes one attempt, so a footer-only outage never delays canonical ingestion. A failed batch stays in the bounded join window and the next flush tries again. Failures emit warnings and the `insert_failed`, `storage_disabled` or `expired_insert` kinds. The `missing` kind counts finalized slots with no footer, and it starts only after the first footer arrives, because a cluster before Alpenglow activation sends none. `invalid` footers are discarded, never repaired with guessed identities. First-shred turbine telemetry cannot advance the footer join window.
+An identified gRPC block waits in slot order for its footer for up to two seconds. If the footer joins first, its fields go into the row. If the wait ends, the row is written with `NULL` footer columns and the footer is not written later. Blocks below the first footer seen on the subscription do not wait, because replay carries no footers. A bounded wait queue of 64 blocks cannot fail ingestion: the oldest block is written without a footer when the queue is full. Shutdown and fatal-condition flushes write every waiting block.
 
-A footer gap may be permanent: upstream replay may provide complete finalized blocks and status evidence without historical footers. Archive/report the gap; never fabricate bank hashes or join a stored node-local bank ID to a new session. New footer tables deduplicate by finalized slot across reconnects; existing `(slot, bank_id)` tables need the planned rebuild in [DDL migration notes](../../ddl/README.md#finalized-footer-identity-and-existing-table-migration).
+The `missing` kind of `superbank_ingest_source_errors_total_total{stage="grpc_footer"}` counts blocks written without a footer after the first footer arrived, because a cluster before Alpenglow activation sends none. `invalid` footers are discarded, never repaired with guessed identities. First-shred turbine telemetry cannot advance the footer join window.
 
-Footer rows buffer until a normal data flush (timer, row pressure or shutdown) or 256 ready footers. Each batch uses a persistent table-specific ClickHouse client, reusing its schema metadata cache. Complete bank data is flushed and marked durable before any footer in that batch; retries retain the batch on failure. Already durable earlier footers may flush during a later unresolved identity hold without advancing the metadata tip. This can add up to the configured flush interval to footer latency; account for it before archiving a range.
+`NULL` footer columns mean no footer is stored. They cover blocks before activation, replayed blocks and any gap. Never fabricate bank hashes or join a stored node-local bank ID to a new session.
+
+`blocks_metadata` is `ReplacingMergeTree(slot)`, so writing a slot again replaces its row. The gRPC and Fumarole sources read the stored footer fields of replayed slots at or below the latest stored slot at start. They copy those fields into a replayed row that has none. The replayed row keeps its own `bank_id`. RPC, Bigtable and Jetstreamer backfills over an existing range do not do this, and they write `NULL` footer columns.
