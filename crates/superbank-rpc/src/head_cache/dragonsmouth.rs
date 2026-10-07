@@ -18,6 +18,7 @@ use yellowstone_block_machine::{
         block_accumulator::{BankBuffer, DragonsmouthBlockCumulator},
     },
     stream::{BlockEventStore, BlockMachineOutput, BlockStream},
+    wrapper::BlockMachineConfig,
 };
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
@@ -41,6 +42,11 @@ const TRANSACTIONS_FILTER_NAME: &str = "_superbank_rpc";
 pub(crate) async fn run(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCacheConfig) {
     run_block_machine_stream(cache, cfg).await;
 }
+
+// Banks freeze on BlockMeta alone, so clusters that send no footers still publish.
+const BLOCK_MACHINE_CONFIG: BlockMachineConfig = BlockMachineConfig {
+    require_block_footer: false,
+};
 
 async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCacheConfig) {
     let mut backoff = Duration::from_millis(250);
@@ -399,10 +405,11 @@ async fn connect_and_subscribe(
                 .as_ref()
                 .map(|update| observe_bank_metadata(&cache, session, update));
         });
-    Ok(BlockStream::<_, SubscribeUpdate, _>::new(
+    Ok(BlockStream::<_, SubscribeUpdate, _>::new_with_config(
         source,
         DragonsmouthBlockCumulator::default(),
         cfg.min_commitment,
+        BLOCK_MACHINE_CONFIG,
     )
     .map(|result| result.map_err(|e| e.to_string())))
 }
@@ -570,10 +577,11 @@ mod tests {
             .chain(coverage_events(12, 10));
         let source = futures_util::stream::iter(events.map(Ok::<_, std::io::Error>))
             .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
-        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
             source,
             DragonsmouthBlockCumulator::default(),
             CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
         );
         while let Some(output) = stream.next().await {
             handle_output(&cache, session.id, output.unwrap());
@@ -746,10 +754,11 @@ mod tests {
             .inspect(|event| {
                 observe_bank_metadata(&cache, session.id, event.as_ref().unwrap());
             });
-        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
             source,
             DragonsmouthBlockCumulator::default(),
             CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
         );
         while let Some(output) = stream.next().await {
             handle_output(&cache, session.id, output.unwrap());
@@ -801,10 +810,11 @@ mod tests {
             .inspect(|event| {
                 observe_bank_metadata(&cache, session.id, event.as_ref().unwrap());
             });
-        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
             source,
             DragonsmouthBlockCumulator::default(),
             CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
         );
         while let Some(output) = stream.next().await {
             handle_output(&cache, session.id, output.unwrap());
@@ -880,10 +890,11 @@ mod tests {
                     .inspect(|event| {
                         observe_bank_metadata(&cache, session.id, event.as_ref().unwrap())
                     });
-            let mut stream = BlockStream::<_, SubscribeUpdate, _>::new(
+            let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
                 source,
                 DragonsmouthBlockCumulator::default(),
                 CommitmentLevel::Processed,
+                BLOCK_MACHINE_CONFIG,
             );
             let mut saw_processed = false;
             while let Some(output) = stream.next().await {
@@ -949,10 +960,11 @@ mod tests {
         }
         let source = futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
             .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
-        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
             source,
             DragonsmouthBlockCumulator::default(),
             CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
         );
         let mut saw_winner = false;
         while let Some(output) = stream.next().await {

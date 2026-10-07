@@ -369,7 +369,7 @@ cargo run -p superbank -- --config path/to/superbank.yaml
 
 - For Fumarole and gRPC ingest, `meta_cost_units` is written when Yellowstone provides `cost_units`; rows ingested before this behavior may still have `NULL`.
 - For Fumarole and gRPC ingest, apply `entries.sql` or set `CLICKHOUSE_ENTRIES_TABLE` to a table that exists before starting Superbank.
-- For gRPC ingest, apply the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; the footer fields of the proven winning bank are written in the block's own `blocks_metadata` row. Fumarole 0.8 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
+- For gRPC ingest, apply the updated `blocks_metadata.sql` before starting. Complete finalized blocks, bank status and footers share one subscription; the footer fields of the proven winning bank are written in the block's own `blocks_metadata` row. Fumarole 0.9 uses sealed-blockhash envelopes where available and retains its trusted historical genesis-slot bound.
 - Fumarole requires exactly one evidenced historical bound: the certificate's genesis slot or `--fumarole-preactivation-through-slot`. It accepts the bound slot and rejects later blocks; use bank-tagged gRPC for later blocks.
 - `/metrics` includes Fumarole backpressure gauges/counters such as
   `superbank_ingest_fumarole_memory_soft_limit_bytes`,
@@ -416,7 +416,7 @@ This exercises local bundle export, manifest discovery, ingestor restore and RPC
 
 ### Live stream integrity
 
-Canonical gRPC and Fumarole writers require `commitment: finalized`. The head cache serves speculative banks. Fumarole 0.8 assembles by `(slot, sealed blockhash)`; a legacy envelope without a hash permits only one local bank identity. An evidenced `fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound is required: Fumarole does not supply the footer evidence needed for postmigration qualification.
+Canonical gRPC and Fumarole writers require `commitment: finalized`. The head cache serves speculative banks. Fumarole 0.9 assembles by `(slot, sealed blockhash)`; a legacy envelope without a hash permits only one local bank identity. An evidenced `fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound is required: Fumarole does not supply the footer evidence needed for postmigration qualification.
 
 Full blocks are validated before buffering or inserts: exact transaction counts (including zero), unique contiguous indices and signatures, and, when entries are requested, exact entry counts, indices, slot identity and transaction range tiling. `--entries-table` always carries a value (default `default.entries`), so entry payloads are always requested and validated. Malformed payloads never enter writer buffers or acknowledge source offsets. A rejected later gRPC update flushes an already complete, qualified earlier prefix before exiting. Same-slot contradictions and unresolved bank identity retain buffered data without advancing restart progress. Complete Fumarole banks may flush while other banks are assembling, but Fumarole commits no pending offsets until every pending bank has completed. Restart replays unacknowledged data.
 
@@ -430,7 +430,7 @@ Connection-local counters cannot be joined across subscriptions; sealed blockhas
 
 When trusted same-cluster `getAgGenesisCert` returns authoritative null, first record `getSlot` at finalized commitment from that endpoint, **then** its null certificate response. Keep both responses and attest a slot at or below that finalized tip with `--fumarole-preactivation-through-slot` / `FUMAROLE_PREACTIVATION_THROUGH_SLOT` / `fumarole-preactivation-through-slot`. This is operator-supplied offline evidence; Superbank does not fetch it itself. Failures, missing evidence and unsupported RPC methods never mean preactivation. The run remains bounded and cannot follow future activation. A subsequent run requires newly qualified evidence or the certificate's genesis slot; never set both bounds. A numeric zero is usable only if actually evidenced.
 
-At a Fumarole historical cutoff, the first out-of-bound event flushes prior validated complete rows before returning an error. It never assembles or writes the rejected payload and never calls the client's all-offset `commit()`: Fumarole 0.8 has no safe-prefix acknowledgment API. Pending siblings remain unacknowledged. Restart replays the valid prefix idempotently. Retire the bounded consumer or qualify a new historical run; repeated restart with the same bound will reach the same cutoff, rather than consume postmigration data.
+At a Fumarole historical cutoff, the first out-of-bound event flushes prior validated complete rows before returning an error. It never assembles or writes the rejected payload and never calls the client's all-offset `commit()`: Fumarole 0.9 has no safe-prefix acknowledgment API. Pending siblings remain unacknowledged. Restart replays the valid prefix idempotently. Retire the bounded consumer or qualify a new historical run; repeated restart with the same bound will reach the same cutoff, rather than consume postmigration data.
 
 ### Footer columns
 

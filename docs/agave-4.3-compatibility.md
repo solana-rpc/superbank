@@ -17,7 +17,7 @@ The existing String reward-type columns and Int64 reward amounts accommodate VAT
 
 ## Ingestion and streaming boundaries
 
-JSON-RPC and Bigtable ingestion use Agave 4.3 types. Yellowstone gRPC ingestion, Fumarole block assembly, and the head cache preserve VAT reward value 6 with the stable Yellowstone 13 schema (upgraded from 13.0.0-rc4). Prost retains this i32 value when decoding and re-encoding. The `grpc-streaming` feature uses Agave's `solana-storage-proto = 4.3.0` generated output types, including `VATDebit = 6`, without changing existing field numbers or values. Only the Superbank service envelope is compiled locally.
+JSON-RPC and Bigtable ingestion use Agave 4.3 types. Yellowstone gRPC ingestion, Fumarole block assembly, and the head cache preserve VAT reward value 6 with the stable Yellowstone 14 schema. Prost retains this i32 value when decoding and re-encoding. The `grpc-streaming` feature uses Agave's `solana-storage-proto = 4.3.0` generated output types, including `VATDebit = 6`, without changing existing field numbers or values. Only the Superbank service envelope is compiled locally.
 
 Synthetic wire fixtures exercise these conversions. They do **not** certify a deployed Yellowstone/Fumarole producer: record its exact version and replay captured payloads before qualifying a production rollout. Never infer producer correctness or cluster feature activation from the Agave version alone.
 
