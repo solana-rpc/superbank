@@ -233,6 +233,19 @@ pub(crate) async fn fetch_present_slots_in_range(
         })
 }
 
+/// Aliases must differ from the source columns, or ClickHouse resolves the WHERE columns to the aggregates.
+fn stored_footers_sql(blocks_table: &str) -> String {
+    format!(
+        "SELECT slot, lower(hex(any(bank_hash))) AS stored_bank_hash, \
+         any(block_producer_time_nanos) AS stored_producer_time_nanos, \
+         lower(hex(any(block_user_agent))) AS stored_user_agent \
+         FROM {blocks_table} \
+         WHERE slot BETWEEN ? AND ? AND has(?, slot) AND bank_hash IS NOT NULL \
+         AND block_producer_time_nanos IS NOT NULL AND block_user_agent IS NOT NULL \
+         GROUP BY slot"
+    )
+}
+
 /// Footer fields already stored for `slots`. Rows without a complete footer are skipped.
 pub(crate) async fn fetch_stored_footers(
     clickhouse: &ClickHouseClient,
@@ -242,23 +255,15 @@ pub(crate) async fn fetch_stored_footers(
     #[derive(Debug, Deserialize, Row)]
     struct StoredFooterRow {
         slot: u64,
-        bank_hash: Option<String>,
-        block_producer_time_nanos: Option<u64>,
-        block_user_agent: Option<String>,
+        stored_bank_hash: Option<String>,
+        stored_producer_time_nanos: Option<u64>,
+        stored_user_agent: Option<String>,
     }
 
     let (Some(&first), Some(&last)) = (slots.iter().min(), slots.iter().max()) else {
         return Ok(HashMap::new());
     };
-    let query = format!(
-        "SELECT slot, lower(hex(any(bank_hash))) AS bank_hash, \
-         any(block_producer_time_nanos) AS block_producer_time_nanos, \
-         lower(hex(any(block_user_agent))) AS block_user_agent \
-         FROM {blocks_table} \
-         WHERE slot BETWEEN ? AND ? AND has(?, slot) AND bank_hash IS NOT NULL \
-         AND block_producer_time_nanos IS NOT NULL AND block_user_agent IS NOT NULL \
-         GROUP BY slot"
-    );
+    let query = stored_footers_sql(blocks_table);
     let rows = clickhouse
         .query(&query)
         .bind(first)
@@ -270,9 +275,9 @@ pub(crate) async fn fetch_stored_footers(
     let mut stored = HashMap::with_capacity(rows.len());
     for row in rows {
         let (Some(hash), Some(nanos), Some(agent)) = (
-            row.bank_hash,
-            row.block_producer_time_nanos,
-            row.block_user_agent,
+            row.stored_bank_hash,
+            row.stored_producer_time_nanos,
+            row.stored_user_agent,
         ) else {
             continue;
         };
@@ -770,6 +775,65 @@ mod tests {
             block_producer_time_nanos: 100 + u64::from(tag),
             block_user_agent: vec![tag; 3],
         }
+    }
+
+    #[test]
+    fn stored_footers_query_aliases_do_not_shadow_filtered_columns() {
+        let sql = stored_footers_sql("db.blocks_metadata");
+        for column in ["bank_hash", "block_producer_time_nanos", "block_user_agent"] {
+            assert!(
+                !sql.contains(&format!("AS {column}")),
+                "{column} alias shadows the column"
+            );
+        }
+        assert!(sql.contains("WHERE slot BETWEEN ? AND ?"));
+    }
+
+    #[test]
+    fn stored_footers_query_runs_on_clickhouse_local() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let Ok(mut child) = Command::new("clickhouse-local")
+            .arg("--multiquery")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("skipping: clickhouse-local is not installed");
+            return;
+        };
+        let select = stored_footers_sql("blocks_metadata")
+            .replacen('?', "10", 1)
+            .replacen('?', "12", 1)
+            .replacen('?', "[10, 11, 12]", 1);
+        let script = format!(
+            "CREATE TABLE blocks_metadata (slot UInt64, bank_hash Nullable(FixedString(32)), \
+             block_producer_time_nanos Nullable(UInt64), block_user_agent Nullable(String)) \
+             ENGINE = MergeTree ORDER BY slot;\n\
+             INSERT INTO blocks_metadata VALUES \
+             (10, unhex(repeat('01', 32)), 7, 'agave'), (11, NULL, NULL, NULL), \
+             (12, unhex(repeat('02', 32)), 8, 'x');\n\
+             {select} ORDER BY slot FORMAT TSV;"
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rows: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.split('\t').next().unwrap().to_string())
+            .collect();
+        assert_eq!(rows, ["10", "12"]);
     }
 
     #[test]
