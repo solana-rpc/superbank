@@ -189,7 +189,6 @@ pub enum ArchiveLocationType {
 pub enum ArchiveTable {
     Transactions,
     BlocksMetadata,
-    BlockFooters,
     Entries,
     Gsfa,
     GsfaHot,
@@ -202,7 +201,6 @@ impl ArchiveTable {
         match self {
             ArchiveTable::Transactions => "transactions",
             ArchiveTable::BlocksMetadata => "blocks_metadata",
-            ArchiveTable::BlockFooters => "block_footers",
             ArchiveTable::Entries => "entries",
             ArchiveTable::Gsfa => "gsfa",
             ArchiveTable::GsfaHot => "gsfa_hot",

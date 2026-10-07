@@ -530,13 +530,6 @@ fn db_archive_tables_cover_superbank_base_and_index_tables() {
                 true
             ),
             (
-                "block_footers",
-                "block_footers",
-                "block_footers.parquet",
-                "slot",
-                false
-            ),
-            (
                 "entries",
                 "entries",
                 "entries.parquet",
@@ -580,7 +573,6 @@ fn s3_archive_sql_uses_clickhouse_s3_function_and_stable_order() {
     let table = DbTables {
         transactions_table: "transactions".to_string(),
         blocks_table: "blocks_metadata".to_string(),
-        block_footers_table: "block_footers".to_string(),
         entries_table: "entries".to_string(),
         gsfa_table: "gsfa".to_string(),
         gsfa_hot_table: "gsfa_hot".to_string(),
@@ -628,7 +620,6 @@ fn s3_archive_sql_omits_settings_clause_when_unset() {
     let table = DbTables {
         transactions_table: "transactions".to_string(),
         blocks_table: "blocks_metadata".to_string(),
-        block_footers_table: "block_footers".to_string(),
         entries_table: "entries".to_string(),
         gsfa_table: "gsfa".to_string(),
         gsfa_hot_table: "gsfa_hot".to_string(),
@@ -666,7 +657,6 @@ fn s3_table_archive_sql_writes_bundle_table_object() {
     let table = DbTables {
         transactions_table: "transactions".to_string(),
         blocks_table: "blocks_metadata".to_string(),
-        block_footers_table: "block_footers".to_string(),
         entries_table: "entries".to_string(),
         gsfa_table: "gsfa".to_string(),
         gsfa_hot_table: "gsfa_hot".to_string(),
@@ -705,7 +695,6 @@ fn s3_archive_sql_omits_final_when_dedup_disabled() {
     let table = DbTables {
         transactions_table: "transactions".to_string(),
         blocks_table: "blocks_metadata".to_string(),
-        block_footers_table: "block_footers".to_string(),
         entries_table: "entries".to_string(),
         gsfa_table: "gsfa".to_string(),
         gsfa_hot_table: "gsfa_hot".to_string(),
@@ -786,7 +775,6 @@ fn delete_sql_covers_all_configured_tables() {
     let tables = DbTables {
         transactions_table: "transactions".to_string(),
         blocks_table: "blocks_metadata".to_string(),
-        block_footers_table: "block_footers".to_string(),
         entries_table: "entries".to_string(),
         gsfa_table: "gsfa".to_string(),
         gsfa_hot_table: "gsfa_hot".to_string(),
@@ -800,7 +788,6 @@ fn delete_sql_covers_all_configured_tables() {
         vec![
             "ALTER TABLE transactions DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
             "ALTER TABLE blocks_metadata DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
-            "ALTER TABLE block_footers DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
             "ALTER TABLE entries DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
             "ALTER TABLE gsfa DELETE WHERE slot BETWEEN 100 AND 123".to_string(),
             "ALTER TABLE gsfa_hot DELETE WHERE slot BETWEEN 100 AND 123".to_string(),

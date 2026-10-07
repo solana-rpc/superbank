@@ -48,7 +48,6 @@ pub struct Config {
     /// `SELECT *` export.
     pub archive_dedup_export: bool,
     pub blocks_table: String,
-    pub block_footers_table: String,
     pub entries_table: String,
     pub gsfa_table: String,
     pub gsfa_hot_table: String,
@@ -156,7 +155,6 @@ impl Config {
         for table in [
             &cli.transactions_table,
             &cli.blocks_table,
-            &cli.block_footers_table,
             &cli.entries_table,
             &cli.gsfa_table,
             &cli.gsfa_hot_table,
@@ -208,7 +206,6 @@ impl Config {
             clickhouse_archive_settings: cli.clickhouse_archive_settings.trim().to_string(),
             archive_dedup_export: cli.archive_dedup_export,
             blocks_table: cli.blocks_table,
-            block_footers_table: cli.block_footers_table,
             entries_table: cli.entries_table,
             gsfa_table: cli.gsfa_table,
             gsfa_hot_table: cli.gsfa_hot_table,
@@ -339,13 +336,6 @@ struct Cli {
         default_value = "blocks_metadata"
     )]
     blocks_table: String,
-
-    #[arg(
-        long = "db-block-footers-table-name",
-        env = "SOLPARQ_DB_BLOCK_FOOTERS_TABLE_NAME",
-        default_value = "block_footers"
-    )]
-    block_footers_table: String,
 
     #[arg(
         long = "db-entries-table-name",
