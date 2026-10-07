@@ -15,8 +15,8 @@ pub(crate) fn serialize_versioned_message(message: &VersionedMessage) -> WriteRe
 #[cfg(test)]
 pub(crate) fn serialize_versioned_transaction(
     transaction: &versioned::VersionedTransaction,
-) -> wincode06::WriteResult<Vec<u8>> {
-    wincode06::serialize(transaction)
+) -> wincode::WriteResult<Vec<u8>> {
+    wincode::serialize(transaction)
 }
 
 #[cfg(test)]

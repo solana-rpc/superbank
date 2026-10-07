@@ -2610,7 +2610,7 @@ mod tests {
             loaded_accounts_data_size_limit: Some(65_536),
             heap_size: Some(32_768),
         });
-        let tx_bytes = wincode06::serialize(&tx).expect("serialize v1 transaction");
+        let tx_bytes = wincode::serialize(&tx).expect("serialize v1 transaction");
         assert_eq!(
             crate::message_wire::serialize_versioned_transaction(&tx)
                 .expect("serialize with Superbank schema"),
@@ -2686,8 +2686,8 @@ mod tests {
                 .unwrap()
                 .into();
             assert_eq!(
-                wincode06::serialize(&decoded).unwrap(),
-                wincode06::serialize(&tx).unwrap()
+                wincode::serialize(&decoded).unwrap(),
+                wincode::serialize(&tx).unwrap()
             );
             let row = map_versioned_transaction_with_meta(42, None, 0, &decoded, None, 1).unwrap();
             assert_eq!(row.tx_version, expected.tx_version);

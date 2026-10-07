@@ -2284,7 +2284,7 @@ fn decode_transaction_error(
         return Ok((1, None));
     };
 
-    match wincode06::deserialize::<solana_transaction_error::TransactionError>(&err.err) {
+    match wincode::deserialize::<solana_transaction_error::TransactionError>(&err.err) {
         Ok(decoded) => {
             let serialized =
                 serde_json::to_string(&decoded).unwrap_or_else(|_| format!("{decoded:?}"));
