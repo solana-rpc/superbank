@@ -1,6 +1,8 @@
 use std::{fs::File, path::Path, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    ArrayRef, FixedSizeBinaryArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::{
     arrow::ArrowWriter,
@@ -439,63 +441,66 @@ fn write_archive_with_invalid_utf8_column() -> (TempDir, std::path::PathBuf) {
 }
 
 #[tokio::test]
-async fn footer_bundle_schema_and_scan_use_manifest_and_inclusive_slot_filter() {
+async fn blocks_metadata_footer_columns_scan_with_nulls() {
     let (_dir, bundle) = write_test_bundle();
     let schema = Arc::new(Schema::new(vec![
         Field::new("slot", DataType::UInt64, false),
-        Field::new("bank_id", DataType::UInt64, false),
-        Field::new("block_producer_time_nanos", DataType::UInt64, false),
+        Field::new("bank_id", DataType::UInt64, true),
+        Field::new("bank_hash", DataType::FixedSizeBinary(32), true),
+        Field::new("block_producer_time_nanos", DataType::UInt64, true),
+        Field::new("block_user_agent", DataType::Utf8, true),
     ]));
+    let hashes = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        vec![None, Some([7u8; 32]), Some([8u8; 32])].into_iter(),
+        32,
+    )
+    .unwrap();
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(UInt64Array::from(vec![10, 11, 12])) as ArrayRef,
-            Arc::new(UInt64Array::from(vec![0, 7, 9])) as ArrayRef,
-            Arc::new(UInt64Array::from(vec![100, 110, 120])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![None, Some(7), Some(9)])) as ArrayRef,
+            Arc::new(hashes) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![None, Some(110), Some(120)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("agave/4.3"),
+                Some("agave/4.3"),
+            ])) as ArrayRef,
         ],
     )
     .unwrap();
     let mut writer = ArrowWriter::try_new(
-        File::create(bundle.join("block_footers.parquet")).unwrap(),
+        File::create(bundle.join("blocks_metadata.parquet")).unwrap(),
         schema,
         None,
     )
     .unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
-    let path = bundle.join("manifest.json");
-    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    manifest["tables"].as_array_mut().unwrap().push(json!({
-        "kind": "block_footers", "file_name": "block_footers.parquet",
-        "table_name": "block_footers", "row_count": 3, "required": false
-    }));
-    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let cli = Cli::try_parse_from([
         "reader",
         "schema",
         "--archive",
         bundle.to_str().unwrap(),
         "--table",
-        "block_footers",
+        "blocks_metadata",
     ])
     .unwrap();
-    assert!(
-        render(cli)
-            .await
-            .unwrap()
-            .contains("block_producer_time_nanos")
-    );
+    let schema_output = render(cli).await.unwrap();
+    assert!(schema_output.contains("block_producer_time_nanos"));
+    assert!(schema_output.contains("block_user_agent"));
     let cli = Cli::try_parse_from([
         "reader",
         "scan",
         "--archive",
         bundle.to_str().unwrap(),
         "--table",
-        "block_footers",
+        "blocks_metadata",
         "--slot-range",
         "10-11",
         "--columns",
-        "slot,bank_id",
+        "slot,bank_id,block_user_agent",
         "--format",
         "json",
     ])
@@ -503,6 +508,37 @@ async fn footer_bundle_schema_and_scan_use_manifest_and_inclusive_slot_filter() 
     let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
     assert_eq!(
         rows,
-        json!([{"slot": 10, "bank_id": 0}, {"slot": 11, "bank_id": 7}])
+        json!([
+            {"slot": 10},
+            {"slot": 11, "bank_id": 7, "block_user_agent": "agave/4.3"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn blocks_metadata_archive_without_footer_columns_still_scans() {
+    let (_dir, bundle) = write_test_bundle();
+    let cli = Cli::try_parse_from([
+        "reader",
+        "scan",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "blocks_metadata",
+        "--slot-range",
+        "10-11",
+        "--columns",
+        "slot,executed_transaction_count",
+        "--format",
+        "json",
+    ])
+    .unwrap();
+    let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
+    assert_eq!(
+        rows,
+        json!([
+            {"slot": 10, "executed_transaction_count": 1},
+            {"slot": 11, "executed_transaction_count": 1}
+        ])
     );
 }

@@ -24,7 +24,6 @@ type_epoch_from-slot_to-slot/
   .done.<hostname>.txt
   transactions.parquet
   blocks_metadata.parquet
-  block_footers.parquet
   entries.parquet
   gsfa.parquet
   gsfa_hot.parquet
@@ -43,7 +42,7 @@ included when they exist on the ClickHouse server and are recorded as skipped in
 `manifest.json` when absent. This lets RPC/Bigtable deployments archive cleanly
 without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
 entries for later PoH-specific tooling.
-When present, `block_footers.parquet` retains Alpenglow bank hash, producer time, and user agent for internal inspection and restore. The archive manifest format is version 3; older bundles remain readable. Canonical block data, bank status and processed footers share one gRPC subscription; footer batches persist only after matching finalized banks have complete durable data. Bank counters belong to that subscription and can change across reconnects; new footer tables deduplicate by finalized slot. Startup table failures disable ancillary writes, and replay may not provide historical footers. Audit and record gaps, then archive only after the qualified footer batches have flushed. A premature archive can omit later footers; block completeness does not establish footer completeness. See the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
+`blocks_metadata.parquet` carries the Alpenglow footer columns `bank_id`, `bank_hash`, `block_producer_time_nanos` and `block_user_agent`. They are `NULL` for blocks stored without a footer, and for archives made before the columns existed. The archive manifest format is version 3; older bundles remain readable and restore with those columns `NULL`. Block data and its footer are written in one `blocks_metadata` row. Replay may not provide historical footers, so audit and record gaps before archiving. See the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
 
 `SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
 bundle. `report.json` is a machine-readable run report: it carries a
@@ -300,11 +299,11 @@ cargo run -p superbank-solparq --bin superbank-solparq-read -- scan \
 ```
 
 Use `--table` to read a non-transaction table from a bundle, for example
-`--table blocks_metadata`, `--table block_footers`, or `--table entries`. The footer table supports `schema` and slot-filtered `scan`, including binary `bank_hash` and `block_user_agent` columns. For example:
+`--table blocks_metadata` or `--table entries`. `blocks_metadata` includes the Alpenglow footer columns, including binary `bank_hash` and a nullable `block_user_agent`. For example:
 
 ```sh
 superbank-solparq-read scan --archive ./archives/custom_0_10-12 \
-  --table block_footers --slot-range 10-11 \
+  --table blocks_metadata --slot-range 10-11 \
   --columns slot,bank_id,block_producer_time_nanos --format json
 ```
 
@@ -805,7 +804,6 @@ That deletes matching slots from:
 
 - `transactions`
 - `blocks_metadata`
-- `block_footers`
 - `entries`
 - `gsfa`
 - `gsfa_hot`
@@ -829,7 +827,6 @@ Common defaults:
 - `--db-database default`
 - `--db-transactions-table-name transactions`
 - `--db-blocks-table-name blocks_metadata`
-- `--db-block-footers-table-name block_footers` (optional Alpenglow footer archive)
 - `--db-entries-table-name entries`
 - `--db-gsfa-table-name gsfa`
 - `--db-gsfa-hot-table-name gsfa_hot`
