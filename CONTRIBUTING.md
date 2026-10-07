@@ -99,7 +99,6 @@ Create the dev tables (single-node) using the schemas under `ddl/local/`:
 cat ddl/local/transactions.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/blocks_metadata.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/entries.sql | docker exec -i clickhouse clickhouse-client --multiquery
-cat ddl/local/block_footers.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/gsfa.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/signatures.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/token_owner_activity.sql | docker exec -i clickhouse clickhouse-client --multiquery

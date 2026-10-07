@@ -93,7 +93,6 @@ table.
 ```bash
 cat ddl/local/transactions.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/blocks_metadata.sql | docker exec -i clickhouse clickhouse-client --multiquery
-cat ddl/local/block_footers.sql | docker exec -i clickhouse clickhouse-client --multiquery
 # Required for Superbank Fumarole/gRPC source defaults and Old Faithful / Jetstreamer PoH entry ingestion.
 cat ddl/local/entries.sql | docker exec -i clickhouse clickhouse-client --multiquery
 cat ddl/local/gsfa.sql | docker exec -i clickhouse clickhouse-client --multiquery

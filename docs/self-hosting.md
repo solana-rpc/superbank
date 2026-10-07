@@ -140,7 +140,6 @@ Superbank uses base tables and several materialized views. Apply the local (sing
 # Base tables
 cat ddl/local/transactions.sql    | docker exec -i superbank-clickhouse clickhouse-client --multiquery
 cat ddl/local/blocks_metadata.sql | docker exec -i superbank-clickhouse clickhouse-client --multiquery
-cat ddl/local/block_footers.sql   | docker exec -i superbank-clickhouse clickhouse-client --multiquery
 cat ddl/local/entries.sql         | docker exec -i superbank-clickhouse clickhouse-client --multiquery  # required for the Fumarole/gRPC defaults shown below
 
 # Materialized views (derived by ClickHouse at insert time — not by the ingestor)
