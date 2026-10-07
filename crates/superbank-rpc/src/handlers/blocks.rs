@@ -1622,8 +1622,8 @@ pub(crate) async fn handle_get_block(
                     payload,
                     fetch_plan,
                     BlockResponseOptions {
-                        // A confirmed head-cache block may not be finalized yet. It has no
-                        // footer, so a footer response must not be cached for later reads.
+                        // A head-cache footer can still arrive after the block, so a footer
+                        // response is not cached for later reads.
                         cache_key: (requested_finalized && !fetch_plan.footer)
                             .then(|| response_cache_key.clone()),
                         timings: None,

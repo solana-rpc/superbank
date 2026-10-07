@@ -25,7 +25,7 @@ use yellowstone_grpc_proto::prelude::{
     GetVersionRequest, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeUpdate,
 };
 
-use crate::clickhouse::BlockMetadataRecord;
+use crate::clickhouse::{BlockFooterRecord, BlockMetadataRecord};
 use crate::head_cache::HeadCache;
 use crate::metrics;
 
@@ -190,6 +190,23 @@ pub(super) fn parse_block_meta(
         rewards_commission_bps,
         rewards_num_partitions,
         footer: None,
+    })
+}
+
+/// A footer needs the full 32-byte bank hash, as the ingestor requires before it stores one.
+fn parse_block_footer(
+    footer: &yellowstone_grpc_proto::prelude::SubscribeUpdateBlockFooter,
+) -> Option<BlockFooterRecord> {
+    if footer.bank_hash.len() != 32 {
+        warn!(
+            slot = footer.slot,
+            "head cache: ignoring a block footer without a full bank hash"
+        );
+        return None;
+    }
+    Some(BlockFooterRecord {
+        block_producer_time_nanos: footer.block_producer_time_nanos,
+        block_user_agent: String::from_utf8_lossy(&footer.block_user_agent).into_owned(),
     })
 }
 
@@ -384,6 +401,13 @@ async fn connect_and_subscribe(
     request
         .entry
         .insert(RESERVED_FILTER_NAME.to_owned(), Default::default());
+    // Footers are optional for freezing a bank. They are tapped to serve getBlock footers.
+    request.block_footer.insert(
+        RESERVED_FILTER_NAME.to_owned(),
+        yellowstone_grpc_proto::prelude::SubscribeRequestFilterBlockFooter {
+            include_certificates: Some(false),
+        },
+    );
     request.accounts.insert(
         RESERVED_FILTER_NAME.to_owned(),
         yellowstone_grpc_proto::prelude::SubscribeRequestFilterAccounts {
@@ -469,6 +493,11 @@ fn observe_bank_metadata(cache: &HeadCache, session: u64, update: &SubscribeUpda
         Some(UpdateOneof::BlockMeta(meta)) => {
             if let Some(metadata) = parse_block_meta(meta) {
                 cache.stage_bank_metadata(session, meta.bank_id, metadata);
+            }
+        }
+        Some(UpdateOneof::BlockFooter(footer)) => {
+            if let Some(record) = parse_block_footer(footer) {
+                cache.stage_bank_footer(session, footer.slot, footer.bank_id, record);
             }
         }
         Some(UpdateOneof::Entry(entry)) => cache.stage_bank_entry(session, entry),
@@ -614,6 +643,111 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn footer_event(slot: u64, hash_len: usize, agent: &[u8]) -> SubscribeUpdate {
+        SubscribeUpdate {
+            update_oneof: Some(
+                yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::BlockFooter(
+                    yellowstone_grpc_proto::prelude::SubscribeUpdateBlockFooter {
+                        slot,
+                        bank_id: slot,
+                        bank_hash: vec![7; hash_len],
+                        block_producer_time_nanos: 1_750_000_000_000_000_001,
+                        block_user_agent: agent.to_vec(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        }
+    }
+
+    async fn published_footer(
+        events: Vec<SubscribeUpdate>,
+        slot: u64,
+    ) -> Option<BlockFooterRecord> {
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let source = futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
+            .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        );
+        while let Some(output) = stream.next().await {
+            handle_output(&cache, session.id, output.unwrap());
+        }
+        let metadata = cache
+            .slot_block_metadata
+            .get(&slot)
+            .expect("published block");
+        metadata.footer.clone()
+    }
+
+    fn expected_footer(agent: &str) -> BlockFooterRecord {
+        BlockFooterRecord {
+            block_producer_time_nanos: 1_750_000_000_000_000_001,
+            block_user_agent: agent.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn head_block_carries_a_footer_that_arrives_before_the_block_freezes() {
+        let mut events = coverage_events(10, 9);
+        events.insert(0, footer_event(10, 32, b"agave/4.4.0"));
+        assert_eq!(
+            published_footer(events, 10).await,
+            Some(expected_footer("agave/4.4.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn head_block_gains_a_footer_that_arrives_after_it_is_published() {
+        let mut events = coverage_events(10, 9);
+        events.push(footer_event(10, 32, b"agave/4.4.0"));
+        assert_eq!(
+            published_footer(events, 10).await,
+            Some(expected_footer("agave/4.4.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn head_block_without_a_footer_has_none() {
+        assert_eq!(published_footer(coverage_events(10, 9), 10).await, None);
+    }
+
+    #[tokio::test]
+    async fn head_footer_without_a_full_bank_hash_is_ignored() {
+        let mut events = coverage_events(10, 9);
+        events.insert(0, footer_event(10, 31, b"agave/4.4.0"));
+        assert_eq!(published_footer(events, 10).await, None);
+    }
+
+    #[tokio::test]
+    async fn head_footer_user_agent_is_decoded_like_the_stored_footer() {
+        let mut events = coverage_events(10, 9);
+        events.insert(0, footer_event(10, 32, &[0x61, 0xff]));
+        assert_eq!(
+            published_footer(events, 10).await,
+            Some(expected_footer("a\u{fffd}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn head_footer_of_another_bank_does_not_attach() {
+        let mut events = coverage_events(10, 9);
+        let mut other = footer_event(10, 32, b"other");
+        if let Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::BlockFooter(
+            footer,
+        )) = other.update_oneof.as_mut()
+        {
+            footer.bank_id = 99;
+        }
+        events.insert(0, other);
+        assert_eq!(published_footer(events, 10).await, None);
     }
 
     #[test]

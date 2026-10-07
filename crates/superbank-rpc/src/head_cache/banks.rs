@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Speculative banks are scoped to one subscription; only a selected bank is published.
 use super::{HeadCache, coverage::Link};
-use crate::clickhouse::BlockMetadataRecord;
+use crate::clickhouse::{BlockFooterRecord, BlockMetadataRecord};
 use solana_commitment_config::CommitmentLevel;
 use std::{
     collections::{HashMap, HashSet},
@@ -31,6 +31,7 @@ pub(super) struct BankState {
 #[derive(Default)]
 struct Bank {
     metadata: Option<BlockMetadataRecord>,
+    footer: Option<BlockFooterRecord>,
     transactions: Option<Vec<SubscribeUpdateTransactionInfo>>,
     sealed_hash: Option<[u8; 32]>,
     entries: Vec<yellowstone_grpc_proto::prelude::SubscribeUpdateEntry>,
@@ -123,7 +124,37 @@ impl HeadCache {
         {
             return;
         }
+        let mut metadata = metadata;
+        metadata.footer = bank.footer.clone();
         bank.metadata = Some(metadata);
+        self.retain_banks(&mut state);
+    }
+
+    pub(super) fn stage_bank_footer(
+        &self,
+        session: u64,
+        slot: u64,
+        bank_id: u64,
+        footer: BlockFooterRecord,
+    ) {
+        let mut state = self.banks.write().expect("head bank lock");
+        let key = (slot, bank_id);
+        if !self.accept_bank(&state, session, key) {
+            return;
+        }
+        let selected = state.selected.get(&slot) == Some(&bank_id);
+        let bank = state.banks.entry(key).or_default();
+        // The first footer for a bank wins. It can arrive before or after the block freezes.
+        if bank.footer.is_some() {
+            return;
+        }
+        if let Some(metadata) = bank.metadata.as_mut() {
+            metadata.footer = Some(footer.clone());
+        }
+        bank.footer = Some(footer.clone());
+        if selected && let Some(mut published) = self.slot_block_metadata.get_mut(&slot) {
+            published.footer = Some(footer);
+        }
         self.retain_banks(&mut state);
     }
 
