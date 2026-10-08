@@ -286,7 +286,7 @@ docker compose up --force-recreate clickhouse-ddl
 Build the production image from the repo root:
 
 ```bash
-docker build -t superbank:0.7.0 .
+docker build -t superbank:0.8.0 .
 ```
 
 The image contains all three binaries (`superbank`, `superbank-rpc`,
@@ -300,7 +300,7 @@ docker run --rm -p 8899:8899 \
   -e CLICKHOUSE_DATABASE=default \
   -e CLICKHOUSE_USER=default \
   -e CLICKHOUSE_PASSWORD=superbank \
-  superbank:0.7.0
+  superbank:0.8.0
 ```
 
 Run the ingestor from the same image by overriding the entrypoint:
@@ -315,7 +315,7 @@ docker run --rm --entrypoint /usr/local/bin/superbank \
   -e CLICKHOUSE_DATABASE=default \
   -e CLICKHOUSE_USER=default \
   -e CLICKHOUSE_PASSWORD=superbank \
-  superbank:0.7.0
+  superbank:0.8.0
 ```
 
 Optional `superbank-rpc` features can be enabled at build time:
