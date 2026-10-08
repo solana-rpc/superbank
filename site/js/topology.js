@@ -63,24 +63,26 @@ export const BASE_TABLES = Object.freeze(['transactions', 'blocks_metadata', 'en
 export const DERIVED_TABLES = Object.freeze(['gsfa', 'signatures', 'gsfa_hot', 'token_owner_activity']);
 export const OPTIONAL_TABLES = Object.freeze(['gsfa_hot', 'token_owner_activity']);
 
-// Shard keys from ddl/cluster/*.sql.
+// Shard keys from ddl/cluster/*.sql, abbreviated for scene sublabels; the
+// exact expressions are in the summary and the info panel.
 const SHARD_KEY = {
-  transactions: 'intDiv(slot, 432000)',
-  blocks_metadata: 'intDiv(slot, 432000)',
-  entries: 'intDiv(slot, 432000)',
-  gsfa: 'cityHash64(address)',
-  signatures: 'cityHash64(signature)',
-  gsfa_hot: 'cityHash64(signature)',
-  token_owner_activity: 'cityHash64(owner)',
+  transactions: 'epoch',
+  blocks_metadata: 'epoch',
+  entries: 'epoch',
+  gsfa: 'address',
+  signatures: 'signature',
+  gsfa_hot: 'signature',
+  token_owner_activity: 'owner',
 };
 
+// Short on purpose: these render as scene label sublabels.
 const INGEST_LIFECYCLE = {
-  grpc: 'live daemon · exits on stream error',
-  fumarole: 'live daemon · consumer-group cursor',
-  rpc: 'one-shot backfill job',
-  bigtable: 'one-shot backfill job',
-  solparq: 'one-shot restore job',
-  jetstreamer: 'per-epoch batch job',
+  grpc: 'live · no reconnect',
+  fumarole: 'live · durable cursor',
+  rpc: 'one-shot backfill',
+  bigtable: 'one-shot backfill',
+  solparq: 'one-shot restore',
+  jetstreamer: 'per-epoch job',
 };
 
 const ENDPOINTS = [
@@ -233,7 +235,7 @@ export function buildTopology(input) {
     const optional = OPTIONAL_TABLES.includes(table);
     addNode(`t-${table}`, 'table', table, {
       variant: derived ? 'view' : 'base',
-      sublabel: sharded ? `shard: ${SHARD_KEY[table]}` : optional ? 'optional index' : derived ? 'MV index' : 'base table',
+      sublabel: sharded ? `sharded by ${SHARD_KEY[table]}` : optional ? 'optional index' : derived ? 'MV index' : 'base table',
       zone: 'clickhouse',
       shards,
       replicas,
