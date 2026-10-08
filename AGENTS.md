@@ -4,6 +4,7 @@
 - Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`), `crates/superbank-solparq/` (ClickHouse-to-Parquet archiver; `superbank-solparq` and `superbank-solparq-read` binaries), and `crates/superbank-verify/` (Proof-of-History validator).
 - ClickHouse DDL: `ddl/`
 - Load tests: `tests/k6/`
+- GitHub Pages site: `site/` (static, no build step): the architecture explorer (`index.html`, Three.js from a CDN) the configuration reference (`config.html`, data in `site/js/config-data/`) and the Alpenglow block lifecycle (`alpenglow.html`, whose code numbers `tests/site/alpenglow-model.test.mjs` re-reads from the Rust source), plus an Info page (`info.html`) listing the sources and versions behind them; their `node:test` checks live in `tests/site/`. The only generated file is `site/build-info.json` (gitignored), which the Pages workflow writes with `scripts/site/build-info.mjs`
 - Helper scripts: `scripts/`
 - Deploy manifests/images: `deploy/`
 - Tilt local k8s dev: `Tiltfile`, `scripts/dev/setup-tilt.sh`
@@ -27,6 +28,10 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
   `cargo test -p superbank-rpc --all-features --locked`
 - Load tests:
   `scripts/test/run-k6.sh` (or run a single scenario under `tests/k6/scenarios/`)
+- GitHub Pages site (`site/`):
+  `node --test "tests/site/*.test.mjs"` (Node 24 as in CI; no npm install; pass the glob, a bare directory path fails)
+  `node scripts/site/build-info.mjs site/build-info.json` (optional: fills in the Info page's commit and versions for a local preview)
+  `python3 -m http.server 8000 -d site` (local preview at http://localhost:8000/)
 
 ## Coding Style & Naming Conventions
 - Use `rustfmt` (stable toolchain with `rustfmt`/`clippy`) for formatting; do not hand-format.
@@ -42,7 +47,7 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
 - Keep one-off agent investigations, findings, plans, and measurement output out of tracked documentation; use PR descriptions or the ignored `artifacts/` directory.
 - Prefer non-destructive git operations; do not rewrite history unless explicitly asked.
 - Run the CI-style checks appropriate to the change; for doc-only changes, verify referenced paths/commands exist.
-- When changing CLI flags, env vars, or scripts, update the docs in the same change.
+- When changing CLI flags, env vars, or scripts, update the docs in the same change. Config options are also listed in `site/js/config-data/*.js`; `tests/site/config.test.mjs` fails until an added, renamed or removed flag, env var or YAML key is reflected there.
 
 ## Commit & Pull Request Guidelines
 - Commit messages are short and imperative; optional Conventional Commit prefixes (`feat:`, `fix:`, `chore:`) are common in history.

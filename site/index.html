@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Superbank architecture</title>
+  <meta name="description" content="Interactive map of Superbank: Solana ledger data flowing through ingest into ClickHouse, served over JSON-RPC and archived to Parquet. Switch sources, caches and storage to see how the topology changes.">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" type="image/png" href="assets/superbank.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <!-- A hash-based skip link would collide with the state hash, so this is a button wired up in main.js. -->
+  <button type="button" id="skip-summary" class="skip-link">Skip to data path summary</button>
+
+  <header class="site-header">
+    <div class="wrap site-header__inner">
+      <img class="brand__logo" src="assets/superbank.png" alt="" width="28" height="28">
+      <p class="brand__name">Superbank</p>
+      <nav class="site-nav" aria-label="Site">
+        <a class="site-nav__link" href="./" aria-current="page">Architecture</a>
+        <a class="site-nav__link" href="config.html">Configuration</a>
+        <a class="site-nav__link" href="alpenglow.html">Alpenglow</a>
+        <a class="site-nav__link" href="info.html">Info</a>
+      </nav>
+      <a class="chip-link" href="https://github.com/solana-rpc/superbank" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+    </div>
+  </header>
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap hero__inner">
+      <p class="eyebrow"><span class="eyebrow__dot" aria-hidden="true"></span>Architecture explorer</p>
+      <h1 id="hero-title" class="hero__title">Superbank architecture</h1>
+      <p class="hero__lead">How Solana blocks flow from a source into ClickHouse, out through <span class="nowrap">JSON-RPC</span>, and into Parquet archives. Toggle components to see the topology change.</p>
+    </div>
+  </section>
+
+  <!-- Direct child of body: position: sticky only holds inside its parent. -->
+  <section id="controls" aria-label="Configure the topology">
+    <div class="wrap">
+      <details id="controls-details" class="controls" open>
+        <summary class="controls__summary">
+          <span class="controls__summary-label">Configure</span>
+          <span class="controls__summary-state" id="controls-state"></span>
+        </summary>
+        <div class="controls__body">
+          <div class="controls__groups" id="controls-groups"></div>
+          <button type="button" id="reset-config" class="link-button">Reset</button>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <main>
+    <div class="stage-band">
+    <div class="wrap stage" id="stage">
+      <div class="stage__main">
+        <!-- On wide screens #panel is a drawer inside this box; on phones the box
+             dissolves and the panel stacks below the legend. -->
+        <div class="stage__canvas">
+          <div class="stage__view" id="stage-view">
+            <div id="scene" aria-describedby="summary"></div>
+            <p id="scene-loading" class="scene-loading">Loading 3D view…</p>
+            <div id="scene-actions" class="scene-actions">
+              <button type="button" id="walkthrough" class="btn btn--overlay" aria-pressed="false">Walkthrough</button>
+              <button type="button" id="pause" class="btn btn--overlay" aria-pressed="false">Pause</button>
+              <button type="button" id="reset-view" class="btn btn--overlay">Reset view</button>
+            </div>
+            <!-- Steps through the components drawn for this configuration; wired up in main.js. -->
+            <div id="walk-bar" class="walk-bar" role="group" aria-label="Walkthrough" hidden>
+              <div class="walk-bar__nav">
+                <button type="button" id="walk-prev" class="btn btn--overlay"><span aria-hidden="true">‹ </span>Back</button>
+                <p id="walk-status" class="walk-bar__status"></p>
+                <button type="button" id="walk-next" class="btn btn--overlay">Next</button>
+              </div>
+              <div class="walk-bar__order" role="group" aria-labelledby="walk-order-label">
+                <span id="walk-order-label" class="walk-bar__label">Read path</span>
+                <button type="button" id="walk-order-data" class="btn btn--overlay" aria-pressed="true" title="Follow the arrows: caches, superbank-rpc, then clients">Data flow</button>
+                <button type="button" id="walk-order-request" class="btn btn--overlay" aria-pressed="false" title="Follow a request: clients, superbank-rpc, then each cache tier">Requests</button>
+              </div>
+              <button type="button" id="walk-exit" class="btn btn--overlay walk-bar__exit" aria-label="Exit walkthrough">×</button>
+            </div>
+            <div id="scene-fallback" class="scene-fallback" role="status" hidden></div>
+          </div>
+
+          <aside id="panel" class="panel" aria-label="Component details" tabindex="-1"></aside>
+        </div>
+
+        <div class="legend-row">
+          <div id="legend" class="legend" role="group" aria-label="Legend">
+            <ul class="legend__list" aria-label="Particles">
+              <li><span class="swatch swatch--block"></span>Block</li>
+              <li><span class="swatch swatch--rows"></span>Rows</li>
+              <li><span class="swatch swatch--index"></span>Index / MV</li>
+              <li><span class="swatch swatch--parquet"></span>Parquet</li>
+              <li><span class="swatch swatch--query"></span>Query</li>
+              <li><span class="swatch swatch--meta"></span>Bundle metadata</li>
+              <li><span class="swatch swatch--request"></span>Request</li>
+            </ul>
+            <ul class="legend__list" aria-label="Read tiers">
+              <li><span class="swatch swatch--head"></span>Head cache</li>
+              <li><span class="swatch swatch--disk"></span>Disk cache</li>
+              <li><span class="swatch swatch--clickhouse"></span>ClickHouse</li>
+            </ul>
+          </div>
+          <p class="legend-row__hint">Click any component for details</p>
+        </div>
+        <!-- Announces the selection; the drawer itself is not a live region. -->
+        <div id="panel-status" class="sr-only" role="status"></div>
+      </div>
+    </div>
+    </div>
+
+    <section id="summary" class="band" aria-labelledby="summary-title" tabindex="-1">
+      <div class="wrap band__inner">
+        <h2 id="summary-title">Data path for this configuration</h2>
+        <p class="summary__config" id="summary-config"></p>
+        <div class="cells" id="summary-body"></div>
+        <noscript><p class="notice">The interactive explorer needs JavaScript. The sections below describe the default configuration.</p></noscript>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="story-title">
+      <div class="wrap band__inner">
+        <h2 id="story-title">How it fits together</h2>
+        <div class="cells">
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">01</span>
+            <h3 class="cell__title">Write path</h3>
+            <p>Blocks enter from a live stream (Yellowstone gRPC or Fumarole), a bounded backfill (Solana JSON-RPC or Bigtable), a Parquet restore, or the separate Jetstreamer plugin that replays Old Faithful. <code>superbank</code> buffers rows and flushes each batch in a fixed order: <code>transactions</code>, then <code>blocks_metadata</code>, then <code>entries</code>.</p>
+            <p>So a slot in <code>blocks_metadata</code> implies its transactions are stored. Materialized views on <code>transactions</code> then build the <code>gsfa</code> and <code>signatures</code> indexes that the RPC relies on.</p>
+          </article>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">02</span>
+            <h3 class="cell__title">Read path</h3>
+            <p><code>superbank-rpc</code> answers JSON-RPC from ClickHouse. You can put two optional tiers in front: an in-memory head cache of the newest slots and a disk cache of recent finalized slots. A request tries each enabled tier in order and falls through on a miss.</p>
+            <p>ClickHouse is always the last tier. There is no fallback to an upstream Solana RPC and no Parquet read path. gRPC streaming is a separate, optional listener for bounded historical slot ranges.</p>
+          </article>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">03</span>
+            <h3 class="cell__title">Archive &amp; restore</h3>
+            <p><code>superbank-solparq</code> exports ClickHouse tables into Parquet bundles named <code>{kind}_{epoch}_{start}-{end}</code>, either through local disk or straight to S3, where ClickHouse writes the files itself. Each range is checked against Solana <code>getBlocks</code> and the transaction counts in <code>blocks_metadata</code> first.</p>
+            <p>To restore, <code>superbank --source solparq</code> tells ClickHouse to load the bundles back. Parquet is an archive and restore format only.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <ul class="site-footer__links">
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/docs/architecture.md" target="_blank" rel="noopener noreferrer">docs/architecture.md</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank/README.md" target="_blank" rel="noopener noreferrer">superbank</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank-rpc/README.md" target="_blank" rel="noopener noreferrer">superbank-rpc</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank-solparq/README.md" target="_blank" rel="noopener noreferrer">superbank-solparq</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank-verify/README.md" target="_blank" rel="noopener noreferrer">superbank-verify</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/tree/main/ddl" target="_blank" rel="noopener noreferrer">ddl/</a></li>
+      </ul>
+      <p class="site-footer__note">Animation is illustrative, not to scale.</p>
+    </div>
+  </footer>
+</body>
+</html>

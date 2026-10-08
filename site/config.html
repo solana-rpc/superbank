@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Superbank configuration</title>
+  <meta name="description" content="Every configuration option of superbank, superbank-rpc, superbank-solparq, superbank-solparq-read, superbank-verify and the jetstreamer plugin: flags, env vars and YAML keys, with defaults, required Cargo features and related options.">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" type="image/png" href="assets/superbank.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="js/config-page.js"></script>
+</head>
+<body class="cfg-page">
+  <a class="skip-link" href="#cfg-results">Skip to options</a>
+
+  <header class="site-header">
+    <div class="wrap site-header__inner">
+      <img class="brand__logo" src="assets/superbank.png" alt="" width="28" height="28">
+      <p class="brand__name">Superbank</p>
+      <nav class="site-nav" aria-label="Site">
+        <a class="site-nav__link" href="./">Architecture</a>
+        <a class="site-nav__link" href="config.html" aria-current="page">Configuration</a>
+        <a class="site-nav__link" href="alpenglow.html">Alpenglow</a>
+        <a class="site-nav__link" href="info.html">Info</a>
+      </nav>
+      <a class="chip-link" href="https://github.com/solana-rpc/superbank" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+    </div>
+  </header>
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap hero__inner">
+      <p class="eyebrow"><span class="eyebrow__dot" aria-hidden="true"></span>Configuration reference</p>
+      <h1 id="hero-title" class="hero__title">Superbank configuration</h1>
+      <p class="hero__lead">Every flag, env var and YAML key of the Superbank binaries, grouped by component. Labels show where an option applies and which Cargo feature or setting it needs. Search accepts any spelling: <code>disk cache retain</code>, <code>DISK_CACHE_RETAIN</code> or <code>dcr</code>.</p>
+    </div>
+  </section>
+
+  <!-- Direct child of body: position: sticky only holds inside its parent. -->
+  <section id="cfg-bar" class="cfg-bar" aria-label="Search and filter">
+    <div class="wrap cfg-bar__inner">
+      <div class="cfg-search">
+        <label class="sr-only" for="cfg-q">Search configuration options</label>
+        <input id="cfg-q" class="cfg-search__input" type="search" placeholder="Search options" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="100" aria-describedby="cfg-count" aria-keyshortcuts="/">
+        <kbd class="cfg-search__key" aria-hidden="true">/</kbd>
+      </div>
+      <p id="cfg-count" class="cfg-count" role="status"></p>
+      <details id="cfg-filters" class="cfg-filters">
+        <summary class="cfg-filters__summary">
+          <span class="cfg-filters__label">Filters</span>
+          <span class="cfg-filters__state" id="cfg-filter-state"></span>
+        </summary>
+        <div class="cfg-filters__body">
+          <div class="cfg-filters__groups" id="cfg-filter-groups"></div>
+          <button type="button" id="cfg-reset" class="link-button">Reset</button>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <main class="wrap cfg-layout">
+    <nav class="cfg-toc" aria-label="Components">
+      <details id="cfg-toc-details" class="cfg-toc__details" open>
+        <summary class="cfg-toc__summary">Jump to</summary>
+        <ol class="cfg-toc__list" id="cfg-toc-list"></ol>
+      </details>
+    </nav>
+    <div id="cfg-results" class="cfg-results" tabindex="-1">
+      <p id="cfg-loading" class="notice">Loading options…</p>
+      <noscript>
+        <p class="notice">Search and filtering need JavaScript. Each crate README documents its options:
+          <a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank/README.md">superbank</a>,
+          <a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank-rpc/README.md">superbank-rpc</a>,
+          <a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank-solparq/README.md">superbank-solparq</a>,
+          <a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank-verify/README.md">superbank-verify</a>,
+          <a href="https://github.com/solana-rpc/superbank/blob/main/ingest/jetstreamer-clickhouse-plugin/README.md">jetstreamer plugin</a>.</p>
+      </noscript>
+      <div id="cfg-sections"></div>
+      <p id="cfg-empty" class="notice" hidden>No options match. <button type="button" id="cfg-empty-reset" class="link-button">Clear search and filters</button></p>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <ul class="site-footer__links">
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/superbank.example.yaml" target="_blank" rel="noopener noreferrer">superbank.example.yaml</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/superbank-verify.example.yaml" target="_blank" rel="noopener noreferrer">superbank-verify.example.yaml</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/docs/self-hosting.md" target="_blank" rel="noopener noreferrer">docs/self-hosting.md</a></li>
+      </ul>
+      <p class="site-footer__note">Checked against the clap and serde definitions in the source. When they disagree with a README, the code wins.</p>
+    </div>
+  </footer>
+</body>
+</html>

@@ -9,7 +9,7 @@
 
 Ingest Solana ledger data into ClickHouse and serve Solana-compatible JSON-RPC from that data.
 
-[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [superbank-solparq](crates/superbank-solparq/README.md) · [PoH validator](crates/superbank-verify/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md)
+[Ingestor](crates/superbank/README.md) · [RPC server](crates/superbank-rpc/README.md) · [superbank-solparq](crates/superbank-solparq/README.md) · [PoH validator](crates/superbank-verify/README.md) · [ClickHouse DDL](ddl/) · [k6 tests](tests/k6/README.md) · [Interactive architecture explorer](https://solana-rpc.github.io/superbank/)
 
 </div>
 
