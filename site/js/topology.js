@@ -430,6 +430,53 @@ export function buildTopology(input) {
   };
 }
 
+// --- Walkthrough --------------------------------------------------------
+// Visit order for the guided walkthrough: every drawn node exactly once,
+// grouped by the summary sections. The write path follows the data from its
+// source into ClickHouse. The read path either follows the arrows (data
+// direction) or a request (clients -> rpc -> tiers, as the summary tells it).
+// Ids that are not drawn, or already visited, are skipped.
+export const READ_ORDERS = Object.freeze(['data', 'request']);
+
+const WRITE_WALK = [
+  'ingest',
+  't-transactions',
+  't-blocks_metadata',
+  't-entries',
+  't-gsfa',
+  't-signatures',
+  't-gsfa_hot',
+  't-token_owner_activity',
+  'ch',
+  'keeper',
+];
+// Solana and DragonsMouth land here only when they feed the head cache alone.
+const READ_WALK = {
+  data: ['disk-cache', 'solana', 'src-dragonsmouth', 'head-cache', 'rpc', 'jsonrpc-clients', 'grpc-clients'],
+  request: ['jsonrpc-clients', 'rpc', 'head-cache', 'src-dragonsmouth', 'solana', 'disk-cache', 'grpc-clients'],
+};
+const ARCHIVE_WALK = ['solparq', 'solparq-rpc', 'parquet-store'];
+
+export function walkthroughSteps(topology, { readOrder = 'data' } = {}) {
+  const state = topology.state;
+  const drawn = new Set(topology.nodes.map((n) => n.id));
+  const steps = [];
+  const seen = new Set();
+  const add = (section, ids) => {
+    for (const id of ids) {
+      if (!drawn.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      steps.push({ id, section });
+    }
+  };
+  const source = state.source === 'solparq' ? ['parquet-store'] : ['solana', SOURCE_ENDPOINT[state.source]];
+  add('write', [...source, ...WRITE_WALK]);
+  add('read', READ_WALK[READ_ORDERS.includes(readOrder) ? readOrder : 'data']);
+  add('archive', ARCHIVE_WALK);
+  add('verify', ['verify']);
+  return steps;
+}
+
 // Slabs whose membership varies hug the nodes drawn on them: Upstream along
 // its endpoint column (v), Archive along store -> archiver (u). Margins keep
 // each node's footprint on the slab.

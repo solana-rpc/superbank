@@ -98,6 +98,16 @@ const BOUNDS = { u0: -17, u1: 17.6, v0: -7.2, v1: 7.8, y0: -0.3, y1: 2.6 };
 const ZONE_H = 0.28;
 const FADE_S = 0.3;
 const CAMERA_TWEEN_S = 0.45;
+const FOCUS_TWEEN_S = 0.7;
+// A focused frame is the node's zone (its parent, so its siblings stay in
+// view) padded by FOCUS_PAD and never narrower than FOCUS_MIN_SPAN, so small
+// zones (Ingest, Verify) still show their neighbours. FOCUS_MARGIN leaves
+// room for labels, which are hidden rather than clipped at the canvas edge.
+const FOCUS_PAD = 1;
+const FOCUS_MIN_SPAN = 9;
+const FOCUS_MARGIN = 1.1;
+// An overlay inset that would leave less than this share of an axis is ignored.
+const FOCUS_MIN_VISIBLE = 0.4;
 const CLICK_SLOP_PX = 5;
 const TOOLTIP_OFFSET_PX = 12;
 const EDGE_HOVER_PX = 9;
@@ -168,7 +178,7 @@ const easeOut = (x) => 1 - (1 - x) ** 3;
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 const jitter = (base) => base * (0.55 + Math.random() * 0.9);
 
-export function createScene(container, { onSelect, reducedMotion = false, debug = false } = {}) {
+export function createScene(container, { onSelect, focusInset, reducedMotion = false, debug = false } = {}) {
   if (!container) throw new Error('createScene: container is required');
   if (!webgl2Available()) throw new Error('WebGL unavailable');
 
@@ -349,6 +359,8 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   let movedBeforeGesture = false;
   let focusId = null;
   let baseHalfH = 10;
+  // Node the camera is framing ({ id }), or null for the whole diorama.
+  let focus = null;
 
   // --- Materials -----------------------------------------------------------
   // Node materials are per node (fade and hover differ per node);
@@ -1999,9 +2011,14 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   }
   const fullCorners = cornersOf(BOUNDS);
   let fitCorners = fullCorners;
+  // Extent of the zones on screen; a focused frame widens within it.
+  let fitRect = BOUNDS;
   let fitKey = '';
   let camTween = null;
   const tweenTarget = new THREE.Vector3();
+  const tweenDir = new THREE.Vector3();
+  const tweenSph = new THREE.Spherical();
+  const NO_INSET = Object.freeze({ top: 0, right: 0, bottom: 0, left: 0 });
 
   // Frame the union of the zones on screen, easing there unless this is the
   // first build. A camera the user has moved is left alone.
@@ -2017,11 +2034,14 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     const key = [b.u0, b.v0, b.u1, b.v1].join('|');
     if (key === fitKey) return;
     fitKey = key;
+    fitRect = b;
     fitCorners = cornersOf(b);
     if (!userMoved) applyFit(false, animate);
   }
 
-  function fitFor(dir, aspect, corners = fitCorners) {
+  // Fits `corners` into the part of the canvas not covered by `inset` (px),
+  // centred in that part. halfH is for the whole canvas height.
+  function fitFor(dir, width, height, corners = fitCorners, inset = NO_INSET, margin = 1) {
     const forward = new THREE.Vector3().copy(dir).negate();
     const right = new THREE.Vector3().crossVectors(forward, UP).normalize();
     const up = new THREE.Vector3().crossVectors(right, forward).normalize();
@@ -2038,53 +2058,128 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       y0 = Math.min(y0, y);
       y1 = Math.max(y1, y);
     }
-    let halfW = ((x1 - x0) / 2) * 1.02;
-    let halfH = ((y1 - y0) / 2) * 1.04;
+    const visibleW = width - inset.left - inset.right;
+    const visibleH = height - inset.top - inset.bottom;
+    const aspect = visibleW / visibleH;
+    let halfW = ((x1 - x0) / 2) * 1.02 * margin;
+    let halfH = ((y1 - y0) / 2) * 1.04 * margin;
     if (halfW / halfH > aspect) halfH = halfW / aspect;
     else halfW = halfH * aspect;
+    halfH *= height / visibleH;
+    // The camera centre sits half the inset difference away from the content
+    // centre (world units per px = 2 * halfH / height).
+    const unit = (2 * halfH) / height;
+    const cx = (x0 + x1) / 2 - ((inset.left - inset.right) / 2) * unit;
+    const cy = (y0 + y1) / 2 + ((inset.top - inset.bottom) / 2) * unit;
     // Pivot on the ground plane so orbiting feels anchored to the diorama.
-    const target = new THREE.Vector3().addScaledVector(right, (x0 + x1) / 2).addScaledVector(up, (y0 + y1) / 2);
+    const target = new THREE.Vector3().addScaledVector(right, cx).addScaledVector(up, cy);
     target.addScaledVector(forward, -target.y / forward.y);
     return { halfH, target };
   }
 
-  function choosePose(aspect) {
-    const land = fitFor(POSES.landscape, aspect, fullCorners);
-    const port = fitFor(POSES.portrait, aspect, fullCorners);
+  // The focused node's zone, padded and widened to FOCUS_MIN_SPAN. Null when
+  // nothing is focused or the node is no longer drawn.
+  function focusCorners() {
+    const node = focus ? topology?.nodes?.find((n) => n.id === focus.id) : null;
+    if (!node) return null;
+    const [u, v] = node.pos ?? [0, 0];
+    const rect = topology.zones?.find((z) => z.id === node.zone)?.rect ?? [u, v, u, v];
+    // Widening is spent on the diorama rather than on empty ground past its
+    // edge (Archive sits at the front, Verify at the back), but never so far
+    // that the padded zone leaves the frame.
+    const span = (lo, hi, min, max) => {
+      const grow = Math.max(0, FOCUS_MIN_SPAN - (hi - lo) - 2 * FOCUS_PAD) / 2;
+      const a = lo - FOCUS_PAD - grow;
+      const b = hi + FOCUS_PAD + grow;
+      const shift = clamp(Math.max(0, min - a) - Math.max(0, b - max), -grow, grow);
+      return [a + shift, b + shift];
+    };
+    const [u0, u1] = span(rect[0], rect[2], fitRect.u0, fitRect.u1);
+    const [v0, v1] = span(rect[1], rect[3], fitRect.v0, fitRect.v1);
+    return cornersOf({ u0, u1, v0, v1, y0: BOUNDS.y0, y1: BOUNDS.y1 });
+  }
+
+  // Canvas px covered by page overlays (details drawer, walkthrough bar). An
+  // axis whose inset would leave too little canvas is not inset at all.
+  function readInset() {
+    let raw = null;
+    try {
+      raw = focusInset?.() ?? null;
+    } catch (err) {
+      console.warn('focusInset failed; framing the whole canvas', err);
+    }
+    if (!raw) return NO_INSET;
+    const px = (x) => (Number.isFinite(x) && x > 0 ? x : 0);
+    let top = px(raw.top);
+    let right = px(raw.right);
+    let bottom = px(raw.bottom);
+    let left = px(raw.left);
+    if (size.width - left - right < size.width * FOCUS_MIN_VISIBLE) left = right = 0;
+    if (size.height - top - bottom < size.height * FOCUS_MIN_VISIBLE) top = bottom = 0;
+    return { top, right, bottom, left };
+  }
+
+  function choosePose(width, height) {
+    const land = fitFor(POSES.landscape, width, height, fullCorners);
+    const port = fitFor(POSES.portrait, width, height, fullCorners);
     return port.halfH * 1.25 < land.halfH ? 'portrait' : 'landscape';
   }
 
-  function applyFit(reset, animate = false) {
+  // Drain orbit/zoom momentum first or damping keeps moving the camera away
+  // from the pose we are about to place.
+  function drainMomentum() {
+    const damping = controls.enableDamping;
+    controls.enableDamping = false;
+    controls.update();
+    controls.enableDamping = damping;
+  }
+
+  function applyFit(reset, animate = false, seconds = CAMERA_TWEEN_S) {
     const { width, height } = size;
     if (!width || !height) return;
-    const aspect = width / height;
     const place = reset || !userMoved;
     if (place) {
-      const next = choosePose(aspect);
+      const next = choosePose(width, height);
       if (next !== pose) {
         pose = next;
         onPoseChange();
       }
     }
-    const fit = fitFor(POSES[pose], aspect);
-    if (reset) {
-      // Drain orbit/zoom momentum first or damping keeps moving the camera
-      // away from the pose we are about to restore.
-      const damping = controls.enableDamping;
-      controls.enableDamping = false;
-      controls.update();
-      controls.enableDamping = damping;
-    }
+    const corners = focusCorners();
+    const fit = corners ? fitFor(POSES[pose], width, height, corners, readInset(), FOCUS_MARGIN) : fitFor(POSES[pose], width, height);
+    if (reset) drainMomentum();
     if (animate && place && !reset && !reducedMotion) {
-      camTween = { t: 0, fromH: baseHalfH, toH: fit.halfH, from: controls.target.clone(), to: fit.target };
-      invalidate();
+      startCameraTween(fit, seconds);
       return;
     }
     camTween = null;
-    setFrame(fit.halfH, fit.target, aspect, place);
+    setFrame(fit.halfH, fit.target, width / height, place);
   }
 
-  function setFrame(halfH, target, aspect, place) {
+  // Eases from wherever the camera is, including a user's orbit and zoom, to
+  // `fit` on the current pose. The orbit direction is interpolated in
+  // spherical coordinates (azimuth the short way round) so it stays above
+  // the ground.
+  function startCameraTween(fit, seconds) {
+    const from = new THREE.Spherical().setFromVector3(tmpVec.subVectors(camera.position, controls.target));
+    const to = new THREE.Spherical().setFromVector3(POSES[pose]);
+    const turn = THREE.MathUtils.euclideanModulo(to.theta - from.theta + Math.PI, 2 * Math.PI) - Math.PI;
+    camTween = {
+      t: 0,
+      seconds,
+      fromH: baseHalfH / camera.zoom,
+      toH: fit.halfH,
+      from: controls.target.clone(),
+      to: fit.target,
+      fromPhi: from.phi,
+      toPhi: to.phi,
+      fromTheta: from.theta,
+      turn,
+    };
+    invalidate();
+  }
+
+  function setFrame(halfH, target, aspect, place, dir = POSES[pose]) {
     baseHalfH = halfH;
     camera.top = halfH;
     camera.bottom = -halfH;
@@ -2092,7 +2187,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     camera.right = halfH * aspect;
     if (place) {
       controls.target.copy(target);
-      camera.position.copy(target).addScaledVector(POSES[pose], CAMERA_DIST);
+      camera.position.copy(target).addScaledVector(dir, CAMERA_DIST);
       camera.zoom = 1;
       camera.lookAt(target);
     }
@@ -2106,10 +2201,14 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     // Held while a press is in progress; a real drag keeps userMoved set, so
     // the tween never resumes over the user's camera. A plain click resumes it.
     if (!camTween || userMoved || !size.width || !size.height) return false;
-    camTween.t = Math.min(1, camTween.t + dt / CAMERA_TWEEN_S);
+    camTween.t = Math.min(1, camTween.t + dt / camTween.seconds);
     const k = easeOut(camTween.t);
+    const lerp = THREE.MathUtils.lerp;
     tweenTarget.lerpVectors(camTween.from, camTween.to, k);
-    setFrame(THREE.MathUtils.lerp(camTween.fromH, camTween.toH, k), tweenTarget, size.width / size.height, true);
+    tweenDir.setFromSpherical(tweenSph.set(1, lerp(camTween.fromPhi, camTween.toPhi, k), camTween.fromTheta + camTween.turn * k));
+    // Land exactly on the pose so later fits and orbits start clean.
+    if (camTween.t >= 1) tweenDir.copy(POSES[pose]);
+    setFrame(lerp(camTween.fromH, camTween.toH, k), tweenTarget, size.width / size.height, true, tweenDir);
     labelsDirty = true;
     if (camTween.t >= 1) camTween = null;
     return true;
@@ -2237,9 +2336,22 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       paused = Boolean(value);
       invalidate();
     },
+    // Back to the fitted frame: the focused node if there is one, otherwise
+    // the whole diorama.
     resetView() {
       userMoved = false;
       applyFit(true);
+      invalidate();
+    },
+    // Eases the camera to frame node `id` with its zone, or back out to the
+    // whole diorama for null. Takes over from any orbit or zoom the user made.
+    focus(id) {
+      const next = typeof id === 'string' && id ? { id } : null;
+      if (!next && !focus) return;
+      focus = next;
+      drainMomentum();
+      userMoved = false;
+      applyFit(false, true, FOCUS_TWEEN_S);
       invalidate();
     },
     dispose() {

@@ -7,7 +7,7 @@
 // it to enumerated values.
 
 import { DEFAULT_STATE, ENUMS, FLAGS, normalizeState, parseHash, serializeHash } from './state.js';
-import { buildTopology } from './topology.js';
+import { buildTopology, walkthroughSteps } from './topology.js';
 
 const FALLBACK_REPO_BLOB = 'https://github.com/solana-rpc/superbank/blob/main/';
 const FALLBACK_NOTICE =
@@ -104,6 +104,10 @@ let topology = buildTopology(state);
 let scene = null;
 let selectedId = null;
 let syncingScene = false;
+// { index } while the walkthrough runs. The current step is the selection.
+let walk = null;
+// Read-path order for the walkthrough ('data' or 'request'); not in the hash.
+let readOrder = 'data';
 
 // content.js is imported dynamically so a missing or broken module cannot stop
 // the page from booting. The promise is cached; panel rendering degrades to the
@@ -234,12 +238,14 @@ function panelEmpty() {
 // Open/closed state and side live on #stage so the CSS can move the overlay
 // buttons. The drawer opens on the side away from the selected node, so the
 // highlighted node stays visible at any width (u runs about -17 .. 17.6).
+// During the walkthrough it stays on the right and the scene frames each step
+// in the space left of it, so the drawer does not jump from side to side.
 function setDrawer(node) {
   const stage = $('stage');
   stage.classList.toggle('is-drawer-open', Boolean(node));
-  if (node) stage.dataset.side = (node.pos?.[0] ?? 0) > 0 ? 'left' : 'right';
+  if (node) stage.dataset.side = !walk && (node.pos?.[0] ?? 0) > 0 ? 'left' : 'right';
   else delete stage.dataset.side;
-  const status = node ? `Details for ${node.label}` : '';
+  const status = node ? walkStatus(node) ?? `Details for ${node.label}` : '';
   if ($('panel-status').textContent !== status) $('panel-status').textContent = status;
 }
 
@@ -325,6 +331,11 @@ function renderPanel() {
 
 function selectNode(id) {
   if (!id || !topology.nodes.some((n) => n.id === id)) return clearSelection();
+  if (walk) {
+    const index = walkSteps().findIndex((step) => step.id === id);
+    if (index >= 0) return goToStep(index);
+    endWalk();
+  }
   const changed = id !== selectedId;
   selectedId = id;
   renderPanel();
@@ -340,6 +351,7 @@ function selectNode(id) {
 }
 
 function clearSelection() {
+  endWalk();
   selectedId = null;
   panelEmpty();
   syncSceneSelection(null);
@@ -357,8 +369,139 @@ function syncSceneSelection(id) {
   }
 }
 
+// --- Walkthrough ------------------------------------------------------------
+// Steps through every component drawn for this configuration in flow order
+// (walkthroughSteps in topology.js), opening its details and framing it in the
+// scene. Selecting another node jumps to its step; clearing the selection
+// (close, Escape, a click on empty canvas) ends the walkthrough.
+const READ_ORDER_BUTTONS = { data: 'walk-order-data', request: 'walk-order-request' };
+
+const walkSteps = () => walkthroughSteps(topology, { readOrder });
+
+function startWalk() {
+  walk = { index: 0 };
+  $('walk-bar').hidden = false;
+  $('walkthrough').setAttribute('aria-pressed', 'true');
+  goToStep(0);
+  // On phones the bar is a strip under the canvas; make sure it is on screen.
+  $('walk-bar').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+}
+
+function goToStep(index) {
+  const steps = walkSteps();
+  if (!walk || !steps.length) return;
+  walk.index = Math.min(Math.max(index, 0), steps.length - 1);
+  const { id } = steps[walk.index];
+  selectedId = id;
+  renderWalkBar(steps);
+  // Render the drawer before focusing so the scene measures it open.
+  renderPanel();
+  syncSceneSelection(id);
+  scene?.focus(id);
+  if (!contentMod) contentReady.then(() => walk && selectedId === id && renderPanel());
+}
+
+// Past either end does nothing (Finish is a deliberate click).
+function stepWalk(delta) {
+  if (!walk) return;
+  const index = walk.index + delta;
+  if (index >= 0 && index < walkSteps().length) goToStep(index);
+}
+
+// Tears down the walkthrough UI and zooms back out. The selection is left to
+// the caller (clearSelection calls this first).
+function endWalk() {
+  if (!walk) return;
+  walk = null;
+  // Hiding the bar would drop focus on the page; hand it to the toggle first.
+  if ($('walk-bar').contains(document.activeElement)) $('walkthrough').focus({ preventScroll: true });
+  $('walk-bar').hidden = true;
+  $('walkthrough').setAttribute('aria-pressed', 'false');
+  scene?.focus(null);
+}
+
+function renderWalkBar(steps) {
+  const { index } = walk;
+  const last = index === steps.length - 1;
+  const section = topology.summary.find((s) => s.id === steps[index].section)?.title ?? '';
+  $('walk-status').textContent = `${section} · ${index + 1} / ${steps.length}`;
+  const prev = $('walk-prev');
+  const next = $('walk-next');
+  // A disabled button drops focus; keep it in the bar.
+  if (index === 0 && document.activeElement === prev) next.focus();
+  prev.disabled = index === 0;
+  next.replaceChildren(last ? 'Finish' : 'Next', last ? '' : el('span', { 'aria-hidden': 'true', text: ' ›' }));
+  for (const [order, id] of Object.entries(READ_ORDER_BUTTONS)) $(id).setAttribute('aria-pressed', String(order === readOrder));
+}
+
+// Announced through #panel-status in place of "Details for …".
+function walkStatus(node) {
+  if (!walk) return null;
+  const steps = walkSteps();
+  const index = steps.findIndex((step) => step.id === node.id);
+  if (index < 0) return null;
+  const section = topology.summary.find((s) => s.id === steps[index].section)?.title ?? '';
+  return `Step ${index + 1} of ${steps.length}, ${section}: ${node.label}`;
+}
+
+// Canvas px covered by the drawer, the walkthrough bar and the overlay buttons,
+// so the scene can frame a focused node in what is left. On phones these sit
+// outside the canvas and measure as no overlap.
+function focusInset() {
+  const view = $('scene').getBoundingClientRect();
+  const inset = { top: 0, right: 0, bottom: 0, left: 0 };
+  const over = (node) => {
+    if (!node || node.hidden) return null;
+    const r = node.getBoundingClientRect();
+    const hit = r.width > 0 && r.height > 0 && r.left < view.right && r.right > view.left && r.top < view.bottom && r.bottom > view.top;
+    return hit ? r : null;
+  };
+  const panel = $('panel').classList.contains('has-content') ? over($('panel')) : null;
+  if (panel) {
+    if (panel.left - view.left < view.right - panel.right) inset.left = panel.right - view.left;
+    else inset.right = view.right - panel.left;
+  }
+  const bar = over($('walk-bar'));
+  if (bar) inset.bottom = view.bottom - bar.top;
+  const actions = over($('scene-actions'));
+  if (actions) inset.top = actions.bottom - view.top;
+  return inset;
+}
+
+function setupWalkthrough() {
+  $('walkthrough').addEventListener('click', () => (walk ? clearSelection() : startWalk()));
+  $('walk-prev').addEventListener('click', () => stepWalk(-1));
+  $('walk-next').addEventListener('click', () => {
+    if (walk && walk.index < walkSteps().length - 1) stepWalk(1);
+    else clearSelection();
+  });
+  $('walk-exit').addEventListener('click', () => clearSelection());
+  for (const [order, id] of Object.entries(READ_ORDER_BUTTONS)) {
+    $(id).addEventListener('click', () => {
+      readOrder = order;
+      if (!walk) return;
+      // Same node, new position in the order; the camera stays where it is.
+      const steps = walkSteps();
+      walk.index = Math.max(0, steps.findIndex((step) => step.id === selectedId));
+      renderWalkBar(steps);
+      const node = topology.nodes.find((n) => n.id === selectedId);
+      if (node) $('panel-status').textContent = walkStatus(node) ?? '';
+    });
+  }
+  // Arrow keys step, unless a control that uses them (the selector radios) has focus.
+  document.addEventListener('keydown', (event) => {
+    if (!walk || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    const target = event.target;
+    if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, select, textarea'))) return;
+    event.preventDefault();
+    stepWalk(event.key === 'ArrowRight' ? 1 : -1);
+  });
+}
+
 // --- Render -----------------------------------------------------------------
 function render() {
+  const walkId = walk ? selectedId : null;
   topology = buildTopology(state);
   renderSummary();
 
@@ -378,6 +521,12 @@ function render() {
     showFallback();
   }
 
+  // Stay on the same component if it is still drawn, else on the same step number.
+  if (walk) {
+    const index = walkSteps().findIndex((step) => step.id === walkId);
+    goToStep(index >= 0 ? index : walk.index);
+  }
+
   const serialized = serializeHash(state);
   history.replaceState(null, '', serialized ? `#${serialized}` : location.pathname + location.search);
 }
@@ -394,6 +543,7 @@ function showFallback() {
     console.warn('scene dispose failed', err);
   }
   scene = null;
+  endWalk();
   $('scene-loading').hidden = true;
   $('scene').hidden = true;
   $('scene-actions').hidden = true;
@@ -414,11 +564,13 @@ async function startScene() {
         if (id) selectNode(id);
         else clearSelection();
       },
+      focusInset,
       reducedMotion: reduced,
       debug: new URLSearchParams(location.search).has('debug'),
     });
     scene.update(topology);
     if (selectedId) syncSceneSelection(selectedId);
+    if (walk) scene.focus(selectedId);
     $('scene-loading').hidden = true;
     // With reduced motion there are no particles to pause.
     $('pause').hidden = reduced;
@@ -443,6 +595,7 @@ function setupSceneButtons() {
 buildControls();
 setupDisclosure();
 setupSceneButtons();
+setupWalkthrough();
 syncControls();
 panelEmpty();
 render();

@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { isDeepStrictEqual } from 'node:util';
 import { DEFAULT_STATE, allStates } from '../../site/js/state.js';
-import { buildTopology } from '../../site/js/topology.js';
+import { READ_ORDERS, buildTopology, walkthroughSteps } from '../../site/js/topology.js';
 
 function index(topo) {
   const nodes = new Map(topo.nodes.map((n) => [n.id, n]));
@@ -288,6 +288,72 @@ test('buildTopology is deterministic and falls back to defaults for junk input',
   }
   for (const junk of [undefined, null, {}, 'source=rpc', { source: '<script>', head: 'yes' }]) {
     assert.deepEqual(buildTopology(junk).state, DEFAULT_STATE);
+  }
+});
+
+const WALKS = new Map(MODELS.map((m) => [m, Object.fromEntries(READ_ORDERS.map((order) => [order, walkthroughSteps(m.topo, { readOrder: order })]))]));
+const walkIds = (steps) => steps.map((s) => s.id);
+
+test('walkthrough visits every drawn node exactly once, and nothing else', () => {
+  forEachModel((m) => {
+    const drawn = m.topo.nodes.map((n) => n.id).sort();
+    for (const [order, steps] of Object.entries(WALKS.get(m))) {
+      eq(m, walkIds(steps).sort(), drawn, `${order} walkthrough must cover the drawn nodes once each`);
+    }
+  });
+});
+
+test('walkthrough sections are contiguous and follow the summary order', () => {
+  forEachModel((m) => {
+    const summaryIds = m.topo.summary.map((s) => s.id);
+    for (const [order, steps] of Object.entries(WALKS.get(m))) {
+      const runs = steps.map((s) => s.section).filter((section, i, all) => section !== all[i - 1]);
+      eq(m, new Set(runs).size, runs.length, `${order}: a section is split`);
+      for (const section of runs) ok(m, summaryIds.includes(section), `${order}: section ${section} is not a summary section`);
+      eq(m, runs, summaryIds.filter((id) => runs.includes(id)), `${order}: sections out of summary order`);
+    }
+  });
+});
+
+test('walkthrough starts at the source of the data', () => {
+  forEachModel((m) => {
+    const first = m.state.source === 'solparq' ? 'parquet-store' : 'solana';
+    for (const [order, steps] of Object.entries(WALKS.get(m))) eq(m, steps[0].id, first, `${order}: first step`);
+  });
+});
+
+test('walkthrough in data order follows the arrows', () => {
+  forEachModel((m) => {
+    const at = new Map(walkIds(WALKS.get(m).data).map((id, i) => [id, i]));
+    for (const e of m.topo.edges) {
+      if (e.style === 'control') continue;
+      // Archive -> restore loop: bundles are written back into the restore source.
+      if (m.state.source === 'solparq' && e.to === 'parquet-store') continue;
+      ok(m, at.get(e.from) < at.get(e.to), `edge ${e.id} runs backwards in the data-order walkthrough`);
+    }
+  });
+});
+
+test('walkthrough in request order follows a request through the tiers', () => {
+  forEachModel((m) => {
+    const { data, request } = WALKS.get(m);
+    const ids = walkIds(request);
+    const journey = [m.topo.readPath.client, 'rpc', ...m.topo.readPath.tiers.map((t) => t.node).filter((id) => id !== 'ch')];
+    const positions = journey.map((id) => ids.indexOf(id));
+    eq(m, positions, [...positions].sort((a, b) => a - b), 'request journey out of order');
+    // Only the read section differs between the two orders.
+    const notRead = (steps) => steps.filter((s) => s.section !== 'read');
+    eq(m, notRead(request), notRead(data), 'write, archive and verify steps must not depend on the read order');
+  });
+});
+
+test('walkthroughSteps is deterministic and falls back to data order', () => {
+  for (const m of MODELS.filter((_, i) => i % 97 === 0)) {
+    const { data } = WALKS.get(m);
+    eq(m, walkthroughSteps(m.topo), data, 'default read order must be data');
+    for (const junk of ['', 'requests', '<script>', null, 42]) {
+      eq(m, walkthroughSteps(m.topo, { readOrder: junk }), data, `readOrder ${String(junk)} must fall back to data`);
+    }
   }
 });
 

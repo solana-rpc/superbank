@@ -69,8 +69,23 @@
             <div id="scene" aria-describedby="summary"></div>
             <p id="scene-loading" class="scene-loading">Loading 3D view…</p>
             <div id="scene-actions" class="scene-actions">
+              <button type="button" id="walkthrough" class="btn btn--overlay" aria-pressed="false">Walkthrough</button>
               <button type="button" id="pause" class="btn btn--overlay" aria-pressed="false">Pause</button>
               <button type="button" id="reset-view" class="btn btn--overlay">Reset view</button>
+            </div>
+            <!-- Steps through the components drawn for this configuration; wired up in main.js. -->
+            <div id="walk-bar" class="walk-bar" role="group" aria-label="Walkthrough" hidden>
+              <div class="walk-bar__nav">
+                <button type="button" id="walk-prev" class="btn btn--overlay"><span aria-hidden="true">‹ </span>Back</button>
+                <p id="walk-status" class="walk-bar__status"></p>
+                <button type="button" id="walk-next" class="btn btn--overlay">Next</button>
+              </div>
+              <div class="walk-bar__order" role="group" aria-labelledby="walk-order-label">
+                <span id="walk-order-label" class="walk-bar__label">Read path</span>
+                <button type="button" id="walk-order-data" class="btn btn--overlay" aria-pressed="true" title="Follow the arrows: caches, superbank-rpc, then clients">Data flow</button>
+                <button type="button" id="walk-order-request" class="btn btn--overlay" aria-pressed="false" title="Follow a request: clients, superbank-rpc, then each cache tier">Requests</button>
+              </div>
+              <button type="button" id="walk-exit" class="btn btn--overlay walk-bar__exit" aria-label="Exit walkthrough">×</button>
             </div>
             <div id="scene-fallback" class="scene-fallback" role="status" hidden></div>
           </div>

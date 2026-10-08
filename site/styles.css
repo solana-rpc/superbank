@@ -601,6 +601,61 @@ details[open] > .controls__summary::after {
   color: var(--text);
 }
 
+.btn--overlay:disabled {
+  border-color: var(--line);
+  color: var(--text-3);
+  cursor: default;
+}
+
+/* Walkthrough bar. Phones: a strip under the canvas, mirroring the toolbar
+   strip above it. */
+.walk-bar {
+  z-index: 20;
+  display: flex;
+  order: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px 16px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.walk-bar__nav,
+.walk-bar__order {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.walk-bar__status {
+  min-width: 19ch;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-align: center;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.walk-bar__label {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.walk-bar__exit {
+  width: 28px;
+  padding: 0;
+  font-size: 16px;
+}
+
 /* The only rounded element on the page: the solana.com "Get started" pill. */
 .btn--primary {
   padding: 10px 20px;
@@ -1286,6 +1341,39 @@ details[open] > .controls__summary::after {
 
   /* Keep Pause / Reset view clear of an open right-hand drawer. */
   .stage.is-drawer-open:not([data-side='left']) .scene-actions {
+    right: calc(var(--drawer-w) + 12px);
+  }
+
+  /* Over the bottom of the canvas, centred in the space the drawer leaves.
+     Gaps between the controls let drags through to the scene. */
+  .walk-bar {
+    position: absolute;
+    right: 0;
+    bottom: 12px;
+    left: 0;
+    padding: 0;
+    border-top: 0;
+    pointer-events: none;
+  }
+
+  .walk-bar > * {
+    padding: 4px;
+    border: 1px solid var(--line-strong);
+    background: var(--label-bg);
+    pointer-events: auto;
+  }
+
+  .walk-bar > .walk-bar__exit {
+    width: 38px;
+    height: 38px;
+    padding: 0;
+  }
+
+  .walk-bar__label {
+    padding-left: 6px;
+  }
+
+  .stage.is-drawer-open:not([data-side='left']) .walk-bar {
     right: calc(var(--drawer-w) + 12px);
   }
 }
