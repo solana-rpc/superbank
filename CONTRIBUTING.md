@@ -210,18 +210,30 @@ CI enforces PR titles via the `Lint PR title` GitHub Actions check.
 
 Releases use [`cargo-release`](https://github.com/crate-ci/cargo-release) (`cargo install cargo-release`), configured in `release.toml`. The version lives in one place, `version` under `[workspace.package]` in the root `Cargo.toml`, and a release tag is always `v<that version>`.
 
-From an up-to-date `main`, as a maintainer (the "Tags" ruleset only lets maintainers and admins create tags, and the release commit is pushed straight to `main`):
+Between releases, `main` carries the next version with a `-dev` suffix (for example `0.8.0-dev`). `-dev` sorts before `-rc1`, so both release candidates and the final release are upgrades from it.
+
+Release from an up-to-date `main`, as a maintainer (the "Tags" ruleset only lets maintainers and admins create tags, and the release commit is pushed straight to `main`):
 
 ```bash
+git switch main && git pull
 cargo release 0.8.0-rc1            # dry run: shows the version bump, commit and tag
 cargo release 0.8.0-rc1 --execute  # bump, commit, sign the v0.8.0-rc1 tag, push
 ```
 
-That sets the workspace version, updates `Cargo.lock` (and the README's docker tags for final releases), commits `chore(release): v<version>`, creates the signed tag and pushes both. The pushed tag starts the **Release** workflow, which:
+That sets the workspace version, updates `Cargo.lock`, commits `chore(release): v<version>`, creates the signed tag and pushes both. Repeat with `0.8.0-rc2` and so on as needed, then release `0.8.0` the same way; a final release also points the README's docker tags at the new version.
+
+The pushed tag starts the **Release** workflow, which:
 
 1. checks that the tag equals the workspace version at that commit, and stops if not;
 2. runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL, runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite;
 3. after E2E passes, has GoReleaser build `superbank`, `superbank-rpc`, `superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` for Linux amd64 and Linux arm64 and publish a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`. Versions with a pre-release suffix (`-rc1`, ...) are published as pre-releases.
+
+After a final release, start the next cycle in a small PR:
+
+```bash
+cargo release version 0.8.1-dev --execute   # or 0.9.0-dev for a minor release
+git switch -c chore/start-0.8.1-dev && git commit -am "chore: start 0.8.1-dev"
+```
 
 Nothing is published to crates.io.
 
