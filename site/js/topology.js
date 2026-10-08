@@ -489,7 +489,7 @@ function describe(state) {
   }
 
   if (state.verify) {
-    const verify = ['`superbank-verify` re-checks Proof of History from ClickHouse (`blocks_metadata`, `entries`; `transactions` too with `--full`). It never reads Parquet.'];
+    const verify = ['`superbank-verify` re-checks Proof of History from ClickHouse (`blocks_metadata`, `entries`; `transactions` too with `--mode full`, which recomputes every PoH hash). It never reads Parquet.'];
     if (ENTRY_SOURCES.includes(state.source)) verify.push('This source writes `entries`, so its slots are verifiable.');
     else if (state.source === 'solparq') verify.push('Restored slots are verifiable only if the bundles archived `entries`.');
     else verify.push('This source writes no `entries`, so verify reports its slots as `unverifiable` (exit code 3), not failed.');
