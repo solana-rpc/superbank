@@ -98,7 +98,8 @@ function makeNode(id, kind, label, extra = {}) {
     label,
     sublabel: '',
     variant: null,
-    pos: POS[id],
+    // Copied so a renderer mutating node.pos can't corrupt later builds.
+    pos: [...POS[id]],
     zone: null,
     dimmed: false,
     status: null,

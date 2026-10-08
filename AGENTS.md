@@ -4,6 +4,7 @@
 - Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`), `crates/superbank-solparq/` (ClickHouse-to-Parquet archiver; `superbank-solparq` and `superbank-solparq-read` binaries), and `crates/superbank-verify/` (Proof-of-History validator).
 - ClickHouse DDL: `ddl/`
 - Load tests: `tests/k6/`
+- Architecture explorer site: `site/` (static GitHub Pages page, Three.js from a CDN, no build step); its `node:test` checks for the topology/state model live in `tests/site/`
 - Helper scripts: `scripts/`
 - Deploy manifests/images: `deploy/`
 - Tilt local k8s dev: `Tiltfile`, `scripts/dev/setup-tilt.sh`
@@ -27,6 +28,9 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
   `cargo test -p superbank-rpc --all-features --locked`
 - Load tests:
   `scripts/test/run-k6.sh` (or run a single scenario under `tests/k6/scenarios/`)
+- Architecture explorer site (`site/`):
+  `node --test "tests/site/*.test.mjs"` (Node 24 as in CI; no npm install; pass the glob, a bare directory path fails)
+  `python3 -m http.server 8000 -d site` (local preview at http://localhost:8000/)
 
 ## Coding Style & Naming Conventions
 - Use `rustfmt` (stable toolchain with `rustfmt`/`clippy`) for formatting; do not hand-format.
