@@ -116,7 +116,11 @@
               <li><span class="swatch swatch--clickhouse"></span>ClickHouse</li>
             </ul>
           </div>
-          <p class="legend-row__hint">Click any component for details</p>
+          <!-- Matches scene.js: on (pointer: coarse) one finger scrolls the page. -->
+          <p class="legend-row__hint">
+            <span class="legend-row__hint-mouse">Click any component for details</span>
+            <span class="legend-row__hint-touch"><span class="nowrap">Tap a component</span> · <span class="nowrap">two fingers to pan and zoom</span></span>
+          </p>
         </div>
         <!-- Announces the selection; the drawer itself is not a live region. -->
         <div id="panel-status" class="sr-only" role="status"></div>

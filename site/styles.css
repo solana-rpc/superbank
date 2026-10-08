@@ -716,6 +716,20 @@ details[open] > .controls__summary::after {
   color: var(--text-3);
 }
 
+.legend-row__hint-touch {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  .legend-row__hint-mouse {
+    display: none;
+  }
+
+  .legend-row__hint-touch {
+    display: inline;
+  }
+}
+
 .legend__list {
   display: flex;
   flex-wrap: wrap;
