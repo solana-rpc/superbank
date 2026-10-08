@@ -244,6 +244,32 @@ export default {
       ],
     },
     {
+      id: 'ag-genesis-cert',
+      title: 'getAgGenesisCert',
+      intro: 'Source for the Alpenglow genesis certificate (Agave 4.3+). The answer comes from a trusted RPC on the same cluster as the ClickHouse data; superbank-rpc checks its shape, not its signature.',
+      items: [
+        opt('AG_GENESIS_CERT_RPC_URL', {
+          type: 'url',
+          text: 'Trusted same-cluster HTTP(S) RPC that supports `getAgGenesisCert`. Unset, empty or blank keeps startup working, but `getAgGenesisCert` then returns an unavailable-source error. Never point it back at this instance.',
+        }),
+        opt('AG_GENESIS_CERT_RPC_TIMEOUT_MS', {
+          type: 'u64 (ms)',
+          default: '2000',
+          text: 'Total budget for one certificate fetch, including admission, connection and response body. With a source configured it must be below `RPC_REQUEST_TIMEOUT_MS`, or startup fails.',
+          relations: [
+            { type: 'capped-by', to: 'RPC_REQUEST_TIMEOUT_MS' },
+            { type: 'see', to: 'AG_GENESIS_CERT_RPC_URL' },
+          ],
+        }),
+        opt('AG_GENESIS_CERT_REFRESH_INTERVAL_SECS', {
+          type: 'u64 (seconds, 1–300)',
+          default: '5',
+          text: 'How long an authoritative `null` (not migrated yet) is reused before refreshing. A certificate stays cached until restart; failures are cached for 1 second.',
+          relations: [{ type: 'see', to: 'AG_GENESIS_CERT_RPC_URL' }],
+        }),
+      ],
+    },
+    {
       id: 'clickhouse',
       title: 'ClickHouse connection',
       items: [
@@ -513,7 +539,15 @@ export default {
           text: 'Yellowstone gRPC (DragonsMouth) endpoint that feeds the cache.',
         }),
         opt('DRAGONSMOUTH_X_TOKEN', { type: 'string', secret: true, text: 'Optional `x-token` header for the DragonsMouth endpoint.' }),
-        opt('HEAD_CACHE_RETAIN_SLOTS', { type: 'u64', default: '32', text: 'Slots of head data kept in memory.' }),
+        opt('HEAD_CACHE_RETAIN_SLOTS', {
+          type: 'u64',
+          default: '32',
+          text: "Newest slots kept in memory. The default of 32 is a development size; production keeps several hundred or more, sized to the memory superbank-rpc has. With the disk cache, the window must reach down to the disk cache's tip for the signature-status history cache and the empty-address watermark to answer (startup warns below 256 when the history cache is on).",
+          relations: [
+            { type: 'see', to: 'SIGNATURE_STATUS_HISTORY_CACHE_ENTRIES' },
+            { type: 'see', to: 'DISK_CACHE_GSFA_EMPTY_WATERMARK_TTL_SECS' },
+          ],
+        }),
         opt('HEAD_CACHE_MIN_COMMITMENT', {
           type: 'processed | confirmed | finalized',
           default: 'processed',

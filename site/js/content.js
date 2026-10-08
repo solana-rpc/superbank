@@ -652,7 +652,7 @@ function headCache(state) {
     title: 'Head cache',
     subtitle: 'superbank-rpc · Cargo feature grpc-head-cache',
     body: compact([
-      'An in-memory window of the newest slots (32 by default) fed by its own DragonsMouth subscription, independent of the ingestor, which reconnects with backoff when the stream drops.',
+      'An in-memory window of the newest `HEAD_CACHE_RETAIN_SLOTS` slots (32 by default, a development size; production keeps several hundred or more, sized to the memory superbank-rpc has), fed by its own DragonsMouth subscription, independent of the ingestor, which reconnects with backoff when the stream drops.',
       'It makes `processed` commitment possible on a subset of methods (`getBlock` never accepts it), and without it `processed` requests are rejected.',
       'Handlers merge its data with ClickHouse results while the cache itself never queries ClickHouse, and the feature pulls in an AGPL-3.0 dependency, which is why it is not a default feature.',
       state.disk ? 'It is independent of the disk cache, which is filled from source ClickHouse and not from this cache.' : null,
@@ -661,7 +661,7 @@ function headCache(state) {
       cfg('HEAD_CACHE_ENABLED', 'false', 'runtime switch on top of the Cargo feature'),
       cfg('DRAGONSMOUTH_ENDPOINT', 'required', 'when enabled'),
       cfg('DRAGONSMOUTH_X_TOKEN', 'optional'),
-      cfg('HEAD_CACHE_RETAIN_SLOTS', '32'),
+      cfg('HEAD_CACHE_RETAIN_SLOTS', '32', 'development default; production keeps several hundred or more'),
       cfg('HEAD_CACHE_MIN_COMMITMENT', 'processed', 'processed | confirmed | finalized; a floor on how fresh head reads may be'),
       cfg('GRPC_MAX_DECODING_BYTES', '67108864'),
     ],

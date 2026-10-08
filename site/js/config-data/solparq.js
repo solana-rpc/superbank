@@ -126,6 +126,12 @@ export default {
           text: 'Archive kinds to produce: `hourly`, `epoch`, `custom` or `custom:{n}`, comma-separated or by repeating the flag. More than one kind requires `--server-mode`; duplicates are rejected, and only one custom size may be configured.',
           relations: [{ type: 'see', to: 'SOLPARQ_SERVER_MODE' }],
         }),
+        opt('SOLPARQ_HOURLY_SLOT_DURATION_MS', '--hourly-slot-duration-ms', {
+          type: 'u64 (ms)',
+          default: '400',
+          text: 'Nominal slot duration used to size `hourly` archives: 400 gives 9000 slots, 200 gives 18000. Must be positive and divide 3600000 exactly. Alpenglow does not change it.',
+          relations: [{ type: 'see', to: 'SOLPARQ_ARCHIVE_RANGE_TYPE' }],
+        }),
         opt('SOLPARQ_CUSTOM_SLOT_RANGE', '--custom-slot-range', {
           type: 'u64 (slots)',
           default: '1000',

@@ -39,6 +39,35 @@ export default {
       ],
     },
     {
+      id: 'era',
+      title: 'Historical bound and reward era',
+      intro: 'Upstream Jetstreamer does not expose bank or footer data for later blocks, so a run must be bounded, and block reward commissions need their SIMD-0291 era stated. The standalone binary checks both before it starts.',
+      items: [
+        envOnly('JETSTREAMER_ALPENGLOW_GENESIS_SLOT', LIB, {
+          type: 'u64',
+          required: 'unless `JETSTREAMER_PREACTIVATION_THROUGH_SLOT` is set; exactly one bound',
+          text: 'Trusted Alpenglow genesis certificate slot. Blocks after it are rejected, and the binary clamps a requested range to it.',
+          relations: [{ type: 'conflicts', to: 'JETSTREAMER_PREACTIVATION_THROUGH_SLOT' }],
+        }),
+        envOnly('JETSTREAMER_PREACTIVATION_THROUGH_SLOT', LIB, {
+          type: 'u64',
+          required: 'unless `JETSTREAMER_ALPENGLOW_GENESIS_SLOT` is set; exactly one bound',
+          text: 'Offline attestation: a finalized slot recorded from a trusted same-cluster RPC before its `getAgGenesisCert` returned null. Bounds the run like the genesis slot.',
+        }),
+        envOnly('JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT', LIB, {
+          type: 'u64',
+          required: 'unless `JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT=true`',
+          text: 'Evidenced SIMD-0291 activation slot. Earlier block rewards keep their percent commission (bps NULL); later ones keep basis points (percent NULL).',
+          relations: [{ type: 'conflicts', to: 'JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT' }],
+        }),
+        envOnly('JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT', LIB, {
+          type: 'bool',
+          default: 'false',
+          text: 'Attest that the whole bounded range predates SIMD-0291, so every block reward commission is a percent. Exactly one of this and the activation slot is required.',
+        }),
+      ],
+    },
+    {
       id: 'batching',
       title: 'Flushing and batching',
       items: [

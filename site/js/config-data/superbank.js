@@ -82,7 +82,7 @@ export default {
           type: 'processed | confirmed | finalized',
           default: 'finalized',
           requires: [GRPC, FUMAROLE, RPC, BIGTABLE],
-          text: 'Commitment level of the stream or RPC queries. RPC block discovery does not support `processed` and uses `confirmed` instead.',
+          text: 'Commitment level of the stream or RPC queries. The gRPC and Fumarole sources store only finalized banks and fail at startup on any other value; serve processed data from the superbank-rpc head cache instead. The RPC and Bigtable backfills accept all three, and RPC block discovery uses `confirmed` when given `processed`.',
         }),
         opt('--dragonsmouth-from-slot', 'DRAGONSMOUTH_FROM_SLOT', {
           type: FROM_SLOT_SPEC,
@@ -137,6 +137,15 @@ export default {
           type: 'string',
           required: true,
           text: 'Name of the Fumarole persistent consumer group.',
+        }),
+        opt('--fumarole-alpenglow-genesis-slot', 'FUMAROLE_ALPENGLOW_GENESIS_SLOT', {
+          type: 'u64',
+          text: "Optional trusted Alpenglow genesis certificate slot. The stream accepts blocks up to this slot, flushes the validated rows before it and stops at the first later block without committing offsets. Unset tails live. Footers come from the server's `block_footer` filter; a server without it leaves the footer columns NULL.",
+          relations: [{ type: 'conflicts', to: 'FUMAROLE_PREACTIVATION_THROUGH_SLOT' }],
+        }),
+        opt('--fumarole-preactivation-through-slot', 'FUMAROLE_PREACTIVATION_THROUGH_SLOT', {
+          type: 'u64',
+          text: 'Optional offline attestation: a finalized slot recorded from a trusted same-cluster RPC before its `getAgGenesisCert` returned null. The stream stops after this slot, like the genesis-slot bound. Superbank does not fetch this evidence itself.',
         }),
         opt('--fumarole-create-consumer-group', 'FUMAROLE_CREATE_CONSUMER_GROUP', {
           type: 'bool',

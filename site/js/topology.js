@@ -299,7 +299,7 @@ export function buildTopology(input) {
 
   const tiers = [];
   if (state.head) {
-    addNode('head-cache', 'memory', 'Head cache', { sublabel: 'in-memory · newest 32 slots', zone: 'serve' });
+    addNode('head-cache', 'memory', 'Head cache', { sublabel: 'in-memory · newest slots', zone: 'serve' });
     addEdge('src-dragonsmouth', 'head-cache', 'stream', {
       particle: 'block',
       emit: { type: 'stream', rate: 3 },
@@ -545,7 +545,7 @@ function describe(state) {
 
   const read = ['JSON-RPC clients → `superbank-rpc` on `:8899`. Each request tries the enabled tiers in order and falls through on a miss.'];
   if (state.head) {
-    read.push('Head cache: an in-memory window of the newest 32 slots, fed by its own DragonsMouth subscription (separate from any ingest connection). It enables `processed` commitment.');
+    read.push('Head cache: an in-memory window of the newest `HEAD_CACHE_RETAIN_SLOTS` slots (32 by default, a development size; production keeps several hundred or more), fed by its own DragonsMouth subscription (separate from any ingest connection). It enables `processed` commitment.');
   } else {
     read.push('No head cache: `processed` commitment is rejected and the newest data is whatever the ingestor has flushed.');
   }
