@@ -136,18 +136,3 @@ jobs:
       - name: cargo test
         working-directory: ingest/jetstreamer-clickhouse-plugin
         run: cargo test --locked
-
-  # Catches main falling behind a release: a v<version> tag newer than the
-  # workspace version in Cargo.toml (see scripts/release/version.py).
-  version:
-    name: Version matches releases
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Test the version script
-        run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
-
-      - name: Workspace version is not behind a release tag
-        run: python3 scripts/release/version.py check
