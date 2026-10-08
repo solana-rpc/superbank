@@ -352,7 +352,9 @@ function startWalk() {
   goToStep(0);
   // On wide screens the bar sits over the bottom of the canvas; make sure it is
   // on screen. On phones it is pinned to the bottom of the screen already.
-  $('walk-bar').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+  if (matchMedia('(min-width: 900px)').matches) {
+    $('walk-bar').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+  }
 }
 
 function goToStep(index) {
