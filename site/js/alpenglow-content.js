@@ -211,7 +211,7 @@ const STEP = {
       s.era === 'alpenglow'
         ? 'Under Alpenglow the wait is short, and `confirmed` and `finalized` publish at the same moment.'
         : s.min === 'finalized'
-          ? `Under Tower BFT the wait is about ${U('towerRootDepthSlots')} slots, which is why the buffer floor is wider than the window.`
+          ? `Under Tower BFT the wait is about ${U('towerRootDepthSlots')} slots; the extra ${C('pendingCommitmentSlots')} slots of buffer keep the bank alive through it.`
           : 'Under Tower BFT optimistic confirmation follows shortly.',
     ],
     refs: [REFS.headBanks, REFS.rpcConfig],
