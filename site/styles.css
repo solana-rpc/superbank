@@ -1437,11 +1437,46 @@ details[open] > .controls__summary::after {
   box-shadow: inset 0 -1px 0 var(--green);
 }
 
-/* Logo, two links and the GitHub chip do not fit a phone next to the name. */
+/* Phones: the logo, name and GitHub chip keep the first row and the four
+   page links take a full-width second row. The nav scrolls sideways only if
+   a very narrow screen still cannot fit it. */
 @media (max-width: 519px) {
-  .site-nav ~ .chip-link,
-  .site-header__inner:has(.site-nav) .brand__name {
+  .site-header__inner {
+    flex-wrap: wrap;
+    row-gap: 4px;
+    height: auto;
+    padding-block: 12px 6px;
+  }
+
+  .site-nav {
+    order: 3;
+    flex: 1 0 100%;
+    justify-content: space-between;
+    margin-left: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .site-nav::-webkit-scrollbar {
     display: none;
+  }
+
+  .site-nav__link {
+    flex: none;
+    padding: 0 4px;
+    letter-spacing: 0;
+  }
+
+  .site-nav__link:first-child {
+    padding-left: 0;
+  }
+
+  .site-nav__link:last-child {
+    padding-right: 0;
+  }
+
+  .site-nav + .chip-link {
+    margin-left: auto;
   }
 }
 
@@ -2085,4 +2120,181 @@ mark {
 
 #cfg-empty .link-button {
   margin-left: 8px;
+}
+
+/* --- Info page ----------------------------------------------------------- */
+
+.info-lead {
+  max-width: 820px;
+  margin-top: 10px;
+  font-size: 15px;
+}
+
+.info-h3 {
+  margin-top: 36px;
+  font-size: 18px;
+}
+
+.info-muted {
+  color: var(--text-3);
+}
+
+.info-dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 40px;
+  margin: 20px 0 0;
+}
+
+.info-dl dt {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.info-dl dd {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.info-table-wrap {
+  margin-top: 20px;
+  overflow-x: auto;
+}
+
+.info-table {
+  width: 100%;
+  max-width: 900px;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.info-table th,
+.info-table td {
+  padding: 10px 16px 10px 0;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: baseline;
+}
+
+.info-table thead th {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.info-table tbody th {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.info-sources {
+  display: grid;
+  gap: 8px;
+  max-width: 900px;
+  margin-top: 20px;
+}
+
+.info-group {
+  border: 1px solid var(--line);
+}
+
+.info-group__summary {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+}
+
+.info-group__title {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.info-group__count {
+  margin-left: auto;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.info-group__page {
+  padding: 0 16px;
+  font-size: 13px;
+}
+
+.info-paths,
+.info-upstream,
+.info-edit {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.info-paths {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 380px), 1fr));
+  gap: 4px 24px;
+  padding: 12px 16px 16px;
+  font-size: 13px;
+}
+
+.info-paths a,
+.info-edit a {
+  text-decoration: none;
+}
+
+.info-paths a:hover code,
+.info-edit a:hover code {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.info-upstream {
+  display: grid;
+  gap: 6px;
+  max-width: 900px;
+  margin-top: 12px;
+  font-size: 14px;
+}
+
+.info-list {
+  margin-top: 10px;
+  padding-left: 18px;
+}
+
+.info-list li + li {
+  margin-top: 4px;
+}
+
+.info-edit {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  font-size: 14px;
+}
+
+.info-edit li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+.info-edit span {
+  min-width: 180px;
+  color: var(--text);
+}
+
+.info-cta {
+  display: inline-block;
+  margin-top: 24px;
+  text-decoration: none;
 }

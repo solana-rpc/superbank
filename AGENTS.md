@@ -4,7 +4,7 @@
 - Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`), `crates/superbank-solparq/` (ClickHouse-to-Parquet archiver; `superbank-solparq` and `superbank-solparq-read` binaries), and `crates/superbank-verify/` (Proof-of-History validator).
 - ClickHouse DDL: `ddl/`
 - Load tests: `tests/k6/`
-- GitHub Pages site: `site/` (static, no build step): the architecture explorer (`index.html`, Three.js from a CDN) the configuration reference (`config.html`, data in `site/js/config-data/`) and the Alpenglow block lifecycle (`alpenglow.html`, whose code numbers `tests/site/alpenglow-model.test.mjs` re-reads from the Rust source); their `node:test` checks live in `tests/site/`
+- GitHub Pages site: `site/` (static, no build step): the architecture explorer (`index.html`, Three.js from a CDN) the configuration reference (`config.html`, data in `site/js/config-data/`) and the Alpenglow block lifecycle (`alpenglow.html`, whose code numbers `tests/site/alpenglow-model.test.mjs` re-reads from the Rust source), plus an Info page (`info.html`) listing the sources and versions behind them; their `node:test` checks live in `tests/site/`. The only generated file is `site/build-info.json` (gitignored), which the Pages workflow writes with `scripts/site/build-info.mjs`
 - Helper scripts: `scripts/`
 - Deploy manifests/images: `deploy/`
 - Tilt local k8s dev: `Tiltfile`, `scripts/dev/setup-tilt.sh`
@@ -30,6 +30,7 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
   `scripts/test/run-k6.sh` (or run a single scenario under `tests/k6/scenarios/`)
 - GitHub Pages site (`site/`):
   `node --test "tests/site/*.test.mjs"` (Node 24 as in CI; no npm install; pass the glob, a bare directory path fails)
+  `node scripts/site/build-info.mjs site/build-info.json` (optional: fills in the Info page's commit and versions for a local preview)
   `python3 -m http.server 8000 -d site` (local preview at http://localhost:8000/)
 
 ## Coding Style & Naming Conventions
