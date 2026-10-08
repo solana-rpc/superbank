@@ -142,7 +142,7 @@ function buildControls() {
         body.append(
           el('span', { class: 'toggle' }, [
             el('input', { type: 'checkbox', role: 'switch', class: 'ctl-input', id, name: flag, title: hint }),
-            el('label', { class: 'ctl-toggle', for: id, title: hint }, [el('span', { class: 'ctl-toggle__track', 'aria-hidden': 'true' }), el('span', { text })]),
+            el('label', { class: `ctl-toggle ctl-toggle--${flag}`, for: id, title: hint }, [el('span', { class: 'ctl-toggle__sq', 'aria-hidden': 'true' }), el('span', { text })]),
           ]),
         );
       }
@@ -212,10 +212,11 @@ function renderSummary() {
   $('controls-state').textContent = describeConfig(state);
   const grid = $('summary-body');
   grid.replaceChildren(
-    ...topology.summary.map((section) => {
+    ...topology.summary.map((section, i) => {
       const headingId = `summary-${section.id}`;
-      return el('section', { class: 'summary__section', 'aria-labelledby': headingId }, [
-        el('h3', { id: headingId, text: section.title }),
+      return el('section', { class: 'cell summary__section', 'aria-labelledby': headingId }, [
+        el('span', { class: 'cell__index', 'aria-hidden': 'true', text: String(i + 1).padStart(2, '0') }),
+        el('h3', { id: headingId, class: 'cell__title', text: section.title }),
         el('ol', {}, section.steps.map((step) => rich('li', step))),
       ]);
     }),

@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Superbank architecture</title>
   <meta name="description" content="Interactive map of Superbank: Solana ledger data flowing through ingest into ClickHouse, served over JSON-RPC and archived to Parquet. Switch sources, caches and storage to see how the topology changes.">
-  <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#f7f8fb" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
   <link rel="icon" type="image/png" href="assets/superbank.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;700&display=swap">
   <link rel="stylesheet" href="styles.css">
   <script type="importmap">
   {
@@ -26,14 +28,19 @@
 
   <header class="site-header">
     <div class="wrap site-header__inner">
-      <img class="site-header__logo" src="assets/superbank.png" alt="" width="36" height="36">
-      <div class="site-header__text">
-        <h1 class="wordmark"><span class="wordmark__super">SUPER</span><span class="wordmark__bank">BANK</span></h1>
-        <p class="tagline">Solana ledger → ClickHouse → JSON-RPC, with Parquet archival</p>
-      </div>
-      <a class="site-header__link" href="https://github.com/solana-rpc/superbank" target="_blank" rel="noopener noreferrer">GitHub</a>
+      <img class="brand__logo" src="assets/superbank.png" alt="" width="28" height="28">
+      <p class="brand__name">Superbank</p>
+      <a class="chip-link" href="https://github.com/solana-rpc/superbank" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
     </div>
   </header>
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap hero__inner">
+      <p class="eyebrow"><span class="eyebrow__dot" aria-hidden="true"></span>Architecture explorer</p>
+      <h1 id="hero-title" class="hero__title">Superbank architecture</h1>
+      <p class="hero__lead">How Solana blocks flow from a source into ClickHouse, out through <span class="nowrap">JSON-RPC</span>, and into Parquet archives. Toggle components to see the topology change.</p>
+    </div>
+  </section>
 
   <!-- Direct child of body: position: sticky only holds inside its parent. -->
   <section id="controls" aria-label="Configure the topology">
@@ -52,6 +59,7 @@
   </section>
 
   <main>
+    <div class="stage-band">
     <div class="wrap stage" id="stage">
       <div class="stage__main">
         <!-- On wide screens #panel is a drawer inside this box; on phones the box
@@ -93,36 +101,42 @@
         <div id="panel-status" class="sr-only" role="status"></div>
       </div>
     </div>
+    </div>
 
-    <div class="wrap">
-      <section id="summary" class="summary" aria-labelledby="summary-title" tabindex="-1">
+    <section id="summary" class="band" aria-labelledby="summary-title" tabindex="-1">
+      <div class="wrap band__inner">
         <h2 id="summary-title">Data path for this configuration</h2>
         <p class="summary__config" id="summary-config"></p>
-        <div class="summary__grid" id="summary-body"></div>
+        <div class="cells" id="summary-body"></div>
         <noscript><p class="notice">The interactive explorer needs JavaScript. The sections below describe the default configuration.</p></noscript>
-      </section>
+      </div>
+    </section>
 
-      <section class="story" aria-labelledby="story-title">
+    <section class="band" aria-labelledby="story-title">
+      <div class="wrap band__inner">
         <h2 id="story-title">How it fits together</h2>
-        <div class="story__grid">
-          <article class="story__card">
-            <h3>Write path</h3>
+        <div class="cells">
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">01</span>
+            <h3 class="cell__title">Write path</h3>
             <p>Blocks enter from a live stream (Yellowstone gRPC or Fumarole), a bounded backfill (Solana JSON-RPC or Bigtable), a Parquet restore, or the separate Jetstreamer plugin that replays Old Faithful. <code>superbank</code> buffers rows and flushes each batch in a fixed order: <code>transactions</code>, then <code>blocks_metadata</code>, then <code>entries</code>.</p>
             <p>So a slot in <code>blocks_metadata</code> implies its transactions are stored. Materialized views on <code>transactions</code> then build the <code>gsfa</code> and <code>signatures</code> indexes that the RPC relies on.</p>
           </article>
-          <article class="story__card">
-            <h3>Read path</h3>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">02</span>
+            <h3 class="cell__title">Read path</h3>
             <p><code>superbank-rpc</code> answers JSON-RPC from ClickHouse. You can put two optional tiers in front: an in-memory head cache of the newest slots and a disk cache of recent finalized slots. A request tries each enabled tier in order and falls through on a miss.</p>
             <p>ClickHouse is always the last tier. There is no fallback to an upstream Solana RPC and no Parquet read path. gRPC streaming is a separate, optional listener for bounded historical slot ranges.</p>
           </article>
-          <article class="story__card">
-            <h3>Archive &amp; restore <img class="story__logo" src="assets/solparq.png" alt="" width="49" height="22"></h3>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">03</span>
+            <h3 class="cell__title">Archive &amp; restore</h3>
             <p><code>superbank-solparq</code> exports ClickHouse tables into Parquet bundles named <code>{kind}_{epoch}_{start}-{end}</code>, either through local disk or straight to S3, where ClickHouse writes the files itself. Each range is checked against Solana <code>getBlocks</code> and the transaction counts in <code>blocks_metadata</code> first.</p>
             <p>To restore, <code>superbank --source solparq</code> tells ClickHouse to load the bundles back. Parquet is an archive and restore format only.</p>
           </article>
         </div>
-      </section>
-    </div>
+      </div>
+    </section>
   </main>
 
   <footer class="site-footer">

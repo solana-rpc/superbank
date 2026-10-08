@@ -10,16 +10,18 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 
+// Solana brand purple/green plus the blue from the official gradient
+// (solana.com/branding); orange (Parquet) and yellow (ClickHouse) are data
+// colours kept from the component brands.
 const PALETTE = Object.freeze({
-  purple: '#7C4DDB',
-  blue: '#2E86DE',
-  teal: '#14B8A6',
+  purple: '#9945FF',
+  blue: '#64A8F2',
+  green: '#14F195',
   orange: '#F59E0B',
   yellow: '#FACC15',
-  green: '#22C55E',
   amber: '#F59E0B',
-  slate: '#64748B',
-  pulse: '#F8FAFC',
+  slate: '#848895',
+  pulse: '#FFFFFF',
 });
 
 // query: a SQL statement one process sends another (solparq -> ClickHouse);
@@ -27,10 +29,10 @@ const PALETTE = Object.freeze({
 const PARTICLE_COLOR = {
   block: PALETTE.purple,
   rows: PALETTE.blue,
-  index: PALETTE.teal,
+  index: PALETTE.green,
   parquet: PALETTE.orange,
   query: '#EC4899',
-  meta: '#94A3B8',
+  meta: '#ABABBA',
 };
 const PARTICLE_SIZE = {
   block: [0.24, 0.24, 0.24],
@@ -40,74 +42,62 @@ const PARTICLE_SIZE = {
   query: [0.26, 0.26, 0.26],
   meta: [0.16, 0.05, 0.12],
 };
-const TIER_COLOR = { 'head-cache': PALETTE.purple, 'disk-cache': PALETTE.teal, ch: PALETTE.yellow };
+const TIER_COLOR = { 'head-cache': PALETTE.purple, 'disk-cache': PALETTE.green, ch: PALETTE.yellow };
 const STATUS_COLOR = { ok: PALETTE.green, warn: PALETTE.amber, info: PALETTE.blue };
 const PROCESS_COLOR = {
   superbank: PALETTE.purple,
-  jetstreamer: '#9A6CF0',
+  jetstreamer: '#B57BFF',
   rpc: PALETTE.blue,
   solparq: PALETTE.orange,
   verify: PALETTE.slate,
 };
 const ENDPOINT_COLOR = {
-  grpc: '#8B5CF6',
+  grpc: PALETTE.purple,
   fumarole: '#EF4444',
-  jsonrpc: '#3B82F6',
-  bigtable: '#06B6D4',
+  jsonrpc: PALETTE.blue,
+  bigtable: '#80ECFF',
   oldfaithful: '#D97706',
 };
 const ZONE_TINT = {
-  upstream: '#8B5CF6',
+  upstream: PALETTE.purple,
   ingest: PALETTE.purple,
   clickhouse: PALETTE.yellow,
   serve: PALETTE.blue,
   archive: PALETTE.orange,
-  verify: PALETTE.slate,
+  verify: PALETTE.green,
 };
 
-const THEMES = {
-  light: {
-    hemiSky: '#ffffff',
-    hemiGround: '#a3acbf',
-    hemi: 1.9,
-    sun: 1.6,
-    platform: '#E6EAF2',
-    zoneTint: 0.14,
-    edgeNeutral: '#94A3B8',
-    edgeMix: 0.55,
-    shadow: 0.18,
-    metal: '#C3CAD6',
-    dark: '#334155',
-    shell: '#3A4459',
-    server: '#2B3245',
-    tintScale: {},
-  },
-  dark: {
-    hemiSky: '#dfe6ff',
-    hemiGround: '#273049',
-    hemi: 1.6,
-    sun: 1.3,
-    platform: '#1E2742',
-    zoneTint: 0.08,
-    edgeNeutral: '#64748B',
-    edgeMix: 0.65,
-    shadow: 0.45,
-    metal: '#9AA4B5',
-    dark: '#273046',
-    shell: '#323C55',
-    // Lighter than the platform so the server blocks read on a dark page.
-    server: '#5B6785',
-    // Yellow over navy turns muddy brown; keep the ClickHouse tint faint.
-    tintScale: { clickhouse: 0.45 },
-  },
-};
+// The page is dark only (like solana.com), so there is a single theme tuned
+// for a black background.
+const THEME = Object.freeze({
+  hemiSky: '#ece8ff',
+  hemiGround: '#1a1726',
+  hemi: 1.6,
+  sun: 1.3,
+  // Lifted off pure black so the slabs read against the page.
+  platform: '#16161D',
+  // Surfaces stay near-monochrome like solana.com/data; colour is for data.
+  zoneTint: 0.05,
+  edgeNeutral: '#5C5C70',
+  edgeMix: 0.65,
+  shadow: 0.5,
+  metal: '#9AA0B0',
+  dark: '#1D1D26',
+  shell: '#2B2B38',
+  // Lighter than the platform so the server blocks read on a dark page.
+  server: '#4D4D66',
+  // Yellow over near-black turns muddy; keep the ClickHouse tint faint.
+  tintScale: { clickhouse: 0.45 },
+});
 
-// Union of the zone rects in topology.js plus head room for the tallest node
-// and its label. Fixed so the camera does not jump when zones come and go.
+// Union of every zone rect topology.js can emit, plus head room for the
+// tallest node and its label. The pose (landscape/portrait) is chosen against
+// this so it never flips on a toggle; the frame fits only the zones on screen.
 const BOUNDS = { u0: -17, u1: 17.6, v0: -7.2, v1: 7.8, y0: -0.3, y1: 2.6 };
 
 const ZONE_H = 0.28;
 const FADE_S = 0.3;
+const CAMERA_TWEEN_S = 0.45;
 const CLICK_SLOP_PX = 5;
 const TOOLTIP_OFFSET_PX = 12;
 const EDGE_HOVER_PX = 9;
@@ -213,9 +203,8 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   // contract; styles.css can override them without !important.
   const defaults = document.createElement('style');
   defaults.textContent = [
-    ':where(.zone-label){font:600 10px/1 system-ui,-apple-system,sans-serif;letter-spacing:.14em;text-transform:uppercase;',
-    'color:rgba(71,85,105,.75);white-space:nowrap;pointer-events:none;user-select:none}',
-    '@media (prefers-color-scheme: dark){:where(.zone-label){color:rgba(148,163,184,.7)}}',
+    ':where(.zone-label){font:600 10px/1 ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;',
+    'color:#848895;white-space:nowrap;pointer-events:none;user-select:none}',
   ].join('');
   document.head.appendChild(defaults);
 
@@ -248,8 +237,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   scene.add(layout);
   layout.updateMatrixWorld(true);
 
-  const darkQuery = window.matchMedia?.('(prefers-color-scheme: dark)') ?? null;
-  let theme = darkQuery?.matches ? THEMES.dark : THEMES.light;
+  const theme = THEME;
 
   // --- Shared resources ----------------------------------------------------
   const geoCache = new Map();
@@ -620,8 +608,8 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   }
 
   function buildLocalDb(b) {
-    const body = b.mk(PALETTE.teal, { roughness: 0.4 });
-    const band = b.mk(new THREE.Color(PALETTE.teal).lerp(new THREE.Color('#ffffff'), 0.45), { roughness: 0.4 });
+    const body = b.mk(PALETTE.green, { roughness: 0.4 });
+    const band = b.mk(new THREE.Color(PALETTE.green).lerp(new THREE.Color('#ffffff'), 0.45), { roughness: 0.4 });
     b.add(cyl(0.4, 0.4, 0.66, 28), body, 0, 0.35, 0);
     b.add(cyl(0.41, 0.41, 0.05, 28), band, 0, 0.3, 0);
     b.add(cyl(0.41, 0.41, 0.05, 28), band, 0, 0.5, 0);
@@ -885,7 +873,13 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     label.center.set(0, 1);
     layout.add(label);
     overlay.appendChild(el);
-    const view = { id: zone.id, data: zone, mesh, mat, label, el, appear: reducedMotion ? 1 : 0, leaving: false };
+    // Hairline outline on the slab's top face, echoing the bordered cells on
+    // solana.com/data.
+    const lineMat = new THREE.LineBasicMaterial({ color: '#ECE4FD', transparent: true, opacity: 0, depthWrite: false });
+    const outline = new THREE.LineLoop(undefined, lineMat);
+    outline.renderOrder = -1;
+    layout.add(outline);
+    const view = { id: zone.id, data: zone, mesh, mat, outline, lineMat, label, el, appear: reducedMotion ? 1 : 0, leaving: false };
     zoneViews.set(zone.id, view);
     placeZoneLabel(view);
     applyZoneData(view, zone);
@@ -909,6 +903,18 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     const d = v1 - v0;
     view.mesh.geometry = geo(`zone:${w.toFixed(2)}:${d.toFixed(2)}`, () => new RoundedBoxGeometry(w, ZONE_H, d, 3, 0.12));
     view.mesh.position.set((u0 + u1) / 2, -ZONE_H / 2, (v0 + v1) / 2);
+    // Inset so the square outline stays inside the slab's rounded corners.
+    const hw = w / 2 - 0.06;
+    const hd = d / 2 - 0.06;
+    view.outline.geometry = geo(`zoneline:${w.toFixed(2)}:${d.toFixed(2)}`, () =>
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(-hw, 0, -hd),
+        new THREE.Vector3(hw, 0, -hd),
+        new THREE.Vector3(hw, 0, hd),
+        new THREE.Vector3(-hw, 0, hd),
+      ]),
+    );
+    view.outline.position.set((u0 + u1) / 2, 0.004, (v0 + v1) / 2);
     placeZoneLabel(view);
     view.el.textContent = zone.label;
     applyZoneLook(view);
@@ -919,15 +925,17 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     view.mat.color.set(theme.platform).lerp(new THREE.Color(ZONE_TINT[view.id] ?? PALETTE.slate), tint);
     const fade = easeOut(view.appear);
     setOpacity(view.mat, fade);
+    view.lineMat.opacity = 0.18 * fade;
     view.mesh.scale.y = 0.2 + 0.8 * fade;
     view.el.style.opacity = view.appear < 1 ? String(fade) : '';
   }
 
   function destroyZoneView(view) {
-    layout.remove(view.mesh);
+    layout.remove(view.mesh, view.outline);
     layout.remove(view.label);
     view.el.remove();
     view.mat.dispose();
+    view.lineMat.dispose();
     zoneViews.delete(view.id);
   }
 
@@ -1073,7 +1081,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     view.mat.color.copy(tint);
     view.arrowMat.color.copy(tint);
     if (hover) {
-      view.mat.color.lerp(new THREE.Color(theme === THEMES.dark ? '#ffffff' : '#0F172A'), 0.2);
+      view.mat.color.lerp(new THREE.Color('#ffffff'), 0.2);
       view.arrowMat.color.copy(view.mat.color);
     }
     view.mat.opacity = opacity;
@@ -1110,7 +1118,9 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   // --- Reconcile -----------------------------------------------------------
   function update(topo) {
     if (disposed || !topo) return;
+    const firstUpdate = !topology;
     topology = topo;
+    refitToZones(topo.zones ?? EMPTY, !firstUpdate);
 
     const zoneIds = new Set();
     for (const zone of topo.zones ?? EMPTY) {
@@ -1268,6 +1278,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
         active = true;
       }
     }
+    if (stepCameraTween(dt)) active = true;
     return active;
   }
 
@@ -1981,11 +1992,36 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   if (coarsePointer) canvas.style.touchAction = 'pan-y';
 
   // --- Camera fit ----------------------------------------------------------
-  const corners = [];
-  for (const u of [BOUNDS.u0, BOUNDS.u1])
-    for (const v of [BOUNDS.v0, BOUNDS.v1]) for (const y of [BOUNDS.y0, BOUNDS.y1]) corners.push(new THREE.Vector3(u, y, v));
+  function cornersOf(b) {
+    const out = [];
+    for (const u of [b.u0, b.u1]) for (const v of [b.v0, b.v1]) for (const y of [b.y0, b.y1]) out.push(new THREE.Vector3(u, y, v));
+    return out;
+  }
+  const fullCorners = cornersOf(BOUNDS);
+  let fitCorners = fullCorners;
+  let fitKey = '';
+  let camTween = null;
+  const tweenTarget = new THREE.Vector3();
 
-  function fitFor(dir, aspect) {
+  // Frame the union of the zones on screen, easing there unless this is the
+  // first build. A camera the user has moved is left alone.
+  function refitToZones(zones, animate) {
+    if (!zones.length) return;
+    const b = { u0: Infinity, u1: -Infinity, v0: Infinity, v1: -Infinity, y0: BOUNDS.y0, y1: BOUNDS.y1 };
+    for (const { rect } of zones) {
+      b.u0 = Math.min(b.u0, rect[0]);
+      b.v0 = Math.min(b.v0, rect[1]);
+      b.u1 = Math.max(b.u1, rect[2]);
+      b.v1 = Math.max(b.v1, rect[3]);
+    }
+    const key = [b.u0, b.v0, b.u1, b.v1].join('|');
+    if (key === fitKey) return;
+    fitKey = key;
+    fitCorners = cornersOf(b);
+    if (!userMoved) applyFit(false, animate);
+  }
+
+  function fitFor(dir, aspect, corners = fitCorners) {
     const forward = new THREE.Vector3().copy(dir).negate();
     const right = new THREE.Vector3().crossVectors(forward, UP).normalize();
     const up = new THREE.Vector3().crossVectors(right, forward).normalize();
@@ -2013,16 +2049,17 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   }
 
   function choosePose(aspect) {
-    const land = fitFor(POSES.landscape, aspect);
-    const port = fitFor(POSES.portrait, aspect);
+    const land = fitFor(POSES.landscape, aspect, fullCorners);
+    const port = fitFor(POSES.portrait, aspect, fullCorners);
     return port.halfH * 1.25 < land.halfH ? 'portrait' : 'landscape';
   }
 
-  function applyFit(reset) {
+  function applyFit(reset, animate = false) {
     const { width, height } = size;
     if (!width || !height) return;
     const aspect = width / height;
-    if (reset || !userMoved) {
+    const place = reset || !userMoved;
+    if (place) {
       const next = choosePose(aspect);
       if (next !== pose) {
         pose = next;
@@ -2030,11 +2067,6 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       }
     }
     const fit = fitFor(POSES[pose], aspect);
-    baseHalfH = fit.halfH;
-    camera.top = fit.halfH;
-    camera.bottom = -fit.halfH;
-    camera.left = -fit.halfH * aspect;
-    camera.right = fit.halfH * aspect;
     if (reset) {
       // Drain orbit/zoom momentum first or damping keeps moving the camera
       // away from the pose we are about to restore.
@@ -2043,15 +2075,44 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       controls.update();
       controls.enableDamping = damping;
     }
-    if (reset || !userMoved) {
-      controls.target.copy(fit.target);
-      camera.position.copy(fit.target).addScaledVector(POSES[pose], CAMERA_DIST);
+    if (animate && place && !reset && !reducedMotion) {
+      camTween = { t: 0, fromH: baseHalfH, toH: fit.halfH, from: controls.target.clone(), to: fit.target };
+      invalidate();
+      return;
+    }
+    camTween = null;
+    setFrame(fit.halfH, fit.target, aspect, place);
+  }
+
+  function setFrame(halfH, target, aspect, place) {
+    baseHalfH = halfH;
+    camera.top = halfH;
+    camera.bottom = -halfH;
+    camera.left = -halfH * aspect;
+    camera.right = halfH * aspect;
+    if (place) {
+      controls.target.copy(target);
+      camera.position.copy(target).addScaledVector(POSES[pose], CAMERA_DIST);
       camera.zoom = 1;
-      camera.lookAt(fit.target);
+      camera.lookAt(target);
     }
     camera.updateProjectionMatrix();
     controls.update();
     updateDensity();
+  }
+
+  // Advanced from stepTweens so it keeps rendering while paused.
+  function stepCameraTween(dt) {
+    // Held while a press is in progress; a real drag keeps userMoved set, so
+    // the tween never resumes over the user's camera. A plain click resumes it.
+    if (!camTween || userMoved || !size.width || !size.height) return false;
+    camTween.t = Math.min(1, camTween.t + dt / CAMERA_TWEEN_S);
+    const k = easeOut(camTween.t);
+    tweenTarget.lerpVectors(camTween.from, camTween.to, k);
+    setFrame(THREE.MathUtils.lerp(camTween.fromH, camTween.toH, k), tweenTarget, size.width / size.height, true);
+    labelsDirty = true;
+    if (camTween.t >= 1) camTween = null;
+    return true;
   }
 
   // Bodies, zone tabs and edge bows are all drawn relative to the camera's
@@ -2092,21 +2153,11 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     invalidate();
   }
 
-  // --- Theme ---------------------------------------------------------------
-  function applyTheme() {
-    theme = darkQuery?.matches ? THEMES.dark : THEMES.light;
-    hemi.color.set(theme.hemiSky);
-    hemi.groundColor.set(theme.hemiGround);
-    hemi.intensity = theme.hemi;
-    sun.intensity = theme.sun;
-    for (const view of zoneViews.values()) applyZoneLook(view);
-    // Theme-dependent colours are baked in at build time; rebuild bodies.
-    for (const view of nodeViews.values()) if (!view.leaving) rebuildNodeBody(view);
-    for (const view of edgeViews.values()) applyEdgeLook(view);
-    rebuildPickables();
-    invalidate();
-  }
-  applyTheme();
+  // --- Lights --------------------------------------------------------------
+  hemi.color.set(theme.hemiSky);
+  hemi.groundColor.set(theme.hemiGround);
+  hemi.intensity = theme.hemi;
+  sun.intensity = theme.sun;
 
   // --- Loop ----------------------------------------------------------------
   const animating = () => !paused && !hidden && inView && !reducedMotion && !disposed;
@@ -2163,7 +2214,6 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     invalidate();
   };
   canvas.addEventListener('webglcontextrestored', onContextRestored);
-  darkQuery?.addEventListener?.('change', applyTheme);
 
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(container);
@@ -2199,7 +2249,6 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       resizeObserver.disconnect();
       intersectionObserver?.disconnect();
       document.removeEventListener('visibilitychange', onVisibility);
-      darkQuery?.removeEventListener?.('change', applyTheme);
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointermove', onPointerMove);
