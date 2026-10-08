@@ -53,7 +53,7 @@ const FLAG_OPTIONS = {
 const GROUPS = [
   { label: 'Source', enum: 'source' },
   { label: 'ClickHouse', enum: 'ch' },
-  { label: 'RPC', flags: ['head', 'disk', 'stream'] },
+  { label: 'Features', flags: ['head', 'disk', 'stream'] },
   { label: 'Archive', enum: 'archive' },
   { label: 'Tools', flags: ['verify'] },
   { label: 'Animate', enum: 'flow' },
