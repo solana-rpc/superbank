@@ -210,7 +210,7 @@ CI enforces PR titles via the `Lint PR title` GitHub Actions check.
 
 Releases use [`cargo-release`](https://github.com/crate-ci/cargo-release) (`cargo install cargo-release`), configured in `release.toml`. The version lives in one place, `version` under `[workspace.package]` in the root `Cargo.toml`, and a release tag is always `v<that version>`.
 
-Between releases, `main` carries the next version with a `-dev` suffix (for example `0.8.0-dev`). `-dev` sorts before `-rc1`, so both release candidates and the final release are upgrades from it.
+Between releases, `main` carries the next version with a `-dev` suffix (for example `0.8.0-dev`). `-dev` sorts before `-rc1`, so both release candidates and the final release are upgrades from it. The number is only a floor: after a release, start the next cycle at the next patch (`0.8.1-dev`), and when you release you can still choose `0.8.1`, `0.9.0` or `1.0.0` (or an rc of any of them). Only a version below the `-dev` one is refused.
 
 Release from an up-to-date `main`, as a maintainer (the "Tags" ruleset only lets maintainers and admins create tags, and the release commit is pushed straight to `main`):
 
