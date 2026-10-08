@@ -595,6 +595,20 @@ details[open] > .controls__summary::after {
   color: var(--text);
 }
 
+/* The one control to press first: Walkthrough, and Next once it runs. Comes
+   before the pressed and disabled rules so those still win on the same button. */
+.btn--accent {
+  border-color: var(--green);
+  background: var(--green);
+  color: #000;
+}
+
+.btn--accent:hover {
+  border-color: #5cf7b9;
+  background: #5cf7b9;
+  color: #000;
+}
+
 .btn--overlay[aria-pressed='true'] {
   border-color: #fff;
   background: rgba(255, 255, 255, 0.1);
@@ -607,18 +621,31 @@ details[open] > .controls__summary::after {
   cursor: default;
 }
 
-/* Walkthrough bar. Phones: a strip under the canvas, mirroring the toolbar
-   strip above it. */
+/* Walkthrough bar. Phones: pinned to the bottom of the screen, because the
+   step text sits below the canvas and you scroll down to read it. Under the
+   sticky selector bar (z-index 30) so its drop-down still covers it. */
 .walk-bar {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
   z-index: 20;
   display: flex;
-  order: 1;
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: 8px 16px;
-  padding: 8px 0;
-  border-top: 1px solid var(--line);
+  padding: 8px var(--gutter);
+  border-top: 1px solid var(--line-strong);
+  background: var(--bg);
+}
+
+/* Keeps the end of the page clear of the pinned bar; main.js sets the height
+   (0 while the bar is hidden). */
+@media (max-width: 899px) {
+  body {
+    padding-bottom: var(--walk-bar-h, 0px);
+  }
 }
 
 .walk-bar__nav,
@@ -1367,6 +1394,7 @@ details[open] > .controls__summary::after {
     left: 0;
     padding: 0;
     border-top: 0;
+    background: none;
     pointer-events: none;
   }
 

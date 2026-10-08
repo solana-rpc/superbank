@@ -350,7 +350,8 @@ function startWalk() {
   $('walk-bar').hidden = false;
   $('walkthrough').setAttribute('aria-pressed', 'true');
   goToStep(0);
-  // On phones the bar is a strip under the canvas; make sure it is on screen.
+  // On wide screens the bar sits over the bottom of the canvas; make sure it is
+  // on screen. On phones it is pinned to the bottom of the screen already.
   $('walk-bar').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
 }
 
@@ -436,6 +437,10 @@ function focusInset() {
 }
 
 function setupWalkthrough() {
+  // Phones pin the bar to the bottom of the screen and styles.css pads the page
+  // by its height, which wraps with the width and is 0 while hidden.
+  const bar = $('walk-bar');
+  new ResizeObserver(() => document.documentElement.style.setProperty('--walk-bar-h', `${bar.offsetHeight}px`)).observe(bar);
   $('walkthrough').addEventListener('click', () => (walk ? clearSelection() : startWalk()));
   $('walk-prev').addEventListener('click', () => stepWalk(-1));
   $('walk-next').addEventListener('click', () => {
