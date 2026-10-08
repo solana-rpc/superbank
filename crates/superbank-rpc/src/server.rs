@@ -270,6 +270,8 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     }
 
     let epoch_schedule = epoch_schedule_from_config(&args)?;
+    let ag_genesis_cert = crate::ag_genesis_cert::AgGenesisCertSource::from_config(&args)
+        .map_err(|message| RpcError::Config(message.to_string()))?;
 
     // Initialize ClickHouse client
     let routing_policy = build_routing_policy(&args)?;
@@ -443,6 +445,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     }
 
     let state = Arc::new(AppState {
+        ag_genesis_cert,
         clickhouse,
         rpc_parameter_filters,
         max_signatures_limit: args.max_signatures_limit,

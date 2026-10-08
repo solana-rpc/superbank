@@ -10,6 +10,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
 if [[ $# -gt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "usage: scripts/dev/run-jetstreamer-entries-smoke.sh [epoch|start:end]" >&2
+  echo "set one historical bound (ALPENGLOW_GENESIS_SLOT or PREACTIVATION_THROUGH_SLOT) and one independent commission era (BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT or BLOCK_REWARD_COMMISSION_PERCENT=true), all prefixed JETSTREAMER_; see plugin README" >&2
   exit 1
 fi
 
@@ -24,6 +25,34 @@ command -v cargo >/dev/null 2>&1 || {
 }
 
 range="${1:-358560000:358560099}"
+
+# Mirror the plugin's env parsing: unsigned integers, and 1/true/yes/on or 0/false/no/off.
+env_u64() {
+  local value="${!1:-}"
+  [[ "${value}" =~ ^\+?[0-9]+$ ]] && echo "${value}"
+}
+env_bool() {
+  local value="${!1:-}"
+  case "${value,,}" in
+    1 | true | yes | on) echo true ;;
+    0 | false | no | off) echo false ;;
+  esac
+}
+
+genesis_slot="$(env_u64 JETSTREAMER_ALPENGLOW_GENESIS_SLOT || true)"
+preactivation_slot="$(env_u64 JETSTREAMER_PREACTIVATION_THROUGH_SLOT || true)"
+if [[ -n "${genesis_slot}" && -n "${preactivation_slot}" ]] ||
+   [[ -z "${genesis_slot}" && -z "${preactivation_slot}" ]]; then
+  echo "set exactly one evidenced numeric bound: JETSTREAMER_ALPENGLOW_GENESIS_SLOT or JETSTREAMER_PREACTIVATION_THROUGH_SLOT (see plugin README)" >&2
+  exit 1
+fi
+bps_slot="$(env_u64 JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT || true)"
+percent_era="$(env_bool JETSTREAMER_BLOCK_REWARD_COMMISSION_PERCENT || true)"
+if [[ -n "${bps_slot}" && "${percent_era}" == "true" ]] ||
+   [[ -z "${bps_slot}" && "${percent_era}" != "true" ]]; then
+  echo "qualify exactly one independent SIMD-0291 reward era with a numeric slot or a true percent flag (see plugin README)" >&2
+  exit 1
+fi
 threads="${JETSTREAMER_THREADS:-4}"
 container="clickhouse"
 image="clickhouse/clickhouse-server:26.1.2.11"

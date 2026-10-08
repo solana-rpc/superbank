@@ -3129,6 +3129,15 @@ mod tests {
     }
 
     #[test]
+    fn block_metadata_query_selects_footer_columns() {
+        for include_rewards in [false, true] {
+            let query = build_block_metadata_query("t", 1, include_rewards, "", true);
+            assert!(query.contains("block_producer_time_nanos"), "{query}");
+            assert!(query.contains("block_user_agent"), "{query}");
+        }
+    }
+
+    #[test]
     fn inflation_boundary_query_reads_only_lightweight_metadata() {
         let query = build_inflation_boundary_query(
             "default.blocks_metadata",

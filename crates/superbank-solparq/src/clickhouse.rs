@@ -94,27 +94,29 @@ pub enum ArchiveTableKind {
 
 impl ArchiveTableKind {
     pub fn as_str(self) -> &'static str {
-        match self {
-            ArchiveTableKind::Transactions => "transactions",
-            ArchiveTableKind::BlocksMetadata => "blocks_metadata",
-            ArchiveTableKind::Entries => "entries",
-            ArchiveTableKind::Gsfa => "gsfa",
-            ArchiveTableKind::GsfaHot => "gsfa_hot",
-            ArchiveTableKind::Signatures => "signatures",
-            ArchiveTableKind::TokenOwnerActivity => "token_owner_activity",
-        }
+        const NAMES: [&str; 7] = [
+            "transactions",
+            "blocks_metadata",
+            "entries",
+            "gsfa",
+            "gsfa_hot",
+            "signatures",
+            "token_owner_activity",
+        ];
+        NAMES[self as usize]
     }
 
     pub fn file_name(self) -> &'static str {
-        match self {
-            ArchiveTableKind::Transactions => "transactions.parquet",
-            ArchiveTableKind::BlocksMetadata => "blocks_metadata.parquet",
-            ArchiveTableKind::Entries => "entries.parquet",
-            ArchiveTableKind::Gsfa => "gsfa.parquet",
-            ArchiveTableKind::GsfaHot => "gsfa_hot.parquet",
-            ArchiveTableKind::Signatures => "signatures.parquet",
-            ArchiveTableKind::TokenOwnerActivity => "token_owner_activity.parquet",
-        }
+        const FILE_NAMES: [&str; 7] = [
+            "transactions.parquet",
+            "blocks_metadata.parquet",
+            "entries.parquet",
+            "gsfa.parquet",
+            "gsfa_hot.parquet",
+            "signatures.parquet",
+            "token_owner_activity.parquet",
+        ];
+        FILE_NAMES[self as usize]
     }
 }
 
