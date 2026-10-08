@@ -12,6 +12,10 @@ on:
       - "site/**"
       - "tests/site/**"
       - ".github/workflows/pages.yml"
+      # tests/site/config.test.mjs checks the config reference against these
+      # sources, so a PR that changes a flag or env var runs it too.
+      - "crates/**/src/**"
+      - "ingest/jetstreamer-clickhouse-plugin/src/**"
   workflow_dispatch:
 
 concurrency:
