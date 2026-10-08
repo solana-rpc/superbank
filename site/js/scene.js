@@ -100,6 +100,7 @@ const BOUNDS = { u0: -17, u1: 17.6, v0: -7.2, v1: 7.8, y0: -0.3, y1: 2.6 };
 const ZONE_H = 0.28;
 const FADE_S = 0.3;
 const CLICK_SLOP_PX = 5;
+const TOOLTIP_OFFSET_PX = 12;
 const EDGE_HOVER_PX = 9;
 const EDGE_SAMPLES = 24;
 const MAX_CUBES = 400;
@@ -195,7 +196,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   const tooltip = document.createElement('div');
   tooltip.className = 'edge-tooltip';
   tooltip.setAttribute('role', 'tooltip');
-  Object.assign(tooltip.style, { position: 'absolute', left: '0', top: '0', pointerEvents: 'none', display: 'none' });
+  Object.assign(tooltip.style, { position: 'absolute', left: '0', top: '0', transform: 'none', pointerEvents: 'none', display: 'none' });
   // Prepend so controls the page already placed in the container stay on top.
   container.prepend(canvas, overlay, tooltip);
 
@@ -211,7 +212,9 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
 
   const scene = new THREE.Scene();
   const camera = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, CAMERA_DIST * 4);
-  const controls = new OrbitControls(camera, canvas);
+  // Connected to the canvas further down, after our own pointer listeners, so
+  // onPointerDown sees the camera state from before OrbitControls' 'start'.
+  const controls = new OrbitControls(camera);
   controls.enableDamping = !reducedMotion;
   controls.dampingFactor = 0.09;
   controls.minZoom = 0.6;
@@ -220,6 +223,11 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   controls.maxPolarAngle = 1.2;
   controls.screenSpacePanning = true;
   controls.zoomToCursor = true;
+  // On touch-first devices one finger scrolls the page (the stage fills most of
+  // a phone screen) and two fingers pan and zoom the scene. A touches.ONE value
+  // that is not a TOUCH constant makes OrbitControls ignore one-finger drags.
+  const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+  if (coarsePointer) controls.touches.ONE = null;
 
   const hemi = new THREE.HemisphereLight();
   const sun = new THREE.DirectionalLight();
@@ -339,6 +347,10 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   let size = { width: 0, height: 0 };
   let pose = 'landscape';
   let userMoved = false;
+  // userMoved as it was when the current press began; a press that turns out
+  // to be a click puts it back.
+  let movedBeforeGesture = false;
+  let focusId = null;
   let baseHalfH = 10;
 
   // --- Materials -----------------------------------------------------------
@@ -697,8 +709,9 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     button.type = 'button';
     button.className = 'node-label';
     button.dataset.nodeId = node.id;
-    button.style.pointerEvents = 'auto';
-    button.style.visibility = 'hidden';
+    // Hidden until the first layout pass places it (see setLabelHidden).
+    button.style.clipPath = 'inset(50%)';
+    button.style.pointerEvents = 'none';
     const title = document.createElement('span');
     title.className = 'node-label__title';
     const sub = document.createElement('span');
@@ -708,6 +721,15 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     button.addEventListener('click', () => onSelect?.(id));
     button.addEventListener('pointerenter', () => setHoverNode(id));
     button.addEventListener('pointerleave', () => setHoverNode(null));
+    // Tabbing to a label the layout had to hide reveals it.
+    button.addEventListener('focus', () => {
+      focusId = id;
+      setHoverNode(id);
+    });
+    button.addEventListener('blur', () => {
+      if (focusId === id) focusId = null;
+      setHoverNode(null);
+    });
     const label = new CSS2DObject(button);
     label.center.set(0.5, 1);
     group.add(label);
@@ -836,6 +858,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
 
   function destroyNodeView(view) {
     if (selectRing.parent === view.group) detachSelectRing();
+    if (focusId === view.id) focusId = null;
     if (hoverNodeId === view.id) {
       hoverNodeId = null;
       canvas.style.cursor = '';
@@ -935,6 +958,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       leaving: false,
       removed: false,
       em: { wait: 0, cycle: 0, left: 0, next: 0 },
+      emitJson: JSON.stringify(data.emit ?? null),
     };
     edgeViews.set(data.id, view);
     buildEdgeGeometry(view, from, to);
@@ -1009,7 +1033,6 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   }
 
   function applyEdgeData(view, data) {
-    const prev = view.data;
     view.data = data;
     const alphaMap = data.style === 'control' ? dashTex : null;
     if (view.mat.alphaMap !== alphaMap) {
@@ -1017,7 +1040,13 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       view.mat.alphaTest = alphaMap ? 0.02 : 0;
       view.mat.needsUpdate = true;
     }
-    if (prev !== data && JSON.stringify(prev.emit) !== JSON.stringify(data.emit)) resetEmitter(view);
+    // Compare against the stored spec: update() may already have replaced
+    // view.data before calling this.
+    const emitJson = JSON.stringify(data.emit ?? null);
+    if (emitJson !== view.emitJson) {
+      view.emitJson = emitJson;
+      resetEmitter(view);
+    }
     applyEdgeLook(view);
   }
 
@@ -1170,8 +1199,10 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     pickables = [];
     for (const view of nodeViews.values()) {
       if (view.leaving) continue;
+      // The contact shadow is wider than the node; picking it would select
+      // nodes from clicks on empty ground.
       view.body.traverse((o) => {
-        if (o.isMesh) pickables.push(o);
+        if (o.isMesh && !o.material.userData.isShadow) pickables.push(o);
       });
     }
   }
@@ -1327,6 +1358,9 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     const to = nodeViews.get(view.data.to);
     if (!to || to.leaving) return;
     if (to.data.buffer && view.data.channel === 'data') {
+      // Cubes already in flight when data animation is switched off must not
+      // refill the hopper.
+      if (!gate(view)) return;
       if (to.buf.count === 0) to.buf.firstAt = simTime;
       to.buf.count++;
       return;
@@ -1540,9 +1574,19 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     return out;
   }
 
-  // Hover only promotes a label that is currently hidden: moving a visible
-  // label out from under the cursor would flip hover off and on every frame.
-  const revealsOnHover = (view) => view.id === hoverNodeId && view.labelSide === null;
+  // Hover or keyboard focus promotes a label only if it was hidden when that
+  // hover/focus began (revealId), and it stays promoted until pointer and focus
+  // have both left. Promoting an already visible label could move it out from
+  // under the cursor and flip hover off and on.
+  let revealId = null;
+  const revealsOnHover = (view) => view.id === revealId && (view.id === hoverNodeId || view.id === focusId);
+
+  // Labels the layout cannot fit are clipped away rather than made invisible,
+  // so they stay in the tab order and keyboard users can still reach them.
+  function setLabelHidden(view, hidden) {
+    view.button.style.clipPath = hidden ? 'inset(50%)' : '';
+    view.button.style.pointerEvents = hidden ? 'none' : 'auto';
+  }
 
   function labelPriority(view) {
     if (view.id === selectedId) return -2;
@@ -1649,6 +1693,9 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
 
   function layoutLabels() {
     labelsDirty = false;
+    // Deferred to the frame so a pointer moving from a node's mesh onto its
+    // label (leave, then enter) keeps the reveal.
+    if (!hoverNodeId && !focusId) revealId = null;
     const { width, height } = size;
     if (!width || !height) return;
     camera.updateMatrixWorld();
@@ -1657,7 +1704,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     camUp.setFromMatrixColumn(camera.matrixWorld, 1).applyQuaternion(layoutInverse);
     const views = [];
     for (const view of nodeViews.values()) {
-      if (view.leaving) view.button.style.visibility = 'hidden';
+      if (view.leaving) setLabelHidden(view, true);
       else views.push(view);
     }
     // Batch DOM reads before any writes. Full and compact sizes are derived
@@ -1724,13 +1771,13 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       }
       setCompact(view, compact);
       if (!choice) {
-        view.button.style.visibility = 'hidden';
+        setLabelHidden(view, true);
         view.labelSide = null;
         continue;
       }
       placed.push(choice.rect.slice());
       view.labelSide = choice.side;
-      view.button.style.visibility = '';
+      setLabelHidden(view, false);
       const [cx, cy] = LABEL_CENTER[choice.side];
       view.label.center.set(cx, cy);
       // Anchor the label in 3D so CSS2DRenderer projects it onto (ax, ay):
@@ -1773,6 +1820,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
 
   function setHoverNode(id) {
     if (hoverNodeId === id) return;
+    if (id && id !== revealId) revealId = nodeViews.get(id)?.labelSide === null ? id : null;
     const prev = hoverNodeId ? nodeViews.get(hoverNodeId) : null;
     hoverNodeId = id;
     if (prev) applyNodeLook(prev);
@@ -1795,9 +1843,17 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     const view = id ? edgeViews.get(id) : null;
     if (view && view.data.label) {
       tooltip.textContent = view.data.label;
-      tooltip.style.left = `${x}px`;
-      tooltip.style.top = `${y}px`;
       tooltip.style.display = '';
+      // Measure once shown, then keep it inside the container: flip to the
+      // other side of the cursor near an edge, and clamp as a last resort.
+      const w = tooltip.offsetWidth;
+      const h = tooltip.offsetHeight;
+      let left = x + TOOLTIP_OFFSET_PX;
+      let top = y + TOOLTIP_OFFSET_PX;
+      if (left + w > size.width) left = x - TOOLTIP_OFFSET_PX - w;
+      if (top + h > size.height) top = y - TOOLTIP_OFFSET_PX - h;
+      tooltip.style.left = `${clamp(left, 0, Math.max(0, size.width - w))}px`;
+      tooltip.style.top = `${clamp(top, 0, Math.max(0, size.height - h))}px`;
     } else {
       tooltip.style.display = 'none';
     }
@@ -1850,17 +1906,29 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   let downX = 0;
   let downY = 0;
   let downId = null;
+  // Registered before controls.connect(), so this runs ahead of OrbitControls'
+  // own pointerdown and its 'start' event.
   function onPointerDown(event) {
     downId = event.pointerId;
     downX = event.clientX;
     downY = event.clientY;
+    movedBeforeGesture = userMoved;
     setHoverEdge(null);
   }
   function onPointerUp(event) {
     if (event.pointerId !== downId) return;
     downId = null;
     if (Math.hypot(event.clientX - downX, event.clientY - downY) >= CLICK_SLOP_PX) return;
+    // A press without movement is a click, not a camera gesture, so it must
+    // not freeze the responsive pose and fit.
+    userMoved = movedBeforeGesture;
+    // Right and middle buttons drive the camera; only the primary button selects.
+    if (event.button !== 0) return;
     onSelect?.(pickNode(event));
+  }
+  // Sent when the browser takes over a touch (e.g. to scroll the page).
+  function onPointerCancel(event) {
+    if (event.pointerId === downId) downId = null;
   }
   function onPointerMove(event) {
     if (downId !== null || event.buttons) return;
@@ -1883,6 +1951,10 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   canvas.addEventListener('pointerup', onPointerUp);
   canvas.addEventListener('pointermove', onPointerMove);
   canvas.addEventListener('pointerleave', onPointerLeave);
+  canvas.addEventListener('pointercancel', onPointerCancel);
+  controls.connect(canvas);
+  // connect() sets touch-action: none; let the browser keep vertical scrolling.
+  if (coarsePointer) canvas.style.touchAction = 'pan-y';
 
   // --- Camera fit ----------------------------------------------------------
   const corners = [];
@@ -2044,6 +2116,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     }
   }
 
+  // Fires on pointerdown too; onPointerUp undoes this when the press was a click.
   controls.addEventListener('start', () => {
     userMoved = true;
     setHoverEdge(null);
@@ -2059,6 +2132,13 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     if (!hidden) invalidate();
   };
   document.addEventListener('visibilitychange', onVisibility);
+  // three rebuilds its GL state on restore but nothing redraws a scene that is
+  // paused, hidden or in reduced motion.
+  const onContextRestored = () => {
+    labelsDirty = true;
+    invalidate();
+  };
+  canvas.addEventListener('webglcontextrestored', onContextRestored);
   darkQuery?.addEventListener?.('change', applyTheme);
 
   const resizeObserver = new ResizeObserver(resize);
@@ -2066,7 +2146,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   const intersectionObserver =
     typeof IntersectionObserver === 'function'
       ? new IntersectionObserver((entries) => {
-          inView = entries.some((e) => e.isIntersecting);
+          inView = entries[entries.length - 1].isIntersecting;
           if (inView) invalidate();
         })
       : null;
@@ -2100,6 +2180,8 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerleave', onPointerLeave);
+      canvas.removeEventListener('pointercancel', onPointerCancel);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
       controls.dispose();
       for (const view of [...edgeViews.values()]) destroyEdgeView(view);
       for (const view of [...nodeViews.values()]) destroyNodeView(view);
