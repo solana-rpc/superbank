@@ -19,6 +19,8 @@ Usage:
 Environment (common):
   RPC_URL                  Superbank RPC endpoint (default: http://localhost:8899)
   REFERENCE_RPC_URL        Reference RPC endpoint for validation scenarios (optional)
+  AGAVE43_REFERENCE_RPC_URL Optional 4.3.x reference for request-error parity
+  INFLATION_REWARD_MAX_ADDRESSES Match target gIR limit (default: 100; 0 skips limit check)
   TFA_REFERENCE_RPC_URL    Reference RPC endpoint for getTransactionsForAddress validation (optional)
   VALIDATE_LATEST_BLOCKHASH Set to 0 to skip reference isBlockhashValid validation (default: 1)
 
@@ -34,7 +36,7 @@ Suite defaults (override as needed):
   TX_ENCODING              (default: jsonParsed)
 
 Notes:
-  - Validation tests are skipped unless REFERENCE_RPC_URL is set.
+  - Reference comparisons require REFERENCE_RPC_URL; local contract checks always run.
   - Head-cache WS scenario runs only if RPC supports `commitment=processed` and SOLANA_WS_URL is set.
   - The getInflationReward stress scenario is skipped unless INFLATION_REWARD_EPOCH is set.
   - Stress/soak/spike scenarios are long-running; enable them explicitly via flags.
@@ -228,6 +230,9 @@ run_basic_suite() {
 }
 
 run_validation_suite() {
+  run_k6 "validate:Agave 4.3 request errors" \
+    "tests/k6/scenarios/validation/superbank-rpc-validate-agave43.js"
+
   if [[ -z "${REFERENCE_RPC_URL:-}" ]]; then
     skip "validation suite" "REFERENCE_RPC_URL not set"
   else

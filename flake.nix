@@ -9,6 +9,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -16,12 +18,17 @@
       self,
       nixpkgs,
       flake-utils,
+      rust-overlay,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
         lib = pkgs.lib;
+        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         dockerCli =
           if pkgs.stdenv.isLinux then
@@ -61,11 +68,8 @@
               gnused
               coreutils
 
-              # Rust toolchain (repo also has rust-toolchain.toml pinned to stable).
-              rustc
-              cargo
-              clippy
-              rustfmt
+              # Compiler and components come from the repository's exact pin.
+              rustToolchain
               rust-analyzer
 
               # Repo scripts/tests.

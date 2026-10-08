@@ -37,3 +37,40 @@ fn semantic_cli_errors_are_operational_failures() {
         String::from_utf8_lossy(&output.stderr).contains("--resume requires --checkpoint-file")
     );
 }
+
+#[test]
+fn migration_pair_obeys_cli_env_yaml_precedence_without_connecting() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("verify.yaml");
+    let valid = format!("42:{}", bs58::encode([7; 32]).into_string());
+    for (yaml, env, cli, expected) in [
+        ("invalid", valid.as_str(), None, "window-slots"),
+        (
+            valid.as_str(),
+            "invalid",
+            Some(valid.as_str()),
+            "window-slots",
+        ),
+        (valid.as_str(), "invalid", None, "alpenglow-genesis-block"),
+    ] {
+        std::fs::write(
+            &path,
+            format!("full: true\nwindow-slots: 129\nalpenglow-genesis-block: '{yaml}'\n"),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_superbank-verify"));
+        command
+            .args(["--config", path.to_str().unwrap()])
+            .env("SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK", env);
+        if let Some(pair) = cli {
+            command.args(["--alpenglow-genesis-block", pair]);
+        }
+        let result = command.output().unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}

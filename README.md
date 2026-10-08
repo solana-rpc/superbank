@@ -28,7 +28,7 @@ Solana-compatible JSON-RPC endpoints backed by that data.
 - Archive Superbank ClickHouse table bundles to Parquet (`crates/superbank-solparq`)
 - Inspect and read superbank-solparq Parquet archives from local files or S3 (`superbank-solparq-read` binary in `crates/superbank-solparq`)
 - Restore superbank-solparq Parquet archives (local or S3) back into ClickHouse (`source: solparq`)
-- Validate Proof-of-History over the stored data (`crates/superbank-verify`)
+- Validate historical Proof-of-History and post-genesis Alpenglow entry chains over stored data (`crates/superbank-verify`), using trusted same-cluster `getAgGenesisCert` or an offline genesis block pair
 - Optionally expose ClickHouse-backed gRPC block and transaction streams (`--features grpc-streaming`)
 - k6 load + validation scenarios for supported RPC methods (`tests/k6/`)
 
@@ -109,8 +109,11 @@ required local schemas, replays a small Old Faithful range through the Jetstream
 plugin, and prints verification queries, run:
 
 ```bash
-scripts/dev/run-jetstreamer-entries-smoke.sh
+JETSTREAMER_BLOCK_REWARD_COMMISSION_BPS_FROM_SLOT=<trusted-SIMD-0291-slot> \
+JETSTREAMER_ALPENGLOW_GENESIS_SLOT=<trusted-genesis-slot> scripts/dev/run-jetstreamer-entries-smoke.sh
 ```
+
+For commission-bearing Jetstreamer block rewards, separately qualify the SIMD-0291 activation or attest a whole-percent historical range; see the [plugin commission configuration](ingest/jetstreamer-clickhouse-plugin/README.md#block-reward-commission-era).
 
 That helper also adjusts the local Docker ClickHouse `default` user so the host-side Jetstreamer
 HTTP client can connect to `localhost:8123`.
@@ -131,6 +134,8 @@ cp superbank.example.yaml superbank.yaml
 Edit `superbank.yaml` to choose a source and set credentials/endpoints:
 
 - Fumarole: `source: fumarole`, `fumarole-endpoint`, `fumarole-consumer-group`, optional `fumarole-x-token`
+- The Fumarole source tails live and stores the Alpenglow footer fields when the Fumarole server supports the footer filter; an older server yields `NULL` footers. An optional `fumarole-alpenglow-genesis-slot` or `fumarole-preactivation-through-slot` bound makes the stream stop after that slot.
+- Live gRPC/Fumarole canonical writers require finalized commitment; complete bank data is validated before inserts and source offset acknowledgment. gRPC scalar zero requires matching subscription-local status evidence: legacy data retains a NULL bank ID, and unresolved identity holds later blocks and all flushes for replay.
 - gRPC (DragonsMouth): `source: grpc`, `endpoint`, optional `x-token`
 - RPC: `source: rpc`, `rpc-url`, `rpc-from-slot`, and either `rpc-to-slot` or `rpc-slot-count`
   (add `rpc-skip-ingested-slots` to backfill only slots missing from ClickHouse in that range)
@@ -180,6 +185,11 @@ curl -sS http://localhost:8899 \
 
 ## Configuration
 
+Before activation, a trusted same-cluster `getAgGenesisCert` can successfully return `null`. For a bounded historical Fumarole or Jetstreamer run, first record the same endpoint's `getSlot` with finalized commitment, then obtain its authoritative null certificate response. Keep both responses as operational evidence and set `FUMAROLE_PREACTIVATION_THROUGH_SLOT` or `JETSTREAMER_PREACTIVATION_THROUGH_SLOT` to that recorded finalized slot (or an earlier slot). These settings are explicit offline attestations by the operator; neither binary discovers or validates that external evidence. A missing, unsupported, failed or malformed certificate response cannot qualify this mode. The bound never advances automatically; qualify a new snapshot for further historical work, or use the trusted certificate slot once one exists. Do not configure both genesis and preactivation bounds. Slot zero is valid only when actually evidenced, never a placeholder for an unknown boundary.
+
+
+`superbank-rpc` serves `getAgGenesisCert` from an explicitly trusted, same-cluster Agave 4.3+ RPC endpoint configured by `AG_GENESIS_CERT_RPC_URL` (or `--ag-genesis-cert-rpc-url`). Its bounded lazy fetch caches authoritative `null` for `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` (default 5 seconds), failures for one second, and the immutable certificate for the process lifetime. Set `AG_GENESIS_CERT_RPC_TIMEOUT_MS` (default 2000 ms) below `RPC_REQUEST_TIMEOUT_MS`. A missing, unsupported, malformed, or unavailable source returns an error, never an inferred pre-migration `null`. Configuration is optional for existing deployments; see the [certificate source and trust boundary](crates/superbank-rpc/README.md#alpenglow-genesis-certificate-source).
+
 Address history requests share a separate `DISK_CACHE_ADDRESS_QUERY_TIMEOUT_MS` cache budget
 (default `100` ms) across signature bounds, address scans, and transaction hydration. Expiry
 falls back to primary ClickHouse; the general cache and maintenance deadlines remain independent.
@@ -211,6 +221,7 @@ their existing behavior. Use `rbx2` for RBX2 or an empty value for standalone Cl
   It can also read RPC parameter filters from the shared YAML file when started
   with `--config superbank.yaml` / `SUPERBANK_CONFIG=superbank.yaml`.
   See `crates/superbank-rpc/README.md`.
+- `superbank-solparq` hourly archives use a nominal cluster slot cadence: `--hourly-slot-duration-ms` / `SOLPARQ_HOURLY_SLOT_DURATION_MS` defaults to `400` (9000 slots); set `200` for 18000-slot hourly windows on a 200 ms cluster. Cadence changes separately from Alpenglow activation. Epoch/custom ranges and existing archive names remain compatible. See the [hourly archive cadence and transition guidance](crates/superbank-solparq/README.md#hourly-slot-cadence).
 
 ## Docker local development
 
@@ -388,6 +399,8 @@ rows already present on the target by exact table key instead of failing the run
 
 ## Development
 
+Build with Rust **1.98.1**, pinned in `rust-toolchain.toml`. See the [Agave 4.3 compatibility and rollout notes](docs/agave-4.3-compatibility.md).
+
 ```bash
 cargo build -p superbank -p superbank-rpc -p superbank-solparq -p superbank-verify
 
@@ -407,7 +420,7 @@ scripts/dev/run-local-rpc.sh
 ### Nix (flakes)
 
 This repo includes a Nix flake with a dev shell that provides `tilt`, `docker`, `kubectl`, `kind`,
-Rust tooling, `k6`, and common CLI utilities.
+Rust tooling, `k6`, and common CLI utilities. The locked `rust-overlay` reads `rust-toolchain.toml`, including `rustfmt` and `clippy`, so the shell uses the same exact compiler as non-Nix builds rather than the compiler bundled with nixpkgs.
 
 Enable flakes (if needed):
 
@@ -420,6 +433,7 @@ Enter the dev shell:
 
 ```bash
 nix develop
+nix develop -c rustc --version # must match rust-toolchain.toml
 ```
 
 If you don't want to change global Nix config, you can also run:
