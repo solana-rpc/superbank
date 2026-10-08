@@ -194,7 +194,7 @@ pub(crate) async fn handle_get_signature_statuses(
                         (
                             meta.pos.slot,
                             meta.err.clone(),
-                            cache.confirmation_status_string(meta.pos.slot),
+                            cache.confirmation_status_string(&meta),
                         ),
                     );
                 }
@@ -1244,9 +1244,7 @@ pub(crate) async fn handle_get_signatures_for_address(
                     err: meta.err.clone(),
                     memo: meta.memo.clone(),
                     block_time: meta.block_time,
-                    confirmation_status: Some(
-                        cache.confirmation_status_string(meta.pos.slot).to_string(),
-                    ),
+                    confirmation_status: Some(cache.confirmation_status_string(&meta).to_string()),
                 })
                 .collect::<Vec<_>>();
             return Ok(json_rpc_success_response(id, json!(signature_infos)));
@@ -1550,9 +1548,7 @@ pub(crate) async fn handle_get_signatures_for_address(
                     err: meta.err.clone(),
                     memo: meta.memo.clone(),
                     block_time: meta.block_time,
-                    confirmation_status: cache
-                        .confirmation_status_string(meta.pos.slot)
-                        .to_string(),
+                    confirmation_status: cache.confirmation_status_string(&meta).to_string(),
                 });
             }
         }

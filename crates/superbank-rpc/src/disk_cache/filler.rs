@@ -782,6 +782,7 @@ mod tests {
             rewards_commission: Vec::new(),
             rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
+            footer: None,
         }];
         let rows = coverage_from_metadata(
             SlotRange {

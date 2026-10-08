@@ -2,6 +2,7 @@
 name = "superbank-workspace"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 publish = false
@@ -9,6 +10,7 @@ publish = false
 [workspace.package]
 version = "0.6.0"
 edition = "2024"
+rust-version = "1.98.1"
 license = "AGPL-3.0-only"
 authors = [
     "Triton One Limited",

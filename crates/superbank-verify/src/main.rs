@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod alpenglow;
 mod chain;
 mod chdb;
 mod checkpoint;

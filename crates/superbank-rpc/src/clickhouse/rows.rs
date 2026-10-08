@@ -14,7 +14,8 @@ use crate::processing::{ProcessingError, ProcessingResult};
 
 use super::read_query::ReadEndpoint;
 use super::types::{
-    BlockMetadataRecord, QueryTimings, StoredAccountsTransactionRecord, StoredTransactionRecord,
+    BlockFooterRecord, BlockMetadataRecord, QueryTimings, StoredAccountsTransactionRecord,
+    StoredTransactionRecord,
 };
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -107,6 +108,8 @@ pub(crate) struct BlockMetadataRow {
     pub(crate) rewards_commission: Vec<Option<u8>>,
     pub(crate) rewards_commission_bps: Vec<Option<u16>>,
     pub(crate) rewards_num_partitions: Option<u64>,
+    pub(crate) block_producer_time_nanos: Option<u64>,
+    pub(crate) block_user_agent: Option<ByteBuf>,
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -120,6 +123,8 @@ pub(crate) struct BlockMetadataBaseRow {
     pub(crate) executed_transaction_count: u64,
     pub(crate) entry_count: u64,
     pub(crate) rewards_num_partitions: Option<u64>,
+    pub(crate) block_producer_time_nanos: Option<u64>,
+    pub(crate) block_user_agent: Option<ByteBuf>,
 }
 
 #[cfg(feature = "disk-cache")]
@@ -387,7 +392,19 @@ pub(crate) fn map_block_metadata_base_row(row: BlockMetadataBaseRow) -> BlockMet
         rewards_commission: Vec::new(),
         rewards_commission_bps: Vec::new(),
         rewards_num_partitions: row.rewards_num_partitions,
+        footer: map_block_footer(row.block_producer_time_nanos, row.block_user_agent),
     }
+}
+
+/// A footer needs both fields. A partial pair is treated as absent, never guessed.
+fn map_block_footer(
+    block_producer_time_nanos: Option<u64>,
+    block_user_agent: Option<ByteBuf>,
+) -> Option<BlockFooterRecord> {
+    Some(BlockFooterRecord {
+        block_producer_time_nanos: block_producer_time_nanos?,
+        block_user_agent: String::from_utf8_lossy(&block_user_agent?).into_owned(),
+    })
 }
 
 pub(crate) fn map_block_signature_row(row: BlockSignatureRow) -> String {
@@ -681,13 +698,15 @@ pub(crate) fn map_block_metadata_row(row: BlockMetadataRow) -> BlockMetadataReco
         rewards_commission: row.rewards_commission,
         rewards_commission_bps: row.rewards_commission_bps,
         rewards_num_partitions: row.rewards_num_partitions,
+        footer: map_block_footer(row.block_producer_time_nanos, row.block_user_agent),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::primary_block_signature;
+    use super::{BlockFooterRecord, primary_block_signature};
     use crate::processing::ProcessingError;
+    use serde_bytes::ByteBuf;
 
     #[test]
     fn primary_block_signature_rejects_empty_signature_list() {
@@ -710,5 +729,27 @@ mod tests {
             primary_block_signature(&[signature, [8u8; 64]], 42).expect("primary signature");
 
         assert_eq!(resolved, signature);
+    }
+
+    #[test]
+    fn footer_needs_both_stored_fields() {
+        let agent = || Some(ByteBuf::from(b"agave/v4.3.0".to_vec()));
+        assert_eq!(
+            super::map_block_footer(Some(7), agent()),
+            Some(BlockFooterRecord {
+                block_producer_time_nanos: 7,
+                block_user_agent: "agave/v4.3.0".to_string(),
+            })
+        );
+        assert_eq!(super::map_block_footer(None, None), None);
+        assert_eq!(super::map_block_footer(Some(7), None), None);
+        assert_eq!(super::map_block_footer(None, agent()), None);
+    }
+
+    #[test]
+    fn footer_user_agent_with_invalid_utf8_does_not_fail_the_block() {
+        let footer = super::map_block_footer(Some(1), Some(ByteBuf::from(vec![0x61, 0xff])))
+            .expect("footer");
+        assert_eq!(footer.block_user_agent, "a\u{fffd}");
     }
 }

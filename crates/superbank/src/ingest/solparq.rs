@@ -950,6 +950,23 @@ mod tests {
     }
 
     #[test]
+    fn restore_of_an_archive_without_footer_columns_omits_them() {
+        let columns = parse_describe_columns("slot\tUInt64\nbank_id\tNullable(UInt64)\n");
+        let object = S3Object {
+            url: "http://minio:9000/bucket/blocks_metadata.parquet",
+            access_key: "ak",
+            secret_key: "sk",
+        };
+        let sql = build_s3_restore_sql("db.blocks_metadata", &columns, &object, None, None, "");
+        assert!(sql.starts_with(
+            "INSERT INTO db.blocks_metadata (`slot`, `bank_id`) SELECT `slot`, `bank_id` FROM s3("
+        ));
+        for column in ["bank_hash", "block_producer_time_nanos", "block_user_agent"] {
+            assert!(!sql.contains(column), "{column} must stay at its default");
+        }
+    }
+
+    #[test]
     fn s3_restore_sql_escapes_quotes() {
         let columns = vec!["slot".to_string()];
         let object = S3Object {
