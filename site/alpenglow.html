@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Superbank on Alpenglow</title>
+  <meta name="description" content="Follow one block through Superbank under Alpenglow and Tower BFT: banks, confirmation levels, and when the block reaches the head cache, the primary ingestor and the disk cache.">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" type="image/png" href="assets/superbank.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="alpenglow.css">
+  <script type="module" src="js/alpenglow-page.js"></script>
+</head>
+<body class="ag-page">
+  <!-- A hash-based skip link would collide with the state hash, so this is a button wired up in alpenglow-page.js. -->
+  <button type="button" id="skip-summary" class="skip-link">Skip to the lifecycle summary</button>
+
+  <header class="site-header">
+    <div class="wrap site-header__inner">
+      <img class="brand__logo" src="assets/superbank.png" alt="" width="28" height="28">
+      <p class="brand__name">Superbank</p>
+      <nav class="site-nav" aria-label="Site">
+        <a class="site-nav__link" href="./">Architecture</a>
+        <a class="site-nav__link" href="config.html">Configuration</a>
+        <a class="site-nav__link" href="alpenglow.html" aria-current="page">Alpenglow</a>
+      </nav>
+      <a class="chip-link" href="https://github.com/solana-rpc/superbank" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+    </div>
+  </header>
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap hero__inner">
+      <p class="eyebrow"><span class="eyebrow__dot" aria-hidden="true"></span>Block lifecycle</p>
+      <h1 id="hero-title" class="hero__title">One block through Superbank on Alpenglow</h1>
+      <p class="hero__lead">Step through a single slot as Yellowstone reports its banks and commitment, and see when the head cache, the primary ingestor and the disk cache each pick it up. Switch to Tower BFT to compare.</p>
+    </div>
+  </section>
+
+  <!-- Direct child of body: position: sticky only holds inside its parent. -->
+  <section id="controls" aria-label="Configure the lifecycle">
+    <div class="wrap">
+      <details id="controls-details" class="controls" open>
+        <summary class="controls__summary">
+          <span class="controls__summary-label">Configure</span>
+          <span class="controls__summary-state" id="controls-state"></span>
+        </summary>
+        <div class="controls__body">
+          <div class="controls__groups" id="controls-groups"></div>
+          <button type="button" id="reset-config" class="link-button">Reset</button>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <main>
+    <div class="stage-band">
+    <div class="wrap stage" id="stage">
+      <div class="stage__main">
+        <!-- On wide screens #panel is a drawer inside this box; on phones the box
+             dissolves and the panel stacks below the legend. -->
+        <div class="stage__canvas">
+          <div class="stage__view" id="stage-view">
+            <div id="timeline" class="ag-timeline" aria-describedby="summary"></div>
+            <div id="scene-actions" class="scene-actions">
+              <button type="button" id="walkthrough" class="btn btn--overlay" aria-pressed="false">Walkthrough</button>
+              <button type="button" id="play" class="btn btn--overlay" aria-pressed="false">Play</button>
+              <button type="button" id="restart" class="btn btn--overlay">Restart</button>
+            </div>
+            <!-- Steps through the lifecycle for this configuration; wired up in alpenglow-page.js. -->
+            <div id="walk-bar" class="walk-bar" role="group" aria-label="Lifecycle steps">
+              <div class="walk-bar__nav">
+                <button type="button" id="walk-prev" class="btn btn--overlay"><span aria-hidden="true">‹ </span>Back</button>
+                <p id="walk-status" class="walk-bar__status"></p>
+                <button type="button" id="walk-next" class="btn btn--overlay">Next<span aria-hidden="true"> ›</span></button>
+              </div>
+            </div>
+          </div>
+
+          <aside id="panel" class="panel" aria-label="Details" tabindex="-1"></aside>
+        </div>
+
+        <div class="legend-row">
+          <div id="legend" class="legend" role="group" aria-label="Legend">
+            <ul class="legend__list" aria-label="Commitment">
+              <li><span class="ag-swatch ag-swatch--processed"></span>Processed</li>
+              <li><span class="ag-swatch ag-swatch--confirmed"></span>Confirmed</li>
+              <li><span class="ag-swatch ag-swatch--finalized"></span>Finalized</li>
+            </ul>
+            <ul class="legend__list" aria-label="Bank">
+              <li><span class="ag-swatch ag-swatch--held"></span>Held</li>
+              <li><span class="ag-swatch ag-swatch--discarded"></span>Discarded</li>
+            </ul>
+            <ul class="legend__list" aria-label="Read tiers">
+              <li><span class="swatch swatch--head"></span>Head cache</li>
+              <li><span class="swatch swatch--disk"></span>Disk cache</li>
+              <li><span class="swatch swatch--clickhouse"></span>ClickHouse</li>
+            </ul>
+          </div>
+          <p class="legend-row__hint">Click a lane for details</p>
+        </div>
+        <!-- Announces the step and selection; the drawer itself is not a live region. -->
+        <div id="panel-status" class="sr-only" role="status"></div>
+      </div>
+    </div>
+    </div>
+
+    <section id="summary" class="band" aria-labelledby="summary-title" tabindex="-1">
+      <div class="wrap band__inner">
+        <h2 id="summary-title">Lifecycle for this configuration</h2>
+        <p class="summary__config" id="summary-config"></p>
+        <ol class="ag-steps" id="summary-body"></ol>
+        <noscript>
+          <p class="notice">The interactive timeline needs JavaScript. In short, on Alpenglow with the defaults:</p>
+          <ol class="ag-steps">
+            <li>Yellowstone reports a new bank for slot N with a node-local <code>bank_id</code>; the head cache buffers it.</li>
+            <li>The bank freezes and passes the completeness check; at <code>processed</code> it is published to the head cache.</li>
+            <li>Votor roots the block once it has a finalization certificate; Yellowstone reports <code>confirmed</code> and <code>finalized</code> together.</li>
+            <li>The ingestor's own finalized subscription writes it to ClickHouse, with the footer fields in <code>blocks_metadata</code>.</li>
+            <li>The head cache drops it once 32 newer slots are published; reads then come from ClickHouse.</li>
+            <li>When the finalized tip is at least 75 slots past it, the disk cache copies it from ClickHouse.</li>
+          </ol>
+        </noscript>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="story-title">
+      <div class="wrap band__inner">
+        <h2 id="story-title">What changes under Alpenglow</h2>
+        <div class="cells">
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">01</span>
+            <h3 class="cell__title">Banks</h3>
+            <p>Yellowstone tags every update with a node-local <code>bank_id</code>, so two versions of one slot can be told apart. The head cache buffers each <code>(slot, bank_id)</code> separately, shows the first bank to freeze to <code>processed</code> readers (at the default minimum), and switches to whichever bank a <code>confirmed</code> or <code>finalized</code> status names.</p>
+            <p>Tower BFT streams send no bank ID, so Superbank uses <code>bank_id = slot</code> and a fork drops the whole slot. Bank IDs never cross a subscription: the ingestor's stream numbers banks independently, and a head-cache reconnect clears everything.</p>
+          </article>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">02</span>
+            <h3 class="cell__title">Commitment</h3>
+            <p>Superbank only sees Yellowstone's <code>processed</code>, <code>confirmed</code> and <code>finalized</code> statuses. Under Alpenglow, Agave reports <code>confirmed</code> and <code>finalized</code> together when votor roots a block that has a fast- or slow-finalization certificate.</p>
+            <p>Under Tower BFT, <code>confirmed</code> comes shortly after a supermajority votes, and <code>finalized</code> about 32 slots later at the root. So under Alpenglow the head cache holds finalized data for most of its window, and <code>HEAD_CACHE_MIN_COMMITMENT=confirmed</code> behaves like <code>finalized</code>.</p>
+          </article>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">03</span>
+            <h3 class="cell__title">Footers &amp; sources</h3>
+            <p>Alpenglow blocks end with a footer (SIMD-0307). The ingestor writes the finalized winner's <code>bank_id</code>, <code>bank_hash</code>, producer time and user agent into <code>blocks_metadata</code>, and <code>getBlock</code> returns them with <code>footer: true</code>.</p>
+            <p>The Alpenglow genesis certificate marks slot G, the last Tower BFT block; <code>getAgGenesisCert</code> proxies it from a trusted Agave node. Jetstreamer, and Fumarole when given a bound, stop at G or at an attested preactivation slot; Yellowstone gRPC and unbounded Fumarole carry on live.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <ul class="site-footer__links">
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/docs/agave-4.3-compatibility.md" target="_blank" rel="noopener noreferrer">docs/agave-4.3-compatibility.md</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank-rpc/README.md" target="_blank" rel="noopener noreferrer">superbank-rpc</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/crates/superbank/README.md" target="_blank" rel="noopener noreferrer">superbank</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/ddl/README.md" target="_blank" rel="noopener noreferrer">ddl/</a></li>
+        <li><a href="https://github.com/solana-foundation/solana-improvement-documents/blob/f1f6c8b05dc205552d3c290a854a438392701107/proposals/0326-alpenglow.md" target="_blank" rel="noopener noreferrer">SIMD-0326 Alpenglow</a></li>
+      </ul>
+      <p class="site-footer__note">Slot positions marked ≈ are illustrative: consensus timing varies, and slot length is set per cluster. Code numbers are read from the Superbank source.</p>
+    </div>
+  </footer>
+</body>
+</html>

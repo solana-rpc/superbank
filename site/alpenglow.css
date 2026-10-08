@@ -1,0 +1,552 @@
+/* Alpenglow lifecycle page. Loaded after styles.css and reuses its tokens and
+   components (selector bar, stage, drawer, walk bar, legend, bands); only the
+   timeline (slot ruler + lanes) and the step list are new. Tier colours match
+   the explorer's swatches: head #9945ff, disk #14f195, ClickHouse #facc15. */
+
+.ag-page {
+  --ag-label-w: 104px;
+  --ag-processed: #ababba;
+  --ag-confirmed: #64a8f2;
+  --ag-finalized: #ffffff;
+  --ag-head: #9945ff;
+  --ag-disk: #14f195;
+  --ag-clickhouse: #facc15;
+  --ag-discarded: #ec4899;
+}
+
+/* The timeline sets its own height; the explorer's fixed canvas height does not apply. */
+.ag-page .stage__view {
+  height: auto;
+  overflow: visible;
+}
+
+/* Stepping is the main interaction here, so the step bar sits in the toolbar
+   above the timeline (the timeline is taller than most viewports). */
+.ag-page .scene-actions {
+  order: -2;
+}
+
+.ag-page .walk-bar {
+  order: -1;
+  border-top: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.ag-page .walk-bar__status {
+  min-width: 0;
+  white-space: normal;
+}
+
+.ag-page .walk-bar .btn {
+  white-space: nowrap;
+}
+
+.ag-timeline {
+  padding-block: 16px;
+}
+
+/* --- Slot ruler ---------------------------------------------------------- */
+
+.ag-ruler {
+  position: relative;
+  padding-top: 40px;
+}
+
+.ag-markers {
+  position: absolute;
+  inset: 0 0 18px var(--ag-label-w);
+  pointer-events: none;
+}
+
+.ag-marker,
+.ag-slotmark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  transition: left 0.45s ease;
+}
+
+.ag-marker {
+  border-left: 1px solid var(--text);
+}
+
+.ag-marker--fin {
+  top: 18px;
+  border-left-color: var(--ag-finalized);
+  border-left-style: dashed;
+}
+
+.ag-marker__label {
+  position: absolute;
+  top: 0;
+  left: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 14px;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.ag-marker__label.is-right {
+  right: 4px;
+  left: auto;
+}
+
+.ag-marker--fin .ag-marker__label {
+  color: var(--text-2);
+}
+
+.ag-slotmark {
+  top: 36px;
+  border-left: 1px dotted var(--line-strong);
+}
+
+.ag-slotmark__label {
+  position: absolute;
+  bottom: -16px;
+  left: 0;
+  transform: translateX(-50%);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.ag-bands {
+  display: grid;
+  gap: 6px;
+}
+
+.ag-band {
+  display: grid;
+  grid-template-columns: var(--ag-label-w) 1fr;
+  align-items: center;
+}
+
+.ag-band__label {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.ag-band__track {
+  position: relative;
+  height: 10px;
+  background: var(--surface-2);
+}
+
+.ag-band__fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  transition: left 0.45s ease, width 0.45s ease;
+}
+
+.ag-band__fill--head {
+  background: var(--ag-head);
+}
+
+.ag-band__fill--clickhouse {
+  background: var(--ag-clickhouse);
+}
+
+.ag-band__fill--disk {
+  background: var(--ag-disk);
+}
+
+.ag-ticks {
+  position: relative;
+  height: 18px;
+  margin-left: var(--ag-label-w);
+}
+
+.ag-tick {
+  position: absolute;
+  top: 4px;
+  transform: translateX(-50%);
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* --- Lanes --------------------------------------------------------------- */
+
+.ag-lanes {
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.ag-lane {
+  display: grid;
+  gap: 6px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.ag-lane p {
+  margin: 0;
+}
+
+.ag-lane__label {
+  justify-self: start;
+  padding: 2px 0;
+  border: 0;
+  border-bottom: 1px dotted var(--line-strong);
+  background: none;
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.ag-lane__label:hover,
+.ag-lane__label[aria-pressed='true'] {
+  border-bottom-color: currentColor;
+  color: var(--text);
+}
+
+.ag-lane__label:focus-visible {
+  outline: 1px solid var(--text);
+  outline-offset: 2px;
+}
+
+.ag-lane.is-selected {
+  background: linear-gradient(90deg, rgba(153, 69, 255, 0.08), transparent 60%);
+}
+
+.ag-muted,
+.ag-meta {
+  color: var(--text-3);
+}
+
+.ag-meta {
+  margin-top: 6px !important;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.ag-msgs,
+.ag-banks,
+.ag-stores {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ag-msg {
+  padding: 2px 6px;
+  border: 1px solid var(--line-strong);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* A bank: slot, bank ID, then state and token. The border carries the token
+   colour; the state (held, discarded, …) changes the line style or fades it. */
+.ag-bank {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--line-strong);
+  font-family: var(--mono);
+  font-size: 12px;
+  transition: opacity 0.3s ease, border-color 0.3s ease;
+}
+
+.ag-bank__slot {
+  font-weight: 700;
+}
+
+.ag-bank__state {
+  color: var(--text-2);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.ag-token--processed {
+  border-color: var(--ag-processed);
+}
+
+.ag-token--confirmed {
+  border-color: var(--ag-confirmed);
+}
+
+.ag-token--finalized {
+  border-color: var(--ag-finalized);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.ag-bank--visible {
+  box-shadow: inset 3px 0 0 var(--ag-head);
+}
+
+.ag-bank--held,
+.ag-bank--staged {
+  border-style: dashed;
+}
+
+.ag-bank--discarded {
+  border-color: var(--ag-discarded);
+  opacity: 0.7;
+}
+
+.ag-bank--discarded .ag-bank__name {
+  text-decoration: line-through;
+}
+
+.ag-bank--evicted,
+.ag-bank--cleared {
+  opacity: 0.45;
+}
+
+.ag-store {
+  padding: 4px 8px;
+  border: 1px dashed var(--line-strong);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.ag-store--done {
+  border-style: solid;
+  color: var(--text);
+}
+
+.ag-store--clickhouse {
+  box-shadow: inset 3px 0 0 var(--ag-clickhouse);
+}
+
+.ag-store--disk {
+  box-shadow: inset 3px 0 0 var(--ag-disk);
+}
+
+.ag-store--pending {
+  border-color: var(--amber);
+}
+
+.ag-store--never {
+  color: var(--text-3);
+  text-decoration: line-through;
+}
+
+.ag-probe__ask {
+  font-size: 12px;
+}
+
+.ag-probe__result {
+  margin-top: 4px !important;
+  padding-left: 10px;
+  border-left: 3px solid var(--line-strong);
+}
+
+.ag-probe__result--head {
+  border-left-color: var(--ag-head);
+}
+
+.ag-probe__result--disk {
+  border-left-color: var(--ag-disk);
+}
+
+.ag-probe__result--clickhouse {
+  border-left-color: var(--ag-clickhouse);
+}
+
+.ag-probe__tier {
+  font-weight: 600;
+}
+
+.ag-lane code,
+.ag-steps code {
+  padding: 1px 4px;
+  background: var(--code-bg);
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+.ag-lead {
+  color: var(--text);
+}
+
+.ag-note {
+  padding-left: 10px;
+  border-left: 2px solid var(--amber);
+  color: var(--text-2);
+}
+
+.ag-sources a {
+  overflow-wrap: anywhere;
+}
+
+/* --- Legend -------------------------------------------------------------- */
+
+.ag-swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--line-strong);
+}
+
+.ag-swatch--processed {
+  border-color: var(--ag-processed);
+}
+
+.ag-swatch--confirmed {
+  border-color: var(--ag-confirmed);
+}
+
+.ag-swatch--finalized {
+  border-color: var(--ag-finalized);
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.ag-swatch--held {
+  border-style: dashed;
+  border-color: var(--text-2);
+}
+
+.ag-swatch--discarded {
+  border-color: var(--ag-discarded);
+}
+
+/* --- Step list (summary band) --------------------------------------------- */
+
+.ag-steps {
+  display: grid;
+  gap: 0;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: ag-step;
+  border-top: 1px solid var(--line);
+}
+
+.ag-steps > li {
+  counter-increment: ag-step;
+  border-bottom: 1px solid var(--line);
+}
+
+.ag-steps__jump {
+  display: grid;
+  grid-template-columns: 2.5ch 1fr;
+  gap: 2px 12px;
+  width: 100%;
+  padding: 12px 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ag-steps__jump::before {
+  content: counter(ag-step, decimal-leading-zero);
+  grid-row: span 2;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.9;
+}
+
+.ag-steps__title {
+  font-weight: 600;
+}
+
+.ag-steps__text {
+  color: var(--text-2);
+}
+
+.ag-steps__jump:hover .ag-steps__title {
+  text-decoration: underline;
+}
+
+.ag-steps__jump:focus-visible {
+  outline: 1px solid var(--text);
+  outline-offset: 2px;
+}
+
+.ag-steps__item[aria-current='step'] {
+  box-shadow: inset 2px 0 0 var(--purple);
+}
+
+.ag-steps__item[aria-current='step'] .ag-steps__jump {
+  padding-left: 10px;
+}
+
+/* noscript fallback list */
+.ag-steps > li:not(.ag-steps__item) {
+  padding: 10px 0;
+  color: var(--text-2);
+}
+
+/* --- Wider screens ------------------------------------------------------- */
+
+@media (min-width: 700px) {
+  .ag-page {
+    --ag-label-w: 168px;
+  }
+
+  .ag-lane {
+    grid-template-columns: var(--ag-label-w) 1fr;
+    align-items: start;
+  }
+}
+
+@media (min-width: 900px) {
+  /* One toolbar row: steps on the left, actions on the right, timeline below. */
+  .ag-page .stage__view {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding-top: 12px;
+    transition: padding-right 0.15s ease;
+  }
+
+  .ag-page .scene-actions,
+  .ag-page .walk-bar {
+    position: static;
+    border: 0;
+  }
+
+  .ag-page .scene-actions {
+    order: -1;
+    margin-left: auto;
+  }
+
+  .ag-page .walk-bar {
+    order: -2;
+    justify-content: flex-start;
+    pointer-events: auto;
+  }
+
+  .ag-timeline {
+    flex: 1 1 100%;
+    padding-block: 8px 16px;
+  }
+
+  /* The drawer overlays the stage; keep the toolbar and timeline beside it. */
+  .ag-page .stage.is-drawer-open .stage__view {
+    padding-right: calc(var(--drawer-w) + 24px);
+  }
+}

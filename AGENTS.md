@@ -4,7 +4,7 @@
 - Rust workspace (root `Cargo.toml`): `superbank-workspace`, `crates/superbank/` (ingestor), `crates/superbank-rpc/` (JSON-RPC server; bin: `superbank-rpc`), `crates/superbank-solparq/` (ClickHouse-to-Parquet archiver; `superbank-solparq` and `superbank-solparq-read` binaries), and `crates/superbank-verify/` (Proof-of-History validator).
 - ClickHouse DDL: `ddl/`
 - Load tests: `tests/k6/`
-- GitHub Pages site: `site/` (static, no build step): the architecture explorer (`index.html`, Three.js from a CDN) and the configuration reference (`config.html`, data in `site/js/config-data/`); their `node:test` checks live in `tests/site/`
+- GitHub Pages site: `site/` (static, no build step): the architecture explorer (`index.html`, Three.js from a CDN) the configuration reference (`config.html`, data in `site/js/config-data/`) and the Alpenglow block lifecycle (`alpenglow.html`, whose code numbers `tests/site/alpenglow-model.test.mjs` re-reads from the Rust source); their `node:test` checks live in `tests/site/`
 - Helper scripts: `scripts/`
 - Deploy manifests/images: `deploy/`
 - Tilt local k8s dev: `Tiltfile`, `scripts/dev/setup-tilt.sh`

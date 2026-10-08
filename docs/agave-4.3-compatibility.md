@@ -2,6 +2,8 @@
 
 The main ingestor and RPC server build on the Agave **4.4.0-beta.0** crates with Rust **1.98.1**. The behavior reference is the tagged [Agave v4.3.0 source](https://github.com/anza-xyz/agave/tree/v4.3.0), not whichever version happens to serve a public endpoint. This is compatibility for Superbank's existing methods, not an implementation of every validator RPC.
 
+For a step-by-step view of one block's banks, commitment and arrival in the head cache, ClickHouse and the disk cache under Alpenglow and Tower BFT, see the [Alpenglow block lifecycle](https://solana-rpc.github.io/superbank/alpenglow.html).
+
 ## Behavior changes
 
 | Contract | Superbank behavior |
