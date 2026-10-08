@@ -785,7 +785,7 @@ function solparq(state) {
     title: 'superbank-solparq',
     subtitle: 'crates/superbank-solparq · archiver',
     body: [
-      'Archives ClickHouse tables into Parquet bundles: hourly (9,000 slots), epoch (432,000, aligned) or custom (`--custom-slot-range`, default 1,000), with `transactions` and `blocks_metadata` required and the other tables included when present.',
+      'Archives ClickHouse tables into Parquet bundles: hourly (one nominal hour of slots set by `--hourly-slot-duration-ms`: 9,000 at the 400 ms default, 18,000 at 200 ms), epoch (432,000, aligned) or custom (`--custom-slot-range`, default 1,000), with `transactions` and `blocks_metadata` required and the other tables included when present.',
       'Before archiving it checks the range against Solana RPC `getBlocks` and each slot’s `executed_transaction_count` in `blocks_metadata`, and a range with missing blocks or mismatches is skipped unless you pass `--force-archive`.',
       s3
         ? 'In S3 mode solparq sends the `INSERT INTO FUNCTION s3(…)` query and ClickHouse uploads each table\'s Parquet itself, so the bytes never pass through solparq; solparq writes only the bundle\'s small files (`manifest.json`, `report.json`, `.done`, and `SHA256SUMS.txt` with `--archive-s3-write-checksums`).'

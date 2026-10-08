@@ -561,7 +561,7 @@ function describe(state) {
   if (state.archive !== 'off' || state.source === 'solparq') {
     const archive = [];
     if (state.archive === 'local') {
-      archive.push('`superbank-solparq` streams `SELECT … FORMAT Parquet` from ClickHouse and writes bundle directories to local disk, named `{kind}_{epoch}_{start}-{end}` (hourly = 9,000 slots, epoch = 432,000).');
+      archive.push('`superbank-solparq` streams `SELECT … FORMAT Parquet` from ClickHouse and writes bundle directories to local disk, named `{kind}_{epoch}_{start}-{end}` (hourly = one nominal hour, 9,000 slots at the default `--hourly-slot-duration-ms 400`; epoch = 432,000).');
     } else if (state.archive === 's3') {
       archive.push('`superbank-solparq` sends ClickHouse an `INSERT INTO FUNCTION s3(…)` query per table, and ClickHouse uploads the Parquet straight to S3; the bytes never pass through solparq. solparq then writes the bundle\'s `manifest.json`, `report.json` and `.done` marker itself (plus `SHA256SUMS.txt` with `--archive-s3-write-checksums`). Bundles are named `{kind}_{epoch}_{start}-{end}`.');
     }
