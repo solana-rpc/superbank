@@ -77,7 +77,7 @@ const activeLine = (active, activeText) => (active ? activeText : 'It is not the
 
 function solana(state) {
   const inUse = buildTopology(state)
-    .nodes.filter((n) => n.kind === 'endpoint' && !n.dimmed)
+    .nodes.filter((n) => n.kind === 'endpoint')
     .map((n) => n.label);
   return {
     title: 'Solana network',

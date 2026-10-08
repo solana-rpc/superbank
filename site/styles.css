@@ -1012,15 +1012,6 @@ details[open] > .controls__summary::after {
   outline-offset: 2px;
 }
 
-.node-label.is-dimmed {
-  opacity: 0.45;
-}
-
-.node-label.is-dimmed:hover,
-.node-label.is-dimmed:focus-visible {
-  opacity: 0.85;
-}
-
 .node-label.is-selected {
   border-color: var(--purple);
   box-shadow: 0 0 0 2px var(--ring);

@@ -10,11 +10,6 @@ import { normalizeState } from './state.js';
 // (u, v) onto the isometric ground plane.
 const POS = {
   solana: [-15, 0],
-  'src-dragonsmouth': [-11, -4.4],
-  'src-fumarole': [-11, -2.2],
-  'src-jsonrpc': [-11, 0],
-  'src-bigtable': [-11, 2.2],
-  'src-oldfaithful': [-11, 4.4],
   ingest: [-6.5, 0],
   't-transactions': [-1.5, -2],
   't-blocks_metadata': [-1.5, 0],
@@ -36,7 +31,8 @@ const POS = {
 };
 
 const ZONES = {
-  upstream: { label: 'Upstream', rect: [-17, -5.6, -9.4, 5.6] },
+  // Upstream and Archive are refitted to the nodes drawn in them (zoneRect).
+  upstream: { label: 'Upstream', rect: [-17, -2, -9.4, 2] },
   ingest: { label: 'Ingest', rect: [-8.4, -1.8, -4.6, 1.8] },
   clickhouse: { label: 'ClickHouse', rect: [-3.2, -4.4, 7.2, 4.4] },
   serve: { label: 'Serve', rect: [8.2, -4.4, 17.6, 4] },
@@ -85,6 +81,10 @@ const INGEST_LIFECYCLE = {
   jetstreamer: 'per-epoch job',
 };
 
+// Upstream column, top to bottom. Only endpoints in use are drawn, stacked
+// around v = 0 so the active source sits level with the ingest node.
+const ENDPOINT_U = -11;
+const ENDPOINT_SPACING = 2.2;
 const ENDPOINTS = [
   ['src-dragonsmouth', 'grpc', 'Yellowstone gRPC', 'DragonsMouth'],
   ['src-fumarole', 'fumarole', 'Yellowstone Fumarole', 'consumer group'],
@@ -93,7 +93,7 @@ const ENDPOINTS = [
   ['src-oldfaithful', 'oldfaithful', 'Old Faithful', 'epoch CAR archives'],
 ];
 
-function makeNode(id, kind, label, extra = {}) {
+function makeNode(id, kind, label, { pos = POS[id], ...extra } = {}) {
   return {
     id,
     kind,
@@ -101,9 +101,8 @@ function makeNode(id, kind, label, extra = {}) {
     sublabel: '',
     variant: null,
     // Copied so a renderer mutating node.pos can't corrupt later builds.
-    pos: [...POS[id]],
+    pos: [...pos],
     zone: null,
-    dimmed: false,
     status: null,
     buffer: null,
     shards: 1,
@@ -157,7 +156,7 @@ export function buildTopology(input) {
   const storeLocation = state.archive === 's3' ? 's3' : 'local';
 
   // --- Upstream -----------------------------------------------------------
-  // Endpoints stay on screen (dimmed) so the source column reads as a menu.
+  // Only components involved in the selected configuration are drawn.
   const usedEndpoints = new Set();
   if (state.source !== 'solparq') usedEndpoints.add(SOURCE_ENDPOINT[state.source]);
   // Head cache opens its own DragonsMouth subscription inside superbank-rpc
@@ -167,10 +166,12 @@ export function buildTopology(input) {
   // (crates/superbank-solparq/src/clickhouse.rs).
   if (archiveOn) usedEndpoints.add('src-jsonrpc');
 
-  const solana = addNode('solana', 'network', 'Solana', { sublabel: 'validators', zone: 'upstream' });
-  for (const [id, variant, label, sublabel] of ENDPOINTS) {
-    addNode(id, 'endpoint', label, { variant, sublabel, zone: 'upstream', dimmed: !usedEndpoints.has(id) });
-  }
+  if (usedEndpoints.size > 0) addNode('solana', 'network', 'Solana', { sublabel: 'validators', zone: 'upstream' });
+  const endpoints = ENDPOINTS.filter(([id]) => usedEndpoints.has(id));
+  endpoints.forEach(([id, variant, label, sublabel], i) => {
+    const v = (i - (endpoints.length - 1) / 2) * ENDPOINT_SPACING;
+    addNode(id, 'endpoint', label, { variant, sublabel, zone: 'upstream', pos: [ENDPOINT_U, v] });
+  });
   // Solana feeds every endpoint in use. Live endpoints carry a block stream;
   // historical ones (JSON-RPC history, Bigtable, Old Faithful) are pulled in
   // bursts by the ingest job instead.
@@ -185,7 +186,6 @@ export function buildTopology(input) {
       label: live ? 'live blocks' : id === 'src-oldfaithful' ? 'ledger archived per epoch' : 'ledger history',
     });
   }
-  solana.dimmed = usedEndpoints.size === 0;
 
   // --- Ingest -------------------------------------------------------------
   const ingest = addNode('ingest', 'process', jetstreamer ? 'jetstreamer-clickhouse' : 'superbank', {
@@ -231,6 +231,8 @@ export function buildTopology(input) {
 
   // --- ClickHouse ---------------------------------------------------------
   for (const table of [...BASE_TABLES, ...DERIVED_TABLES]) {
+    // Nothing writes entries for rpc/bigtable, so the table is left out.
+    if (table === 'entries' && !(writesEntries || restoring)) continue;
     const derived = DERIVED_TABLES.includes(table);
     const optional = OPTIONAL_TABLES.includes(table);
     addNode(`t-${table}`, 'table', table, {
@@ -388,7 +390,7 @@ export function buildTopology(input) {
   const zoneIds = new Set(nodes.map((n) => n.zone).filter(Boolean));
   const zones = Object.entries(ZONES)
     .filter(([id]) => zoneIds.has(id))
-    .map(([id, zone]) => ({ id, ...zone }));
+    .map(([id, zone]) => ({ id, ...zone, rect: zoneRect(id, nodes) }));
 
   return {
     state,
@@ -408,6 +410,23 @@ export function buildTopology(input) {
     },
     summary: describe(state),
   };
+}
+
+// Slabs whose membership varies hug the nodes drawn on them: Upstream along
+// its endpoint column (v), Archive along store -> archiver (u). Margins keep
+// each node's footprint on the slab.
+function zoneRect(id, nodes) {
+  const [u0, v0, u1, v1] = ZONES[id].rect;
+  const pos = nodes.filter((n) => n.zone === id).map((n) => n.pos);
+  if (id === 'upstream') {
+    const vs = pos.map((p) => p[1]);
+    return [u0, Math.min(...vs) - 2, u1, Math.max(...vs) + 2];
+  }
+  if (id === 'archive') {
+    const us = pos.map((p) => p[0]);
+    return [Math.min(...us) - 1.7, v0, Math.max(...us) + 2, v1];
+  }
+  return [u0, v0, u1, v1];
 }
 
 // Ordered, plain-text description of the data path for the given state. Used

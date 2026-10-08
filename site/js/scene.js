@@ -65,7 +65,6 @@ const THEMES = {
     edgeNeutral: '#94A3B8',
     edgeMix: 0.55,
     shadow: 0.18,
-    dim: '#CBD2DE',
     metal: '#C3CAD6',
     dark: '#334155',
     shell: '#3A4459',
@@ -82,7 +81,6 @@ const THEMES = {
     edgeNeutral: '#64748B',
     edgeMix: 0.65,
     shadow: 0.45,
-    dim: '#3A4258',
     metal: '#9AA4B5',
     dark: '#273046',
     shell: '#323C55',
@@ -354,7 +352,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   let baseHalfH = 10;
 
   // --- Materials -----------------------------------------------------------
-  // Node materials are per node (fade, dimming and hover differ per node);
+  // Node materials are per node (fade and hover differ per node);
   // geometries are shared through the cache.
   function makeBuilder(group, mats) {
     const mk = (color, opts = {}) => {
@@ -803,7 +801,6 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     view.sub.textContent = node.sublabel || '';
     view.sub.hidden = !node.sublabel;
     const cls = view.button.classList;
-    cls.toggle('is-dimmed', Boolean(node.dimmed));
     cls.toggle('is-optional', Boolean(node.optional));
     cls.toggle('is-selected', selectedId === node.id);
     for (const s of ['ok', 'warn', 'info']) cls.toggle(`status-${s}`, node.status === s);
@@ -824,21 +821,15 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     applyNodeLook(view);
   }
 
-  const dimColor = new THREE.Color();
   function applyNodeLook(view) {
-    const dimmed = Boolean(view.data.dimmed);
-    const hover = hoverNodeId === view.id && !dimmed;
+    const hover = hoverNodeId === view.id;
     const fade = easeOut(view.appear);
-    dimColor.set(theme.dim);
     for (const m of view.mats) {
       const { base, baseOpacity } = m.userData;
       m.color.copy(base);
-      if (dimmed && !m.userData.isShadow) m.color.lerp(dimColor, 0.72);
-      const opacity = baseOpacity * fade * (dimmed ? (m.userData.isShadow ? 0.5 : 0.42) : 1);
-      setOpacity(m, opacity);
+      setOpacity(m, baseOpacity * fade);
       if (m.emissive) {
         m.emissive.copy(m.userData.baseEmissive);
-        if (dimmed) m.emissive.multiplyScalar(0.2);
         if (hover) m.emissive.lerp(base, 0.35);
       }
     }
@@ -873,13 +864,8 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
 
   // --- Zones ---------------------------------------------------------------
   function createZoneView(zone) {
-    const [u0, v0, u1, v1] = zone.rect;
-    const w = u1 - u0;
-    const d = v1 - v0;
-    const g = geo(`zone:${w.toFixed(2)}:${d.toFixed(2)}`, () => new RoundedBoxGeometry(w, ZONE_H, d, 3, 0.12));
     const mat = new THREE.MeshStandardMaterial({ roughness: 0.92, metalness: 0, transparent: true, opacity: 0 });
-    const mesh = new THREE.Mesh(g, mat);
-    mesh.position.set((u0 + u1) / 2, -ZONE_H / 2, (v0 + v1) / 2);
+    const mesh = new THREE.Mesh(undefined, mat);
     mesh.renderOrder = -2;
     layout.add(mesh);
     const el = document.createElement('div');
@@ -903,8 +889,15 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     else view.label.position.set(u0 + 0.2, 0, v0);
   }
 
+  // A zone's rect can change between updates (the Upstream slab hugs the
+  // endpoints in use). Geometries are cached by size, so this never leaks.
   function applyZoneData(view, zone) {
     view.data = zone;
+    const [u0, v0, u1, v1] = zone.rect;
+    const w = u1 - u0;
+    const d = v1 - v0;
+    view.mesh.geometry = geo(`zone:${w.toFixed(2)}:${d.toFixed(2)}`, () => new RoundedBoxGeometry(w, ZONE_H, d, 3, 0.12));
+    view.mesh.position.set((u0 + u1) / 2, -ZONE_H / 2, (v0 + v1) / 2);
     placeZoneLabel(view);
     view.el.textContent = zone.label;
     applyZoneLook(view);
@@ -1152,6 +1145,9 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
         if (view.key !== edgeGeoKey(data, from, to) || view.data.style !== data.style) {
           view.data = data;
           buildEdgeGeometry(view, from, to);
+          // The tube is built at the endpoints' final positions; fade it back
+          // in while a node slides there so it never points at empty space.
+          if (!reducedMotion && (from.posT < 1 || to.posT < 1)) view.appear = 0;
         }
         applyEdgeData(view, data);
       }
@@ -1591,7 +1587,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
   function labelPriority(view) {
     if (view.id === selectedId) return -2;
     if (revealsOnHover(view)) return -1;
-    return (view.data.dimmed ? 10 : 0) + (LABEL_PRIORITY[view.data.kind] ?? 5);
+    return LABEL_PRIORITY[view.data.kind] ?? 5;
   }
 
   const overlaps = (a, b) => a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];

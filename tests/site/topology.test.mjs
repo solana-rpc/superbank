@@ -71,6 +71,13 @@ test('every edge connects two existing, distinct nodes', () => {
   });
 });
 
+test('every drawn component is involved: each node has at least one edge', () => {
+  // Components that take no part in the selected configuration are removed.
+  forEachModel((m) => {
+    for (const n of m.topo.nodes) ok(m, m.touching(n.id).length > 0, `node ${n.id} is drawn but not connected`);
+  });
+});
+
 test('zones are well formed and every node sits inside its zone', () => {
   forEachModel((m) => {
     const zones = new Map();
@@ -115,7 +122,8 @@ test('node fields follow the contract', () => {
       ok(m, VARIANTS[n.kind].includes(n.variant), `${at}: variant ${n.variant} invalid for kind ${n.kind}`);
       ok(m, isText(n.label), `${at}: label`);
       ok(m, typeof n.sublabel === 'string', `${at}: sublabel must be a string`);
-      ok(m, typeof n.dimmed === 'boolean', `${at}: dimmed`);
+      // Unused components are removed, never drawn dimmed.
+      ok(m, !Object.hasOwn(n, 'dimmed'), `${at}: no dimmed flag`);
       ok(m, typeof n.optional === 'boolean', `${at}: optional`);
       ok(m, [null, 'ok', 'warn', 'info'].includes(n.status), `${at}: status`);
       ok(m, n.shards === 1 || n.shards === 3, `${at}: shards`);
@@ -296,17 +304,19 @@ test('rule: entries edge exists only for sources that write PoH entries', () => 
     } else if (carriesEntries) {
       eq(m, into.map((e) => e.id), ['ingest->t-entries'], 'entries source: only the ingest edge feeds t-entries');
     } else {
-      eq(m, into, [], 'rpc/bigtable: nothing may feed t-entries');
+      ok(m, !m.node('t-entries'), 'rpc/bigtable: nothing writes entries, so the table is not drawn');
     }
   });
 });
 
-test('rule: every base table is written, MVs hang off transactions, optional tables are flagged', () => {
+test('rule: every drawn base table is written, MVs hang off transactions, optional tables are flagged', () => {
   // gsfa/signatures/gsfa_hot/token_owner_activity are materialized views on transactions (ddl/*).
-  const base = ['t-transactions', 't-blocks_metadata', 't-entries'];
   const derived = ['t-gsfa', 't-signatures', 't-gsfa_hot', 't-token_owner_activity'];
   forEachModel((m) => {
+    const base = ['t-transactions', 't-blocks_metadata'];
+    if (m.node('t-entries')) base.push('t-entries');
     eq(m, m.topo.nodes.filter((n) => n.kind === 'table').map((n) => n.id).sort(), [...base, ...derived].sort(), 'table node set');
+    for (const id of base) ok(m, m.into(id).length > 0, `${id}: a drawn base table must be written`);
     for (const id of base) eq(m, m.node(id).variant, 'base', `${id} is a base table`);
     for (const id of derived) {
       eq(m, m.node(id).variant, 'view', `${id} is a materialized view`);
@@ -324,8 +334,7 @@ test('rule: Yellowstone DragonsMouth is in use iff source=grpc or the head cache
   forEachModel((m) => {
     const { source, head } = m.state;
     const dm = m.node('src-dragonsmouth');
-    ok(m, dm, 'src-dragonsmouth node is always drawn');
-    eq(m, dm.dimmed, !(source === 'grpc' || head), 'src-dragonsmouth dimmed state');
+    eq(m, Boolean(dm), source === 'grpc' || head, 'src-dragonsmouth drawn iff in use');
     eq(m, Boolean(m.edge('src-dragonsmouth->ingest')), source === 'grpc', 'ingest subscription iff source=grpc');
     eq(m, Boolean(m.edge('src-dragonsmouth->head-cache')), head, 'head-cache subscription iff head');
     if (source === 'grpc' && head) {
@@ -340,7 +349,7 @@ test('rule: each source lights exactly its own upstream endpoint', () => {
     const { source, head, archive } = m.state;
     if (source !== 'solparq') ok(m, m.edge(`${endpointOf[source]}->ingest`), `${source}: ${endpointOf[source]}->ingest`);
     else ok(m, !m.topo.edges.some((e) => e.from.startsWith('src-') && e.to === 'ingest'), 'solparq: no upstream endpoint feeds ingest');
-    // A dimmed endpoint is a menu entry: it must have no edges at all.
+    // Only endpoints in use are drawn.
     const lit = {
       'src-dragonsmouth': source === 'grpc' || head,
       'src-fumarole': source === 'fumarole',
@@ -350,11 +359,10 @@ test('rule: each source lights exactly its own upstream endpoint', () => {
       'src-oldfaithful': source === 'jetstreamer',
     };
     for (const [id, expected] of Object.entries(lit)) {
-      eq(m, m.node(id).dimmed, !expected, `${id}: dimmed`);
+      eq(m, Boolean(m.node(id)), expected, `${id}: drawn iff in use`);
       eq(m, Boolean(m.edge(`solana->${id}`)), expected, `${id}: solana feed edge iff in use`);
-      if (!expected) eq(m, m.touching(id), [], `${id}: dimmed endpoint must have no edges`);
     }
-    eq(m, m.node('solana').dimmed, !Object.values(lit).some(Boolean), 'solana dimmed only when nothing is in use');
+    eq(m, Boolean(m.node('solana')), Object.values(lit).some(Boolean), 'solana drawn iff an endpoint is in use');
   });
 });
 
@@ -423,7 +431,7 @@ test('rule: archive mode decides who moves the Parquet bytes', () => {
     if (archive !== 'off') {
       // solparq validates each range against Solana JSON-RPC getBlocks.
       eq(m, m.edge('solparq->src-jsonrpc')?.style, 'control', 'archive on: control edge to src-jsonrpc');
-      eq(m, m.node('src-jsonrpc').dimmed, false, 'archive on: src-jsonrpc must be lit');
+      ok(m, m.node('src-jsonrpc'), 'archive on: src-jsonrpc is drawn');
     }
   });
 });
