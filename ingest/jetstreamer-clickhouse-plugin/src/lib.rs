@@ -1485,6 +1485,9 @@ impl BlocksMetadataRow {
                 slot,
                 blockhash,
                 rewards,
+                // Not read yet: the commission era still comes from the
+                // operator's SIMD-0291 settings (see block_reward_commission).
+                commission_rate_in_basis_points: _,
                 block_time,
                 block_height,
                 executed_transaction_count,

@@ -3749,7 +3749,7 @@ name = "jetstreamer-firehose"
 version = "0.7.0"
 dependencies = [
  "ahash 0.8.12",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bincode",
  "cid",
  "crc",
