@@ -146,6 +146,16 @@
   transition: left 0.45s ease, width 0.45s ease;
 }
 
+.ag-band__break {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  z-index: 1;
+  width: 3px;
+  margin-left: -1px;
+  background: var(--bg);
+}
+
 .ag-band__fill--head {
   background: var(--ag-head);
 }
@@ -172,6 +182,11 @@
   font-family: var(--mono);
   font-size: 10px;
   white-space: nowrap;
+  transition: left 0.45s ease;
+}
+
+.ag-tick--break {
+  top: 1px;
 }
 
 /* --- Lanes --------------------------------------------------------------- */

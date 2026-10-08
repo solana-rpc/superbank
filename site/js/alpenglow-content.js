@@ -6,7 +6,7 @@
 // textContent. Refs are repo-relative paths with no line numbers (they drift).
 
 import { normalizeState } from './alpenglow-state.js';
-import { CONSTANTS, LANES, SOURCES, STEP_IDS, UPSTREAM } from './alpenglow-model.js';
+import { CONSTANTS, LANES, PRODUCTION_RETAIN_EXAMPLE, SOURCES, STEP_IDS, UPSTREAM, retainSlots } from './alpenglow-model.js';
 
 export const REPO_BLOB = 'https://github.com/solana-rpc/superbank/blob/main/';
 
@@ -14,6 +14,7 @@ const REFS = {
   compat: 'docs/agave-4.3-compatibility.md',
   rpcReadme: 'crates/superbank-rpc/README.md',
   rpcConfig: 'crates/superbank-rpc/src/config.rs',
+  rpcServer: 'crates/superbank-rpc/src/server.rs',
   headBanks: 'crates/superbank-rpc/src/head_cache/banks.rs',
   headMod: 'crates/superbank-rpc/src/head_cache/mod.rs',
   headStream: 'crates/superbank-rpc/src/head_cache/dragonsmouth.rs',
@@ -101,18 +102,21 @@ const LANE = {
     body: [
       'Banks are buffered per `(slot, bank_id)` and sealed only when complete. A frozen bank is published once its commitment token reaches `HEAD_CACHE_MIN_COMMITMENT`, and that gate applies to concurrent `processed` readers too.',
       'A `processed` bank never replaces the bank already shown for its slot. A `confirmed` or `finalized` status names the winner: the head cache shows it, drops the losers and re-indexes signatures that first landed on an abandoned bank.',
-      `The window is the newest ${C('headRetainSlots')} slots it has published, counted from its newest published slot. With a minimum above \`processed\`, that is the newest \`confirmed\` or \`finalized\` slot, and buffered banks are kept ${C('pendingCommitmentSlots')} extra slots while they wait.`,
+      `The window is the newest \`HEAD_CACHE_RETAIN_SLOTS\` slots it has published, counted from its newest published slot. With a minimum above \`processed\`, that is the newest \`confirmed\` or \`finalized\` slot, and buffered banks are kept ${C('pendingCommitmentSlots')} extra slots while they wait.`,
+      `The code default of ${C('headRetainSlots')} slots is a development size. Production installations keep several hundred slots or more, sized to the RAM available to \`superbank-rpc\` (this page uses ${PRODUCTION_RETAIN_EXAMPLE} as an example). Features that combine the head and disk tiers need the window to reach down to the disk cache’s tip, and \`superbank-rpc\` warns at startup when it is below ${C('statusHistoryMinRetainSlots')}.`,
       s.era === 'alpenglow'
-        ? 'Under Alpenglow a slot is finalized soon after it freezes, so for most of the window the head cache holds finalized data, and a `confirmed` minimum behaves exactly like `finalized`.'
-        : `Under Tower BFT a slot is rooted about ${U('towerRootDepthSlots')} slots behind the tip, which is where it leaves a window counted from the processed tip. With the default minimum the head cache serves \`processed\` and \`confirmed\` reads, and \`finalized\` ones for at most a moment.`,
+        ? 'Under Alpenglow a slot is finalized soon after it freezes, so for almost the whole window the head cache holds finalized data, and a `confirmed` minimum behaves exactly like `finalized`.'
+        : retainSlots(s) <= U('towerRootDepthSlots')
+          ? `Under Tower BFT a slot is rooted about ${U('towerRootDepthSlots')} slots behind the tip, which is where it leaves a ${retainSlots(s)}-slot window counted from the processed tip. With the default minimum the head cache serves \`processed\` and \`confirmed\` reads, and \`finalized\` ones for at most a moment.`
+          : `Under Tower BFT a slot is rooted about ${U('towerRootDepthSlots')} slots behind the tip, well inside a ${retainSlots(s)}-slot window, so the head cache serves it at every commitment until it ages out.`,
       `A reconnect starts a new session that clears every slot, bank and proof (backoff ${C('backoffStartMs')} ms doubling to ${C('backoffMaxSecs')} s). The latest-slot tip is trusted only if it advanced within ${C('tipMaxAgeSecs')} s.`,
     ],
     config: [
       cfg('HEAD_CACHE_ENABLED', 'false', 'needs `--features grpc-head-cache`'),
-      cfg('HEAD_CACHE_RETAIN_SLOTS', String(C('headRetainSlots'))),
+      cfg('HEAD_CACHE_RETAIN_SLOTS', String(C('headRetainSlots')), `code default; this page: ${retainSlots(s)}`),
       cfg('HEAD_CACHE_MIN_COMMITMENT', 'processed', `this page: \`${s.min}\``),
     ],
-    refs: [REFS.headBanks, REFS.headMod, REFS.headCoverage, REFS.rpcConfig, REFS.rpcReadme],
+    refs: [REFS.headBanks, REFS.headMod, REFS.headCoverage, REFS.rpcConfig, REFS.rpcServer, REFS.rpcReadme],
     sources: [],
   }),
 
@@ -135,11 +139,14 @@ const LANE = {
     sources: s.era === 'alpenglow' ? ['simdFooter', 'simdMigration'] : ['simdMigration'],
   }),
 
-  disk: () => ({
+  disk: (s) => ({
     title: 'Disk cache',
     subtitle: 'A loopback ClickHouse holding recent finalized slots, copied from the source ClickHouse.',
     body: [
       `The filler copies finalized rows from the source ClickHouse, never from the head cache, and stays at least ${C('diskMinLagSlots')} slots behind the source’s finalized tip. A range counts as covered only after its transaction counts check out.`,
+      s.retain === 'default'
+        ? `With the ${C('headRetainSlots')}-slot default head window, the head cache drops a slot before the disk cache copies it, so ClickHouse answers in between.`
+        : 'With a production-sized head window the two tiers overlap: the head cache still holds a slot when the disk cache copies it and keeps answering first until the slot ages out, then the disk cache takes over.',
       'It mirrors the source table’s columns, footer columns included, so it can answer `getBlock` with `footer: true` once those columns exist in the source.',
       'It is a near cache, never a source of truth: misses, holes and errors fall through to the source ClickHouse.',
     ],
@@ -148,7 +155,7 @@ const LANE = {
       cfg('DISK_CACHE_REPAIR_MIN_LAG_SLOTS', String(C('diskMinLagSlots'))),
       cfg('DISK_CACHE_RETAIN_SLOTS', 'required', 'no default'),
     ],
-    refs: [REFS.diskFiller, REFS.rpcConfig, REFS.rpcReadme],
+    refs: [REFS.diskFiller, REFS.rpcConfig, REFS.rpcServer, REFS.rpcReadme],
     sources: [],
   }),
 
@@ -259,7 +266,7 @@ const STEP = {
   edge: () => ({
     body: [
       'Two things happen at about the same slot and their order is not fixed: the root arrives, and the slot passes the edge of a window counted from the processed (or confirmed) tip. If the root comes first, the head cache briefly serves the block as `finalized`.',
-      'The ingestor then needs up to the footer wait plus one flush to land the rows, so a read in this gap can find nothing. Raising `HEAD_CACHE_RETAIN_SLOTS` or the minimum moves the window, not the root.',
+      'The ingestor then needs up to the footer wait plus one flush to land the rows, so a read in this gap can find nothing. This race only exists at the development-sized default: a production window of several hundred slots keeps the slot long after its root.',
     ],
     refs: [REFS.headMod, REFS.ingestCli],
     sources: ['voteLockout', 'simdTowerFinality'],

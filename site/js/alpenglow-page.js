@@ -8,7 +8,7 @@
 // it to enumerated values.
 
 import { DEFAULT_STATE, ENUMS, normalizeState, parseHash, serializeHash } from './alpenglow-state.js';
-import { LANES, SOURCES, buildLifecycle } from './alpenglow-model.js';
+import { CONSTANTS, LANES, PRODUCTION_RETAIN_EXAMPLE, SOURCES, buildLifecycle } from './alpenglow-model.js';
 import { createTimeline } from './alpenglow-timeline.js';
 import { el, rich } from './dom.js';
 
@@ -25,6 +25,16 @@ const OPTIONS = {
     processed: ['Processed', 'superbank-rpc HEAD_CACHE_MIN_COMMITMENT=processed (default)'],
     confirmed: ['Confirmed', 'superbank-rpc HEAD_CACHE_MIN_COMMITMENT=confirmed'],
     finalized: ['Finalized', 'superbank-rpc HEAD_CACHE_MIN_COMMITMENT=finalized'],
+  },
+  retain: {
+    large: [
+      `Production (e.g. ${PRODUCTION_RETAIN_EXAMPLE})`,
+      'HEAD_CACHE_RETAIN_SLOTS sized to the RAM superbank-rpc has: production installs keep several hundred slots or more',
+    ],
+    default: [
+      `Default (${CONSTANTS.headRetainSlots.value})`,
+      `HEAD_CACHE_RETAIN_SLOTS=${CONSTANTS.headRetainSlots.value}, the code default, sized for development`,
+    ],
   },
   scenario: {
     clean: ['One bank', 'A single bank for slot N, start to finish'],
@@ -47,6 +57,7 @@ const OPTIONS = {
 const GROUPS = [
   { label: 'Consensus', enum: 'era' },
   { label: 'Head minimum', enum: 'min' },
+  { label: 'Head window', enum: 'retain' },
   { label: 'Scenario', enum: 'scenario' },
   { label: 'Probe', enum: 'method' },
   { label: 'At', enum: 'read' },
@@ -114,6 +125,7 @@ function describeConfig(s) {
   return [
     labelFor('era', s.era),
     `Head minimum: ${labelFor('min', s.min)}`,
+    `Head window: ${labelFor('retain', s.retain)}`,
     labelFor('scenario', s.scenario),
     `${labelFor('method', s.method)} @ ${labelFor('read', s.read)}`,
   ].join(' · ');

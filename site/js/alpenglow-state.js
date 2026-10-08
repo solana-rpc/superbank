@@ -6,6 +6,8 @@ export const ENUMS = Object.freeze({
   era: Object.freeze(['alpenglow', 'tower']),
   // HEAD_CACHE_MIN_COMMITMENT on superbank-rpc.
   min: Object.freeze(['processed', 'confirmed', 'finalized']),
+  // HEAD_CACHE_RETAIN_SLOTS: a production-sized window, or the code default (32).
+  retain: Object.freeze(['large', 'default']),
   scenario: Object.freeze(['clean', 'fork', 'retry', 'reconnect']),
   // The read probe: which JSON-RPC call, at which commitment.
   method: Object.freeze(['getTransaction', 'getBlock']),
@@ -15,6 +17,7 @@ export const ENUMS = Object.freeze({
 export const DEFAULT_STATE = Object.freeze({
   era: 'alpenglow',
   min: 'processed',
+  retain: 'large',
   scenario: 'clean',
   method: 'getTransaction',
   read: 'confirmed',
@@ -49,11 +52,12 @@ export function serializeHash(state) {
   return params.toString();
 }
 
-// Every valid state, for exhaustive tests (2*3*4*2*3 = 144 states).
+// Every valid state, for exhaustive tests (2*3*2*4*2*3 = 288 states).
 export function* allStates() {
   for (const era of ENUMS.era)
     for (const min of ENUMS.min)
-      for (const scenario of ENUMS.scenario)
-        for (const method of ENUMS.method)
-          for (const read of ENUMS.read) yield { era, min, scenario, method, read };
+      for (const retain of ENUMS.retain)
+        for (const scenario of ENUMS.scenario)
+          for (const method of ENUMS.method)
+            for (const read of ENUMS.read) yield { era, min, retain, scenario, method, read };
 }

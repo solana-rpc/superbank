@@ -120,8 +120,8 @@
             <li>The bank freezes and passes the completeness check; at <code>processed</code> it is published to the head cache.</li>
             <li>Votor roots the block once it has a finalization certificate; Yellowstone reports <code>confirmed</code> and <code>finalized</code> together.</li>
             <li>The ingestor's own finalized subscription writes it to ClickHouse, with the footer fields in <code>blocks_metadata</code>.</li>
-            <li>The head cache drops it once 32 newer slots are published; reads then come from ClickHouse.</li>
             <li>When the finalized tip is at least 75 slots past it, the disk cache copies it from ClickHouse.</li>
+            <li>The head cache keeps answering first until the slot leaves its window: several hundred slots or more in production (the code default of 32 is a development size). Reads then come from the disk cache.</li>
           </ol>
         </noscript>
       </div>

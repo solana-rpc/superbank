@@ -3,19 +3,25 @@
 // and is reachable by keyboard and screen readers. All text goes through
 // textContent (el/rich), never innerHTML.
 //
-// The ruler is linear in slots over a fixed range, so switching eras moves the
-// finalized-tip marker by the real ~32-slot difference. Elements persist across
-// updates so CSS can animate their positions.
+// The ruler is linear in slots up to N+112, so switching eras moves the
+// finalized-tip marker by the real ~32-slot difference; beyond that a
+// compressed segment reaches a production-sized head window. Elements persist
+// across updates so CSS can animate their positions.
 
 import { appendRich, el, rich } from './dom.js';
 import { CONSTANTS, LANES, answerRead, slotLabel } from './alpenglow-model.js';
 
-const DOMAIN = [-36, 112];
+const DOMAIN = [-36, 560];
+const BREAK = 112; // slots past N where the ruler starts compressing
+const BREAK_PCT = 76; // ...and how much of its width the linear part takes
 const DISK_LAG = CONSTANTS.diskMinLagSlots.value;
-const RETAIN = CONSTANTS.headRetainSlots.value;
 
 const clamp = (x) => Math.min(DOMAIN[1], Math.max(DOMAIN[0], x));
-const pct = (rel) => ((clamp(rel) - DOMAIN[0]) / (DOMAIN[1] - DOMAIN[0])) * 100;
+function pct(rel) {
+  const x = clamp(rel);
+  if (x <= BREAK) return ((x - DOMAIN[0]) / (BREAK - DOMAIN[0])) * BREAK_PCT;
+  return BREAK_PCT + ((x - BREAK) / (DOMAIN[1] - BREAK)) * (100 - BREAK_PCT);
+}
 
 const STATUS_TEXT = {
   staged: 'buffering',
@@ -33,7 +39,8 @@ export function createTimeline(host, { onLane } = {}) {
   // --- Ruler ---------------------------------------------------------------
   const band = (tier, label) => {
     const fill = el('span', { class: `ag-band__fill ag-band__fill--${tier}` });
-    const row = el('div', { class: 'ag-band' }, [el('span', { class: 'ag-band__label', text: label }), el('span', { class: 'ag-band__track' }, [fill])]);
+    const gap = el('span', { class: 'ag-band__break', style: `left:${BREAK_PCT}%` });
+    const row = el('div', { class: 'ag-band' }, [el('span', { class: 'ag-band__label', text: label }), el('span', { class: 'ag-band__track' }, [fill, gap])]);
     return { row, fill };
   };
   const bands = {
@@ -49,16 +56,17 @@ export function createTimeline(host, { onLane } = {}) {
   const tip = marker('tip');
   const fin = marker('fin');
   const slotMark = el('span', { class: 'ag-slotmark' }, [el('span', { class: 'ag-slotmark__label', text: 'N' })]);
-  const ticks = el(
-    'div',
-    { class: 'ag-ticks', 'aria-hidden': 'true' },
-    [
+  // The head-window tick follows the selected HEAD_CACHE_RETAIN_SLOTS.
+  const windowTick = el('span', { class: 'ag-tick' });
+  const ticks = el('div', { class: 'ag-ticks', 'aria-hidden': 'true' }, [
+    ...[
       [-32, 'N−32'],
-      [RETAIN, `N+${RETAIN}`],
+      [32, 'N+32'],
       [DISK_LAG, `N+${DISK_LAG}`],
-      [DISK_LAG + 32, `N+${DISK_LAG + 32}`],
     ].map(([rel, text]) => el('span', { class: 'ag-tick', style: `left:${pct(rel)}%`, text })),
-  );
+    el('span', { class: 'ag-tick ag-tick--break', style: `left:${BREAK_PCT}%`, text: '⋯' }),
+    windowTick,
+  ]);
   const markers = el('div', { class: 'ag-markers', 'aria-hidden': 'true' }, [slotMark, fin.node, tip.node]);
   const ruler = el('div', { class: 'ag-ruler', role: 'img' }, [
     markers,
@@ -121,6 +129,9 @@ export function createTimeline(host, { onLane } = {}) {
       // Flip the label to the left of its line near the right edge.
       m.label.classList.toggle('is-right', pct(rel) > 60);
     }
+    windowTick.hidden = frame.retain <= BREAK;
+    windowTick.style.left = `${pct(featured + frame.retain)}%`;
+    windowTick.textContent = slotLabel(featured + frame.retain);
     slotMark.style.left = `${pct(featured)}%`;
     slotMark.firstChild.textContent = slotLabel(featured);
     ruler.setAttribute(
@@ -142,7 +153,7 @@ export function createTimeline(host, { onLane } = {}) {
     const banks = frame.banks.length ? el('ul', { class: 'ag-banks' }, frame.banks.map(bankChip)) : muted('Nothing buffered yet.');
     const windowText = frame.headCleared
       ? `New session after a reconnect: only slots after ${slotLabel(w.lo - 1)}.`
-      : `Window ${slotLabel(w.lo)} … ${slotLabel(w.hi)} (newest ${RETAIN} published slots).`;
+      : `Window ${slotLabel(w.lo)} … ${slotLabel(w.hi)} (newest ${frame.retain} published slots).`;
     lanes.head.body.replaceChildren(banks, el('p', { class: 'ag-meta', text: windowText }));
 
     // Ingest

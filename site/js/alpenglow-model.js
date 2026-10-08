@@ -16,6 +16,7 @@ export const meets = (token, level) => token != null && RANK[token] >= RANK[leve
 
 export const CONSTANTS = Object.freeze({
   headRetainSlots: { value: 32, name: 'HEAD_CACHE_RETAIN_SLOTS', ref: 'crates/superbank-rpc/src/config.rs' },
+  statusHistoryMinRetainSlots: { value: 256, name: 'STATUS_HISTORY_MIN_HEAD_RETAIN_SLOTS', ref: 'crates/superbank-rpc/src/server.rs' },
   pendingCommitmentSlots: { value: 64, name: 'PENDING_COMMITMENT_SLOTS', ref: 'crates/superbank-rpc/src/head_cache/banks.rs' },
   tipMaxAgeSecs: { value: 1, name: 'TIP_MAX_AGE', ref: 'crates/superbank-rpc/src/head_cache/coverage.rs' },
   backoffStartMs: { value: 250, name: 'reconnect backoff (first)', ref: 'crates/superbank-rpc/src/head_cache/dragonsmouth.rs' },
@@ -100,7 +101,14 @@ export const LANES = Object.freeze([
   { id: 'probe', label: 'Read probe' },
 ]);
 
-const RETAIN = CONSTANTS.headRetainSlots.value;
+// The code default (32) is a development size. Production installs keep
+// several hundred slots or more, sized to the RAM superbank-rpc has; features
+// that join the head and disk tiers need the window to reach the disk cache's
+// tip (superbank-rpc warns below 256). Illustrative, not read from code.
+export const PRODUCTION_RETAIN_EXAMPLE = 512;
+
+export const retainSlots = (state) => (state.retain === 'default' ? CONSTANTS.headRetainSlots.value : PRODUCTION_RETAIN_EXAMPLE);
+
 const DISK_LAG = CONSTANTS.diskMinLagSlots.value;
 const ROOT_DEPTH = UPSTREAM.towerRootDepthSlots.value;
 
@@ -115,6 +123,7 @@ class World {
   constructor(state) {
     this.state = state;
     this.tower = state.era === 'tower';
+    this.retain = retainSlots(state);
     this.tip = 0;
     this.fin = this.tower ? -ROOT_DEPTH : -1;
     this.tipApprox = false;
@@ -206,7 +215,7 @@ class World {
 
   headWindow() {
     const hi = this.headHi();
-    let lo = hi - (RETAIN - 1);
+    let lo = hi - (this.retain - 1);
     if (this.dropTip != null) lo = Math.max(lo, this.dropTip + 1);
     return { lo, hi };
   }
@@ -248,6 +257,7 @@ class World {
         banks: this.banks,
         headWindow: this.headWindow(),
         headCleared: this.dropTip != null,
+        retain: this.retain,
         featured: this.featured,
         tx: this.tx,
         stored: this.stored,
@@ -397,30 +407,51 @@ function ingested(w, slots) {
   );
 }
 
-// `slot` leaves the window once the newest published slot reaches slot + RETAIN.
+// Where the tip and finalized tip stand when `slot` leaves the head window:
+// the newest published slot reaches slot + retain.
+function evictPosition(w, slot) {
+  const { min } = w.state;
+  const edge = slot + w.retain;
+  if (min === 'processed') return [edge, edge - (w.tower ? ROOT_DEPTH : 1), { finApprox: true }];
+  if (min === 'confirmed' && w.tower) return [edge + 1, edge + 1 - ROOT_DEPTH, { tipApprox: true, finApprox: true }];
+  return [edge + (w.tower ? ROOT_DEPTH : 1), edge, { tipApprox: true }];
+}
+
+// ...and when the disk cache copies it: the finalized tip is DISK_LAG past it.
+const diskPosition = (w, slot) => [DISK_LAG + slot + (w.tower ? ROOT_DEPTH : 1), DISK_LAG + slot, { tipApprox: true }];
+
 function evicted(w, slot) {
   const { min } = w.state;
-  const edge = slot + RETAIN;
-  if (min === 'processed') w.at(edge, edge - (w.tower ? ROOT_DEPTH : 1), { finApprox: true });
-  else if (min === 'confirmed' && w.tower) w.at(edge + 1, edge + 1 - ROOT_DEPTH, { tipApprox: true, finApprox: true });
-  else w.at(edge + (w.tower ? ROOT_DEPTH : 1), edge, { tipApprox: true });
+  w.at(...evictPosition(w, slot));
   const counted = min === 'processed' ? 'processed' : min === 'confirmed' && w.tower ? 'confirmed' : 'finalized';
+  const next = w.disk[slot] ? 'the disk cache' : 'ClickHouse';
   w.snap(
     'evicted',
     'Dropped from the head cache',
-    `The head cache keeps the newest ${RETAIN} slots it has published, counted from its newest \`${counted}\` slot. Slot ${slotLabel(slot)} falls out of that window, and reads move to the next tier.`,
-    { note: 'This assumes the ingestor has flushed slot N by now, which it normally has.' },
+    `The head cache keeps the newest ${w.retain} slots it has published, counted from its newest \`${counted}\` slot. Slot ${slotLabel(slot)} falls out of that window, and reads move to ${next}.`,
+    { note: w.disk[slot] ? null : 'This assumes the ingestor has flushed the slot by now, which it normally has.' },
   );
 }
 
 function copiedToDisk(w, slot) {
   w.disk[slot] = true;
-  w.at(DISK_LAG + slot + (w.tower ? ROOT_DEPTH : 1), DISK_LAG + slot, { tipApprox: true });
+  w.at(...diskPosition(w, slot));
+  const stillHead = w.dropTip == null && w.visible(slot) && w.headWindow().lo <= slot;
   w.snap(
     'disk',
     'Copied to the disk cache',
-    `Once the source ClickHouse finalized tip is at least ${DISK_LAG} slots past the block, the disk cache filler copies its rows from ClickHouse (never from the head cache), checks the transaction counts and only then marks the range covered.`,
+    `Once the source ClickHouse finalized tip is at least ${DISK_LAG} slots past the block, the disk cache filler copies its rows from ClickHouse (never from the head cache), checks the transaction counts and only then marks the range covered.${
+      stillHead ? ' The head cache still holds the slot, so reads keep going there first.' : ''
+    }`,
   );
+}
+
+// Eviction and the disk copy, in the order their slot positions put them in.
+function tail(w, slot, { evict = true } = {}) {
+  const events = [['disk', diskPosition(w, slot)[0]]];
+  if (evict) events.push(['evict', evictPosition(w, slot)[0]]);
+  events.sort((a, b) => a[1] - b[1]);
+  for (const [kind] of events) (kind === 'disk' ? copiedToDisk : evicted)(w, slot);
 }
 
 function towerConfirm(w, bank) {
@@ -446,8 +477,11 @@ function towerConfirm(w, bank) {
 // Tower: the root lands about where the slot leaves a window counted from the
 // processed (or confirmed) tip. Which comes first is not fixed, so this frame
 // shows both done and the ingestor's write still in flight.
+const atTowerEdge = (w) => w.tower && w.state.min !== 'finalized' && w.dropTip == null && w.retain <= ROOT_DEPTH;
+
 function towerRoot(w, bank) {
-  const atEdge = w.state.min !== 'finalized' && w.dropTip == null;
+  const atEdge = atTowerEdge(w);
+  const wasVisible = bank.status === 'visible';
   w.at(bank.slot + ROOT_DEPTH, bank.slot, { tipApprox: true });
   w.commit(bank, 'finalized');
   w.pending = true;
@@ -455,7 +489,7 @@ function towerRoot(w, bank) {
     w.snap(
       'edge',
       'Rooted at the edge of the head window',
-      `Slot ${slotLabel(bank.slot)} reaches max lockout and is rooted about ${ROOT_DEPTH} slots behind the tip, which is where it leaves the ${RETAIN}-slot head window. Whichever happens first, the head cache serves it as \`finalized\` for at most a moment, and the ingestor writes it within seconds.`,
+      `Slot ${slotLabel(bank.slot)} reaches max lockout and is rooted about ${ROOT_DEPTH} slots behind the tip, which is where it leaves the ${w.retain}-slot head window. Whichever happens first, the head cache serves it as \`finalized\` for at most a moment, and the ingestor writes it within seconds.`,
       {
         upstream: 'The block reaches maximum vote lockout and becomes the root.',
         stream: [`SlotStatus · finalized · ${slotLabel(bank.slot)}`],
@@ -468,7 +502,9 @@ function towerRoot(w, bank) {
       'Rooted (finalized)',
       w.dropTip != null
         ? `Slot ${slotLabel(bank.slot)} is rooted about ${ROOT_DEPTH} slots behind the tip. The new head-cache session never saw it.`
-        : `Slot ${slotLabel(bank.slot)} is rooted about ${ROOT_DEPTH} slots behind the tip and is published now that it meets \`finalized\`. The window counts from the newest finalized slot, so it stays for about ${RETAIN} more slots.`,
+        : wasVisible
+          ? `Slot ${slotLabel(bank.slot)} is rooted about ${ROOT_DEPTH} slots behind the tip, well inside the ${w.retain}-slot head window, so the head cache now answers \`finalized\` reads for it too.`
+          : `Slot ${slotLabel(bank.slot)} is rooted about ${ROOT_DEPTH} slots behind the tip and is published now that it meets \`finalized\`. The window counts from the newest finalized slot, so it stays for about ${w.retain} more slots.`,
       {
         upstream: 'The block reaches maximum vote lockout and becomes the root.',
         stream: [`SlotStatus · finalized · ${slotLabel(bank.slot)}`],
@@ -520,9 +556,9 @@ function buildSteps(state) {
       { upstream: 'Slot N is not an ancestor of the chain being rooted.', stream: ['ForkDetected · N'] },
     );
     towerRoot(w, c);
+    const edge = atTowerEdge(w);
     ingested(w, [1]);
-    if (state.min === 'finalized') evicted(w, 1);
-    copiedToDisk(w, 1);
+    tail(w, 1, { evict: !edge });
     return w.frames;
   }
 
@@ -545,9 +581,9 @@ function buildSteps(state) {
     // clean
     towerConfirm(w, a);
     towerRoot(w, a);
+    const edge = atTowerEdge(w);
     ingested(w, [0]);
-    if (state.min === 'finalized') evicted(w, 0);
-    copiedToDisk(w, 0);
+    tail(w, 0, { evict: !edge });
     return w.frames;
   }
 
@@ -566,8 +602,7 @@ function buildSteps(state) {
   }
   const featured = scenario === 'retry' ? 1 : 0;
   ingested(w, scenario === 'retry' ? [0, 1] : [0]);
-  evicted(w, featured);
-  copiedToDisk(w, featured);
+  tail(w, featured);
   return w.frames;
 }
 

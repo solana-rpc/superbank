@@ -5,9 +5,11 @@ import { DEFAULT_STATE, ENUMS, allStates, normalizeState, parseHash, serializeHa
 test('defaults are accepted values and cover every key', () => {
   assert.deepEqual(Object.keys(DEFAULT_STATE).sort(), Object.keys(ENUMS).sort());
   for (const [key, values] of Object.entries(ENUMS)) assert.ok(values.includes(DEFAULT_STATE[key]), key);
-  // The page opens on Alpenglow with the head-cache default minimum.
+  // The page opens on Alpenglow with the head-cache default minimum and a
+  // production-sized window (32 is a development default).
   assert.equal(DEFAULT_STATE.era, 'alpenglow');
   assert.equal(DEFAULT_STATE.min, 'processed');
+  assert.equal(DEFAULT_STATE.retain, 'large');
 });
 
 test('parseHash accepts every enum value, with or without a leading #', () => {
@@ -47,7 +49,7 @@ test('serializeHash writes only non-defaults and round-trips every state', () =>
     // Idempotent: serializing the parsed state gives the same string.
     assert.equal(serializeHash(parseHash(hash)), hash);
   }
-  assert.equal(count, 2 * 3 * 4 * 2 * 3);
+  assert.equal(count, 2 * 3 * 2 * 4 * 2 * 3);
 });
 
 test('normalizeState drops unknown keys and invalid values', () => {

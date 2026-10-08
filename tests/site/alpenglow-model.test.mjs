@@ -4,7 +4,18 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { allStates } from '../../site/js/alpenglow-state.js';
-import { CONSTANTS, LANES, RANK, SOURCES, STEP_IDS, UPSTREAM, answerRead, buildLifecycle, meets } from '../../site/js/alpenglow-model.js';
+import {
+  CONSTANTS,
+  LANES,
+  PRODUCTION_RETAIN_EXAMPLE,
+  RANK,
+  SOURCES,
+  STEP_IDS,
+  UPSTREAM,
+  answerRead,
+  buildLifecycle,
+  meets,
+} from '../../site/js/alpenglow-model.js';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const READS = ['processed', 'confirmed', 'finalized'];
@@ -14,7 +25,7 @@ const STATUSES = new Set(['staged', 'frozen', 'held', 'visible', 'discarded', 'c
 // Model state keys only; method/read do not change the frames.
 const CASES = [...allStates()].filter((s) => s.method === 'getTransaction' && s.read === 'processed');
 const BUILT = CASES.map((state) => ({ state, life: buildLifecycle(state) }));
-const name = (s) => `era=${s.era} min=${s.min} scenario=${s.scenario}`;
+const name = (s) => `era=${s.era} min=${s.min} retain=${s.retain} scenario=${s.scenario}`;
 
 function eachFrame(fn) {
   for (const { state, life } of BUILT) life.steps.forEach((frame, i) => fn(frame, state, i, life.steps));
@@ -48,7 +59,7 @@ test('frames are well formed', () => {
     assert.ok(typeof f.summary === 'string' && f.summary, where);
     assert.equal(f.summary.split('`').length % 2, 1, `unbalanced backticks: ${where}`);
     assert.ok(!/[<>]/.test(f.summary + f.title + (f.upstream ?? '') + (f.note ?? '')), `angle bracket in copy: ${where}`);
-    assert.ok(f.headWindow.hi - f.headWindow.lo <= CONSTANTS.headRetainSlots.value - 1, where);
+    assert.ok(f.headWindow.hi - f.headWindow.lo <= f.retain - 1, where);
     for (const b of f.banks) {
       assert.ok(STATUSES.has(b.status), `${where} bank ${b.id} status ${b.status}`);
       assert.ok(b.token === null || b.token in RANK, where);
@@ -122,8 +133,46 @@ test('rule: Alpenglow reports confirmed and finalized together', () => {
 });
 
 test('rule: Tower confirms before it finalizes', () => {
-  const steps = buildLifecycle({ era: 'tower', scenario: 'clean', min: 'processed' }).steps.map((s) => s.id);
-  assert.ok(steps.indexOf('confirmed') < steps.indexOf('edge'), steps.join(','));
+  for (const retain of ['default', 'large']) {
+    const steps = buildLifecycle({ era: 'tower', scenario: 'clean', min: 'processed', retain }).steps.map((s) => s.id);
+    const root = steps.indexOf(retain === 'default' ? 'edge' : 'finalized');
+    assert.ok(root > 0 && steps.indexOf('confirmed') < root, steps.join(','));
+  }
+});
+
+test('rule: the Tower root races eviction only with a window no deeper than the root', () => {
+  for (const { state, life } of BUILT) {
+    const hasEdge = life.steps.some((s) => s.id === 'edge');
+    const expected = state.era === 'tower' && state.retain === 'default' && state.min !== 'finalized' && state.scenario !== 'reconnect' && state.scenario !== 'fork';
+    assert.equal(hasEdge, expected, name(state));
+  }
+});
+
+test('rule: the default window evicts before the disk copy; a production window copies first', () => {
+  for (const { state, life } of BUILT) {
+    const ids = life.steps.map((s) => s.id);
+    const evict = ids.indexOf('evicted');
+    const disk = ids.indexOf('disk');
+    if (evict < 0 || disk < 0) continue;
+    if (state.retain === 'default') assert.ok(evict < disk, name(state));
+    else assert.ok(disk < evict, name(state));
+  }
+});
+
+test('rule: with a production window, ClickHouse never has to answer for a clean slot', () => {
+  for (const { state, life } of BUILT) {
+    if (state.retain !== 'large' || state.scenario !== 'clean') continue;
+    for (const f of life.steps)
+      for (const method of METHODS)
+        for (const read of ['confirmed', 'finalized'])
+          assert.notEqual(answerRead(f, method, read).tier, 'clickhouse', `${name(state)} step=${f.id} ${method}@${read}`);
+  }
+});
+
+test('the production example is above the head/disk overlap threshold', () => {
+  assert.ok(PRODUCTION_RETAIN_EXAMPLE >= CONSTANTS.statusHistoryMinRetainSlots.value);
+  assert.ok(PRODUCTION_RETAIN_EXAMPLE > CONSTANTS.diskMinLagSlots.value + UPSTREAM.towerRootDepthSlots.value);
+  assert.ok(CONSTANTS.headRetainSlots.value < CONSTANTS.statusHistoryMinRetainSlots.value);
 });
 
 test('rule: the ingestor writes only finalized, canonical banks', () => {
@@ -141,15 +190,15 @@ test('rule: the disk cache copies only ingested slots at least 75 behind the fin
     for (const slot of Object.keys(f.disk)) {
       assert.ok(f.stored[slot], `disk before ClickHouse: ${name(state)} step=${f.id}`);
       assert.ok(f.fin >= Number(slot) + CONSTANTS.diskMinLagSlots.value, `${name(state)} step=${f.id}`);
-      // ...and never while the head cache still shows the slot.
-      assert.ok(!visibleIn(f, Number(slot)), `${name(state)} step=${f.id}`);
+      // ...and, with the 32-slot default, never while the head cache still shows the slot.
+      if (state.retain === 'default') assert.ok(!visibleIn(f, Number(slot)), `${name(state)} step=${f.id}`);
     }
   });
 });
 
-test('rule: under Tower at the default minimum, ClickHouse never has the slot while the head still shows it', () => {
+test('rule: at the Tower root edge, ClickHouse never has the slot while the head still shows it', () => {
   eachFrame((f, state) => {
-    if (state.era !== 'tower' || state.min === 'finalized') return;
+    if (state.era !== 'tower' || state.min === 'finalized' || state.retain !== 'default') return;
     for (const slot of Object.keys(f.stored)) assert.ok(!visibleIn(f, Number(slot)), `${name(state)} step=${f.id}`);
   });
 });
@@ -227,6 +276,7 @@ test('rule: Tower fork never reaches ClickHouse', () => {
 
 const DRIFT = {
   headRetainSlots: /env = "HEAD_CACHE_RETAIN_SLOTS", default_value_t = (\d+)\)/,
+  statusHistoryMinRetainSlots: /const STATUS_HISTORY_MIN_HEAD_RETAIN_SLOTS: u64 = (\d+);/,
   diskMinLagSlots: /env = "DISK_CACHE_REPAIR_MIN_LAG_SLOTS", default_value_t = (\d+)\)/,
   pendingCommitmentSlots: /const PENDING_COMMITMENT_SLOTS: u64 = (\d+);/,
   tipMaxAgeSecs: /const TIP_MAX_AGE: Duration = Duration::from_secs\((\d+)\);/,
