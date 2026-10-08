@@ -84,7 +84,10 @@ function appendRich(parent, text) {
   }
   parts.forEach((part, i) => {
     if (!part) return;
-    parent.append(i % 2 ? el('code', { text: part }) : document.createTextNode(part));
+    // Short single tokens (flags, env vars) stay on one line instead of
+    // splitting at a hyphen; longer ones (paths) may still wrap to fit the panel.
+    const token = part.length <= 40 && !/\s/.test(part);
+    parent.append(i % 2 ? el('code', { text: part, class: token ? 'is-token' : null }) : document.createTextNode(part));
   });
   return parent;
 }

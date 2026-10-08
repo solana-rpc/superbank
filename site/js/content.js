@@ -55,6 +55,8 @@ const REFS = {
   verifyExample: 'superbank-verify.example.yaml',
   verifyCli: 'crates/superbank-verify/src/cli.rs',
   verifySmoke: 'scripts/dev/run-verify-smoke.sh',
+  solparqValidation: 'crates/superbank-solparq/src/clickhouse.rs',
+  solparqBackfill: 'crates/superbank-solparq/src/backfill.rs',
 };
 
 export function allRefs() {
@@ -77,7 +79,7 @@ const activeLine = (active, activeText) => (active ? activeText : 'It is not the
 
 function solana(state) {
   const inUse = buildTopology(state)
-    .nodes.filter((n) => n.kind === 'endpoint')
+    .nodes.filter((n) => n.zone === 'upstream' && n.kind === 'endpoint')
     .map((n) => n.label);
   return {
     title: 'Solana network',
@@ -152,9 +154,6 @@ function srcJsonrpc(state) {
     body: [
       '`superbank --source rpc` uses a plain Solana JSON-RPC endpoint for bounded backfills: `getBlocks` discovers the slots, then `getBlock` fetches each one.',
       activeLine(state.source === 'rpc', 'This is the active ingest source, and the job ends when the requested range is done.'),
-      state.archive === 'off'
-        ? 'When archiving is on, `superbank-solparq` also calls `getBlocks` here to validate each range before it archives it.'
-        : '`superbank-solparq` also calls `getBlocks` here to confirm which slots Solana produced before it archives a range.',
     ],
     config: [
       cfg('rpc-url', 'required', 'RPC_URL'),
@@ -163,10 +162,29 @@ function srcJsonrpc(state) {
       cfg('rpc-slot-list', 'unset', 'fetch exactly these slots; excludes the range options and rpc-skip-ingested-slots'),
       cfg('rpc-timeout-secs', '30'),
       cfg('rpc-retry-backoff-ms', '500'),
-      cfg('--solana-rpc-url', 'https://api.mainnet-beta.solana.com', 'superbank-solparq flag (SOLPARQ_SOLANA_RPC_URL), used for validation'),
     ],
-    refs: [REFS.ingestRpc, REFS.ingestExample, REFS.solparqConfig],
+    refs: [REFS.ingestRpc, REFS.ingestExample],
     ...sourceAction(state, 'rpc'),
+  };
+}
+
+// The archiver's own validation endpoint; only drawn while archiving is on.
+function solparqRpc() {
+  return {
+    title: 'Solana RPC (archive validation)',
+    subtitle: 'superbank-solparq · --solana-rpc-url',
+    body: [
+      'Before it archives a range, `superbank-solparq` calls `getBlocks` here to confirm which slots Solana actually produced, then checks ClickHouse for missing blocks and transaction-count mismatches.',
+      'It is configured on the archiver alone (`--solana-rpc-url`), separate from whatever endpoint feeds `superbank`, so it can be a different provider.',
+      'If this endpoint cannot answer (for example `getBlocks` is disabled), archiving stalls unless `--allow-rpc-validation-failure` is set; verified data problems still block. `--backfill-gaps` also uses it to refetch missing slots through a `superbank --source rpc` subprocess.',
+    ],
+    config: [
+      cfg('--solana-rpc-url', 'https://api.mainnet-beta.solana.com', 'SOLPARQ_SOLANA_RPC_URL'),
+      cfg('--allow-rpc-validation-failure', 'false', 'archive even when this check cannot run'),
+      cfg('--force-archive', 'false', 'archive despite missing blocks or mismatches'),
+      cfg('--backfill-gaps', 'false', 'refetch missing slots from this endpoint first'),
+    ],
+    refs: [REFS.solparqReadme, REFS.solparqConfig, REFS.solparqValidation, REFS.solparqBackfill],
   };
 }
 
@@ -824,6 +842,7 @@ function verify(state) {
 const STATIC = {
   keeper,
   'grpc-clients': grpcClients,
+  'solparq-rpc': solparqRpc,
 };
 
 const BY_STATE = {

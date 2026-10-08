@@ -39,6 +39,7 @@ const EXPECTED_IDS = [
   'grpc-clients',
   'parquet-store',
   'solparq',
+  'solparq-rpc',
   'verify',
 ];
 

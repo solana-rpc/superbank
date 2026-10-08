@@ -353,8 +353,7 @@ test('rule: each source lights exactly its own upstream endpoint', () => {
     const lit = {
       'src-dragonsmouth': source === 'grpc' || head,
       'src-fumarole': source === 'fumarole',
-      // The archiver validates ranges against JSON-RPC getBlocks (superbank-solparq/clickhouse.rs).
-      'src-jsonrpc': source === 'rpc' || archive !== 'off',
+      'src-jsonrpc': source === 'rpc',
       'src-bigtable': source === 'bigtable',
       'src-oldfaithful': source === 'jetstreamer',
     };
@@ -430,8 +429,13 @@ test('rule: archive mode decides who moves the Parquet bytes', () => {
     }
     if (archive !== 'off') {
       // solparq validates each range against Solana JSON-RPC getBlocks.
-      eq(m, m.edge('solparq->src-jsonrpc')?.style, 'control', 'archive on: control edge to src-jsonrpc');
-      ok(m, m.node('src-jsonrpc'), 'archive on: src-jsonrpc is drawn');
+      // solparq validates ranges against its own Solana RPC (--solana-rpc-url), drawn
+      // in the archive lane rather than reusing an upstream ingest endpoint.
+      eq(m, m.edge('solparq->solparq-rpc')?.style, 'control', 'archive on: control edge to solparq-rpc');
+      eq(m, m.node('solparq-rpc')?.zone, 'archive', 'archive on: solparq-rpc sits in the archive lane');
+      ok(m, !m.touching('solparq').some((e) => e.from.startsWith('src-') || e.to.startsWith('src-')), 'solparq never links to an upstream endpoint');
+    } else {
+      ok(m, !m.node('solparq-rpc'), 'archive off: no solparq-rpc');
     }
   });
 });

@@ -27,6 +27,7 @@ const POS = {
   'grpc-clients': [16, 2],
   'parquet-store': [-1.5, 6.5],
   solparq: [4, 6.5],
+  'solparq-rpc': [7.8, 6.5],
   verify: [2, -6.1],
 };
 
@@ -162,9 +163,6 @@ export function buildTopology(input) {
   // Head cache opens its own DragonsMouth subscription inside superbank-rpc
   // (crates/superbank-rpc/src/head_cache/dragonsmouth.rs).
   if (state.head) usedEndpoints.add('src-dragonsmouth');
-  // solparq validates each range against Solana RPC getBlocks
-  // (crates/superbank-solparq/src/clickhouse.rs).
-  if (archiveOn) usedEndpoints.add('src-jsonrpc');
 
   if (usedEndpoints.size > 0) addNode('solana', 'network', 'Solana', { sublabel: 'validators', zone: 'upstream' });
   const endpoints = ENDPOINTS.filter(([id]) => usedEndpoints.has(id));
@@ -346,7 +344,11 @@ export function buildTopology(input) {
   }
   if (archiveOn) {
     addNode('solparq', 'process', 'superbank-solparq', { variant: 'solparq', sublabel: 'archiver · :30303 ops', zone: 'archive' });
-    addEdge('solparq', 'src-jsonrpc', 'control', { label: 'getBlocks validation' });
+    // solparq validates each range against Solana RPC getBlocks through its own
+    // --solana-rpc-url (crates/superbank-solparq/src/config.rs, clickhouse.rs).
+    // It is unrelated to any ingest endpoint, so it is drawn in the archive lane.
+    addNode('solparq-rpc', 'endpoint', 'Solana RPC', { variant: 'jsonrpc', sublabel: 'getBlocks validation', zone: 'archive' });
+    addEdge('solparq', 'solparq-rpc', 'control', { label: 'getBlocks validation' });
     if (state.archive === 'local') {
       addEdge('ch', 'solparq', 'batch', {
         particle: 'parquet',
