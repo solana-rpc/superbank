@@ -1,5 +1,10 @@
 name: Release
 
+# Push a signed v<version> tag on the commit that set that version (bump it
+# first with the "Prepare release" workflow). The tag must equal the workspace
+# version in Cargo.toml at that commit; this is checked before anything else
+# runs. Tags are created by maintainers: the "Tags" ruleset blocks
+# github-actions[bot], so this workflow never creates one itself.
 on:
   push:
     tags:
@@ -17,13 +22,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Check release version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Tag matches the workspace version
+        id: tag
+        run: |
+          set -euo pipefail
+          python3 scripts/release/version.py verify-tag "${GITHUB_REF_NAME}"
+          echo "tag=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
+
   e2e:
     name: E2E - Tilt + k6
+    needs: [version]
     uses: ./.github/workflows/e2e.yml
 
   goreleaser:
     name: GoReleaser
-    needs: [e2e]
+    needs: [version, e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -65,9 +87,11 @@ jobs:
         run: echo "RUST_VERSION=$(rustc --version)" >> "${GITHUB_ENV}"
 
       - name: Verify tag matches Cargo package versions
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           metadata_file="${RUNNER_TEMP}/cargo-metadata.json"
           cargo metadata --format-version=1 --locked --no-deps > "${metadata_file}"
           python3 - "$tag_version" "${metadata_file}" <<'PY'
@@ -98,3 +122,5 @@ jobs:
           args: release --clean --config .goreleaser.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Two tags can share a commit (an rc and its final release); name the one being released.
+          GORELEASER_CURRENT_TAG: ${{ needs.version.outputs.tag }}

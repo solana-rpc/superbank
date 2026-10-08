@@ -208,20 +208,20 @@ CI enforces PR titles via the `Lint PR title` GitHub Actions check.
 
 ### Releases
 
-Releases are tag-driven and published by GoReleaser:
+Releases are published by GoReleaser from a signed tag. The version lives in one place, `version` under `[workspace.package]` in the root `Cargo.toml`, and a release tag is always `v<that version>`:
 
-1. Update the shared package version under `[workspace.package]` in the root `Cargo.toml`.
-2. Create and push a signed annotated `vX.Y.Z` or `vX.Y.Z-<prerelease>` tag.
-3. The release workflow verifies that the tag version matches the Cargo package versions.
-4. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL, runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite before assets are published.
-5. After E2E passes, GoReleaser builds `superbank`, `superbank-rpc`, `superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` for Linux amd64 and Linux arm64, then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`.
+1. Run **Prepare release** (Actions → Prepare release → Run workflow, from `main`) with the new version, for example `0.7.1-rc3` or `0.7.1`. It sets the version in `Cargo.toml`, `Cargo.lock` and the README's docker tags on a `release/v<version>` branch. Open the PR from the link in the run summary (a PR opened by the workflow itself would not run CI) and merge it.
+2. Once it is on `main`, a maintainer tags `main` and pushes the tag (the "Tags" ruleset only lets maintainers and admins create tags):
 
-Example:
+   ```bash
+   git fetch origin
+   git tag -s v0.7.1-rc3 -m "Release v0.7.1-rc3" origin/main
+   git push origin v0.7.1-rc3
+   ```
 
-```bash
-git tag -s v0.6.0 -m "Release v0.6.0"
-git push origin v0.6.0
-```
+3. The **Release** workflow first checks that the tag equals the workspace version at that commit and stops if not. It then runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL, runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite. After E2E passes, GoReleaser builds `superbank`, `superbank-rpc`, `superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` for Linux amd64 and Linux arm64, then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`. Versions with a pre-release suffix (`-rc1`, ...) are published as pre-releases.
+
+CI's **Version matches releases** check fails when a `v*` release tag is newer than the workspace version, so `main` cannot quietly fall behind a release. To bump locally instead of using the workflow: `python3 scripts/release/version.py set <version>`, then `cargo update --workspace`.
 
 Repository settings required (GitHub UI):
 

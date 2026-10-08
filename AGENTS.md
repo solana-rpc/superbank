@@ -26,6 +26,7 @@ Config lives in `superbank.example.yaml`; copy to `superbank.yaml` for local run
   `cargo clippy -p superbank-rpc --all-targets --all-features --locked -- -D warnings`
   `cargo test --workspace --locked`
   `cargo test -p superbank-rpc --all-features --locked`
+  `python3 -m unittest discover -s scripts/release -p 'test_*.py'` and `python3 scripts/release/version.py check` (release version helper; see CONTRIBUTING.md "Releases")
 - Load tests:
   `scripts/test/run-k6.sh` (or run a single scenario under `tests/k6/scenarios/`)
 - GitHub Pages site (`site/`):

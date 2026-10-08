@@ -1,0 +1,86 @@
+name: Prepare release
+
+# Bumps the workspace version on a release/v<version> branch. Open the PR from
+# the link in the run summary: a PR opened by a person runs CI, while one
+# opened with GITHUB_TOKEN would not. After it merges, a maintainer pushes a
+# signed v<version> tag on main, which starts the Release workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v, for example 0.7.1-rc3 or 0.7.1"
+        required: true
+        type: string
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Bump version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Run Prepare release from main, not ${GITHUB_REF}"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: 1.98.1
+
+      # The input reaches the shell only through env, and version.py rejects
+      # anything that is not SemVer before it is used in a branch name.
+      - name: Set version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: python3 scripts/release/version.py set "${VERSION}"
+
+      - name: Update Cargo.lock
+        run: |
+          set -euo pipefail
+          cargo update --workspace
+          cargo metadata --format-version=1 --locked --no-deps > /dev/null
+          git diff --stat
+
+      - name: Push release branch
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          branch="release/v${VERSION}"
+          if git ls-remote --exit-code --heads origin "${branch}" > /dev/null; then
+            echo "::error::${branch} already exists; delete it or choose another version"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git commit -am "chore(release): prepare v${VERSION}"
+          git push origin "${branch}"
+          title="chore(release): prepare v${VERSION}"
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}?expand=1&title=${title// /%20}"
+          {
+            echo "### Release branch ready: \`${branch}\`"
+            echo
+            echo "1. [Open the pull request](${url}) and merge it once CI passes."
+            echo "2. Once it is on \`main\`, tag \`main\` and push the tag to start **Release**:"
+            echo
+            echo "   \`\`\`bash"
+            echo "   git fetch origin && git tag -s v${VERSION} -m \"Release v${VERSION}\" origin/main"
+            echo "   git push origin v${VERSION}"
+            echo "   \`\`\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
