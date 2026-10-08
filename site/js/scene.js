@@ -109,6 +109,8 @@ const FOCUS_MARGIN = 1.1;
 // An overlay inset that would leave less than this share of an axis is ignored.
 const FOCUS_MIN_VISIBLE = 0.4;
 const CLICK_SLOP_PX = 5;
+// On touch screens a tap this close to a label (and on no node) selects it.
+const LABEL_TAP_SLOP_PX = 8;
 const TOOLTIP_OFFSET_PX = 12;
 const EDGE_HOVER_PX = 9;
 const EDGE_SAMPLES = 24;
@@ -234,6 +236,9 @@ export function createScene(container, { onSelect, focusInset, reducedMotion = f
   // On touch-first devices one finger scrolls the page (the stage fills most of
   // a phone screen) and two fingers pan and zoom the scene. A touches.ONE value
   // that is not a TOUCH constant makes OrbitControls ignore one-finger drags.
+  // Labels take no pointer input there either (setLabelHidden): a finger that
+  // lands on one would never reach the canvas, and Chrome's touch adjustment
+  // snaps nearby touches onto them, so most pinches arrived as one finger.
   const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
   if (coarsePointer) controls.touches.ONE = null;
 
@@ -764,6 +769,7 @@ export function createScene(container, { onSelect, focusInset, reducedMotion = f
       posT: 1,
       buf: { count: 0, firstAt: 0 },
       labelSide: null,
+      labelHidden: true,
       compact: false,
     };
     nodeViews.set(id, view);
@@ -1630,9 +1636,11 @@ export function createScene(container, { onSelect, focusInset, reducedMotion = f
 
   // Labels the layout cannot fit are clipped away rather than made invisible,
   // so they stay in the tab order and keyboard users can still reach them.
+  // On touch screens labels never take pointer input; labelAt() resolves taps.
   function setLabelHidden(view, hidden) {
+    view.labelHidden = hidden;
     view.button.style.clipPath = hidden ? 'inset(50%)' : '';
-    view.button.style.pointerEvents = hidden ? 'none' : 'auto';
+    view.button.style.pointerEvents = hidden || coarsePointer ? 'none' : 'auto';
   }
 
   function labelPriority(view) {
@@ -1953,9 +1961,17 @@ export function createScene(container, { onSelect, focusInset, reducedMotion = f
   let downX = 0;
   let downY = 0;
   let downId = null;
+  // Set when a second finger joins the press: a pinch or two-finger pan is
+  // never a tap, whichever finger lifts first.
+  let multiTouch = false;
   // Registered before controls.connect(), so this runs ahead of OrbitControls'
   // own pointerdown and its 'start' event.
   function onPointerDown(event) {
+    if (!event.isPrimary) {
+      multiTouch = true;
+      return;
+    }
+    multiTouch = false;
     downId = event.pointerId;
     downX = event.clientX;
     downY = event.clientY;
@@ -1965,13 +1981,33 @@ export function createScene(container, { onSelect, focusInset, reducedMotion = f
   function onPointerUp(event) {
     if (event.pointerId !== downId) return;
     downId = null;
-    if (Math.hypot(event.clientX - downX, event.clientY - downY) >= CLICK_SLOP_PX) return;
+    if (multiTouch || Math.hypot(event.clientX - downX, event.clientY - downY) >= CLICK_SLOP_PX) return;
     // A press without movement is a click, not a camera gesture, so it must
     // not freeze the responsive pose and fit.
     userMoved = movedBeforeGesture;
     // Right and middle buttons drive the camera; only the primary button selects.
     if (event.button !== 0) return;
-    onSelect?.(pickNode(event));
+    onSelect?.(pickTap(event));
+  }
+  // Labels draw over the scene, so a tap inside one wins over a node mesh, and
+  // a near miss on a label only counts if no mesh was hit. Off touch screens
+  // the label buttons take their own clicks and never get here.
+  function pickTap(event) {
+    if (!coarsePointer) return pickNode(event);
+    const near = labelAt(event.clientX, event.clientY);
+    if (near?.distance === 0) return near.id;
+    return pickNode(event) ?? near?.id ?? null;
+  }
+  // Closest visible label within LABEL_TAP_SLOP_PX of the point (0 = inside).
+  function labelAt(x, y) {
+    let best = null;
+    for (const view of nodeViews.values()) {
+      if (view.leaving || view.labelHidden) continue;
+      const r = view.button.getBoundingClientRect();
+      const distance = Math.hypot(Math.max(r.left - x, 0, x - r.right), Math.max(r.top - y, 0, y - r.bottom));
+      if (distance <= LABEL_TAP_SLOP_PX && (!best || distance < best.distance)) best = { id: view.id, distance };
+    }
+    return best;
   }
   // Sent when the browser takes over a touch (e.g. to scroll the page).
   function onPointerCancel(event) {
