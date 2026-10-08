@@ -154,7 +154,7 @@ test('edge fields follow the contract', () => {
       const at = `edge ${e.id}`;
       ok(m, ['stream', 'batch', 'control', 'read'].includes(e.style), `${at}: style ${e.style}`);
       ok(m, ['data', 'serve', null].includes(e.channel), `${at}: channel ${e.channel}`);
-      ok(m, [null, 'block', 'rows', 'index', 'parquet'].includes(e.particle), `${at}: particle ${e.particle}`);
+      ok(m, [null, 'block', 'rows', 'index', 'parquet', 'query', 'meta'].includes(e.particle), `${at}: particle ${e.particle}`);
       ok(m, isNum(e.speed) && e.speed > 0, `${at}: speed`);
       ok(m, typeof e.label === 'string', `${at}: label must be a string`);
       ok(m, typeof e.conditional === 'boolean', `${at}: conditional`);
@@ -170,15 +170,21 @@ test('edge fields follow the contract', () => {
       if (e.emit?.type === 'flush') {
         ok(m, e.emit.order === null || (Number.isInteger(e.emit.order) && e.emit.order >= 0), `${at}: flush order`);
       }
+      if (e.emit?.type === 'relay' && e.emit.count !== undefined) {
+        ok(m, Number.isInteger(e.emit.count) && e.emit.count > 0, `${at}: relay count`);
+      }
     }
   });
 });
 
-test('control edges are dashed config links: no emission, no particle, no channel', () => {
+test('control edges carry no data: at most a query pulse on the data channel', () => {
   forEachModel((m) => {
     for (const e of m.topo.edges.filter((x) => x.style === 'control')) {
-      eq(m, [e.emit, e.particle, e.channel], [null, null, null], `control edge ${e.id} must not animate`);
+      if (e.particle === null) eq(m, [e.emit, e.channel], [null, null], `control edge ${e.id} must not animate`);
+      else eq(m, [e.particle, e.channel], ['query', 'data'], `control edge ${e.id} may only carry query pulses`);
     }
+    // Query pulses only ever travel on control edges.
+    for (const e of m.topo.edges.filter((x) => x.particle === 'query')) eq(m, e.style, 'control', `query edge ${e.id}`);
   });
 });
 
@@ -419,16 +425,19 @@ test('rule: archive mode decides who moves the Parquet bytes', () => {
       ok(m, !m.edge('ch->parquet-store'), 'local: ClickHouse does not write the store directly');
       ok(m, !m.edge('solparq->ch'), 'local: no solparq->ch control edge');
     } else if (archive === 's3') {
-      // s3: ClickHouse uploads via INSERT INTO FUNCTION s3; solparq only orchestrates.
-      ok(m, m.edge('ch->parquet-store'), 's3: ch->parquet-store');
-      eq(m, m.edge('solparq->ch')?.style, 'control', 's3: solparq->ch is a control edge');
-      ok(m, !m.edge('ch->solparq') && !m.edge('solparq->parquet-store'), 's3: bytes never pass through solparq');
+      // s3: solparq sends INSERT INTO FUNCTION s3 and ClickHouse uploads the Parquet itself
+      // (superbank-solparq/clickhouse.rs); solparq writes only manifest/report/.done (storage.rs).
+      const query = m.edge('solparq->ch');
+      eq(m, [query?.style, query?.particle], ['control', 'query'], 's3: solparq->ch carries the export query');
+      const upload = m.edge('ch->parquet-store');
+      eq(m, [upload?.particle, upload?.emit?.type], ['parquet', 'relay'], 's3: the query arrival triggers the ClickHouse upload');
+      ok(m, !m.edge('ch->solparq'), 's3: Parquet bytes never pass through solparq');
+      eq(m, m.edge('solparq->parquet-store')?.particle, 'meta', 's3: solparq writes only bundle metadata to the bucket');
     } else {
       eq(m, m.touching('solparq'), [], 'archive off: nothing touches solparq');
       ok(m, !m.edge('ch->parquet-store'), 'archive off: nothing archives to the store');
     }
     if (archive !== 'off') {
-      // solparq validates each range against Solana JSON-RPC getBlocks.
       // solparq validates ranges against its own Solana RPC (--solana-rpc-url), drawn
       // in the archive lane rather than reusing an upstream ingest endpoint.
       eq(m, m.edge('solparq->solparq-rpc')?.style, 'control', 'archive on: control edge to solparq-rpc');

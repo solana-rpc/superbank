@@ -22,12 +22,23 @@ const PALETTE = Object.freeze({
   pulse: '#F8FAFC',
 });
 
-const PARTICLE_COLOR = { block: PALETTE.purple, rows: PALETTE.blue, index: PALETTE.teal, parquet: PALETTE.orange };
+// query: a SQL statement one process sends another (solparq -> ClickHouse);
+// meta: small bundle files (manifest, report, checksums, done marker).
+const PARTICLE_COLOR = {
+  block: PALETTE.purple,
+  rows: PALETTE.blue,
+  index: PALETTE.teal,
+  parquet: PALETTE.orange,
+  query: '#EC4899',
+  meta: '#94A3B8',
+};
 const PARTICLE_SIZE = {
   block: [0.24, 0.24, 0.24],
   rows: [0.18, 0.18, 0.18],
   index: [0.12, 0.12, 0.12],
   parquet: [0.3, 0.07, 0.22],
+  query: [0.26, 0.26, 0.26],
+  meta: [0.16, 0.05, 0.12],
 };
 const TIER_COLOR = { 'head-cache': PALETTE.purple, 'disk-cache': PALETTE.teal, ch: PALETTE.yellow };
 const STATUS_COLOR = { ok: PALETTE.green, warn: PALETTE.amber, info: PALETTE.blue };
@@ -950,7 +961,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       appear: reducedMotion ? 1 : 0,
       leaving: false,
       removed: false,
-      em: { wait: 0, cycle: 0, left: 0, next: 0 },
+      em: { wait: 0, cycle: 0, left: 0, next: 0, depth: 0 },
       emitJson: JSON.stringify(data.emit ?? null),
     };
     edgeViews.set(data.id, view);
@@ -1332,6 +1343,15 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
         }
         break;
       }
+      case 'relay': {
+        // Counted relays (emit.count > 1) queue a burst in arrive().
+        if (em.left > 0 && simTime >= em.next) {
+          spawnCube(view, em.depth || 1);
+          em.left--;
+          em.next += BURST_GAP_S;
+        }
+        break;
+      }
       default:
         break;
     }
@@ -1365,7 +1385,15 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
     for (const out of outEdges.get(to.id) ?? EMPTY) {
       if (out.leaving || out.data.emit?.type !== 'relay' || !gate(out)) continue;
       if (out.data.conditional && Math.random() < 0.5) continue;
-      spawnCube(out, depth + 1);
+      const count = out.data.emit.count ?? 1;
+      if (count <= 1) {
+        spawnCube(out, depth + 1);
+      } else {
+        // One arrival triggers a whole burst (e.g. a query -> a table upload).
+        if (out.em.left <= 0) out.em.next = simTime;
+        out.em.left += count;
+        out.em.depth = depth + 1;
+      }
     }
   }
 
@@ -1478,7 +1506,7 @@ export function createScene(container, { onSelect, reducedMotion = false, debug 
       const [sx, sy, sz] = PARTICLE_SIZE[p.type];
       const ramp = 0.3 + 0.7 * clamp(Math.min(p.t, 1 - p.t) / 0.05, 0, 1);
       tmpScale.set(sx * ramp, sy * ramp, sz * ramp);
-      if (p.type === 'parquet') tmpEuler.set(0, p.spin * 0.5, 0);
+      if (p.type === 'parquet' || p.type === 'meta') tmpEuler.set(0, p.spin * 0.5, 0);
       else tmpEuler.set(p.spin * 0.6, p.spin, 0);
       tmpQuat.setFromEuler(tmpEuler);
       tmpMat.compose(tmpPos, tmpQuat, tmpScale);

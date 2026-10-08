@@ -741,7 +741,7 @@ function parquetStore(state) {
   const archiving = state.archive !== 'off';
   const restoring = state.source === 'solparq';
   const write = s3
-    ? 'ClickHouse uploads each table itself with `INSERT INTO FUNCTION s3(…)`.'
+    ? 'solparq sends ClickHouse an `INSERT INTO FUNCTION s3(…)` query per table and ClickHouse uploads the Parquet itself; solparq then writes `manifest.json`, `report.json` and the `.done` marker.'
     : 'solparq writes each bundle into a staging directory and renames it into place once the checksums and manifest exist.';
   const read = s3
     ? 'A restore has ClickHouse read the objects back with `INSERT … SELECT FROM s3()`.'
@@ -788,7 +788,7 @@ function solparq(state) {
       'Archives ClickHouse tables into Parquet bundles: hourly (9,000 slots), epoch (432,000, aligned) or custom (`--custom-slot-range`, default 1,000), with `transactions` and `blocks_metadata` required and the other tables included when present.',
       'Before archiving it checks the range against Solana RPC `getBlocks` and each slot’s `executed_transaction_count` in `blocks_metadata`, and a range with missing blocks or mismatches is skipped unless you pass `--force-archive`.',
       s3
-        ? 'S3 mode only orchestrates: ClickHouse writes each object with `INSERT INTO FUNCTION s3(…)`, so the bytes never pass through solparq.'
+        ? 'In S3 mode solparq sends the `INSERT INTO FUNCTION s3(…)` query and ClickHouse uploads each table\'s Parquet itself, so the bytes never pass through solparq; solparq writes only the bundle\'s small files (`manifest.json`, `report.json`, `.done`, and `SHA256SUMS.txt` with `--archive-s3-write-checksums`).'
         : 'Local mode has ClickHouse stream `SELECT … FORMAT Parquet` over HTTP to solparq, which writes the files to disk.',
       'It runs once or as a loop with `--server-mode` (ops page :30303, metrics :31313, a check every 60 seconds), and ships as a release binary with no compose or Kubernetes manifest in this repository.',
     ],

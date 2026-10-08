@@ -358,14 +358,30 @@ export function buildTopology(input) {
       });
       addEdge('solparq', 'parquet-store', 'batch', { particle: 'parquet', emit: { type: 'relay' }, speed: 3, label: 'bundle directory' });
     } else {
-      // ClickHouse uploads the objects; solparq never touches the bytes
-      // (INSERT INTO FUNCTION s3 in crates/superbank-solparq/src/clickhouse.rs).
-      addEdge('solparq', 'ch', 'control', { label: 'orchestrates export' });
+      // solparq sends the export query; ClickHouse then uploads each table's
+      // Parquet itself, so the bytes never pass through solparq
+      // (build_s3_table_archive_sql in crates/superbank-solparq/src/clickhouse.rs).
+      // The query pulse is what triggers the upload burst (counted relay).
+      addEdge('solparq', 'ch', 'control', {
+        channel: 'data',
+        particle: 'query',
+        emit: { type: 'burst', count: 1, every: 7, offset: 0.5 },
+        speed: 3,
+        label: 'sends INSERT INTO FUNCTION s3(…)',
+      });
       addEdge('ch', 'parquet-store', 'batch', {
         particle: 'parquet',
-        emit: { type: 'burst', count: 5, every: 5, offset: 1 },
+        emit: { type: 'relay', count: 5 },
         speed: 3,
-        label: 'INSERT INTO FUNCTION s3(…)',
+        label: 'ClickHouse uploads Parquet to S3',
+      });
+      // solparq writes the bundle's small files itself (write_manifest,
+      // write_report, write_done_marker in crates/superbank-solparq/src/storage.rs).
+      addEdge('solparq', 'parquet-store', 'batch', {
+        particle: 'meta',
+        emit: { type: 'burst', count: 2, every: 7, offset: 6.2 },
+        speed: 3,
+        label: 'manifest.json, report.json, .done',
       });
     }
   }
@@ -500,7 +516,7 @@ function describe(state) {
     if (state.archive === 'local') {
       archive.push('`superbank-solparq` streams `SELECT … FORMAT Parquet` from ClickHouse and writes bundle directories to local disk, named `{kind}_{epoch}_{start}-{end}` (hourly = 9,000 slots, epoch = 432,000).');
     } else if (state.archive === 's3') {
-      archive.push('`superbank-solparq` has ClickHouse write Parquet straight to S3 (`INSERT INTO FUNCTION s3(…)`); the bytes never pass through solparq. Bundles are named `{kind}_{epoch}_{start}-{end}`.');
+      archive.push('`superbank-solparq` sends ClickHouse an `INSERT INTO FUNCTION s3(…)` query per table, and ClickHouse uploads the Parquet straight to S3; the bytes never pass through solparq. solparq then writes the bundle\'s `manifest.json`, `report.json` and `.done` marker itself (plus `SHA256SUMS.txt` with `--archive-s3-write-checksums`). Bundles are named `{kind}_{epoch}_{start}-{end}`.');
     }
     if (state.archive !== 'off') {
       archive.push('Before archiving a range, solparq checks it against Solana RPC `getBlocks` and against the transaction counts in `blocks_metadata`.');

@@ -651,6 +651,15 @@ details[open] > .controls__summary::after {
   background: var(--orange);
 }
 
+/* Colours match PARTICLE_COLOR in js/scene.js. */
+.swatch--query {
+  background: #ec4899;
+}
+
+.swatch--meta {
+  background: #94a3b8;
+}
+
 /* White pulse that takes the serving tier's colour; the ring keeps it visible on light. */
 .swatch--request {
   border-radius: 50%;
