@@ -595,6 +595,44 @@ details[open] > .controls__summary::after {
   color: var(--text);
 }
 
+/* The one control to press first: Walkthrough, and Next once it runs. Comes
+   before the pressed and disabled rules so those still win on the same button. */
+.btn--accent {
+  border-color: var(--green);
+  background: var(--green);
+  color: #000;
+}
+
+.btn--accent:hover {
+  border-color: #5cf7b9;
+  background: #5cf7b9;
+  color: #000;
+}
+
+/* Set by main.js when nobody has touched the explorer for a few seconds.
+   The ring stays within the 8px phone toolbar padding, so the stage's
+   overflow: hidden does not clip it. */
+.btn--accent.is-nudging {
+  animation: nudge 1.4s ease-out 3;
+}
+
+@keyframes nudge {
+  from {
+    box-shadow: 0 0 0 0 rgba(20, 241, 149, 0.7);
+  }
+
+  to {
+    box-shadow: 0 0 0 8px rgba(20, 241, 149, 0);
+  }
+}
+
+/* The global reduced-motion rule cuts the pulse to nothing; show a still ring. */
+@media (prefers-reduced-motion: reduce) {
+  .btn--accent.is-nudging {
+    box-shadow: 0 0 0 3px rgba(20, 241, 149, 0.45);
+  }
+}
+
 .btn--overlay[aria-pressed='true'] {
   border-color: #fff;
   background: rgba(255, 255, 255, 0.1);
@@ -607,18 +645,31 @@ details[open] > .controls__summary::after {
   cursor: default;
 }
 
-/* Walkthrough bar. Phones: a strip under the canvas, mirroring the toolbar
-   strip above it. */
+/* Walkthrough bar. Phones: pinned to the bottom of the screen, because the
+   step text sits below the canvas and you scroll down to read it. Under the
+   sticky selector bar (z-index 30) so its drop-down still covers it. */
 .walk-bar {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
   z-index: 20;
   display: flex;
-  order: 1;
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: 8px 16px;
-  padding: 8px 0;
-  border-top: 1px solid var(--line);
+  padding: 8px var(--gutter);
+  border-top: 1px solid var(--line-strong);
+  background: var(--bg);
+}
+
+/* Keeps the end of the page clear of the pinned bar; main.js sets the height
+   (0 while the bar is hidden). */
+@media (max-width: 899px) {
+  body {
+    padding-bottom: var(--walk-bar-h, 0px);
+  }
 }
 
 .walk-bar__nav,
@@ -714,6 +765,20 @@ details[open] > .controls__summary::after {
 
 .legend-row__hint {
   color: var(--text-3);
+}
+
+.legend-row__hint-touch {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  .legend-row__hint-mouse {
+    display: none;
+  }
+
+  .legend-row__hint-touch {
+    display: inline;
+  }
 }
 
 .legend__list {
@@ -1353,6 +1418,7 @@ details[open] > .controls__summary::after {
     left: 0;
     padding: 0;
     border-top: 0;
+    background: none;
     pointer-events: none;
   }
 

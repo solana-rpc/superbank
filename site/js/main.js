@@ -350,8 +350,11 @@ function startWalk() {
   $('walk-bar').hidden = false;
   $('walkthrough').setAttribute('aria-pressed', 'true');
   goToStep(0);
-  // On phones the bar is a strip under the canvas; make sure it is on screen.
-  $('walk-bar').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+  // On wide screens the bar sits over the bottom of the canvas; make sure it is
+  // on screen. On phones it is pinned to the bottom of the screen already.
+  if (matchMedia('(min-width: 900px)').matches) {
+    $('walk-bar').scrollIntoView({ block: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
+  }
 }
 
 function goToStep(index) {
@@ -436,6 +439,10 @@ function focusInset() {
 }
 
 function setupWalkthrough() {
+  // Phones pin the bar to the bottom of the screen and styles.css pads the page
+  // by its height, which wraps with the width and is 0 while hidden.
+  const bar = $('walk-bar');
+  new ResizeObserver(() => document.documentElement.style.setProperty('--walk-bar-h', `${bar.offsetHeight}px`)).observe(bar);
   $('walkthrough').addEventListener('click', () => (walk ? clearSelection() : startWalk()));
   $('walk-prev').addEventListener('click', () => stepWalk(-1));
   $('walk-next').addEventListener('click', () => {
@@ -464,6 +471,45 @@ function setupWalkthrough() {
     event.preventDefault();
     stepWalk(event.key === 'ArrowRight' ? 1 : -1);
   });
+}
+
+// --- Idle nudge -------------------------------------------------------------
+// Pulses the Walkthrough button once the stage has been on screen for NUDGE_MS
+// with nothing clicked, changed, wheeled or pinched. Any of those cancels it
+// for the rest of the visit; scrolling the page past the stage does not.
+const NUDGE_MS = 6000;
+
+function setupNudge() {
+  const view = $('stage-view');
+  const button = $('walkthrough');
+  let timer = null;
+  const observer = new IntersectionObserver(
+    (entries) => {
+      clearTimeout(timer);
+      if (!entries[entries.length - 1].isIntersecting) return;
+      timer = setTimeout(() => {
+        button.classList.add('is-nudging');
+        observer.disconnect();
+      }, NUDGE_MS);
+    },
+    { threshold: 0.5 },
+  );
+  // One finger on a phone scrolls the page; only a second finger is a gesture.
+  const onPress = (event) => (event.pointerType !== 'touch' || !event.isPrimary) && cancel();
+  const listeners = [
+    [document, 'click', cancel],
+    [document, 'change', cancel],
+    [view, 'wheel', cancel],
+    [view, 'pointerdown', onPress],
+  ];
+  function cancel() {
+    clearTimeout(timer);
+    observer.disconnect();
+    button.classList.remove('is-nudging');
+    for (const [target, type, fn] of listeners) target.removeEventListener(type, fn, true);
+  }
+  for (const [target, type, fn] of listeners) target.addEventListener(type, fn, { capture: true, passive: true });
+  observer.observe(view);
 }
 
 // --- Render -----------------------------------------------------------------
@@ -563,6 +609,7 @@ buildControls();
 setupDisclosure();
 setupSceneButtons();
 setupWalkthrough();
+setupNudge();
 syncControls();
 panelEmpty();
 render();
