@@ -222,8 +222,21 @@ function renderSummary() {
 // --- Info panel -------------------------------------------------------------
 function panelEmpty() {
   const panel = $('panel');
-  panel.replaceChildren(el('p', { class: 'panel__empty', text: 'Click any component to see what it does, its key config, and where it lives in the code.' }));
+  panel.replaceChildren();
   panel.classList.remove('has-content');
+  setDrawer(null);
+}
+
+// Open/closed state and side live on #stage so the CSS can move the overlay
+// buttons. The drawer opens on the side away from the selected node, so the
+// highlighted node stays visible at any width (u runs about -17 .. 17.6).
+function setDrawer(node) {
+  const stage = $('stage');
+  stage.classList.toggle('is-drawer-open', Boolean(node));
+  if (node) stage.dataset.side = (node.pos?.[0] ?? 0) > 0 ? 'left' : 'right';
+  else delete stage.dataset.side;
+  const status = node ? `Details for ${node.label}` : '';
+  if ($('panel-status').textContent !== status) $('panel-status').textContent = status;
 }
 
 function renderPanel() {
@@ -241,7 +254,12 @@ function renderPanel() {
   const scrollTop = panel.scrollTop;
   const title = el('h2', { class: 'panel__title', id: 'panel-title', tabindex: '-1', text: content?.title ?? node.label });
   const close = el('button', { type: 'button', class: 'panel__close', 'aria-label': 'Close details', text: '×' });
-  close.addEventListener('click', () => clearSelection({ focusPanel: true }));
+  close.addEventListener('click', () => {
+    const id = selectedId;
+    clearSelection();
+    // Return focus to the node's label; the hidden drawer cannot hold it.
+    document.querySelector(`.node-label[data-node-id="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
+  });
   const children = [el('div', { class: 'panel__head' }, [title, close])];
 
   const subtitle = content?.subtitle ?? node.sublabel;
@@ -298,6 +316,7 @@ function renderPanel() {
   panel.replaceChildren(...children);
   panel.classList.add('has-content');
   panel.scrollTop = scrollTop;
+  setDrawer(node);
 }
 
 function selectNode(id) {
@@ -316,11 +335,10 @@ function selectNode(id) {
   if (!contentMod) contentReady.then(() => selectedId === id && renderPanel());
 }
 
-function clearSelection({ focusPanel = false } = {}) {
+function clearSelection() {
   selectedId = null;
   panelEmpty();
   syncSceneSelection(null);
-  if (focusPanel) $('panel').focus({ preventScroll: true });
 }
 
 // scene.select() must not echo back into onSelect; the flag breaks that loop

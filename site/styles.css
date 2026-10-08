@@ -457,7 +457,15 @@ details[open] > .controls__summary::after {
 }
 
 .stage__main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   min-width: 0;
+}
+
+/* Phones: transparent wrapper, so the view, legend row and panel stack in order. */
+.stage__canvas {
+  display: contents;
 }
 
 .stage__view {
@@ -478,7 +486,7 @@ details[open] > .controls__summary::after {
 }
 
 .is-fallback .panel,
-.is-fallback .legend {
+.is-fallback .legend-row {
   display: none;
 }
 
@@ -572,13 +580,26 @@ details[open] > .controls__summary::after {
   font-size: 14px;
 }
 
+.legend-row {
+  order: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 28px;
+  padding: 0 2px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
 .legend {
   display: flex;
   flex-wrap: wrap;
   gap: 8px 28px;
-  padding: 12px 2px 0;
-  color: var(--muted);
-  font-size: 12.5px;
+}
+
+.legend-row__hint {
+  font-weight: 600;
+  color: var(--text);
 }
 
 .legend__list {
@@ -664,14 +685,13 @@ details[open] > .controls__summary::after {
   border-radius: var(--radius);
 }
 
+/* Nothing selected: the hint in the legend row says what to do. */
 .panel:not(.has-content) {
-  border-style: dashed;
-  background: transparent;
+  display: none;
 }
 
-.panel__empty {
-  color: var(--muted);
-  font-size: 14px;
+.panel {
+  order: 2;
 }
 
 .panel__head {
@@ -964,7 +984,7 @@ details[open] > .controls__summary::after {
   cursor: pointer;
   pointer-events: auto;
   user-select: none;
-  transition: opacity 0.2s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .node-label__title {
@@ -976,6 +996,11 @@ details[open] > .controls__summary::after {
   color: var(--muted);
   font-size: 10.5px;
   font-weight: 400;
+}
+
+/* scene.js sets data-density on its label overlay when the diorama is small. */
+.scene-labels[data-density='compact'] .node-label__sub {
+  display: none;
 }
 
 .node-label:hover {
@@ -1055,7 +1080,10 @@ details[open] > .controls__summary::after {
 @media (min-width: 900px) {
   :root {
     --bar-h: 140px;
-    --stage-h: clamp(420px, 62vh, 780px);
+    /* Tracks the diorama's aspect (it fits to width). The content column stops
+       growing at 1400px, so the height stops at the 1440px value too. */
+    --stage-h: clamp(420px, min(34vw, 490px), 72vh);
+    --drawer-w: 360px;
   }
 
   .controls__summary {
@@ -1087,14 +1115,6 @@ details[open] > .controls__summary::after {
     margin: 0 0 6px;
   }
 
-  .stage {
-    grid-template-columns: minmax(0, 1fr) 340px;
-    align-items: start;
-  }
-
-  .stage.is-fallback {
-    grid-template-columns: minmax(0, 1fr);
-  }
 
   /* Wide screens: the buttons float over the canvas's empty top-right corner. */
   .stage__view {
@@ -1114,15 +1134,48 @@ details[open] > .controls__summary::after {
     background: none;
   }
 
-  .panel {
-    height: var(--stage-h);
-    overflow-y: auto;
+  /* The canvas spans the full width; the info panel is a drawer inside it. */
+  .stage__canvas {
+    position: relative;
+    display: block;
   }
 
+  .panel {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    bottom: 12px;
+    z-index: 25;
+    width: min(var(--drawer-w), calc(100% - 24px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    box-shadow: 0 14px 34px -14px rgba(15, 23, 42, 0.45);
+    transition: opacity 0.15s ease, transform 0.15s ease, visibility 0s linear 0s;
+  }
+
+  /* Stays laid out (so it can fade) but is inert and invisible when closed. */
   .panel:not(.has-content) {
-    display: grid;
-    place-items: center;
-    text-align: center;
+    display: block;
+    visibility: hidden;
+    opacity: 0;
+    transform: translateX(12px);
+    pointer-events: none;
+    transition: opacity 0.15s ease, transform 0.15s ease, visibility 0s linear 0.15s;
+  }
+
+  /* main.js opens the drawer on the side away from the selected node. */
+  .stage[data-side='left'] .panel {
+    right: auto;
+    left: 12px;
+  }
+
+  .stage[data-side='left'] .panel:not(.has-content) {
+    transform: translateX(-12px);
+  }
+
+  /* Keep Pause / Reset view clear of an open right-hand drawer. */
+  .stage.is-drawer-open:not([data-side='left']) .scene-actions {
+    right: calc(var(--drawer-w) + 24px);
   }
 
   .site-header__inner {

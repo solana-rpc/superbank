@@ -52,37 +52,44 @@
   </section>
 
   <main>
-    <div class="wrap stage">
+    <div class="wrap stage" id="stage">
       <div class="stage__main">
-        <div class="stage__view" id="stage-view">
-          <div id="scene" aria-describedby="summary"></div>
-          <p id="scene-loading" class="scene-loading">Loading 3D view…</p>
-          <div id="scene-actions" class="scene-actions">
-            <button type="button" id="pause" class="btn btn--overlay" aria-pressed="false">Pause</button>
-            <button type="button" id="reset-view" class="btn btn--overlay">Reset view</button>
+        <!-- On wide screens #panel is a drawer inside this box; on phones the box
+             dissolves and the panel stacks below the legend. -->
+        <div class="stage__canvas">
+          <div class="stage__view" id="stage-view">
+            <div id="scene" aria-describedby="summary"></div>
+            <p id="scene-loading" class="scene-loading">Loading 3D view…</p>
+            <div id="scene-actions" class="scene-actions">
+              <button type="button" id="pause" class="btn btn--overlay" aria-pressed="false">Pause</button>
+              <button type="button" id="reset-view" class="btn btn--overlay">Reset view</button>
+            </div>
+            <div id="scene-fallback" class="scene-fallback" role="status" hidden></div>
           </div>
-          <div id="scene-fallback" class="scene-fallback" role="status" hidden></div>
+
+          <aside id="panel" class="panel" aria-label="Component details" tabindex="-1"></aside>
         </div>
 
-        <div id="legend" class="legend" role="group" aria-label="Legend">
-          <ul class="legend__list" aria-label="Particles">
-            <li><span class="swatch swatch--block"></span>Block</li>
-            <li><span class="swatch swatch--rows"></span>Rows</li>
-            <li><span class="swatch swatch--index"></span>Index / MV</li>
-            <li><span class="swatch swatch--parquet"></span>Parquet</li>
-            <li><span class="swatch swatch--request"></span>Request</li>
-          </ul>
-          <ul class="legend__list" aria-label="Read tiers">
-            <li><span class="swatch swatch--head"></span>Head cache</li>
-            <li><span class="swatch swatch--disk"></span>Disk cache</li>
-            <li><span class="swatch swatch--clickhouse"></span>ClickHouse</li>
-          </ul>
+        <div class="legend-row">
+          <div id="legend" class="legend" role="group" aria-label="Legend">
+            <ul class="legend__list" aria-label="Particles">
+              <li><span class="swatch swatch--block"></span>Block</li>
+              <li><span class="swatch swatch--rows"></span>Rows</li>
+              <li><span class="swatch swatch--index"></span>Index / MV</li>
+              <li><span class="swatch swatch--parquet"></span>Parquet</li>
+              <li><span class="swatch swatch--request"></span>Request</li>
+            </ul>
+            <ul class="legend__list" aria-label="Read tiers">
+              <li><span class="swatch swatch--head"></span>Head cache</li>
+              <li><span class="swatch swatch--disk"></span>Disk cache</li>
+              <li><span class="swatch swatch--clickhouse"></span>ClickHouse</li>
+            </ul>
+          </div>
+          <p class="legend-row__hint">Click any component for details</p>
         </div>
+        <!-- Announces the selection; the drawer itself is not a live region. -->
+        <div id="panel-status" class="sr-only" role="status"></div>
       </div>
-
-      <aside id="panel" class="panel" aria-label="Component details" aria-live="polite" tabindex="-1">
-        <p class="panel__empty">Click any component to see what it does, its key config, and where it lives in the code.</p>
-      </aside>
     </div>
 
     <div class="wrap">
