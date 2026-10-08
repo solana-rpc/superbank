@@ -208,20 +208,34 @@ CI enforces PR titles via the `Lint PR title` GitHub Actions check.
 
 ### Releases
 
-Releases are tag-driven and published by GoReleaser:
+Releases use [`cargo-release`](https://github.com/crate-ci/cargo-release) (`cargo install cargo-release`), configured in `release.toml`. The version lives in one place, `version` under `[workspace.package]` in the root `Cargo.toml`, and a release tag is always `v<that version>`.
 
-1. Update the shared package version under `[workspace.package]` in the root `Cargo.toml`.
-2. Create and push a signed annotated `vX.Y.Z` or `vX.Y.Z-<prerelease>` tag.
-3. The release workflow verifies that the tag version matches the Cargo package versions.
-4. The release workflow runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL, runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite before assets are published.
-5. After E2E passes, GoReleaser builds `superbank`, `superbank-rpc`, `superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` for Linux amd64 and Linux arm64, then publishes a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`.
+Between releases, `main` carries the next version with a `-dev` suffix (for example `0.8.0-dev`). `-dev` sorts before `-rc1`, so both release candidates and the final release are upgrades from it. The number is only a floor: after a release, start the next cycle at the next patch (`0.8.1-dev`), and when you release you can still choose `0.8.1`, `0.9.0` or `1.0.0` (or an rc of any of them). Only a version below the `-dev` one is refused.
 
-Example:
+Release from an up-to-date `main`, as a maintainer (the "Tags" ruleset only lets maintainers and admins create tags, and the release commit is pushed straight to `main`):
 
 ```bash
-git tag -s v0.6.0 -m "Release v0.6.0"
-git push origin v0.6.0
+git switch main && git pull
+cargo release 0.8.0-rc1            # dry run: shows the version bump, commit and tag
+cargo release 0.8.0-rc1 --execute  # bump, commit, sign the v0.8.0-rc1 tag, push
 ```
+
+That sets the workspace version, updates `Cargo.lock`, commits `chore(release): v<version>`, creates the signed tag and pushes both. Repeat with `0.8.0-rc2` and so on as needed, then release `0.8.0` the same way; a final release also points the README's docker tags at the new version.
+
+The pushed tag starts the **Release** workflow, which:
+
+1. checks that the tag equals the workspace version at that commit, and stops if not;
+2. runs a Tilt-backed E2E gate that starts ClickHouse, applies local DDL, runs `superbank` ingestion, starts `superbank-rpc`, and runs the k6 release suite;
+3. after E2E passes, has GoReleaser build `superbank`, `superbank-rpc`, `superbank-solparq`, `superbank-solparq-read`, and `superbank-verify` for Linux amd64 and Linux arm64 and publish a GitHub Release with `.tar.gz` archives, release notes, and `SHA256SUMS.txt`. Versions with a pre-release suffix (`-rc1`, ...) are published as pre-releases.
+
+After a final release, start the next cycle in a small PR:
+
+```bash
+cargo release version 0.8.1-dev --execute   # or 0.9.0-dev for a minor release
+git switch -c chore/start-0.8.1-dev && git commit -am "chore: start 0.8.1-dev"
+```
+
+Nothing is published to crates.io.
 
 Repository settings required (GitHub UI):
 

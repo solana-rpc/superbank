@@ -6772,7 +6772,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superbank"
-version = "0.6.0"
+version = "0.8.0-dev"
 dependencies = [
  "anyhow",
  "axum",
@@ -6825,7 +6825,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-rpc"
-version = "0.6.0"
+version = "0.8.0-dev"
 dependencies = [
  "async-stream",
  "axum",
@@ -6898,7 +6898,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-solparq"
-version = "0.6.0"
+version = "0.8.0-dev"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -6930,7 +6930,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-verify"
-version = "0.6.0"
+version = "0.8.0-dev"
 dependencies = [
  "anyhow",
  "axum",
@@ -6963,7 +6963,7 @@ dependencies = [
 
 [[package]]
 name = "superbank-workspace"
-version = "0.6.0"
+version = "0.8.0-dev"
 
 [[package]]
 name = "symbolic-common"
