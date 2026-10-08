@@ -471,6 +471,45 @@ function setupWalkthrough() {
   });
 }
 
+// --- Idle nudge -------------------------------------------------------------
+// Pulses the Walkthrough button once the stage has been on screen for NUDGE_MS
+// with nothing clicked, changed, wheeled or pinched. Any of those cancels it
+// for the rest of the visit; scrolling the page past the stage does not.
+const NUDGE_MS = 6000;
+
+function setupNudge() {
+  const view = $('stage-view');
+  const button = $('walkthrough');
+  let timer = null;
+  const observer = new IntersectionObserver(
+    (entries) => {
+      clearTimeout(timer);
+      if (!entries[entries.length - 1].isIntersecting) return;
+      timer = setTimeout(() => {
+        button.classList.add('is-nudging');
+        observer.disconnect();
+      }, NUDGE_MS);
+    },
+    { threshold: 0.5 },
+  );
+  // One finger on a phone scrolls the page; only a second finger is a gesture.
+  const onPress = (event) => (event.pointerType !== 'touch' || !event.isPrimary) && cancel();
+  const listeners = [
+    [document, 'click', cancel],
+    [document, 'change', cancel],
+    [view, 'wheel', cancel],
+    [view, 'pointerdown', onPress],
+  ];
+  function cancel() {
+    clearTimeout(timer);
+    observer.disconnect();
+    button.classList.remove('is-nudging');
+    for (const [target, type, fn] of listeners) target.removeEventListener(type, fn, true);
+  }
+  for (const [target, type, fn] of listeners) target.addEventListener(type, fn, { capture: true, passive: true });
+  observer.observe(view);
+}
+
 // --- Render -----------------------------------------------------------------
 function render() {
   const walkId = walk ? selectedId : null;
@@ -568,6 +607,7 @@ buildControls();
 setupDisclosure();
 setupSceneButtons();
 setupWalkthrough();
+setupNudge();
 syncControls();
 panelEmpty();
 render();

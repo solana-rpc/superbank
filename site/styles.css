@@ -609,6 +609,30 @@ details[open] > .controls__summary::after {
   color: #000;
 }
 
+/* Set by main.js when nobody has touched the explorer for a few seconds.
+   The ring stays within the 8px phone toolbar padding, so the stage's
+   overflow: hidden does not clip it. */
+.btn--accent.is-nudging {
+  animation: nudge 1.4s ease-out 3;
+}
+
+@keyframes nudge {
+  from {
+    box-shadow: 0 0 0 0 rgba(20, 241, 149, 0.7);
+  }
+
+  to {
+    box-shadow: 0 0 0 8px rgba(20, 241, 149, 0);
+  }
+}
+
+/* The global reduced-motion rule cuts the pulse to nothing; show a still ring. */
+@media (prefers-reduced-motion: reduce) {
+  .btn--accent.is-nudging {
+    box-shadow: 0 0 0 3px rgba(20, 241, 149, 0.45);
+  }
+}
+
 .btn--overlay[aria-pressed='true'] {
   border-color: #fff;
   background: rgba(255, 255, 255, 0.1);
