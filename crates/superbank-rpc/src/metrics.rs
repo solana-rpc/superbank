@@ -785,6 +785,8 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_backfill_inflight_ranges: Gauge,
     #[cfg(feature = "disk-cache")]
+    disk_cache_given_up_slots: Gauge,
+    #[cfg(feature = "disk-cache")]
     disk_cache_fill_errors_total: Counter,
     #[cfg(feature = "disk-cache")]
     disk_cache_poisoned_slots_total: Counter,
@@ -948,6 +950,8 @@ impl Metrics {
         let disk_cache_backfill_slots_remaining = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_backfill_inflight_ranges = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_given_up_slots = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_fill_errors_total = Counter::default();
         #[cfg(feature = "disk-cache")]
@@ -1421,6 +1425,11 @@ impl Metrics {
                 disk_cache_backfill_inflight_ranges.clone(),
             );
             registry.register(
+                "disk_cache_given_up_slots",
+                "Incomplete slots inside the retention window the forwarder has given up on",
+                disk_cache_given_up_slots.clone(),
+            );
+            registry.register(
                 "disk_cache_fill_errors",
                 "ClickHouse fetch failures in the backfill/repair filler",
                 disk_cache_fill_errors_total.clone(),
@@ -1587,6 +1596,8 @@ impl Metrics {
             disk_cache_backfill_slots_remaining,
             #[cfg(feature = "disk-cache")]
             disk_cache_backfill_inflight_ranges,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_given_up_slots,
             #[cfg(feature = "disk-cache")]
             disk_cache_fill_errors_total,
             #[cfg(feature = "disk-cache")]
@@ -2553,6 +2564,14 @@ pub(crate) fn disk_cache_backfill_inflight(ranges: usize) {
     metrics
         .disk_cache_backfill_inflight_ranges
         .set(i64::try_from(ranges).unwrap_or(i64::MAX));
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_given_up_slots(slots: usize) {
+    let metrics = metrics();
+    metrics
+        .disk_cache_given_up_slots
+        .set(i64::try_from(slots).unwrap_or(i64::MAX));
 }
 
 #[cfg(feature = "disk-cache")]

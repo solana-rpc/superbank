@@ -39,6 +39,8 @@ pub(crate) struct FillerConfig {
     pub(crate) repair_interval: Duration,
     pub(crate) repair_min_lag_slots: u64,
     pub(crate) max_attempts: u32,
+    /// How long a given-up slot waits before one more attempt; zero never retries.
+    pub(crate) given_up_retry: Duration,
 }
 
 impl Default for FillerConfig {
@@ -52,6 +54,7 @@ impl Default for FillerConfig {
             repair_interval: Duration::from_secs(5),
             repair_min_lag_slots: 75,
             max_attempts: 10,
+            given_up_retry: Duration::from_secs(600),
         }
     }
 }
@@ -124,6 +127,101 @@ struct ClaimableWindow {
     source_tip: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GiveUp {
+    First,
+    /// A slot released for a retry was still incomplete.
+    Again,
+}
+
+/// Incomplete-fill attempts per slot, and the slots given up after
+/// `max_attempts`. The source can backfill a slot later, so a given-up slot is
+/// released after `retry_after` with one attempt left.
+#[derive(Debug)]
+pub(crate) struct FillAttempts {
+    max_attempts: u32,
+    retry_after: Duration,
+    attempts: HashMap<u64, u32>,
+    given_up: HashMap<u64, Instant>,
+    /// Released slots whose retry has not resolved yet.
+    retrying: HashSet<u64>,
+}
+
+impl FillAttempts {
+    fn new(max_attempts: u32, retry_after: Duration) -> Self {
+        Self {
+            max_attempts,
+            retry_after,
+            attempts: HashMap::new(),
+            given_up: HashMap::new(),
+            retrying: HashSet::new(),
+        }
+    }
+
+    /// Counts an incomplete read, and reports when it gives the slot up.
+    fn incomplete(&mut self, slot: u64, now: Instant) -> Option<GiveUp> {
+        let attempt = self.attempts.entry(slot).or_default();
+        *attempt += 1;
+        if *attempt < self.max_attempts || self.given_up.contains_key(&slot) {
+            return None;
+        }
+        self.given_up.insert(slot, now);
+        Some(if self.retrying.remove(&slot) {
+            GiveUp::Again
+        } else {
+            GiveUp::First
+        })
+    }
+
+    /// Forgets a published slot; returns whether it was filled by a retry.
+    fn filled(&mut self, slot: u64) -> bool {
+        self.attempts.remove(&slot);
+        self.given_up.remove(&slot);
+        self.retrying.remove(&slot)
+    }
+
+    /// Makes slots given up at least `retry_after` ago plannable again.
+    fn release_due(&mut self, now: Instant) {
+        if self.retry_after.is_zero() {
+            return;
+        }
+        let retry_after = self.retry_after;
+        let mut released = Vec::new();
+        self.given_up.retain(|slot, given_up_at| {
+            let due = now.saturating_duration_since(*given_up_at) >= retry_after;
+            if due {
+                released.push(*slot);
+            }
+            !due
+        });
+        for slot in released {
+            self.attempts
+                .insert(slot, self.max_attempts.saturating_sub(1));
+            self.retrying.insert(slot);
+        }
+    }
+
+    fn retain_from(&mut self, floor: u64) {
+        self.attempts.retain(|slot, _| *slot >= floor);
+        self.given_up.retain(|slot, _| *slot >= floor);
+        self.retrying.retain(|slot| *slot >= floor);
+    }
+
+    fn clear(&mut self) {
+        self.attempts.clear();
+        self.given_up.clear();
+        self.retrying.clear();
+    }
+
+    fn is_given_up(&self, slot: u64) -> bool {
+        self.given_up.contains_key(&slot)
+    }
+
+    fn given_up_count(&self) -> usize {
+        self.given_up.len()
+    }
+}
+
 pub(crate) async fn run(
     cache: Arc<DiskCache>,
     source: ClickHouseClient,
@@ -137,10 +235,10 @@ pub(crate) async fn run(
         slots_per_query = cfg.slots_per_query,
         max_concurrency = cfg.max_concurrency,
         max_slots_per_sec = cfg.max_slots_per_sec,
+        given_up_retry_secs = cfg.given_up_retry.as_secs(),
         "disk cache: ClickHouse forwarder started"
     );
-    let mut attempts: HashMap<u64, u32> = HashMap::new();
-    let mut given_up: HashSet<u64> = HashSet::new();
+    let mut attempts = FillAttempts::new(cfg.max_attempts, cfg.given_up_retry);
     let mut backoff = Duration::from_millis(250);
     let mut rate_limiter = SlotRateLimiter::new(
         cfg.slots_per_query,
@@ -155,7 +253,6 @@ pub(crate) async fn run(
             match cache.refresh_schema(&source).await {
                 Ok(true) => {
                     attempts.clear();
-                    given_up.clear();
                     info!("disk cache: source schema changed; local cache rebuilt");
                 }
                 Ok(false) => {}
@@ -184,15 +281,16 @@ pub(crate) async fn run(
             continue;
         };
         last_source_tip = Some(window.source_tip);
-        attempts.retain(|slot, _| *slot >= window.floor);
-        given_up.retain(|slot| *slot >= window.floor);
+        attempts.retain_from(window.floor);
+        attempts.release_due(Instant::now());
+        crate::metrics::disk_cache_given_up_slots(attempts.given_up_count());
 
         let holes = cache.holes_in(window.floor, window.tip);
         let remaining = holes.iter().map(|(start, end)| end - start + 1).sum();
         crate::metrics::disk_cache_backfill_remaining(remaining);
         let ranges = plan_ranges(
             &holes,
-            &given_up,
+            &attempts,
             cfg.slots_per_query,
             round_slot_limit(cfg.slots_per_query, cfg.max_concurrency),
         );
@@ -232,19 +330,25 @@ pub(crate) async fn run(
             match outcome.result {
                 Ok(published) => {
                     succeeded = true;
+                    let now = Instant::now();
                     for slot in range.start..=range.end {
                         if published.contains(&slot) {
-                            attempts.remove(&slot);
-                        } else {
-                            let attempt = attempts.entry(slot).or_default();
-                            *attempt += 1;
-                            if *attempt >= cfg.max_attempts && given_up.insert(slot) {
-                                warn!(
-                                    slot,
-                                    attempts = *attempt,
-                                    "disk cache: giving up incomplete slot; source fallback remains active"
-                                );
+                            if attempts.filled(slot) {
+                                info!(slot, "disk cache: filled given-up slot on retry");
                             }
+                            continue;
+                        }
+                        match attempts.incomplete(slot, now) {
+                            Some(GiveUp::First) => warn!(
+                                slot,
+                                attempts = cfg.max_attempts,
+                                "disk cache: giving up incomplete slot; source fallback remains active"
+                            ),
+                            Some(GiveUp::Again) => debug!(
+                                slot,
+                                "disk cache: retried slot still incomplete; giving up until the next retry"
+                            ),
+                            None => {}
                         }
                     }
                 }
@@ -282,6 +386,7 @@ pub(crate) async fn run(
         }
     }
     crate::metrics::disk_cache_backfill_inflight(0);
+    crate::metrics::disk_cache_given_up_slots(0);
     cache.set_ready(false);
     info!("disk cache: ClickHouse forwarder stopped");
 }
@@ -401,14 +506,14 @@ fn retention_floor(tip: u64, retain_slots: u64) -> u64 {
 
 pub(crate) fn plan_ranges(
     holes: &[(u64, u64)],
-    given_up: &HashSet<u64>,
+    attempts: &FillAttempts,
     slots_per_query: u64,
     max_slots: u64,
 ) -> Vec<SlotRange> {
     let mut slots = Vec::new();
     for &(start, end) in holes.iter().rev() {
         for slot in (start..=end).rev() {
-            if !given_up.contains(&slot) {
+            if !attempts.is_given_up(slot) {
                 slots.push(slot);
                 if slots.len() as u64 >= max_slots {
                     break;
@@ -711,15 +816,148 @@ async fn sleep_or_shutdown(
 mod tests {
     use super::*;
 
+    const RETRY: Duration = Duration::from_secs(600);
+
+    fn no_attempts() -> FillAttempts {
+        FillAttempts::new(10, RETRY)
+    }
+
     #[test]
     fn planner_prefers_newest_holes_and_chunks() {
-        let ranges = plan_ranges(&[(1, 5), (10, 20)], &HashSet::new(), 4, 8);
+        let ranges = plan_ranges(&[(1, 5), (10, 20)], &no_attempts(), 4, 8);
         assert_eq!(
             ranges,
             vec![
                 SlotRange { start: 17, end: 20 },
                 SlotRange { start: 13, end: 16 },
             ]
+        );
+    }
+
+    #[test]
+    fn given_up_slot_is_released_after_the_retry_interval() {
+        let t0 = Instant::now();
+        let mut attempts = FillAttempts::new(2, RETRY);
+        assert_eq!(attempts.incomplete(7, t0), None);
+        assert_eq!(attempts.incomplete(7, t0), Some(GiveUp::First));
+        assert!(attempts.is_given_up(7));
+
+        attempts.release_due(t0 + RETRY - Duration::from_secs(1));
+        assert!(attempts.is_given_up(7));
+        assert_eq!(attempts.given_up_count(), 1);
+
+        attempts.release_due(t0 + RETRY);
+        assert!(!attempts.is_given_up(7));
+        assert_eq!(attempts.given_up_count(), 0);
+    }
+
+    #[test]
+    fn zero_retry_interval_never_releases() {
+        let t0 = Instant::now();
+        let mut attempts = FillAttempts::new(1, Duration::ZERO);
+        assert_eq!(attempts.incomplete(7, t0), Some(GiveUp::First));
+
+        attempts.release_due(t0);
+        attempts.release_due(t0 + Duration::from_secs(86_400));
+        assert!(attempts.is_given_up(7));
+        assert_eq!(attempts.given_up_count(), 1);
+    }
+
+    #[test]
+    fn released_slot_is_given_up_again_after_one_incomplete_read() {
+        let t0 = Instant::now();
+        let mut attempts = FillAttempts::new(3, RETRY);
+        for _ in 0..2 {
+            assert_eq!(attempts.incomplete(7, t0), None);
+        }
+        assert_eq!(attempts.incomplete(7, t0), Some(GiveUp::First));
+
+        let t1 = t0 + RETRY;
+        attempts.release_due(t1);
+        assert_eq!(attempts.attempts.get(&7), Some(&2));
+        assert_eq!(attempts.incomplete(7, t1), Some(GiveUp::Again));
+        assert!(attempts.is_given_up(7));
+
+        // The next retry starts from the second give-up, not the first.
+        attempts.release_due(t1 + RETRY - Duration::from_secs(1));
+        assert!(attempts.is_given_up(7));
+        attempts.release_due(t1 + RETRY);
+        assert!(!attempts.is_given_up(7));
+    }
+
+    #[test]
+    fn retried_slot_that_fills_leaves_the_bookkeeping() {
+        let t0 = Instant::now();
+        let mut attempts = FillAttempts::new(1, RETRY);
+        assert_eq!(attempts.incomplete(7, t0), Some(GiveUp::First));
+        assert_eq!(attempts.incomplete(8, t0), Some(GiveUp::First));
+        attempts.release_due(t0 + RETRY);
+
+        assert!(attempts.filled(7));
+        assert!(!attempts.filled(9));
+        assert!(!attempts.attempts.contains_key(&7));
+        assert!(!attempts.retrying.contains(&7));
+
+        // A retried slot that fails once more still reports the retry.
+        assert_eq!(attempts.incomplete(8, t0 + RETRY), Some(GiveUp::Again));
+    }
+
+    #[test]
+    fn retain_from_drops_slots_below_the_floor() {
+        let t0 = Instant::now();
+        let t1 = t0 + RETRY;
+        let mut attempts = FillAttempts::new(1, RETRY);
+        for slot in [5, 15] {
+            assert_eq!(attempts.incomplete(slot, t0), Some(GiveUp::First));
+        }
+        attempts.release_due(t1);
+        for slot in [8, 18] {
+            assert_eq!(attempts.incomplete(slot, t1), Some(GiveUp::First));
+        }
+
+        attempts.retain_from(10);
+        assert!(!attempts.is_given_up(8));
+        assert!(attempts.is_given_up(18));
+        assert_eq!(attempts.given_up_count(), 1);
+        let mut counted: Vec<u64> = attempts.attempts.keys().copied().collect();
+        counted.sort_unstable();
+        assert_eq!(counted, vec![15, 18]);
+        assert_eq!(attempts.retrying, HashSet::from([15]));
+    }
+
+    #[test]
+    fn clear_forgets_every_slot() {
+        let t0 = Instant::now();
+        let mut attempts = FillAttempts::new(1, RETRY);
+        for slot in [5, 15] {
+            assert_eq!(attempts.incomplete(slot, t0), Some(GiveUp::First));
+        }
+        attempts.release_due(t0 + RETRY);
+        assert_eq!(attempts.incomplete(20, t0), Some(GiveUp::First));
+
+        attempts.clear();
+        assert_eq!(attempts.given_up_count(), 0);
+        assert!(attempts.attempts.is_empty());
+        assert!(attempts.retrying.is_empty());
+    }
+
+    #[test]
+    fn planner_skips_given_up_slots_until_released() {
+        let t0 = Instant::now();
+        let mut attempts = FillAttempts::new(1, RETRY);
+        assert_eq!(attempts.incomplete(12, t0), Some(GiveUp::First));
+        assert_eq!(
+            plan_ranges(&[(10, 14)], &attempts, 8, 64),
+            vec![
+                SlotRange { start: 13, end: 14 },
+                SlotRange { start: 10, end: 11 },
+            ]
+        );
+
+        attempts.release_due(t0 + RETRY);
+        assert_eq!(
+            plan_ranges(&[(10, 14)], &attempts, 8, 64),
+            vec![SlotRange { start: 10, end: 14 }]
         );
     }
 
@@ -751,7 +989,7 @@ mod tests {
 
     #[test]
     fn planner_builds_enough_ranges_to_fill_all_workers() {
-        let ranges = plan_ranges(&[(1, 1_000)], &HashSet::new(), 32, round_slot_limit(32, 8));
+        let ranges = plan_ranges(&[(1, 1_000)], &no_attempts(), 32, round_slot_limit(32, 8));
         assert_eq!(ranges.len(), 16);
         assert!(ranges.iter().all(|range| range.len_slots() == 32));
         assert_eq!(
