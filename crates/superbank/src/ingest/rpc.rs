@@ -2575,6 +2575,43 @@ mod tests {
     }
 
     #[test]
+    fn rpc_and_bigtable_block_metadata_keep_the_reward_partition_count() {
+        let rpc_block: UiConfirmedBlock = serde_json::from_value(serde_json::json!({
+            "previousBlockhash": Hash::new_from_array([2; 32]).to_string(),
+            "blockhash": Hash::new_from_array([1; 32]).to_string(),
+            "parentSlot": 305_423_999,
+            "rewards": [{
+                "pubkey": Address::from([3u8; 32]).to_string(),
+                "lamports": 11,
+                "postBalance": 22,
+                "rewardType": "Voting",
+                "commission": 5
+            }],
+            "numRewardPartitions": 314,
+            "blockTime": 1,
+            "blockHeight": 283_833_537
+        }))
+        .expect("getBlock response");
+        let row = map_rpc_block_metadata(305_424_000, &rpc_block, 0).expect("map rpc block");
+        assert_eq!(row.rewards_num_partitions, Some(314));
+        assert_eq!(row.rewards_type, vec![Some("voting".to_string())]);
+
+        let bigtable_block = ConfirmedBlock {
+            previous_blockhash: rpc_block.previous_blockhash.clone(),
+            blockhash: rpc_block.blockhash.clone(),
+            parent_slot: rpc_block.parent_slot,
+            transactions: Vec::new(),
+            rewards: rpc_block.rewards.clone().expect("rewards"),
+            num_partitions: Some(314),
+            block_time: rpc_block.block_time,
+            block_height: rpc_block.block_height,
+        };
+        let row = map_bigtable_block_metadata(305_424_000, &bigtable_block, 0)
+            .expect("map bigtable block");
+        assert_eq!(row.rewards_num_partitions, Some(314));
+    }
+
+    #[test]
     fn rpc_missing_meta_creates_empty_fields() {
         let tx = build_test_transaction();
         let tx_bytes = crate::message_wire::serialize_versioned_transaction(&tx)

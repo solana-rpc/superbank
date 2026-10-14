@@ -2407,6 +2407,32 @@ mod tests {
     use tokio::time::Instant;
 
     #[test]
+    fn block_metadata_keeps_the_reward_partition_count() {
+        let block = SubscribeUpdateBlock {
+            slot: 305_424_000,
+            blockhash: bs58::encode([1; 32]).into_string(),
+            parent_blockhash: bs58::encode([2; 32]).into_string(),
+            rewards: Some(yellowstone_grpc_proto::prelude::Rewards {
+                rewards: vec![Reward {
+                    pubkey: bs58::encode([3; 32]).into_string(),
+                    lamports: 11,
+                    post_balance: 22,
+                    reward_type: RewardType::Voting as i32,
+                    commission: "5".to_string(),
+                    ..Default::default()
+                }],
+                num_partitions: Some(yellowstone_grpc_proto::prelude::NumPartitions {
+                    num_partitions: 314,
+                }),
+            }),
+            ..Default::default()
+        };
+        let row = super::map_block_metadata(&block).expect("map block metadata");
+        assert_eq!(row.rewards_num_partitions, Some(314));
+        assert_eq!(row.rewards_type, vec![Some("Voting".to_string())]);
+    }
+
+    #[test]
     fn generated_reward_types_preserve_storage_names_and_reject_unknown_values() {
         for (wire, expected) in [
             (1, "Fee"),
