@@ -379,6 +379,7 @@ pub struct ClickHouseClient {
     query_cleanup_cluster: Option<String>,
     pub(crate) inflation_reward_limits: InflationRewardQueryLimits,
     pub(crate) inflation_epoch_cache: super::inflation_cache::InflationEpochCache,
+    pub(crate) inflation_response_cache: super::inflation_response_cache::InflationResponseCache,
     pub(crate) tcp_access_check_timeout: Duration,
     pub(crate) replica_health_check_interval: Duration,
     pub(crate) http_connect_timeout: Duration,
@@ -457,6 +458,11 @@ pub struct InflationRewardQueryLimits {
     pub max_bytes_to_read: u64,
     /// Byte budget for validated epoch boundary/partition metadata; zero disables the cache.
     pub epoch_cache_max_bytes: u64,
+    /// Byte budget for complete answers per exact address set; zero disables the cache.
+    pub response_cache_max_bytes: u64,
+    pub response_cache_ttl: Duration,
+    /// Finalized slots past an answer's last block before an answer with nulls may be stored.
+    pub response_cache_settle_slots: u64,
 }
 
 impl Default for InflationRewardQueryLimits {
@@ -467,6 +473,9 @@ impl Default for InflationRewardQueryLimits {
             max_memory_bytes: 536_870_912,
             max_bytes_to_read: 536_870_912,
             epoch_cache_max_bytes: 16 * 1024 * 1024,
+            response_cache_max_bytes: 0,
+            response_cache_ttl: super::inflation_response_cache::DEFAULT_TTL,
+            response_cache_settle_slots: super::inflation_response_cache::DEFAULT_SETTLE_SLOTS,
         }
     }
 }
@@ -643,6 +652,29 @@ impl ClickHouseClientOptions {
 impl ClickHouseClient {
     pub(crate) fn disable_inflation_epoch_cache(&mut self) {
         self.inflation_epoch_cache = super::inflation_cache::InflationEpochCache::new(0);
+        self.inflation_response_cache =
+            super::inflation_response_cache::InflationResponseCache::disabled();
+    }
+
+    pub(crate) fn enable_inflation_response_cache(
+        &mut self,
+        max_bytes: u64,
+        ttl: Duration,
+        settle_slots: u64,
+    ) {
+        self.inflation_response_cache =
+            super::inflation_response_cache::InflationResponseCache::new(
+                max_bytes,
+                ttl,
+                settle_slots,
+            );
+    }
+
+    pub(crate) fn set_inflation_epoch_cache_ttl(&mut self, ttl: Duration) {
+        self.inflation_epoch_cache = super::inflation_cache::InflationEpochCache::with_ttl(
+            self.inflation_reward_limits.epoch_cache_max_bytes,
+            ttl,
+        );
     }
 }
 
@@ -814,6 +846,10 @@ impl ClickHouseClient {
             inflation_epoch_cache: super::inflation_cache::InflationEpochCache::new(
                 inflation_reward_limits.epoch_cache_max_bytes,
             ),
+            inflation_response_cache:
+                super::inflation_response_cache::InflationResponseCache::from_limits(
+                    &inflation_reward_limits,
+                ),
             tcp_access_check_timeout,
             replica_health_check_interval,
             http_connect_timeout,
@@ -3164,6 +3200,7 @@ mod tests {
                 max_memory_bytes: 123_456,
                 max_bytes_to_read: 654_321,
                 epoch_cache_max_bytes: 0,
+                ..InflationRewardQueryLimits::default()
             },
             ..client
         };

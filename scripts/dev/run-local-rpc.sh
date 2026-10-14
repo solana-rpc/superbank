@@ -77,6 +77,9 @@ fi
 : "${GET_INFLATION_REWARD_MAX_MEMORY_BYTES:=536870912}"
 : "${GET_INFLATION_REWARD_MAX_BYTES_TO_READ:=536870912}"
 : "${GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES:=16777216}"
+: "${GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES:=0}"
+: "${GET_INFLATION_REWARD_RESPONSE_CACHE_TTL_SECS:=3600}"
+: "${GET_INFLATION_REWARD_RESPONSE_CACHE_SETTLE_SLOTS:=4500}"
 : "${HYDRATION_CPU_CONCURRENCY:=8}"
 : "${GET_BLOCK_HYDRATION_PARALLELISM:=4}"
 
@@ -277,6 +280,9 @@ export CLICKHOUSE_GSFA_STRICT_PAGINATION=1
   --get-inflation-reward-max-memory-bytes "${GET_INFLATION_REWARD_MAX_MEMORY_BYTES}" \
   --get-inflation-reward-max-bytes-to-read "${GET_INFLATION_REWARD_MAX_BYTES_TO_READ}" \
   --get-inflation-reward-epoch-cache-max-bytes "${GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES}" \
+  --get-inflation-reward-response-cache-max-bytes "${GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES}" \
+  --get-inflation-reward-response-cache-ttl-secs "${GET_INFLATION_REWARD_RESPONSE_CACHE_TTL_SECS}" \
+  --get-inflation-reward-response-cache-settle-slots "${GET_INFLATION_REWARD_RESPONSE_CACHE_SETTLE_SLOTS}" \
   --host "${RPC_HOST}" \
   --port "${RPC_PORT}" \
   --metrics-host "${METRICS_HOST}" \

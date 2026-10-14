@@ -408,6 +408,11 @@ impl RouteMetric {
         self.source = ROUTE_SOURCE_CLICKHOUSE;
     }
 
+    /// Labels the route `clickhouse` without marking the source touched, which cannot be undone.
+    pub(crate) fn label_source_clickhouse(&mut self) {
+        self.source = ROUTE_SOURCE_CLICKHOUSE;
+    }
+
     pub(crate) fn source_response_cache(&mut self) {
         mark_response_cache_source_touched();
         self.source = ROUTE_SOURCE_RESPONSE_CACHE;

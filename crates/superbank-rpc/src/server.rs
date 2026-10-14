@@ -338,8 +338,21 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             max_memory_bytes: args.get_inflation_reward_max_memory_bytes,
             max_bytes_to_read: args.get_inflation_reward_max_bytes_to_read,
             epoch_cache_max_bytes: args.get_inflation_reward_epoch_cache_max_bytes,
+            response_cache_max_bytes: args.get_inflation_reward_response_cache_max_bytes,
+            response_cache_ttl: Duration::from_secs(
+                args.get_inflation_reward_response_cache_ttl_secs,
+            ),
+            response_cache_settle_slots: args.get_inflation_reward_response_cache_settle_slots,
         }),
     );
+    if inert_inflation_response_cache(
+        args.get_inflation_reward_response_cache_max_bytes,
+        args.get_inflation_reward_epoch_cache_max_bytes,
+    ) {
+        warn!(
+            "GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES > 0 but GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES=0; the getInflationReward response cache is off"
+        );
+    }
 
     clickhouse
         .set_get_transaction_single_round_trip(args.clickhouse_get_transaction_single_round_trip);
@@ -640,6 +653,11 @@ fn inert_status_history_cache(
         ),
         Some(_) => None,
     }
+}
+
+/// The getInflationReward response cache keys on epoch-cache boundaries, so it needs that cache.
+fn inert_inflation_response_cache(response_max_bytes: u64, epoch_max_bytes: u64) -> bool {
+    response_max_bytes > 0 && epoch_max_bytes == 0
 }
 
 #[cfg(feature = "disk-cache")]
@@ -1051,6 +1069,15 @@ mod tests {
             "short head window"
         );
         assert_eq!(inert(1, Some((true, true, 256))), None);
+    }
+
+    #[test]
+    fn inert_inflation_response_cache_is_reported() {
+        use super::inert_inflation_response_cache as inert;
+        assert!(inert(1, 0), "epoch cache off forces the response cache off");
+        assert!(!inert(0, 0));
+        assert!(!inert(0, 1));
+        assert!(!inert(1, 1));
     }
 
     #[tokio::test]

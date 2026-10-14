@@ -25,8 +25,8 @@ use tracing::{error, warn};
 use super::block_ranges::{RangeObservation, get_block_slots_response_for_range, resolve_range};
 use crate::block_response_cache::BlockResponseCacheKey;
 use crate::clickhouse::{
-    BlockFooterRecord, InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings,
-    StoredBlockPayload, StoredBlockRecord,
+    BlockFooterRecord, InflationRewardAnswer, InflationRewardLookupOutcome, InflationRewardRecord,
+    QueryTimings, StoredBlockPayload, StoredBlockRecord,
 };
 use crate::handlers::{
     RouteMetric,
@@ -2514,14 +2514,35 @@ pub(crate) async fn handle_get_inflation_reward(
         None
     };
 
-    route.source_clickhouse();
-    let (lookup_outcome, timings) = match state
+    // A response-cache hit must not mark ClickHouse touched, so a lookup marks it when it starts.
+    // The route label alone keeps an abandoned or timed-out request counted as `clickhouse`.
+    if state.clickhouse.inflation_response_cache.enabled() && !requested_pubkeys.is_empty() {
+        route.label_source_clickhouse();
+    } else {
+        route.source_clickhouse();
+    }
+    let lookup = state
         .clickhouse
-        .get_inflation_rewards_for_epoch(&requested_pubkeys, epoch, &state.epoch_schedule)
-        .await
-    {
-        Ok(result) => result,
+        .get_inflation_rewards_cached(
+            &requested_pubkeys,
+            epoch,
+            &state.epoch_schedule,
+            super::mark_clickhouse_source_touched,
+            |required| inflation_reward_tip_reached(state.as_ref(), required),
+        )
+        .await;
+    // Response-cache answers carry no timings, so ClickHouse metrics see only real queries.
+    let (lookup_outcome, timings) = match lookup {
+        Ok(InflationRewardAnswer::ClickHouse { outcome, timings }) => {
+            route.source_clickhouse();
+            (outcome, Some(timings))
+        }
+        Ok(InflationRewardAnswer::ResponseCache(outcome)) => {
+            route.source_response_cache();
+            (outcome, None)
+        }
         Err(e) => {
+            route.source_clickhouse();
             metrics::backend_error("get_inflation_rewards_for_epoch");
             error!(
                 "Failed to query ClickHouse inflation rewards for epoch {}: {}",
@@ -2542,7 +2563,9 @@ pub(crate) async fn handle_get_inflation_reward(
             availability_error.message,
             availability_error.data,
         );
-        add_downstream_header(&mut resp, &timings);
+        if let Some(timings) = &timings {
+            add_downstream_header(&mut resp, timings);
+        }
         return Ok(resp);
     }
     let InflationRewardLookupOutcome::Complete(reward_rows) = lookup_outcome else {
@@ -2553,8 +2576,40 @@ pub(crate) async fn handle_get_inflation_reward(
 
     route.success();
     let mut resp = json_rpc_success_response(id, json!(rewards));
-    add_downstream_header(&mut resp, &timings);
+    if let Some(timings) = &timings {
+        add_downstream_header(&mut resp, timings);
+    }
     Ok(resp)
+}
+
+/// Bounds the tip read that decides whether a `getInflationReward` answer with nulls is stored.
+const INFLATION_REWARD_SETTLE_TIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether ClickHouse's finalized tip is at least `required`. An unknown tip counts as not
+/// reached, so the answer is served but not stored.
+async fn inflation_reward_tip_reached(state: &AppState, required: u64) -> bool {
+    // Primary slots are only ever added, so any value it once reported bounds its tip.
+    let cache = &state.latest_slot_cache;
+    if cache.value.load(std::sync::atomic::Ordering::Relaxed) >= required {
+        return true;
+    }
+    // ClickHouse holds no finalized slot the head has not seen, so a lower head tip settles it.
+    #[cfg(feature = "grpc-head-cache")]
+    if let Some(head) = state.head_cache.as_ref() {
+        let head_tip =
+            head.latest_slot_at_least(solana_commitment_config::CommitmentLevel::Finalized);
+        if head_tip > 0 && head_tip < required {
+            return false;
+        }
+    }
+    matches!(
+        tokio::time::timeout(
+            INFLATION_REWARD_SETTLE_TIP_TIMEOUT,
+            cache.get_or_refresh(&state.clickhouse),
+        )
+        .await,
+        Ok(Ok(tip)) if tip >= required
+    )
 }
 
 pub(crate) async fn handle_get_first_available_block(

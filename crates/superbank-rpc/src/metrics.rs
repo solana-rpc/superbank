@@ -696,6 +696,10 @@ pub struct Metrics {
     inflation_reward_lookups: Family<OperationOutcomeLabels, Counter>,
     inflation_reward_epoch_cache: Family<OperationOutcomeLabels, Counter>,
     inflation_reward_selected_blocks: Histogram,
+    inflation_reward_response_cache: Family<DisconnectOutcomeLabels, Counter>,
+    inflation_reward_response_cache_entries: Gauge,
+    inflation_reward_response_cache_weighted_bytes: Gauge,
+    inflation_reward_response_cache_max_bytes: Gauge,
 
     route_total: Family<RouteLabels, Counter>,
     slot_source: Family<SlotSourceLabels, Counter>,
@@ -856,6 +860,10 @@ impl Metrics {
         let inflation_reward_lookups = Family::default();
         let inflation_reward_epoch_cache = Family::default();
         let inflation_reward_selected_blocks = block_slot_count_histogram();
+        let inflation_reward_response_cache = Family::default();
+        let inflation_reward_response_cache_entries = Gauge::default();
+        let inflation_reward_response_cache_weighted_bytes = Gauge::default();
+        let inflation_reward_response_cache_max_bytes = Gauge::default();
 
         let route_total = Family::default();
         let slot_source = Family::default();
@@ -1144,6 +1152,26 @@ impl Metrics {
             "rpc_inflation_reward_selected_blocks",
             "Distribution of exact reward blocks selected by getInflationReward",
             inflation_reward_selected_blocks.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache",
+            "getInflationReward exact address-set response cache outcomes",
+            inflation_reward_response_cache.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache_entries",
+            "Approximate number of getInflationReward answers cached",
+            inflation_reward_response_cache_entries.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache_weighted_bytes",
+            "Approximate weighted bytes of getInflationReward answers cached",
+            inflation_reward_response_cache_weighted_bytes.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache_max_bytes",
+            "Configured getInflationReward response cache byte budget",
+            inflation_reward_response_cache_max_bytes.clone(),
         );
         registry.register(
             "rpc_route_total",
@@ -1504,6 +1532,10 @@ impl Metrics {
             inflation_reward_lookups,
             inflation_reward_epoch_cache,
             inflation_reward_selected_blocks,
+            inflation_reward_response_cache,
+            inflation_reward_response_cache_entries,
+            inflation_reward_response_cache_weighted_bytes,
+            inflation_reward_response_cache_max_bytes,
             route_total,
             slot_source,
             clickhouse_latency_seconds,
@@ -2183,6 +2215,27 @@ pub(crate) fn inflation_reward_epoch_cache(item: &'static str, outcome: &'static
 pub(crate) fn inflation_reward_selected_blocks(blocks: usize) {
     let metrics = metrics();
     metrics.inflation_reward_selected_blocks(blocks);
+}
+
+/// Only an `outcome` label, so captured request headers never multiply the series.
+pub(crate) fn inflation_reward_response_cache(outcome: &'static str) {
+    metrics()
+        .inflation_reward_response_cache
+        .get_or_create(&DisconnectOutcomeLabels { outcome })
+        .inc();
+}
+
+pub(crate) fn inflation_reward_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
+    let metrics = metrics();
+    metrics
+        .inflation_reward_response_cache_entries
+        .set(clamp_i64(entries));
+    metrics
+        .inflation_reward_response_cache_weighted_bytes
+        .set(clamp_i64(bytes));
+    metrics
+        .inflation_reward_response_cache_max_bytes
+        .set(clamp_i64(max_bytes));
 }
 
 pub(crate) fn rpc_timeout(method: &str) {

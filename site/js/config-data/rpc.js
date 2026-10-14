@@ -239,7 +239,25 @@ export default {
         opt('GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES', {
           type: 'u64 (bytes)',
           default: '16777216',
-          text: 'Budget for the in-process cache of validated epoch boundary and partition-slot metadata. Zero disables it.',
+          text: 'Budget for the in-process cache of validated epoch boundary and partition-slot metadata. It holds no reward rows. Zero disables it and the response cache, a full rollback.',
+        }),
+        opt('GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES', {
+          type: 'u64 (bytes)',
+          default: '0',
+          text: 'Budget for complete answers cached per exact address set, keyed by the epoch-cache boundary they used. `-32004`, `-32017` and errors are never stored. Zero disables it; it is also off while the epoch cache is off, and startup warns.',
+          relations: [{ type: 'requires', to: 'GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES' }],
+        }),
+        opt('GET_INFLATION_REWARD_RESPONSE_CACHE_TTL_SECS', {
+          type: 'u64 (seconds, 1–86400)',
+          default: '3600',
+          text: 'How long a cached answer is served after insertion. A reward-row repair can stay hidden this long unless the process restarts.',
+          relations: [{ type: 'requires', to: 'GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES' }],
+        }),
+        opt('GET_INFLATION_REWARD_RESPONSE_CACHE_SETTLE_SLOTS', {
+          type: 'u64 (slots, at least 825)',
+          default: '4500',
+          text: 'Finalized slots ClickHouse must hold past the last block an answer read before an answer that contains `null` is cached, so a lagging replica cannot freeze a missing block as no reward. Answers where every address has a reward are cached at once.',
+          relations: [{ type: 'requires', to: 'GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES' }],
         }),
       ],
     },
