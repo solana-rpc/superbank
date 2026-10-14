@@ -3,7 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
@@ -110,6 +110,25 @@ struct InflationBoundaryRow {
 struct InflationSlotRow {
     slot: u64,
     block_height: Option<u64>,
+}
+
+#[derive(Deserialize, clickhouse::Row)]
+struct InflationBoundaryStakeRow {
+    boundary_rows: u64,
+    stake_rows: u64,
+}
+
+#[derive(Deserialize, clickhouse::Row)]
+struct InflationLayoutRow {
+    slot: u64,
+    block_height: Option<u64>,
+    stake_rewards: u64,
+}
+
+#[derive(Deserialize, clickhouse::Row)]
+struct InflationLayoutSampleRow {
+    slot: u64,
+    sample: Vec<Array<u8, 32>>,
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -220,6 +239,92 @@ fn build_inflation_progress_query(
             AND slot < {end_slot_exclusive}
          ORDER BY slot DESC
          LIMIT 1
+         {settings_clause}",
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+    )
+}
+
+/// Counts the stored rows of a boundary that declares no partition count, and how many of them hold
+/// a stake reward. Reads `rewards_type` of that one block only.
+fn build_inflation_boundary_stake_query(
+    table: &str,
+    boundary_slot: u64,
+    settings_clause: &str,
+) -> String {
+    let payout_epoch = boundary_slot / SLOT_SHARD_DIVISOR;
+    format!(
+        "SELECT
+            count() AS boundary_rows,
+            countIf(arrayExists(
+                reward_type -> lowerUTF8(ifNull(reward_type, '')) = 'staking',
+                rewards_type
+            )) AS stake_rows
+         FROM {table}
+         PREWHERE
+            intDiv(slot, {slot_shard_divisor}) = {payout_epoch}
+            AND slot = {boundary_slot}
+         {settings_clause}",
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+    )
+}
+
+/// Counts stake rewards per block for heights `first_block_height..=last_block_height` after a
+/// boundary that declares no partition count. Reads `rewards_type` only, never the pubkeys.
+fn build_inflation_partition_layout_query(
+    table: &str,
+    boundary_slot: u64,
+    end_slot_exclusive: u64,
+    first_block_height: u64,
+    last_block_height: u64,
+    settings_clause: &str,
+) -> String {
+    let payout_epoch = boundary_slot / SLOT_SHARD_DIVISOR;
+    format!(
+        "SELECT
+            slot,
+            block_height,
+            toUInt64(arrayCount(
+                reward_type -> lowerUTF8(ifNull(reward_type, '')) = 'staking',
+                rewards_type
+            )) AS stake_rewards
+         FROM {table}
+         PREWHERE
+            intDiv(slot, {slot_shard_divisor}) = {payout_epoch}
+            AND slot > {boundary_slot}
+            AND slot < {end_slot_exclusive}
+            AND block_height >= {first_block_height}
+            AND block_height <= {last_block_height}
+         ORDER BY block_height ASC, slot ASC
+         {settings_clause}",
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+    )
+}
+
+/// Reads the first two and last two stake reward pubkeys of every block in `first_slot..=last_slot`.
+fn build_inflation_partition_sample_query(
+    table: &str,
+    first_slot: u64,
+    last_slot: u64,
+    settings_clause: &str,
+) -> String {
+    let payout_epoch = first_slot / SLOT_SHARD_DIVISOR;
+    format!(
+        "SELECT slot, arrayConcat(arraySlice(stake, 1, 2), arraySlice(stake, -2)) AS sample
+         FROM (
+            SELECT
+                slot,
+                arrayFilter(
+                    (pubkey, reward_type) -> lowerUTF8(ifNull(reward_type, '')) = 'staking',
+                    rewards_pubkey,
+                    rewards_type
+                ) AS stake
+            FROM {table}
+            PREWHERE
+                intDiv(slot, {slot_shard_divisor}) = {payout_epoch}
+                AND slot >= {first_slot}
+                AND slot <= {last_slot}
+         )
+         ORDER BY slot ASC
          {settings_clause}",
         slot_shard_divisor = SLOT_SHARD_DIVISOR,
     )
@@ -519,6 +624,291 @@ fn resolve_folded_inflation_rewards(
         selected_partition_slots: selected_slots.len(),
         last_selected_partition_slot: selected_slots.iter().copied().max(),
     })
+}
+
+/// Derives partition slots from `(block_height, slot, stake_rewards)` rows after a boundary with no
+/// declared count. `Ok(None)` means the next block is stored and no stake rewards follow the boundary.
+fn derive_inflation_partition_slots(
+    rows: &[(u64, u64, u64)],
+    boundary_slot: u64,
+    end_slot_exclusive: u64,
+    boundary_block_height: u64,
+) -> Result<Option<Vec<u64>>, String> {
+    let mut by_height = BTreeMap::<u64, (u64, u64)>::new();
+    let mut height_by_slot = HashMap::<u64, u64>::with_capacity(rows.len());
+    for &(block_height, slot, stake_rewards) in rows {
+        if block_height <= boundary_block_height
+            || slot <= boundary_slot
+            || slot >= end_slot_exclusive
+        {
+            return Err(format!(
+                "partition layout returned unexpected block height {block_height} at slot {slot}"
+            ));
+        }
+        if let Some(previous) = by_height.insert(block_height, (slot, stake_rewards))
+            && previous != (slot, stake_rewards)
+        {
+            return Err(format!(
+                "block height {block_height} has conflicting partition layout rows"
+            ));
+        }
+        if let Some(previous) = height_by_slot.insert(slot, block_height)
+            && previous != block_height
+        {
+            return Err(format!("slot {slot} maps to multiple block heights"));
+        }
+    }
+
+    let first_partition_height = boundary_block_height
+        .checked_add(1)
+        .ok_or_else(|| "partition block height overflowed".to_string())?;
+    let Some(first_stake_height) = by_height
+        .iter()
+        .find(|(_, (_, stake_rewards))| *stake_rewards > 0)
+        .map(|(block_height, _)| *block_height)
+    else {
+        if by_height.contains_key(&first_partition_height) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "block height {first_partition_height} is missing, so the epoch cannot be shown to be non-partitioned"
+        ));
+    };
+    if first_stake_height != first_partition_height {
+        return Err(format!(
+            "stake rewards start at block height {first_stake_height}, not at the first partition height {first_partition_height}"
+        ));
+    }
+
+    let mut partition_slots = Vec::new();
+    let mut block_height = first_partition_height;
+    let end_height = loop {
+        let Some(&(slot, stake_rewards)) = by_height.get(&block_height) else {
+            return Err(format!(
+                "block height {block_height} is missing, so the partition run has no proven end"
+            ));
+        };
+        if partition_slots
+            .last()
+            .is_some_and(|previous| *previous >= slot)
+        {
+            return Err(format!(
+                "partition layout slots do not increase at block height {block_height}"
+            ));
+        }
+        if stake_rewards == 0 {
+            break block_height;
+        }
+        partition_slots.push(slot);
+        block_height = block_height
+            .checked_add(1)
+            .ok_or_else(|| "partition block height overflowed".to_string())?;
+    };
+    if partition_slots.len() > MAX_INFLATION_REWARD_PARTITIONS {
+        return Err(format!(
+            "derived partition count {} exceeds {MAX_INFLATION_REWARD_PARTITIONS}",
+            partition_slots.len()
+        ));
+    }
+    if let Some((stray_height, _)) = by_height
+        .range(end_height..)
+        .find(|(_, (_, stake_rewards))| *stake_rewards > 0)
+    {
+        return Err(format!(
+            "stake rewards at block height {stray_height} follow the partition run that ends before block height {end_height}"
+        ));
+    }
+    Ok(Some(partition_slots))
+}
+
+/// Checks that each sampled stake reward pubkey hashes to the partition of the block that paid it,
+/// and that every partition block returned a sample.
+fn validate_inflation_partition_samples(
+    samples: &[(u64, Vec<[u8; 32]>)],
+    partition_slots: &[u64],
+    seed: &[u8; 32],
+) -> Result<(), String> {
+    let num_partitions = partition_slots.len();
+    let index_by_slot = partition_slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| (*slot, index))
+        .collect::<HashMap<_, _>>();
+    let mut sampled = vec![false; num_partitions];
+    for (slot, pubkeys) in samples {
+        let Some(&index) = index_by_slot.get(slot) else {
+            return Err(format!("partition sample returned unexpected slot {slot}"));
+        };
+        for pubkey in pubkeys {
+            let partition = inflation_reward_partition(pubkey, num_partitions, seed);
+            if partition != index {
+                return Err(format!(
+                    "stake reward in slot {slot} hashes to partition {partition}, expected {index} of {num_partitions}"
+                ));
+            }
+            sampled[index] = true;
+        }
+    }
+    if let Some(index) = sampled.iter().position(|seen| !seen) {
+        return Err(format!(
+            "partition block at slot {} returned no stake reward sample",
+            partition_slots[index]
+        ));
+    }
+    Ok(())
+}
+
+/// Derives the partition count of a boundary that declares none. Returns `None` when the boundary
+/// holds stake rewards, or when the next block is stored and no stake rewards follow the boundary.
+#[allow(clippy::too_many_arguments)]
+async fn derive_inflation_partition_count(
+    query_client: &clickhouse::Client,
+    read_endpoint: &ReadEndpoint,
+    table: &str,
+    settings_clause: &str,
+    boundary: &InflationBoundaryRow,
+    boundary_block_height: u64,
+    end_slot_exclusive: u64,
+    timings: &mut QueryTimings,
+) -> ProcessingResult<Result<Option<usize>, String>> {
+    let stake_query = build_inflation_boundary_stake_query(table, boundary.slot, settings_clause);
+    let stake_started = Instant::now();
+    let mut stake_cursor = read_endpoint
+        .fetch::<InflationBoundaryStakeRow>(
+            query_client,
+            &stake_query,
+            "get_inflation_reward_boundary_stake",
+        )
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+    let stake = stake_cursor
+        .next_optional()
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+    timings.add(QueryTimings {
+        elapsed_ms: stake_started.elapsed().as_millis() as u64,
+        received_bytes: stake_cursor.received_bytes(),
+        decoded_bytes: stake_cursor.decoded_bytes(),
+        rows_read: Some(0),
+        rows_read_unknown: true,
+        rows_returned: u64::from(stake.is_some()),
+    });
+    // Agave pays stake rewards in the boundary block only when the epoch is not partitioned.
+    match stake {
+        Some(row) if row.boundary_rows > 0 && row.stake_rows == row.boundary_rows => {
+            return Ok(Ok(None));
+        }
+        Some(row) if row.boundary_rows > 0 && row.stake_rows == 0 => {}
+        Some(row) => {
+            return Ok(Err(format!(
+                "boundary slot {} has {} stored rows and {} of them hold stake rewards",
+                boundary.slot, row.boundary_rows, row.stake_rows
+            )));
+        }
+        None => {
+            return Ok(Err(format!(
+                "boundary slot {} returned no stake reward check",
+                boundary.slot
+            )));
+        }
+    }
+
+    let (Some(first_block_height), Some(last_block_height)) = (
+        boundary_block_height.checked_add(1),
+        boundary_block_height.checked_add(MAX_INFLATION_REWARD_PARTITIONS as u64 + 1),
+    ) else {
+        return Ok(Err("partition block height overflowed".to_string()));
+    };
+    let layout_query = build_inflation_partition_layout_query(
+        table,
+        boundary.slot,
+        end_slot_exclusive,
+        first_block_height,
+        last_block_height,
+        settings_clause,
+    );
+    let layout_started = Instant::now();
+    let mut layout_cursor = read_endpoint
+        .fetch::<InflationLayoutRow>(
+            query_client,
+            &layout_query,
+            "get_inflation_reward_partition_layout",
+        )
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+    let mut layout = Vec::new();
+    while let Some(row) = layout_cursor
+        .next()
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?
+    {
+        let Some(block_height) = row.block_height else {
+            return Ok(Err(format!(
+                "partition layout slot {} has no block height",
+                row.slot
+            )));
+        };
+        layout.push((block_height, row.slot, row.stake_rewards));
+    }
+    timings.add(QueryTimings {
+        elapsed_ms: layout_started.elapsed().as_millis() as u64,
+        received_bytes: layout_cursor.received_bytes(),
+        decoded_bytes: layout_cursor.decoded_bytes(),
+        rows_read: Some(0),
+        rows_read_unknown: true,
+        rows_returned: layout.len() as u64,
+    });
+    let partition_slots = match derive_inflation_partition_slots(
+        &layout,
+        boundary.slot,
+        end_slot_exclusive,
+        boundary_block_height,
+    ) {
+        Ok(Some(partition_slots)) => partition_slots,
+        Ok(None) => return Ok(Ok(None)),
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let (Some(&first_slot), Some(&last_slot)) = (partition_slots.first(), partition_slots.last())
+    else {
+        return Ok(Err("derived partition run is empty".to_string()));
+    };
+
+    let sample_query =
+        build_inflation_partition_sample_query(table, first_slot, last_slot, settings_clause);
+    let sample_started = Instant::now();
+    let mut sample_cursor = read_endpoint
+        .fetch::<InflationLayoutSampleRow>(
+            query_client,
+            &sample_query,
+            "get_inflation_reward_partition_samples",
+        )
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?;
+    let mut samples = Vec::new();
+    while let Some(row) = sample_cursor
+        .next()
+        .await
+        .map_err(|e| ProcessingError::database(e.to_string(), e))?
+    {
+        samples.push((
+            row.slot,
+            row.sample.into_iter().map(|pubkey| pubkey.0).collect(),
+        ));
+    }
+    timings.add(QueryTimings {
+        elapsed_ms: sample_started.elapsed().as_millis() as u64,
+        received_bytes: sample_cursor.received_bytes(),
+        decoded_bytes: sample_cursor.decoded_bytes(),
+        rows_read: Some(0),
+        rows_read_unknown: true,
+        rows_returned: samples.len() as u64,
+    });
+    Ok(validate_inflation_partition_samples(
+        &samples,
+        &partition_slots,
+        &boundary.parent_blockhash.0,
+    )
+    .map(|()| Some(partition_slots.len())))
 }
 
 #[derive(Deserialize, clickhouse::Row)]
@@ -1591,7 +1981,46 @@ impl ClickHouseClient {
                         }
                         Some(num_partitions)
                     }
-                    None => None,
+                    // Some stored boundaries lack the `numRewardPartitions` that Agave reports;
+                    // derive it from the boundary and the payout blocks after it.
+                    None => match boundary.block_height {
+                        Some(boundary_block_height) => {
+                            let derived = derive_inflation_partition_count(
+                                &query_client,
+                                &read_endpoint,
+                                &blocks_metadata_table,
+                                &settings_clause,
+                                &boundary,
+                                boundary_block_height,
+                                end_slot_exclusive,
+                                &mut timings,
+                            )
+                            .await?;
+                            match derived {
+                                Ok(Some(num_partitions)) => {
+                                    tracing::info!(
+                                        epoch,
+                                        boundary_slot = boundary.slot,
+                                        num_partitions,
+                                        "Derived undeclared inflation reward partition count"
+                                    );
+                                    Some(num_partitions)
+                                }
+                                Ok(None) => None,
+                                Err(reason) => {
+                                    crate::metrics::inflation_reward_lookup(
+                                        "partitioned",
+                                        "invalid_derived_partitions",
+                                    );
+                                    return Err(ProcessingError::database_msg(format!(
+                                        "inflation epoch {epoch} boundary slot {} declares no reward partition count and its payout layout is invalid: {reason}",
+                                        boundary.slot
+                                    )));
+                                }
+                            }
+                        }
+                        None => None,
+                    },
                 };
                 let boundary = InflationBoundary {
                     slot: boundary.slot,
@@ -3133,15 +3562,18 @@ mod tests {
     use super::super::inflation_cache::InflationEpochCache;
     use super::{
         BlockTransactionProjection, ClickHouseClient, InflationRewardLookupOutcome,
-        InflationRewardRecord, InflationRewardSelection, SLOT_SHARD_DIVISOR,
-        build_block_metadata_query, build_block_time_query, build_block_transactions_query,
-        build_blockhash_valid_query, build_inflation_boundary_query,
-        build_inflation_folded_rewards_query, build_inflation_partition_slots_query,
+        InflationRewardRecord, InflationRewardSelection, MAX_INFLATION_REWARD_PARTITIONS,
+        SLOT_SHARD_DIVISOR, build_block_metadata_query, build_block_time_query,
+        build_block_transactions_query, build_blockhash_valid_query,
+        build_inflation_boundary_query, build_inflation_boundary_stake_query,
+        build_inflation_folded_rewards_query, build_inflation_partition_layout_query,
+        build_inflation_partition_sample_query, build_inflation_partition_slots_query,
         build_inflation_progress_query, build_inflation_required_partition_slots_query,
-        build_inflation_rewards_query, build_transaction_count_query, inflation_epoch_slot_bounds,
-        inflation_reward_partition, inflation_rewards_period_is_active, normalize_slots,
-        plan_inflation_reward_partitions, resolve_folded_inflation_rewards,
-        shard_indices_for_slot_range,
+        build_inflation_rewards_query, build_transaction_count_query,
+        derive_inflation_partition_slots, inflation_epoch_slot_bounds, inflation_reward_partition,
+        inflation_rewards_period_is_active, normalize_slots, plan_inflation_reward_partitions,
+        resolve_folded_inflation_rewards, shard_indices_for_slot_range,
+        validate_inflation_partition_samples,
     };
     #[cfg(any(feature = "disk-cache", feature = "grpc-streaming"))]
     use super::{
@@ -3695,6 +4127,255 @@ mod tests {
     }
 
     #[test]
+    fn inflation_boundary_stake_query_reads_only_the_boundary_reward_types() {
+        let query = build_inflation_boundary_stake_query("blocks_metadata", 304_992_000, "");
+        assert!(query.contains("intDiv(slot, 432000) = 706"));
+        assert!(query.contains("AND slot = 304992000"));
+        assert!(query.contains("count() AS boundary_rows"));
+        assert!(query.contains("rewards_type"));
+        assert!(!query.contains("rewards_pubkey"));
+        assert!(!query.contains("block_height"));
+    }
+
+    #[test]
+    fn inflation_partition_layout_query_reads_reward_types_but_not_pubkeys() {
+        let query = build_inflation_partition_layout_query(
+            "blocks_metadata",
+            305_424_000,
+            305_856_000,
+            283_833_538,
+            283_837_634,
+            "",
+        );
+        assert!(query.contains("intDiv(slot, 432000) = 707"));
+        assert!(query.contains("slot > 305424000"));
+        assert!(query.contains("slot < 305856000"));
+        assert!(query.contains("AND block_height >= 283833538"));
+        assert!(query.contains("AND block_height <= 283837634"));
+        assert!(query.contains("toUInt64(arrayCount("));
+        assert!(query.contains("rewards_type"));
+        assert!(!query.contains("rewards_pubkey"));
+        // Height bounds sit in PREWHERE so only the payout granules read `rewards_type`.
+        assert!(!query.contains("WHERE block_height"));
+    }
+
+    #[test]
+    fn inflation_partition_sample_query_reads_only_the_run_slot_range() {
+        let query =
+            build_inflation_partition_sample_query("blocks_metadata", 305_424_001, 305_424_350, "");
+        assert!(query.contains("intDiv(slot, 432000) = 707"));
+        assert!(query.contains("slot >= 305424001"));
+        assert!(query.contains("slot <= 305424350"));
+        assert!(query.contains("arraySlice(stake, 1, 2), arraySlice(stake, -2)"));
+        assert!(query.contains("rewards_pubkey"));
+    }
+
+    #[test]
+    fn derived_partition_slots_follow_the_contiguous_stake_run() {
+        // Boundary slot 10 at height 100; slot 12 is skipped; the duplicate row is an unmerged part.
+        let rows = [
+            (101, 11, 4_000),
+            (102, 13, 3_900),
+            (102, 13, 3_900),
+            (103, 14, 4_100),
+            (104, 15, 0),
+            (105, 16, 0),
+        ];
+        assert_eq!(
+            derive_inflation_partition_slots(&rows, 10, 100, 100),
+            Ok(Some(vec![11, 13, 14]))
+        );
+    }
+
+    #[test]
+    fn derived_partition_slots_prove_a_non_partitioned_epoch_from_the_next_block() {
+        let rows = [(101, 11, 0), (102, 12, 0)];
+        assert_eq!(
+            derive_inflation_partition_slots(&rows, 10, 100, 100),
+            Ok(None)
+        );
+        assert_eq!(
+            derive_inflation_partition_slots(&[(101, 12, 0)], 10, 100, 100),
+            Ok(None)
+        );
+        // Without the block at boundary height + 1, missing payout blocks look like no payouts.
+        for rows in [vec![], vec![(103, 13, 0)]] {
+            let error = derive_inflation_partition_slots(&rows, 10, 100, 100)
+                .expect_err("next block missing");
+            assert!(error.contains("block height 101 is missing"), "{error}");
+        }
+    }
+
+    #[test]
+    fn derived_partition_slots_reject_ambiguous_layouts() {
+        let derive =
+            |rows: &[(u64, u64, u64)]| derive_inflation_partition_slots(rows, 10, 100, 100);
+        let rejected = [
+            (
+                "run starts late",
+                vec![(101, 11, 0), (102, 12, 5), (103, 13, 0)],
+            ),
+            ("first partition missing", vec![(102, 12, 5), (103, 13, 0)]),
+            (
+                "gap inside run",
+                vec![(101, 11, 5), (103, 13, 5), (104, 14, 0)],
+            ),
+            ("run end not landed", vec![(101, 11, 5), (102, 12, 5)]),
+            (
+                "stake after run",
+                vec![(101, 11, 5), (102, 12, 0), (103, 13, 5)],
+            ),
+            (
+                "height in two slots",
+                vec![(101, 11, 5), (101, 12, 5), (102, 13, 0)],
+            ),
+            (
+                "conflicting duplicate",
+                vec![(101, 11, 5), (101, 11, 6), (102, 12, 0)],
+            ),
+            ("slot at two heights", vec![(101, 11, 5), (102, 11, 0)]),
+            (
+                "slots decrease",
+                vec![(101, 12, 5), (102, 11, 5), (103, 13, 0)],
+            ),
+            (
+                "height at boundary",
+                vec![(100, 11, 0), (101, 12, 5), (102, 13, 0)],
+            ),
+            ("slot past epoch", vec![(101, 11, 5), (102, 100, 0)]),
+        ];
+        for (name, rows) in rejected {
+            assert!(derive(&rows).is_err(), "{name}");
+        }
+
+        let max = MAX_INFLATION_REWARD_PARTITIONS as u64;
+        let mut rows = (0..=max)
+            .map(|offset| (101 + offset, 11 + offset, 1))
+            .collect::<Vec<_>>();
+        rows.push((102 + max, 12 + max, 0));
+        let error = derive_inflation_partition_slots(&rows, 10, 1_000_000, 100)
+            .expect_err("run longer than the partition limit");
+        assert!(error.contains("exceeds"), "{error}");
+    }
+
+    fn pubkeys_by_partition(num_partitions: usize, seed: &[u8; 32]) -> Vec<[u8; 32]> {
+        (0..num_partitions)
+            .map(|partition| {
+                (0..=u8::MAX)
+                    .map(|value| [value; 32])
+                    .find(|pubkey| {
+                        inflation_reward_partition(pubkey, num_partitions, seed) == partition
+                    })
+                    .expect("a fixture pubkey for every partition")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn derived_partition_samples_must_hash_to_their_block() {
+        let seed = [1; 32];
+        let slots = [11, 13, 14, 15];
+        let pubkeys = pubkeys_by_partition(slots.len(), &seed);
+        let samples = slots
+            .iter()
+            .zip(&pubkeys)
+            .map(|(slot, pubkey)| (*slot, vec![*pubkey, *pubkey]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_inflation_partition_samples(&samples, &slots, &seed),
+            Ok(())
+        );
+
+        // A stake reward paid in the wrong block means the derived count or seed is wrong.
+        let mut misplaced = samples.clone();
+        misplaced[2].1.push(pubkeys[3]);
+        assert!(validate_inflation_partition_samples(&misplaced, &slots, &seed).is_err());
+        let mut missing = samples.clone();
+        missing[1].1.clear();
+        assert!(validate_inflation_partition_samples(&missing, &slots, &seed).is_err());
+        assert!(validate_inflation_partition_samples(&samples[1..], &slots, &seed).is_err());
+        let mut unexpected = samples.clone();
+        unexpected.push((12, vec![pubkeys[0]]));
+        assert!(validate_inflation_partition_samples(&unexpected, &slots, &seed).is_err());
+    }
+
+    #[test]
+    fn mainnet_undeclared_partition_epochs_hash_to_their_blocks() {
+        // Payout epochs 707, 800 and 917: Agave reports 314, 234 and 258 partitions; ClickHouse
+        // stored none. A `true` pubkey lands in another block under N - 1 and N + 1 partitions.
+        const E707: &str = "4cNsubWyvMxBBec82mhXQnCr9qGgAesnf1y7Ctvdv2pY";
+        const E800: &str = "6ViZa9pL6nRFG7tks64WtFnkURgBgErzgskDVYZBiTKF";
+        const E917: &str = "9ocMTeLNKCRUzfcLVjvD4691ut7sYz1pUno6rf7pZi1E";
+        let cases = [
+            (
+                E707,
+                314,
+                0,
+                "D7FFAE6DEC93DEAE642F96B841BBDE552E02700242364E0AC619ACCE13066A99",
+                false,
+            ),
+            (
+                E707,
+                314,
+                313,
+                "5BB5219C713AE8DF392F0BBA28CC496FCC8EA6B991361130CBBF890A55B0461B",
+                false,
+            ),
+            (
+                E800,
+                234,
+                128,
+                "5A3FAD9039651356A3C9D900F7F96A39AC22DDF89321298684DC451F50BF3302",
+                true,
+            ),
+            (
+                E917,
+                258,
+                0,
+                "0044E9106211C423B0FAF73712E79AEC13B0D169CE951CECEE7DC0B45331B23D",
+                false,
+            ),
+            (
+                E917,
+                258,
+                160,
+                "000152F489A55A5A9D94480DBB8A951CB07A8ED550F1CC8CE6199E6C716C92C2",
+                true,
+            ),
+            (
+                E917,
+                258,
+                257,
+                "0ED565DE6BB6C9D0956B5E4C829C62D701C6BB1C4596A1153D6FBDADABD52250",
+                false,
+            ),
+        ];
+        for (seed, num_partitions, partition, pubkey, moves_with_wrong_count) in cases {
+            let seed = seed
+                .parse::<crate::solana_sdk::hash::Hash>()
+                .expect("seed")
+                .to_bytes();
+            let pubkey: [u8; 32] = hex::decode(pubkey)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+            assert_eq!(
+                inflation_reward_partition(&pubkey, num_partitions, &seed),
+                partition
+            );
+            if moves_with_wrong_count {
+                for wrong in [num_partitions - 1, num_partitions + 1] {
+                    assert_ne!(
+                        inflation_reward_partition(&pubkey, wrong, &seed),
+                        partition,
+                        "{wrong} partitions"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn block_metadata_query_omits_reward_columns_when_not_requested() {
         let query = build_block_metadata_query("default.blocks_metadata", 42, false, "", true);
 
@@ -4053,6 +4734,81 @@ mod tests {
             &first_partition_stakes,
         ));
 
+        // Epoch 46 (payout epoch 47): 6 partitions laid out like mainnet payout epochs 707-917,
+        // with lowercase spellings and no declared count.
+        const DERIVED_PARTITIONS: u64 = 6;
+        let derived_stakes = (100u8..164).map(|value| [value; 32]).collect::<Vec<_>>();
+        let mut derived_slot_by_stake = HashMap::new();
+        let (start, _) = inflation_epoch_slot_bounds(46, &schedule).unwrap();
+        rows.push(block(
+            start,
+            start - 1,
+            Some(3_000),
+            None,
+            &[(vote, 41, "voting", None), (stakes[3], 1, "fee", None)],
+        ));
+        let mut parent = start;
+        for partition in 0..DERIVED_PARTITIONS {
+            let slot = start + 1 + partition * 3;
+            let mut rewards = Vec::new();
+            for stake in &derived_stakes {
+                if inflation_reward_partition(stake, DERIVED_PARTITIONS as usize, &seed) as u64
+                    == partition
+                {
+                    derived_slot_by_stake.insert(*stake, slot);
+                    rewards.push((*stake, i64::from(stake[0]) + 7, "staking", None));
+                }
+            }
+            assert!(
+                !rewards.is_empty(),
+                "partition {partition} pays a stake reward"
+            );
+            rewards.push((vote, 1, "fee", None));
+            rows.push(block(slot, parent, Some(3_001 + partition), None, &rewards));
+            parent = slot;
+        }
+        rows.push(block(
+            parent + 1,
+            parent,
+            Some(3_001 + DERIVED_PARTITIONS),
+            None,
+            &[(vote, 1, "fee", None)],
+        ));
+
+        // Epoch 47 (payout epoch 48): not partitioned, with block heights; the boundary holds stake.
+        let (non_partitioned_start, _) = inflation_epoch_slot_bounds(47, &schedule).unwrap();
+        rows.push(block(
+            non_partitioned_start,
+            non_partitioned_start - 1,
+            Some(4_000),
+            None,
+            &[(vote, 51, "voting", None), (stakes[0], 52, "staking", None)],
+        ));
+        rows.push(block(
+            non_partitioned_start + 1,
+            non_partitioned_start,
+            Some(4_001),
+            None,
+            &[(vote, 1, "fee", None)],
+        ));
+
+        // Epoch 48 (payout epoch 49): no stake rewards at all; the next block holds only a fee.
+        let (no_stake_start, _) = inflation_epoch_slot_bounds(48, &schedule).unwrap();
+        rows.push(block(
+            no_stake_start,
+            no_stake_start - 1,
+            Some(5_000),
+            None,
+            &[(vote, 61, "voting", None)],
+        ));
+        rows.push(block(
+            no_stake_start + 2,
+            no_stake_start,
+            Some(5_001),
+            None,
+            &[(vote, 1, "fee", None)],
+        ));
+
         execute(
             &http,
             &url,
@@ -4116,6 +4872,18 @@ mod tests {
             ("active_first_partition", 44, vec![active_first_partition]),
             ("active_pending", 44, vec![vote, active_other_partition]),
             ("boundary_unavailable", 45, vec![vote]),
+            ("derived_all", 46, {
+                let mut addresses = vec![vote];
+                addresses.extend(derived_stakes.iter().copied());
+                addresses
+            }),
+            (
+                "derived_subset",
+                46,
+                vec![derived_stakes[7], vote, derived_stakes[7], [99; 32]],
+            ),
+            ("non_partitioned_with_height", 47, all.clone()),
+            ("no_stake_rewards_with_height", 48, all.clone()),
         ];
         for (name, epoch, addresses) in cases {
             let before = query_count().await;
@@ -4139,6 +4907,41 @@ mod tests {
                 outcome_key(&expected).chars().take(160).collect::<String>()
             );
         }
+
+        // Every derived stake reward comes from its own partition block.
+        let (derived, _) = uncached
+            .get_inflation_rewards_for_epoch(&derived_stakes, 46, &schedule)
+            .await
+            .expect("derived lookup");
+        let InflationRewardLookupOutcome::Complete(derived) = derived else {
+            panic!("derived epoch is complete: {derived:?}");
+        };
+        assert_eq!(derived.len(), derived_stakes.len());
+        for reward in &derived {
+            assert_eq!(
+                Some(&reward.effective_slot),
+                derived_slot_by_stake.get(&reward.pubkey)
+            );
+        }
+        let (non_partitioned, _) = uncached
+            .get_inflation_rewards_for_epoch(&[stakes[0]], 47, &schedule)
+            .await
+            .expect("non-partitioned lookup");
+        let InflationRewardLookupOutcome::Complete(non_partitioned) = non_partitioned else {
+            panic!("non-partitioned epoch is complete: {non_partitioned:?}");
+        };
+        assert_eq!(non_partitioned.len(), 1);
+        assert_eq!(non_partitioned[0].effective_slot, non_partitioned_start);
+        let (no_stake, _) = uncached
+            .get_inflation_rewards_for_epoch(&all, 48, &schedule)
+            .await
+            .expect("no-stake lookup");
+        let InflationRewardLookupOutcome::Complete(no_stake) = no_stake else {
+            panic!("no-stake epoch is complete: {no_stake:?}");
+        };
+        assert_eq!(no_stake.len(), 1);
+        assert_eq!(no_stake[0].pubkey, vote);
+        assert_eq!(no_stake[0].effective_slot, no_stake_start);
 
         execute(&http, &url, format!("DROP DATABASE {database} SYNC")).await;
     }
