@@ -288,3 +288,162 @@ async fn agave43_inflation_excludes_vat_for_shared_and_vat_only_addresses() {
     assert!(body["result"][2].is_null());
     cleanup(&client, &cfg).await;
 }
+
+async fn set_rewards(
+    client: &clickhouse::Client,
+    database: &str,
+    slot: u64,
+    partitions: Option<u64>,
+    rewards: &[(&str, i64, &str)],
+) {
+    let list = |item: &dyn Fn(&(&str, i64, &str)) -> String| {
+        rewards.iter().map(item).collect::<Vec<_>>().join(",")
+    };
+    let pubkeys = list(&|(name, _, _)| format!("toFixedString('{name}',32)"));
+    let lamports = list(&|(_, lamports, _)| lamports.to_string());
+    let balances = list(&|(_, lamports, _)| (1_000 + lamports).to_string());
+    let types = list(&|(_, _, reward_type)| format!("'{reward_type}'"));
+    let commissions = list(&|_| "7".to_string());
+    let commission_bps = list(&|_| "725".to_string());
+    let partitions = partitions.map_or_else(|| "NULL".to_string(), |count| count.to_string());
+    execute(client, &format!("ALTER TABLE {database}.blocks_metadata UPDATE rewards_present=1,rewards_pubkey=[{pubkeys}],rewards_lamports=[{lamports}],rewards_post_balance=[{balances}],rewards_type=[{types}],rewards_commission=[{commissions}],rewards_commission_bps=[{commission_bps}],rewards_num_partitions={partitions} WHERE slot={slot} SETTINGS mutations_sync=2")).await;
+}
+
+async fn inflation_result(
+    state: &Arc<crate::state::AppState>,
+    epoch: u64,
+    names: &[&str],
+) -> Value {
+    let addresses = names
+        .iter()
+        .map(|name| address(name).to_string())
+        .collect::<Vec<_>>();
+    let response = crate::handlers::blocks::handle_get_inflation_reward(
+        state.clone(),
+        json!(1),
+        Some(vec![json!(addresses), json!({ "epoch": epoch })]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(body.get("error").is_none(), "{body}");
+    body["result"].clone()
+}
+
+#[tokio::test]
+#[ignore = "requires disposable ClickHouse: DISK_CACHE_TEST_URL"]
+async fn agave44_inflation_returns_deactivated_stake_in_both_spellings() {
+    use crate::solana_sdk::hash::Hash;
+    use solana_epoch_rewards_hasher::EpochRewardsHasher;
+    use std::collections::BTreeMap;
+
+    const PARTITIONS: u64 = 4;
+    const UNPARTITIONED_BOUNDARY: u64 = 32;
+    const PARTITIONED_BOUNDARY: u64 = 64;
+    let (client, source, cfg, _) = setup().await;
+    let database = cfg.database.trim_end_matches("_cache");
+    execute(&client, &format!("INSERT INTO {database}.blocks_metadata (slot,parent_slot,blockhash,parent_blockhash,block_time,block_height,executed_transaction_count) SELECT number,number-1,toFixedString('hash',32),toFixedString('hash',32),1700000000+number,number,1 FROM numbers(50,50)")).await;
+    let stake_rewards = [
+        ("grpc", 50, "DeactivatedStake"),
+        ("display", 60, "deactivated-stake"),
+        ("stake", 100, "Staking"),
+    ];
+    // Epoch 0 pays at slot 32 without partitions.
+    let mut unpartitioned = stake_rewards.to_vec();
+    unpartitioned.extend([
+        ("vote", 200, "Voting"),
+        ("vat", -10, "VATDebit"),
+        ("fee", 5, "Fee"),
+    ]);
+    set_rewards(
+        &client,
+        database,
+        UNPARTITIONED_BOUNDARY,
+        None,
+        &unpartitioned,
+    )
+    .await;
+    // Epoch 1 pays at slot 64; partition blocks are slots 65..=68, keyed by the parent blockhash.
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(b"hash");
+    let hasher = EpochRewardsHasher::new(PARTITIONS as usize, &Hash::new_from_array(seed));
+    let partition_slot = |name: &str| {
+        PARTITIONED_BOUNDARY + 1 + hasher.clone().hash_address_to_partition(&address(name)) as u64
+    };
+    let mut slots = BTreeMap::<u64, Vec<(&str, i64, &str)>>::new();
+    slots.insert(
+        PARTITIONED_BOUNDARY,
+        vec![
+            ("vote", 200, "Voting"),
+            ("vat", -10, "VATDebit"),
+            ("boundary", 70, "DeactivatedStake"),
+        ],
+    );
+    for reward in stake_rewards.into_iter().chain([
+        ("vat", -11, "validator-admission-ticket-debit"),
+        ("fee", 5, "Fee"),
+    ]) {
+        slots
+            .entry(partition_slot(reward.0))
+            .or_default()
+            .push(reward);
+    }
+    for (slot, rewards) in &slots {
+        let partitions = (*slot == PARTITIONED_BOUNDARY).then_some(PARTITIONS);
+        set_rewards(&client, database, *slot, partitions, rewards).await;
+    }
+
+    let mut state = Arc::try_unwrap(crate::tests::test_state()).ok().unwrap();
+    state.clickhouse = source;
+    state.epoch_schedule = solana_epoch_schedule::EpochSchedule::custom(32, 32, false);
+    let state = Arc::new(state);
+    let names = ["grpc", "display", "stake", "vote", "vat", "fee", "boundary"];
+    for (epoch, boundary) in [(0, UNPARTITIONED_BOUNDARY), (1, PARTITIONED_BOUNDARY)] {
+        let effective_slot = |name: &str| {
+            if epoch == 0 {
+                boundary
+            } else {
+                partition_slot(name)
+            }
+        };
+        // The second read takes the cached boundary, and the folded query when partitioned.
+        let cold = inflation_result(&state, epoch, &names).await;
+        assert_eq!(inflation_result(&state, epoch, &names).await, cold);
+        for (index, (name, amount, _)) in stake_rewards.iter().enumerate() {
+            assert_eq!(cold[index]["amount"], *amount, "epoch {epoch} {name}");
+            assert_eq!(cold[index]["effectiveSlot"], effective_slot(name));
+            assert_eq!(cold[index]["commissionBps"], 725);
+        }
+        assert_eq!(cold[3]["amount"], 200, "epoch {epoch} vote");
+        assert_eq!(cold[3]["effectiveSlot"], boundary);
+        for (index, name) in names.iter().enumerate().skip(4) {
+            assert!(
+                cold[index].is_null(),
+                "epoch {epoch} {name}: {}",
+                cold[index]
+            );
+        }
+    }
+    // The partitioned epoch ran both the sequential partition query and the folded query.
+    execute(&client, "SYSTEM FLUSH LOGS").await;
+    for operation in [
+        "get_inflation_reward_partition_rewards",
+        "get_inflation_reward_cached_rewards",
+    ] {
+        let count = client
+            .query("SELECT count() FROM system.query_log WHERE type='QueryFinish' AND has(databases, ?) AND query_id LIKE ?")
+            .bind(database)
+            .bind(format!("%:{operation}:%"))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "{operation}");
+    }
+    cleanup(&client, &cfg).await;
+}

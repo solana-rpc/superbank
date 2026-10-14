@@ -54,6 +54,7 @@ Notes:
   block-height-to-slot map are cached in process (`GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES`).
   A repeated epoch then needs one ClickHouse query that reads boundary vote rewards and partition
   stake rewards together; responses are identical to the uncached path.
+  As in Agave, `Voting` rewards come from the boundary block. `Staking` and `DeactivatedStake` rewards come from the boundary block of a non-partitioned epoch, or else from the address's partition block. Both stored `DeactivatedStake` spellings match: `DeactivatedStake` from gRPC and Fumarole, and `deactivated-stake` from RPC, Bigtable, and Jetstreamer. `Fee`, `Rent`, and `VATDebit` rewards are never returned.
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
