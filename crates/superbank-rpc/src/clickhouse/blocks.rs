@@ -798,7 +798,7 @@ fn build_block_time_range_query(
 
     format!(
         "SELECT
-                slot, block_time
+                slot, parent_slot, block_time
              FROM {blocks_metadata_table}
              PREWHERE
                 intDiv(slot, {slot_shard_divisor}) BETWEEN {start_bucket} AND {end_bucket}
@@ -2942,8 +2942,8 @@ impl ClickHouseClient {
         .await
     }
 
-    /// Block times in `[start_slot, end_slot]`, ascending. This narrow range
-    /// read is reserved for the full-history block index.
+    /// Block times and parent links in `[start_slot, end_slot]`, ascending. This narrow range
+    /// read is reserved for the full-history block index, which bypasses the query cache.
     #[cfg(feature = "disk-cache")]
     pub(crate) async fn get_block_times_by_slot_range(
         &self,
@@ -2958,7 +2958,7 @@ impl ClickHouseClient {
             {
                 let settings_clause = self.select_settings_clause_with_timeout(
                     "get_block_times_by_slot_range_local_http",
-                    QueryFreshnessClass::Historical,
+                    QueryFreshnessClass::TipSensitive,
                     timeout,
                 );
                 let ranges = shard_slot_ranges_for_slot_range(start_slot, end_slot, |bucket| {
@@ -3005,7 +3005,7 @@ impl ClickHouseClient {
 
             let settings_clause = self.select_settings_clause_with_timeout(
                 "get_block_times_by_slot_range",
-                QueryFreshnessClass::Historical,
+                QueryFreshnessClass::TipSensitive,
                 timeout,
             );
             let query = build_block_time_range_query(
@@ -3614,7 +3614,7 @@ mod tests {
             "SETTINGS max_threads=2",
         );
 
-        assert!(query.contains("SELECT\n                slot, block_time"));
+        assert!(query.contains("SELECT\n                slot, parent_slot, block_time"));
         assert!(query.contains("intDiv(slot, 432000) BETWEEN 1 AND 1"));
         assert!(query.contains("AND slot BETWEEN 432001 AND 432010"));
         assert!(query.contains("ORDER BY slot ASC"));

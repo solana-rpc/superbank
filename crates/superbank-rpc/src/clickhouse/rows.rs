@@ -131,6 +131,7 @@ pub(crate) struct BlockMetadataBaseRow {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, clickhouse::Row)]
 pub(crate) struct BlockTimeRangeRow {
     pub(crate) slot: u64,
+    pub(crate) parent_slot: u64,
     pub(crate) block_time: Option<i64>,
 }
 
