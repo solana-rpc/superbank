@@ -336,10 +336,10 @@ impl ClickHouseClient {
         if !self.allow_query_settings {
             return String::new();
         }
-        let settings = append_max_execution_time_setting(
+        let settings = self.with_get_transaction_thread_cap(append_max_execution_time_setting(
             "SETTINGS optimize_skip_unused_shards=1, use_query_cache=0",
             self.query_timeout,
-        );
+        ));
         if self.signatures_owner_shard_routed() {
             super::owner_shard::with_owner_shard_settings(&settings)
         } else {
@@ -1868,6 +1868,41 @@ mod tests {
 
         client.allow_query_settings = false;
         assert_eq!(client.single_round_trip_settings_clause(), "");
+    }
+
+    #[test]
+    fn get_transaction_thread_cap_covers_round_trip_and_position_lookup() {
+        let mut client = single_round_trip_test_client("http://127.0.0.1:1", "default", true);
+        client.allow_query_settings = true;
+        assert!(
+            !client
+                .single_round_trip_settings_clause()
+                .contains("max_threads")
+        );
+        assert!(
+            !client
+                .signature_slot_settings_clause()
+                .contains("max_threads")
+        );
+
+        client.get_transaction_max_threads = 3;
+        let cap = "max_threads=3, max_threads_for_indexes=3";
+        assert!(client.single_round_trip_settings_clause().contains(cap));
+        assert!(client.signature_slot_settings_clause().contains(cap));
+
+        client
+            .set_signatures_owner_shard_routing(true, "my_cluster", None)
+            .unwrap();
+        for settings in [
+            client.single_round_trip_settings_clause(),
+            client.signature_slot_settings_clause(),
+        ] {
+            assert!(settings.contains(cap), "{settings}");
+            assert!(
+                settings.ends_with(", force_optimize_skip_unused_shards=0"),
+                "{settings}"
+            );
+        }
     }
 
     #[test]

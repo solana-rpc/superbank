@@ -374,6 +374,8 @@ pub struct ClickHouseClient {
 
     pub(crate) query_timeout: Duration,
     pub(crate) signature_status_max_threads: usize,
+    /// Thread cap for primary getTransaction reads; zero keeps the server's setting.
+    pub(crate) get_transaction_max_threads: usize,
     signature_status_sem: Arc<Semaphore>,
     #[cfg(any(test, feature = "disk-cache"))]
     query_cleanup_cluster: Option<String>,
@@ -435,6 +437,7 @@ pub struct ClickHouseClientOptions {
     pub query_timeout: Duration,
     pub signature_status_max_concurrency: usize,
     pub signature_status_max_threads: usize,
+    pub get_transaction_max_threads: usize,
     pub query_cleanup_cluster: Option<String>,
     pub tcp_access_check_timeout: Duration,
     pub replica_health_check_interval: Duration,
@@ -550,6 +553,7 @@ impl ClickHouseClientOptions {
             query_timeout: Duration::from_millis(8_000),
             signature_status_max_concurrency: 4,
             signature_status_max_threads: 2,
+            get_transaction_max_threads: 0,
             query_cleanup_cluster: None,
             tcp_access_check_timeout: Duration::from_secs(2),
             replica_health_check_interval: Duration::from_secs(10),
@@ -573,6 +577,12 @@ impl ClickHouseClientOptions {
     ) -> Self {
         self.signature_status_max_concurrency = max_concurrency.max(1);
         self.signature_status_max_threads = max_threads.max(1);
+        self
+    }
+
+    /// Thread cap for primary getTransaction reads; zero keeps the server's setting.
+    pub fn with_get_transaction_max_threads(mut self, max_threads: usize) -> Self {
+        self.get_transaction_max_threads = max_threads;
         self
     }
 
@@ -695,6 +705,7 @@ impl ClickHouseClient {
             query_timeout,
             signature_status_max_concurrency,
             signature_status_max_threads,
+            get_transaction_max_threads,
             query_cleanup_cluster,
             tcp_access_check_timeout,
             replica_health_check_interval,
@@ -838,6 +849,7 @@ impl ClickHouseClient {
 
             query_timeout,
             signature_status_max_threads: signature_status_max_threads.max(1),
+            get_transaction_max_threads,
             signature_status_sem: Arc::new(Semaphore::new(signature_status_max_concurrency.max(1))),
             #[cfg(any(test, feature = "disk-cache"))]
             query_cleanup_cluster,
@@ -1196,7 +1208,22 @@ impl ClickHouseClient {
             ),
             self.query_timeout,
         );
-        self.cache_settings_or(settings, self.query_timeout)
+        self.with_get_transaction_thread_cap(self.cache_settings_or(settings, self.query_timeout))
+    }
+
+    /// Appends `GET_TRANSACTION_MAX_THREADS` to a primary getTransaction SETTINGS clause.
+    /// Local-cache reads keep their own cap; without query SETTINGS no cap can be sent.
+    pub(crate) fn with_get_transaction_thread_cap(&self, settings: String) -> String {
+        let max_threads = self.get_transaction_max_threads;
+        if max_threads == 0 || self.cache_partition.is_some() || !self.allow_query_settings {
+            return settings;
+        }
+        let prefix = if settings.trim().is_empty() {
+            "SETTINGS".to_string()
+        } else {
+            format!("{},", settings.trim_end())
+        };
+        format!("{prefix} max_threads={max_threads}, max_threads_for_indexes={max_threads}")
     }
 
     pub(crate) fn inflation_reward_settings_clause(&self, operation: &'static str) -> String {
@@ -3143,6 +3170,45 @@ mod tests {
         ]);
 
         assert!(client.gsfa_hot_routing_configured());
+    }
+
+    #[test]
+    fn get_transaction_thread_cap_applies_only_to_primary_reads() {
+        let operation = "get_transaction_by_signature_distributed";
+        let client = test_client_with_query_cache();
+        let uncapped = client
+            .select_get_transaction_settings_clause(operation, QueryFreshnessClass::Historical);
+        assert!(!uncapped.contains("max_threads"));
+
+        let capped = ClickHouseClient {
+            get_transaction_max_threads: 4,
+            ..client
+        };
+        let clause = capped
+            .select_get_transaction_settings_clause(operation, QueryFreshnessClass::Historical);
+        assert_eq!(
+            clause,
+            format!(
+                "{}, max_threads=4, max_threads_for_indexes=4",
+                uncapped.trim_end()
+            )
+        );
+        assert_eq!(
+            capped.with_get_transaction_thread_cap(String::new()),
+            "SETTINGS max_threads=4, max_threads_for_indexes=4"
+        );
+
+        let mut local_cache = capped.clone();
+        local_cache.cache_partition = Some((1000, 1));
+        let clause = local_cache
+            .select_get_transaction_settings_clause(operation, QueryFreshnessClass::Historical);
+        assert!(!clause.contains("max_threads"));
+
+        let mut no_settings = capped;
+        no_settings.allow_query_settings = false;
+        let clause = no_settings
+            .select_get_transaction_settings_clause(operation, QueryFreshnessClass::Historical);
+        assert!(!clause.contains("max_threads"));
     }
 
     #[test]

@@ -156,6 +156,11 @@ export default {
           text: 'How long a primary-served record stays cached.',
           relations: [{ type: 'requires', to: 'GET_TRANSACTION_PRIMARY_CACHE_MAX_BYTES' }],
         }),
+        opt('GET_TRANSACTION_MAX_THREADS', {
+          type: 'usize',
+          default: '0',
+          text: 'ClickHouse `max_threads` and `max_threads_for_indexes` for primary `getTransaction` reads, including the signature position lookup that `getSignaturesForAddress` cursors also use. Zero keeps the server setting. Local-cache and shard-direct shard-local reads are unchanged.',
+        }),
         envOnly('SIGNATURE_SLOT_CACHE_SIZE', CACHE, {
           type: 'usize',
           default: '50000',
