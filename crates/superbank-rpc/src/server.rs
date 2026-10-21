@@ -301,6 +301,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             args.get_signature_statuses_max_concurrency,
             args.get_signature_statuses_max_threads,
         )
+        .with_get_transaction_max_threads(args.get_transaction_max_threads)
         .with_query_timeout(Duration::from_millis(args.clickhouse_query_timeout_ms))
         .with_tcp_access_check_timeout(Duration::from_millis(
             args.clickhouse_tcp_access_check_timeout_ms,

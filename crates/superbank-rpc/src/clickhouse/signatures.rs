@@ -417,6 +417,19 @@ impl ClickHouseClient {
         }
     }
 
+    /// SETTINGS for the primary signature position lookup, which getTransaction and the
+    /// getSignaturesForAddress `before`/`until` cursors share.
+    pub(crate) fn signature_slot_settings_clause(&self) -> String {
+        let settings = self.with_get_transaction_thread_cap(
+            self.select_settings_clause("get_signature_slot", QueryFreshnessClass::Historical),
+        );
+        if self.signatures_owner_shard_routed() {
+            with_owner_shard_settings(&settings)
+        } else {
+            settings
+        }
+    }
+
     async fn get_signature_slot_by_signature_uncached(
         &self,
         signature_hash: u64,
@@ -468,11 +481,7 @@ impl ClickHouseClient {
             }
 
             let signature_statuses_table = self.signature_lookup_source();
-            let mut settings_clause =
-                self.select_settings_clause("get_signature_slot", QueryFreshnessClass::Historical);
-            if self.signatures_owner_shard_routed() {
-                settings_clause = with_owner_shard_settings(&settings_clause);
-            }
+            let settings_clause = self.signature_slot_settings_clause();
             let query = format!(
                 "SELECT
                     slot,
