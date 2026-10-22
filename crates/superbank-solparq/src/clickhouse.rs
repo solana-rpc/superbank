@@ -6,7 +6,10 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt};
 
-use crate::{archive::ClickHouseBounds, config::Config};
+use crate::{
+    archive::ClickHouseBounds,
+    config::{Config, FooterCoveragePolicy},
+};
 
 #[derive(Debug, Clone)]
 pub struct DbTables {
@@ -225,6 +228,7 @@ impl ClickHouseClient {
         &self,
         tables: &DbTables,
         solana_rpc_url: &str,
+        footer_check: FooterCheck,
         start_slot: u64,
         end_slot: u64,
     ) -> Result<ValidationReport> {
@@ -237,9 +241,10 @@ impl ClickHouseClient {
                 Err(err) => (Vec::new(), Some(err.to_string())),
             };
 
-        let transaction_mismatches = self
-            .fetch_transaction_mismatches(tables, start_slot, end_slot)
-            .await?;
+        let (transaction_mismatches, footer_gap_slots) = futures_util::try_join!(
+            self.fetch_transaction_mismatches(tables, start_slot, end_slot),
+            self.fetch_footer_gap_slots(&tables.blocks_table, footer_check, start_slot, end_slot),
+        )?;
 
         Ok(ValidationReport::from_observed_slots(
             start_slot,
@@ -248,7 +253,8 @@ impl ClickHouseClient {
             produced_slots,
             transaction_mismatches,
             rpc_check_error,
-        ))
+        )
+        .with_footer_gaps(&footer_gap_slots, footer_check.required))
     }
 
     pub async fn stream_local_parquet(
@@ -436,6 +442,26 @@ impl ClickHouseClient {
             .collect())
     }
 
+    /// Stored post-genesis blocks whose footer is incomplete. `FINAL` reads the row a replay left last.
+    async fn fetch_footer_gap_slots(
+        &self,
+        blocks_table: &str,
+        footer_check: FooterCheck,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<u64>> {
+        #[derive(Deserialize)]
+        struct SlotRow {
+            slot: u64,
+        }
+        let Some((first, last)) = footer_check.checked_range(start_slot, end_slot) else {
+            return Ok(Vec::new());
+        };
+        let sql = build_footer_gap_query(blocks_table, first, last);
+        let rows = self.query_json_rows::<SlotRow>(&sql).await?;
+        Ok(rows.into_iter().map(|row| row.slot).collect())
+    }
+
     async fn fetch_transaction_mismatches(
         &self,
         tables: &DbTables,
@@ -621,6 +647,28 @@ impl fmt::Display for SlotRange {
     }
 }
 
+/// Alpenglow footer audit settings for one validation run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FooterCheck {
+    pub genesis_slot: Option<u64>,
+    pub required: bool,
+}
+
+impl FooterCheck {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            genesis_slot: config.alpenglow_genesis_slot,
+            required: config.footer_coverage_policy == FooterCoveragePolicy::Require,
+        }
+    }
+
+    /// The part of `[start_slot, end_slot]` after the genesis slot, if any.
+    pub fn checked_range(&self, start_slot: u64, end_slot: u64) -> Option<(u64, u64)> {
+        let first = self.genesis_slot?.checked_add(1)?.max(start_slot);
+        (first <= end_slot).then_some((first, end_slot))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ValidationReport {
     pub start_slot: u64,
@@ -637,6 +685,10 @@ pub struct ValidationReport {
     /// Slots with more archived rows than declared — fixable by ClickHouse dedup.
     pub transaction_overcount_ranges: Vec<SlotRange>,
     pub rpc_check_error: Option<String>,
+    /// Alpenglow blocks stored without a complete footer.
+    pub footer_missing_ranges: Vec<SlotRange>,
+    /// Footer gaps block the archive (`--footer-coverage-policy require`).
+    pub footer_coverage_required: bool,
 }
 
 impl ValidationReport {
@@ -690,21 +742,44 @@ impl ValidationReport {
             missing_blocks,
             transaction_mismatches,
             rpc_check_error,
+            footer_missing_ranges: Vec::new(),
+            footer_coverage_required: false,
         }
     }
 
+    pub fn with_footer_gaps(mut self, footer_gap_slots: &[u64], required: bool) -> Self {
+        self.footer_missing_ranges = slot_ranges(footer_gap_slots);
+        self.footer_coverage_required = required;
+        self
+    }
+
+    pub fn footer_missing_slots(&self) -> u64 {
+        self.footer_missing_ranges
+            .iter()
+            .map(|range| range.slot_count)
+            .sum()
+    }
+
     pub fn has_warnings(&self) -> bool {
-        !self.missing_blocks.is_empty()
-            || !self.transaction_mismatches.is_empty()
-            || self.rpc_check_error.is_some()
+        self.has_data_warnings() || self.rpc_check_error.is_some()
     }
 
     /// Verified data problems that always block archiving: blocks Solana
-    /// produced but we are missing, or transaction-count mismatches. Excludes
+    /// produced but we are missing, transaction-count mismatches, and footer
+    /// gaps when footers are required. Excludes
     /// the RPC cross-check *failure*, which is a "couldn't verify" condition
     /// rather than a detected gap.
     pub fn has_data_warnings(&self) -> bool {
-        !self.missing_blocks.is_empty() || !self.transaction_mismatches.is_empty()
+        self.missing_blocks.len() + self.transaction_mismatches.len() + self.blocking_footer_gaps()
+            > 0
+    }
+
+    fn blocking_footer_gaps(&self) -> usize {
+        if self.footer_coverage_required {
+            self.footer_missing_ranges.len()
+        } else {
+            0
+        }
     }
 
     /// Whether validation results should block archiving. When
@@ -835,6 +910,15 @@ pub fn build_local_parquet_query(
         "SELECT * FROM {transactions_table}{dedup} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY slot, slot_idx, signature{settings} FORMAT Parquet",
         dedup = final_suffix(dedup),
         settings = settings_suffix(settings, " ")
+    )
+}
+
+/// Slots in `[start_slot, end_slot]` whose stored footer is missing or partial.
+pub fn build_footer_gap_query(blocks_table: &str, start_slot: u64, end_slot: u64) -> String {
+    format!(
+        "SELECT slot FROM {blocks_table} FINAL WHERE slot BETWEEN {start_slot} AND {end_slot} \
+         AND (bank_hash IS NULL OR block_producer_time_nanos IS NULL OR block_user_agent IS NULL) \
+         ORDER BY slot"
     )
 }
 

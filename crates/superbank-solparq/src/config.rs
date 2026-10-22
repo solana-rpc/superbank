@@ -15,6 +15,14 @@ pub enum ArchiveLocation {
     S3,
 }
 
+/// What validation does with Alpenglow blocks that lack a complete stored footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum FooterCoveragePolicy {
+    Report,
+    Require,
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Config {
     pub bucket_name: String,
@@ -78,6 +86,9 @@ pub struct Config {
     /// (missing blocks, transaction mismatches) still block; only the
     /// "couldn't verify" condition is treated as non-blocking. Off by default.
     pub allow_rpc_validation_failure: bool,
+    /// Trusted Alpenglow genesis certificate slot. Slots after it need a stored footer.
+    pub alpenglow_genesis_slot: Option<u64>,
+    pub footer_coverage_policy: FooterCoveragePolicy,
     /// Backfill blocks missing from the archive's slot range (detected by
     /// validation) from Solana RPC before archiving, by invoking the `superbank`
     /// RPC ingestor as a subprocess. Off by default.
@@ -134,7 +145,7 @@ impl Config {
     }
 
     fn from_cli(cli: Cli) -> Result<Self> {
-        hourly_slot_count(cli.hourly_slot_duration_ms)?;
+        validate_cadence_and_footer_policy(&cli)?;
         let archive_kinds = parse_archive_kinds(&cli.archive_range_type, cli.custom_slot_range)?;
         if !cli.server_mode && archive_kinds.len() > 1 {
             return Err(anyhow!(
@@ -221,6 +232,8 @@ impl Config {
             s3_write_checksums: cli.archive_s3_write_checksums,
             force_archive: cli.force_archive,
             allow_rpc_validation_failure: cli.allow_rpc_validation_failure,
+            alpenglow_genesis_slot: cli.alpenglow_genesis_slot,
+            footer_coverage_policy: cli.footer_coverage_policy,
             backfill_gaps: cli.backfill_gaps,
             backfill_superbank_bin: cli.backfill_superbank_bin,
             backfill_include_undercounts: cli.backfill_include_undercounts,
@@ -489,6 +502,23 @@ struct Cli {
     )]
     allow_rpc_validation_failure: bool,
 
+    /// Trusted Alpenglow genesis certificate slot (`getAgGenesisCert` `block.slot`).
+    /// Validation checks the stored footer of every block after it. Unset skips the check.
+    #[arg(
+        long = "alpenglow-genesis-slot",
+        env = "SOLPARQ_ALPENGLOW_GENESIS_SLOT"
+    )]
+    alpenglow_genesis_slot: Option<u64>,
+
+    /// `report` lists Alpenglow blocks without a complete footer; `require` also blocks the archive.
+    #[arg(
+        long = "footer-coverage-policy",
+        env = "SOLPARQ_FOOTER_COVERAGE_POLICY",
+        value_enum,
+        default_value = "report"
+    )]
+    footer_coverage_policy: FooterCoveragePolicy,
+
     /// Backfill blocks missing from the archive's slot range from Solana RPC
     /// before archiving, by invoking the `superbank` RPC ingestor as a
     /// subprocess. Uses `--solana-rpc-url` and the configured ClickHouse
@@ -655,6 +685,18 @@ fn require_s3_value(value: Option<String>, name: &str) -> Result<String> {
         return Err(anyhow!("{name} is required when archive-location-type=s3"));
     }
     Ok(value)
+}
+
+fn validate_cadence_and_footer_policy(cli: &Cli) -> Result<()> {
+    hourly_slot_count(cli.hourly_slot_duration_ms)?;
+    if cli.footer_coverage_policy == FooterCoveragePolicy::Require
+        && cli.alpenglow_genesis_slot.is_none()
+    {
+        return Err(anyhow!(
+            "--footer-coverage-policy require needs --alpenglow-genesis-slot"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_table_name(value: &str) -> Result<()> {

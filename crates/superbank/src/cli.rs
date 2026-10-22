@@ -298,7 +298,7 @@ struct CliArgs {
     #[arg(long, env = "RPC_MAX_INFLIGHT", default_value_t = 64)]
     rpc_max_inflight: usize,
 
-    /// Max supported transaction version for getBlock (default: 0)
+    /// Max supported transaction version for getBlock (default: 1)
     #[arg(long, env = "RPC_MAX_SUPPORTED_TX_VERSION", default_value_t = 1)]
     rpc_max_supported_tx_version: u8,
 

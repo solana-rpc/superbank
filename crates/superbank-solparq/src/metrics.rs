@@ -153,6 +153,8 @@ enum ValidationCategory {
     NotProduced,
     /// Block transaction count does not match the archived transaction rows.
     TransactionMismatch,
+    /// Alpenglow block stored without a complete footer.
+    FooterMissing,
 }
 
 impl ValidationCategory {
@@ -161,6 +163,7 @@ impl ValidationCategory {
             ValidationCategory::MissingBlock => "missing_block",
             ValidationCategory::NotProduced => "not_produced",
             ValidationCategory::TransactionMismatch => "transaction_mismatch",
+            ValidationCategory::FooterMissing => "footer_missing",
         }
     }
 }
@@ -1025,6 +1028,12 @@ impl AppState {
                 ValidationCategory::TransactionMismatch,
                 validation.transaction_mismatches.len() as u64,
                 validation.transaction_mismatch_ranges.len() as u64,
+            );
+            self.observe_validation_category(
+                kind_label,
+                ValidationCategory::FooterMissing,
+                validation.footer_missing_slots(),
+                validation.footer_missing_ranges.len() as u64,
             );
             // Split mismatches by direction: undercount needs re-ingestion,
             // overcount is dedup-fixable.

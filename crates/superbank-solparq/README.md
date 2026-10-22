@@ -42,7 +42,9 @@ included when they exist on the ClickHouse server and are recorded as skipped in
 `manifest.json` when absent. This lets RPC/Bigtable deployments archive cleanly
 without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
 entries for later PoH-specific tooling.
-`blocks_metadata.parquet` carries the Alpenglow footer columns `bank_id`, `bank_hash`, `block_producer_time_nanos` and `block_user_agent`. They are `NULL` for blocks stored without a footer, and for archives made before the columns existed. The archive manifest format is version 3; older bundles remain readable and restore with those columns `NULL`. Block data and its footer are written in one `blocks_metadata` row. Replay may not provide historical footers, so audit and record gaps before archiving. See the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
+`blocks_metadata.parquet` carries the Alpenglow footer columns `bank_id`, `bank_hash`, `block_producer_time_nanos` and `block_user_agent`. They are `NULL` for blocks stored without a footer, and for archives made before the columns existed. The archive manifest format is version 3; older bundles remain readable and restore with those columns `NULL`. Block data and its footer are written in one `blocks_metadata` row. Replay may not provide historical footers. Set `--alpenglow-genesis-slot` so validation reports Alpenglow blocks without a complete footer; see [Alpenglow footer coverage](#alpenglow-footer-coverage) and the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
+
+`transactions.parquet` carries `tx_version` and the v1 transaction config columns `tx_config_priority_fee`, `tx_config_compute_unit_limit`, `tx_config_loaded_accounts_data_size_limit` and `tx_config_heap_size`. They are `NULL` for legacy and v0 transactions, for v1 fields the transaction did not set, and for archives made before the columns existed. Restore names each archived column, so a destination without the v1 columns fails instead of dropping them.
 
 `SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
 bundle. `report.json` is a machine-readable run report: it carries a
@@ -86,7 +88,7 @@ outcome. Its top level is flattened, so run fields sit alongside the header:
 
 ```json
 {
-  "report_version": 1,
+  "report_version": 2,
   "producer": {
     "name": "superbank-solparq",
     "version": "0.5.1-rc1-sp1",
@@ -412,6 +414,8 @@ separate actionable gaps from expected leader gaps and other problems:
   informational).
 - `transaction_mismatch` — block transaction count does not match the archived
   transaction rows (**other data issue**).
+- `footer_missing` — an Alpenglow block is stored without a complete footer.
+  Only reported with `--alpenglow-genesis-slot`.
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
@@ -554,6 +558,7 @@ Before creating an archive, validation logs a gap summary even when
   are expected leader/production gaps.
 - `transaction_mismatch_ranges`: slots where block transaction counts do not
   match transaction rows.
+- `footer_missing_ranges`: Alpenglow blocks stored without a complete footer.
 
 By default, each archive type continues from the highest existing archive of
 that same type. If no archive exists for that type, `superbank-solparq` starts from the
@@ -651,6 +656,8 @@ Before writing an archive, `superbank-solparq` checks:
   `blocks_metadata`.
 - Each block's `executed_transaction_count` matches transaction rows in the
   `transactions` table.
+- With `--alpenglow-genesis-slot`, each stored block after that slot has a
+  complete footer. See [Alpenglow footer coverage](#alpenglow-footer-coverage).
 
 If warnings are found in regular mode, `superbank-solparq` asks for confirmation before
 creating the archive. Use `--force-archive` to archive despite warnings.
@@ -686,6 +693,17 @@ Override it with:
 ```bash
 --solana-rpc-url https://your.rpc.endpoint
 ```
+
+### Alpenglow footer coverage
+
+Set `--alpenglow-genesis-slot` (`SOLPARQ_ALPENGLOW_GENESIS_SLOT`) to the `block.slot` of a trusted same-cluster `getAgGenesisCert` response. Mainnet's is `459652999`. Validation then lists every stored block after that slot whose `bank_hash`, `block_producer_time_nanos` or `block_user_agent` is `NULL`. It reads `blocks_metadata` with `FINAL`. Blocks up to the genesis slot are not checked, because they never carry a footer, so a range that spans the slot is checked only after it. solparq never infers the slot from an epoch, a date or a validator version.
+
+The gaps appear as `footer_missing_ranges` in `report.json`, the text report and the gap summary log, and as the `footer_missing` validation metric category. `--footer-coverage-policy` (`SOLPARQ_FOOTER_COVERAGE_POLICY`) decides what they do:
+
+- `report` (default): the archive proceeds.
+- `require`: footer gaps block the archive like other data problems. `--force-archive` still overrides them, and `--allow-rpc-validation-failure` does not. `require` needs `--alpenglow-genesis-slot`.
+
+Gap backfill uses the RPC source, which carries no footer. Backfilled blocks after the genesis slot stay footer gaps, and solparq logs a warning for them.
 
 ### Backfilling gaps before archiving
 
@@ -846,6 +864,8 @@ Common defaults:
 - `--delete-archived-data-from-slot-zero` unset (off; server mode only)
 - `--repair-mismatches` unset (off)
 - `--allow-rpc-validation-failure` unset (off)
+- `--alpenglow-genesis-slot` unset (no footer check)
+- `--footer-coverage-policy report`
 - `--backfill-gaps` unset (off)
 - `--backfill-superbank-bin superbank`
 - `--backfill-include-undercounts` on (only applies when `--backfill-gaps` is set)

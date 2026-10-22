@@ -1637,7 +1637,7 @@ fn archive_report_document_is_json_with_producer_and_run_facts() {
     let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
 
     // Manifest-style build identity.
-    assert_eq!(value["report_version"], 1);
+    assert_eq!(value["report_version"], 2);
     assert_eq!(value["producer"]["name"], "superbank-solparq");
     assert!(value["producer"]["version"].is_string());
     assert!(value["producer"]["git_sha"].is_string());

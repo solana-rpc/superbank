@@ -275,6 +275,17 @@ export default {
           text: 'Keep archiving when the produced-slots cross-check cannot run (for example a provider without `getBlocks`). Verified problems such as missing blocks or transaction mismatches still block, and missing-block detection is unavailable for that run.',
           relations: [{ type: 'see', to: 'SOLPARQ_FORCE_ARCHIVE' }],
         }),
+        opt('SOLPARQ_ALPENGLOW_GENESIS_SLOT', '--alpenglow-genesis-slot', {
+          type: 'u64',
+          text: 'Trusted `getAgGenesisCert` `block.slot` for the cluster (mainnet `459652999`). Validation reports stored blocks after it that lack a complete Alpenglow footer. Unset skips the check.',
+          relations: [{ type: 'see', to: 'SOLPARQ_FOOTER_COVERAGE_POLICY' }],
+        }),
+        opt('SOLPARQ_FOOTER_COVERAGE_POLICY', '--footer-coverage-policy', {
+          type: 'report | require',
+          default: 'report',
+          text: '`report` lists footer gaps and archives anyway. `require` blocks the archive on footer gaps, like other data problems; `--force-archive` still overrides it. `require` needs `--alpenglow-genesis-slot`.',
+          relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+        }),
         opt('SOLPARQ_REPAIR_MISMATCHES', '--repair-mismatches', {
           type: 'bool',
           default: 'false',
