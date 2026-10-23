@@ -128,8 +128,8 @@ export default {
         }),
         opt('SOLPARQ_HOURLY_SLOT_DURATION_MS', '--hourly-slot-duration-ms', {
           type: 'u64 (ms)',
-          default: '400',
-          text: 'Nominal slot duration used to size `hourly` archives: 400 gives 9000 slots, 200 gives 18000. Must be positive and divide 3600000 exactly. Alpenglow does not change it.',
+          default: '200',
+          text: 'Nominal slot duration used to size `hourly` archives: 200 gives 18000 slots, 400 gives 9000. Must be positive and divide 3600000 exactly. Alpenglow does not change it.',
           relations: [{ type: 'see', to: 'SOLPARQ_ARCHIVE_RANGE_TYPE' }],
         }),
         opt('SOLPARQ_CUSTOM_SLOT_RANGE', '--custom-slot-range', {

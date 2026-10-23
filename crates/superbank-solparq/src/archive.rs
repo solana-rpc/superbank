@@ -27,9 +27,9 @@ use crate::{
     storage::{self, ArchiveDestination},
 };
 
-/// Historical hourly window at the default 400 ms slot cadence.
+/// Historical hourly window at the 400 ms slot cadence.
 pub const HOURLY_SLOTS: u64 = 9_000;
-pub const DEFAULT_HOURLY_SLOT_DURATION_MS: u64 = 400;
+pub const DEFAULT_HOURLY_SLOT_DURATION_MS: u64 = 200;
 pub const EPOCH_SLOTS: u64 = 432_000;
 pub const DEFAULT_CUSTOM_SLOTS: u64 = 1_000;
 

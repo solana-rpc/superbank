@@ -27,8 +27,8 @@ fn hourly_plan_uses_prompt_filename_convention() {
         ArchiveKind::Hourly,
         ClickHouseBounds {
             earliest_slot: 427_236_024,
-            latest_slot: 427_245_023,
-            distinct_slots: 9_000,
+            latest_slot: 427_254_023,
+            distinct_slots: 18_000,
         },
         None,
         true,
@@ -40,8 +40,8 @@ fn hourly_plan_uses_prompt_filename_convention() {
     assert_eq!(plan.kind, ArchiveKind::Hourly);
     assert_eq!(plan.epoch, 988);
     assert_eq!(plan.start_slot, 427_236_024);
-    assert_eq!(plan.end_slot, 427_245_023);
-    assert_eq!(plan.file_name(), "hourly_988_427236024-427245023.parquet");
+    assert_eq!(plan.end_slot, 427_254_023);
+    assert_eq!(plan.file_name(), "hourly_988_427236024-427254023.parquet");
 }
 
 #[test]
