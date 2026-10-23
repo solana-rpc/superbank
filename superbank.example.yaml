@@ -94,7 +94,7 @@ grpc-slot-notifications: true
 # bigtable-progress-every-slots: 10000
 
 # The superbank-solparq archiver is CLI/env only. SOLPARQ_HOURLY_SLOT_DURATION_MS
-# defaults to 400 (9000 slots per hour); set 200 for a 200 ms cluster.
+# defaults to 200 (18000 slots per hour); set 400 for 400 ms history.
 
 # solparq source options (required when source is "solparq"): restore
 # superbank-solparq Parquet archive bundles back into ClickHouse. Loading is

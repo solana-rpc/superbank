@@ -16,8 +16,8 @@ use tracing::{debug, info, warn};
 use crate::{
     backfill,
     clickhouse::{
-        ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, DiskUsage, SlotRange,
-        TableSize, ValidationReport,
+        ArchiveDbTable, ArchiveTableKind, ClickHouseClient, DbTables, DiskUsage, FooterCheck,
+        SlotRange, TableSize, ValidationReport,
     },
     config::Config,
     manifest::{
@@ -27,9 +27,9 @@ use crate::{
     storage::{self, ArchiveDestination},
 };
 
-/// Historical hourly window at the default 400 ms slot cadence.
+/// Historical hourly window at the 400 ms slot cadence.
 pub const HOURLY_SLOTS: u64 = 9_000;
-pub const DEFAULT_HOURLY_SLOT_DURATION_MS: u64 = 400;
+pub const DEFAULT_HOURLY_SLOT_DURATION_MS: u64 = 200;
 pub const EPOCH_SLOTS: u64 = 432_000;
 pub const DEFAULT_CUSTOM_SLOTS: u64 = 1_000;
 
@@ -728,6 +728,10 @@ impl ArchiveRunReport {
                 "validation_transaction_overcount_ranges: {}",
                 ValidationReport::format_ranges(&validation.transaction_overcount_ranges)
             ));
+            lines.push(format!(
+                "validation_footer_missing_ranges: {}",
+                ValidationReport::format_ranges(&validation.footer_missing_ranges)
+            ));
             if let Some(error) = &validation.rpc_check_error {
                 lines.push(format!("validation_rpc_check_error: {error}"));
             }
@@ -950,11 +954,13 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         return Ok(report);
     }
     let mut phase_durations = Vec::new();
+    let footer_check = FooterCheck::from_config(config);
     let validate_started = Instant::now();
     let mut validation = client
         .validate_archive_range(
             &tables,
             &config.solana_rpc_url,
+            footer_check,
             plan.start_slot,
             plan.end_slot,
         )
@@ -997,6 +1003,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
             .validate_archive_range(
                 &tables,
                 &config.solana_rpc_url,
+                footer_check,
                 plan.start_slot,
                 plan.end_slot,
             )
@@ -1040,6 +1047,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         } else {
             let backfill_started = Instant::now();
             let slots_targeted = target_slots.len() as u64;
+            warn_backfill_without_footers(kind, footer_check, &target_slots);
             info!(
                 archive_kind = kind.to_string(),
                 slots_targeted, "backfilling missing blocks before archive"
@@ -1059,6 +1067,7 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
                 .validate_archive_range(
                     &tables,
                     &config.solana_rpc_url,
+                    footer_check,
                     plan.start_slot,
                     plan.end_slot,
                 )
@@ -1408,9 +1417,26 @@ fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {
         transaction_mismatch_gap_count = validation.transaction_mismatch_ranges.len(),
         transaction_mismatch_ranges =
             ValidationReport::format_ranges(&validation.transaction_mismatch_ranges),
+        footer_missing_gap_count = validation.footer_missing_ranges.len(),
+        footer_missing_ranges = ValidationReport::format_ranges(&validation.footer_missing_ranges),
         rpc_check_error = validation.rpc_check_error.as_deref().unwrap_or("none"),
         "archive validation gap summary"
     );
+}
+
+/// The RPC backfill source carries no Alpenglow footer, so post-genesis slots stay footer gaps.
+fn warn_backfill_without_footers(kind: ArchiveKind, footer_check: FooterCheck, slots: &[u64]) {
+    let Some(genesis_slot) = footer_check.genesis_slot else {
+        return;
+    };
+    let post_genesis = slots.iter().filter(|slot| **slot > genesis_slot).count();
+    if post_genesis > 0 {
+        warn!(
+            archive_kind = kind.to_string(),
+            post_genesis_slots = post_genesis,
+            "RPC gap backfill cannot supply Alpenglow footers; these slots remain footer gaps"
+        );
+    }
 }
 
 fn skipped_archive_tables(
@@ -1445,10 +1471,11 @@ fn server_mode_skip_reason(validation: &ValidationReport, config: &Config) -> &'
 
 fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport) -> Result<bool> {
     eprintln!(
-        "WARNING: validation found issues for {} (missing_blocks={}, transaction_mismatches={}, rpc_check_error={}).",
+        "WARNING: validation found issues for {} (missing_blocks={}, transaction_mismatches={}, footer_missing_slots={}, rpc_check_error={}).",
         plan.file_name(),
         validation.missing_blocks.len(),
         validation.transaction_mismatches.len(),
+        validation.footer_missing_slots(),
         validation.rpc_check_error.as_deref().unwrap_or("none")
     );
 

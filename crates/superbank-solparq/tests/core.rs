@@ -27,8 +27,8 @@ fn hourly_plan_uses_prompt_filename_convention() {
         ArchiveKind::Hourly,
         ClickHouseBounds {
             earliest_slot: 427_236_024,
-            latest_slot: 427_245_023,
-            distinct_slots: 9_000,
+            latest_slot: 427_254_023,
+            distinct_slots: 18_000,
         },
         None,
         true,
@@ -40,8 +40,8 @@ fn hourly_plan_uses_prompt_filename_convention() {
     assert_eq!(plan.kind, ArchiveKind::Hourly);
     assert_eq!(plan.epoch, 988);
     assert_eq!(plan.start_slot, 427_236_024);
-    assert_eq!(plan.end_slot, 427_245_023);
-    assert_eq!(plan.file_name(), "hourly_988_427236024-427245023.parquet");
+    assert_eq!(plan.end_slot, 427_254_023);
+    assert_eq!(plan.file_name(), "hourly_988_427236024-427254023.parquet");
 }
 
 #[test]
@@ -1637,7 +1637,7 @@ fn archive_report_document_is_json_with_producer_and_run_facts() {
     let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
 
     // Manifest-style build identity.
-    assert_eq!(value["report_version"], 1);
+    assert_eq!(value["report_version"], 2);
     assert_eq!(value["producer"]["name"], "superbank-solparq");
     assert!(value["producer"]["version"].is_string());
     assert!(value["producer"]["git_sha"].is_string());
