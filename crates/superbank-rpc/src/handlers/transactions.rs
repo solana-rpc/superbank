@@ -505,6 +505,7 @@ pub(crate) async fn handle_get_transaction(
                 route.not_found();
                 return Ok(json_rpc_null_response(id));
             }
+            observe_disk_cache_slot_age(state.as_ref(), record.slot);
             route.source_disk_cache();
             return respond_with_hydrated_transaction(
                 state.as_ref(),
@@ -610,14 +611,31 @@ pub(crate) async fn handle_get_transaction(
 }
 
 /// A cached tip older than this is skipped rather than recorded as a skewed age.
-const PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS: u64 = 10 * 60 * 1000;
+const SLOT_AGE_MAX_TIP_AGE_MS: u64 = 10 * 60 * 1000;
 
 /// Records the age of a primary-served transaction against the finalized tip, which sizes
-/// disk-cache retention. It reads the head cache's finalized tip, or the latest-slot cache when
-/// the head cache has none, without refreshing either, so it adds no query.
+/// disk-cache retention.
 fn observe_primary_slot_age(state: &AppState, slot: u64) {
+    match slot_age_tip(state) {
+        Ok(tip) => metrics::get_transaction_primary_slot_age(tip.saturating_sub(slot)),
+        Err(reason) => metrics::get_transaction_primary_slot_age_skipped(reason),
+    }
+}
+
+/// Records the age of a disk-cache-served transaction against the finalized tip.
+#[cfg(feature = "disk-cache")]
+fn observe_disk_cache_slot_age(state: &AppState, slot: u64) {
+    match slot_age_tip(state) {
+        Ok(tip) => metrics::get_transaction_disk_cache_slot_age(tip.saturating_sub(slot)),
+        Err(reason) => metrics::get_transaction_disk_cache_slot_age_skipped(reason),
+    }
+}
+
+/// Reads the head cache's finalized tip, or the latest-slot cache when the head cache has none,
+/// without refreshing either, so it adds no query.
+fn slot_age_tip(state: &AppState) -> Result<u64, &'static str> {
     // The finalized slot can fall outside a small `HEAD_CACHE_RETAIN_SLOTS` window; the head's
-    // processed tip is then a few dozen slots ahead, far below the smallest (216,000-slot) bucket.
+    // processed tip is then a few dozen slots ahead, well below the smallest (1,000-slot) bucket.
     #[cfg(feature = "grpc-head-cache")]
     let head_tip = state.head_cache.as_ref().map_or(0, |cache| {
         match cache.latest_slot_at_least(CommitmentLevel::Finalized) {
@@ -628,22 +646,19 @@ fn observe_primary_slot_age(state: &AppState, slot: u64) {
     #[cfg(not(feature = "grpc-head-cache"))]
     let head_tip = 0;
     let cache = &state.latest_slot_cache;
-    match primary_slot_age_tip(
+    pick_slot_age_tip(
         head_tip,
         cache.value.load(std::sync::atomic::Ordering::Relaxed),
         cache
             .last_updated_ms
             .load(std::sync::atomic::Ordering::Relaxed),
         crate::util::current_time_millis(),
-    ) {
-        Ok(tip) => metrics::get_transaction_primary_slot_age(tip.saturating_sub(slot)),
-        Err(reason) => metrics::get_transaction_primary_slot_age_skipped(reason),
-    }
+    )
 }
 
-/// Picks the finalized tip for [`observe_primary_slot_age`]: the head cache's when it has one,
-/// otherwise the latest-slot cache's while it is set and fresh. The error is the skip reason.
-fn primary_slot_age_tip(
+/// Picks the finalized tip for [`slot_age_tip`]: the head cache's when it has one, otherwise
+/// the latest-slot cache's while it is set and fresh. The error is the skip reason.
+fn pick_slot_age_tip(
     head_tip: u64,
     cached_tip: u64,
     cached_updated_ms: u64,
@@ -655,7 +670,7 @@ fn primary_slot_age_tip(
     if cached_tip == 0 {
         return Err("no_tip");
     }
-    if now_ms.saturating_sub(cached_updated_ms) > PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS {
+    if now_ms.saturating_sub(cached_updated_ms) > SLOT_AGE_MAX_TIP_AGE_MS {
         return Err("stale_tip");
     }
     Ok(cached_tip)
@@ -2289,23 +2304,23 @@ mod tests {
     }
 
     #[test]
-    fn primary_slot_age_tip_prefers_head_cache_then_fresh_cached_tip() {
+    fn pick_slot_age_tip_prefers_head_cache_then_fresh_cached_tip() {
         let now = 1_000_000_000;
         let fresh = now - 1_000;
-        let stale = now - PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS - 1;
+        let stale = now - SLOT_AGE_MAX_TIP_AGE_MS - 1;
         // The head cache's finalized tip wins, even over an empty or stale latest-slot cache.
-        assert_eq!(primary_slot_age_tip(500, 400, fresh, now), Ok(500));
-        assert_eq!(primary_slot_age_tip(500, 0, 0, now), Ok(500));
-        assert_eq!(primary_slot_age_tip(500, 400, stale, now), Ok(500));
+        assert_eq!(pick_slot_age_tip(500, 400, fresh, now), Ok(500));
+        assert_eq!(pick_slot_age_tip(500, 0, 0, now), Ok(500));
+        assert_eq!(pick_slot_age_tip(500, 400, stale, now), Ok(500));
         // Without one, the latest-slot cache counts only while set and fresh.
-        assert_eq!(primary_slot_age_tip(0, 400, fresh, now), Ok(400));
+        assert_eq!(pick_slot_age_tip(0, 400, fresh, now), Ok(400));
         assert_eq!(
-            primary_slot_age_tip(0, 400, now - PRIMARY_SLOT_AGE_MAX_TIP_AGE_MS, now),
+            pick_slot_age_tip(0, 400, now - SLOT_AGE_MAX_TIP_AGE_MS, now),
             Ok(400)
         );
-        assert_eq!(primary_slot_age_tip(0, 400, stale, now), Err("stale_tip"));
-        assert_eq!(primary_slot_age_tip(0, 0, fresh, now), Err("no_tip"));
+        assert_eq!(pick_slot_age_tip(0, 400, stale, now), Err("stale_tip"));
+        assert_eq!(pick_slot_age_tip(0, 0, fresh, now), Err("no_tip"));
         // An update stamped after `now` (clock step) is fresh, not an underflow.
-        assert_eq!(primary_slot_age_tip(0, 400, now + 5, now), Ok(400));
+        assert_eq!(pick_slot_age_tip(0, 400, now + 5, now), Ok(400));
     }
 }
