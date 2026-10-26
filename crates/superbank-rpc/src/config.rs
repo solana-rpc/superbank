@@ -92,6 +92,11 @@ pub struct RpcConfig {
     )]
     pub(crate) get_transaction_primary_cache_ttl_secs: u64,
 
+    /// Primary getTransaction ClickHouse `max_threads` and `max_threads_for_indexes`;
+    /// zero keeps the server's setting.
+    #[arg(long, env = "GET_TRANSACTION_MAX_THREADS", default_value_t = 0)]
+    pub(crate) get_transaction_max_threads: usize,
+
     /// Let confirmed getBlock requests read and populate the finalized response
     /// cache when their data is provably finalized (set false to disable).
     #[arg(
@@ -1359,6 +1364,7 @@ mod config_tests {
         assert_eq!(cfg.get_block_response_cache_max_bytes, 0);
         assert_eq!(cfg.get_transaction_primary_cache_max_bytes, 0);
         assert_eq!(cfg.get_transaction_primary_cache_ttl_secs, 600);
+        assert_eq!(cfg.get_transaction_max_threads, 0);
         assert!(cfg.get_block_response_cache_share_confirmed);
         assert!(cfg.get_block_response_cache_unsupported_version);
         assert_eq!(cfg.get_block_hydration_parallelism, 4);
@@ -1489,6 +1495,17 @@ mod config_tests {
         ]);
 
         assert!(cfg.clickhouse_get_transaction_single_round_trip);
+    }
+
+    #[test]
+    fn get_transaction_max_threads_flag_and_env_parse() {
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--get-transaction-max-threads", "4"]);
+        assert_eq!(cfg.get_transaction_max_threads, 4);
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvVarGuard::set("GET_TRANSACTION_MAX_THREADS", "2");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.get_transaction_max_threads, 2);
     }
 
     #[test]
