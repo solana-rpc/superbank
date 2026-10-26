@@ -35,6 +35,7 @@ pub(crate) struct MetricsHeaderCaptureConfig {
 }
 
 pub(crate) struct AppState {
+    pub(crate) ag_genesis_cert: crate::ag_genesis_cert::AgGenesisCertSource,
     pub(crate) clickhouse: ClickHouseClient,
     pub(crate) rpc_parameter_filters: RpcParameterFilterSet,
     pub(crate) max_signatures_limit: u64,

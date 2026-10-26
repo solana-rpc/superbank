@@ -10,6 +10,7 @@ mod constants;
 mod disconnect;
 mod gsfa;
 mod inflation_cache;
+mod inflation_response_cache;
 #[cfg(feature = "disk-cache")]
 mod local_transaction;
 mod owner_shard;
@@ -26,15 +27,17 @@ pub mod verification;
 #[cfg(feature = "disk-cache")]
 pub(crate) use client::{CacheAdmissionBusy, ClickHouseTableNames};
 pub use client::{ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits};
+pub(crate) use inflation_response_cache::InflationRewardAnswer;
 #[cfg(feature = "disk-cache")]
 pub(crate) use rows::BlockTimeRangeRow;
 #[allow(unused_imports)]
 pub use types::TransactionsForAddressRecord;
 pub use types::{
-    BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings, SignatureFilter,
-    SignatureRecord, SignatureStatusRecord, SortOrder, StoredAccountsTransactionRecord,
-    StoredBlockPayload, StoredBlockRecord, StoredTransactionRecord, TokenAccountsFilter,
-    TransactionStatusFilter, TransactionsForAddressQuery,
+    BlockFooterRecord, BlockMetadataRecord, NumericFilter, PaginationToken, QueryTimings,
+    SignatureFilter, SignatureRecord, SignatureStatusRecord, SortOrder,
+    StoredAccountsTransactionRecord, StoredBlockPayload, StoredBlockRecord,
+    StoredTransactionRecord, TokenAccountsFilter, TransactionStatusFilter,
+    TransactionsForAddressQuery,
 };
 
 pub(crate) use types::{

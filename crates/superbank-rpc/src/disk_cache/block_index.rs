@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Durable full-history block-time index with a segmented in-process read path.
+//! A slot is covered only when a source row or a later row's parent link proves it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -15,13 +16,19 @@ use crate::clickhouse::{BlockTimeRangeRow, ClickHouseClient};
 
 use super::DiskCacheError;
 use super::coverage::CoverageMap;
+use super::filler::{MAX_SKIPPED_RUN, next_block_after};
 
 const SEGMENT_SLOTS: u64 = 1_000_000;
 const UNKNOWN: i64 = i64::MIN;
 const SKIPPED: i64 = i64::MIN + 1;
 const NULL_TIME: i64 = i64::MIN + 2;
 const DATA_TABLE: &str = "block_times";
-const COVERAGE_TABLE: &str = "coverage";
+const COVERAGE_TABLE: &str = "proven_coverage";
+/// Coverage table that does not prove skipped slots; `open` drops it so the index rebuilds.
+const UNPROVEN_COVERAGE_TABLE: &str = "coverage";
+/// A forward scan waits this long behind the finalized tip for a missing block before it
+/// leaves the block's slots uncovered and moves on.
+const UNPROVEN_SETTLE_SLOTS: u64 = 1_500;
 
 fn segment_memory_bytes() -> u64 {
     SEGMENT_SLOTS * std::mem::size_of::<AtomicI64>() as u64
@@ -132,6 +139,7 @@ impl BlockIndex {
             .iter()
             .map(|&slot| BlockTimeRangeRow {
                 slot,
+                parent_slot: slot.saturating_sub(1),
                 block_time: None,
             })
             .collect::<Vec<_>>();
@@ -180,6 +188,14 @@ impl BlockIndex {
             .execute()
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+        admin
+            .client
+            .query(&format!(
+                "DROP TABLE IF EXISTS {database}.{UNPROVEN_COVERAGE_TABLE}"
+            ))
+            .execute()
+            .await
+            .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
 
         let mut local = admin.background_read_client(1);
         local.database = cfg.database.clone();
@@ -201,11 +217,11 @@ impl BlockIndex {
             .contiguous_tip_span()
     }
 
-    fn durable_tip_span(&self) -> Option<(u64, u64)> {
+    fn durable_covered_span(&self) -> Option<(u64, u64)> {
         self.durable_coverage
             .read()
             .expect("block-index durable coverage lock")
-            .contiguous_tip_span()
+            .covered_span()
     }
 
     pub(crate) fn block_time(&self, slot: u64) -> BlockTimeLookup {
@@ -218,10 +234,12 @@ impl BlockIndex {
         {
             BlockTimeLookup::NotCovered
         } else {
+            // Eviction drops a segment before its coverage, so a missing segment is not covered.
             match self.value(slot) {
-                NULL_TIME => BlockTimeLookup::Found(None),
-                UNKNOWN | SKIPPED => BlockTimeLookup::Skipped,
-                value => BlockTimeLookup::Found(Some(value)),
+                None => BlockTimeLookup::NotCovered,
+                Some(NULL_TIME) => BlockTimeLookup::Found(None),
+                Some(UNKNOWN | SKIPPED) => BlockTimeLookup::Skipped,
+                Some(value) => BlockTimeLookup::Found(Some(value)),
             }
         };
         crate::metrics::block_index_lookup("get_block_time", started.elapsed().as_secs_f64());
@@ -252,7 +270,7 @@ impl BlockIndex {
         proof
     }
 
-    fn value(&self, slot: u64) -> i64 {
+    fn value(&self, slot: u64) -> Option<i64> {
         let segment_id = slot / SEGMENT_SLOTS;
         let offset = (slot % SEGMENT_SLOTS) as usize;
         let segment = self
@@ -261,9 +279,7 @@ impl BlockIndex {
             .expect("block-index segments lock")
             .get(&segment_id)
             .cloned();
-        segment.map_or(UNKNOWN, |segment| {
-            segment.times[offset].load(Ordering::Relaxed)
-        })
+        segment.map(|segment| segment.times[offset].load(Ordering::Relaxed))
     }
 
     fn new_segment() -> Segment {
@@ -397,10 +413,12 @@ impl BlockIndex {
                 .write()
                 .expect("block-index durable coverage lock")
                 .insert_range(range.range_start, range.range_end);
+            // Stored rows keep no parent link; hydration only republishes proven coverage.
             let rows = self
                 .local
                 .read_all::<BlockTimeRangeRow>(&format!(
-                    "SELECT slot, tupleElement(argMax(tuple(block_time), version), 1) AS block_time \
+                    "SELECT slot, toUInt64(0) AS parent_slot, \
+                     tupleElement(argMax(tuple(block_time), version), 1) AS block_time \
                      FROM {database}.{DATA_TABLE} WHERE slot BETWEEN {} AND {} GROUP BY slot ORDER BY slot",
                     range.range_start, range.range_end
                 ), "block_index_hydrate_rows").await
@@ -410,12 +428,14 @@ impl BlockIndex {
         Ok(())
     }
 
-    async fn persist_range(
+    async fn persist_ranges(
         &self,
-        start: u64,
-        end: u64,
+        ranges: &[(u64, u64)],
         rows: &[BlockTimeRangeRow],
     ) -> Result<(), DiskCacheError> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
         let version = now_version();
         let mut insert = self
             .local
@@ -423,7 +443,11 @@ impl BlockIndex {
             .insert::<PersistedBlockTimeRow>(DATA_TABLE)
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
-        for row in rows {
+        for row in rows.iter().filter(|row| {
+            ranges
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&row.slot))
+        }) {
             insert
                 .write(&PersistedBlockTimeRow {
                     slot: row.slot,
@@ -443,31 +467,101 @@ impl BlockIndex {
             .insert::<CoverageRow>(COVERAGE_TABLE)
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
-        coverage
-            .write(&CoverageRow {
-                range_start: start,
-                range_end: end,
-                version,
-            })
-            .await
-            .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+        for &(start, end) in ranges {
+            coverage
+                .write(&CoverageRow {
+                    range_start: start,
+                    range_end: end,
+                    version,
+                })
+                .await
+                .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+        }
         coverage
             .end()
             .await
             .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
-        self.durable_coverage
-            .write()
-            .expect("block-index durable coverage lock")
-            .insert_range(start, end);
-        if !self.publish_memory(start, end, rows) {
-            tracing::debug!(
-                start,
-                end,
-                max_memory_bytes = self.cfg.max_memory_bytes,
-                "block index: durable range is outside the bounded in-process cache"
-            );
+        for &(start, end) in ranges {
+            self.durable_coverage
+                .write()
+                .expect("block-index durable coverage lock")
+                .insert_range(start, end);
+            if !self.publish_memory(start, end, rows) {
+                tracing::debug!(
+                    start,
+                    end,
+                    max_memory_bytes = self.cfg.max_memory_bytes,
+                    "block index: durable range is outside the bounded in-process cache"
+                );
+            }
         }
         Ok(())
+    }
+
+    /// Reads one window and returns its rows with the ranges that rows and parent links prove.
+    async fn scan(
+        &self,
+        source: &ClickHouseClient,
+        start: u64,
+        end: u64,
+    ) -> Result<(Vec<BlockTimeRangeRow>, Vec<(u64, u64)>), DiskCacheError> {
+        let (rows, _) = source
+            .get_block_times_by_slot_range(start, end, self.cfg.query_timeout)
+            .await
+            .map_err(|err| DiskCacheError::ClickHouse(err.to_string()))?;
+        // The next block's parent link proves the skipped slots after the last row.
+        let successor = if rows.last().is_none_or(|row| row.slot < end) {
+            next_block_after(source, end, self.cfg.query_timeout).await?
+        } else {
+            None
+        };
+        let links = rows
+            .iter()
+            .map(|row| (row.slot, row.parent_slot))
+            .chain(successor.map(|row| (row.slot, row.parent_slot)));
+        let proven = proven_ranges(start, end, links);
+        Ok((rows, proven))
+    }
+
+    /// Scans and persists one window. Returns the window, or `None` when nothing is left to scan.
+    async fn scan_once(
+        &self,
+        source: &ClickHouseClient,
+        latest: u64,
+        cursors: &mut ScanCursors,
+    ) -> Option<(u64, u64)> {
+        let ScanWindow {
+            start,
+            end,
+            forward,
+        } = cursors.window(latest, self.cfg.slots_per_query)?;
+        let (rows, proven) = match self.scan(source, start, end).await {
+            Ok(scanned) => scanned,
+            Err(err) => {
+                crate::metrics::block_index_error("source_read");
+                warn!(start, end, "block index: source read failed: {err}");
+                return Some((start, end));
+            }
+        };
+        // Backfill never revisits a window, so it publishes every proven range at once.
+        let settled = if forward {
+            latest.saturating_sub(UNPROVEN_SETTLE_SLOTS)
+        } else {
+            u64::MAX
+        };
+        let plan = plan_scan(start, end, &proven, settled);
+        if let Err(err) = self.persist_ranges(&plan.publish, &rows).await {
+            crate::metrics::block_index_error("persist");
+            warn!(start, end, "block index: local persist failed: {err}");
+            return Some((start, end));
+        }
+        if forward {
+            cursors.forward_next = Some(plan.next);
+            cursors.backfill_floor.get_or_insert(start);
+        } else {
+            cursors.backfill_floor = Some(start);
+        }
+        Some((start, end))
     }
 
     pub(crate) async fn run(
@@ -486,6 +580,7 @@ impl BlockIndex {
             database = self.cfg.database,
             "block index: historical worker started"
         );
+        let mut cursors = ScanCursors::seeded(self.durable_covered_span());
         let mut last_latest = None;
         loop {
             let latest = match source.get_latest_finalized_slot_since(last_latest).await {
@@ -508,38 +603,13 @@ impl BlockIndex {
                     continue;
                 }
             };
-            let (start, end) = match self.durable_tip_span() {
-                Some((_, head)) if head < latest => {
-                    (head + 1, latest.min(head + self.cfg.slots_per_query))
-                }
-                Some((floor, _)) if floor > 0 => {
-                    let end = floor - 1;
-                    (end.saturating_sub(self.cfg.slots_per_query - 1), end)
-                }
-                Some(_) => {
-                    if wait_or_shutdown(&mut shutdown, Duration::from_secs(5)).await {
-                        break;
-                    }
-                    continue;
-                }
-                None => (latest.saturating_sub(self.cfg.slots_per_query - 1), latest),
-            };
             let started = Instant::now();
-            match source
-                .get_block_times_by_slot_range(start, end, self.cfg.query_timeout)
-                .await
-            {
-                Ok((rows, _)) => {
-                    if let Err(err) = self.persist_range(start, end, &rows).await {
-                        crate::metrics::block_index_error("persist");
-                        warn!(start, end, "block index: local persist failed: {err}");
-                    }
+            let Some((start, end)) = self.scan_once(&source, latest, &mut cursors).await else {
+                if wait_or_shutdown(&mut shutdown, Duration::from_secs(5)).await {
+                    break;
                 }
-                Err(err) => {
-                    crate::metrics::block_index_error("source_read");
-                    warn!(start, end, "block index: source read failed: {err}");
-                }
-            }
+                continue;
+            };
             let target = Duration::from_secs_f64(
                 (end - start + 1) as f64 / self.cfg.max_slots_per_sec.max(1) as f64,
             );
@@ -551,6 +621,108 @@ impl BlockIndex {
         }
         crate::metrics::block_index_enabled(false);
     }
+}
+
+/// Where the worker's next scans start, seeded from durable coverage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ScanCursors {
+    /// First slot the next forward scan reads; `None` until the first scan at the tip.
+    forward_next: Option<u64>,
+    /// Lowest slot scanned so far; backfill reads below it.
+    backfill_floor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanWindow {
+    start: u64,
+    end: u64,
+    forward: bool,
+}
+
+impl ScanCursors {
+    fn seeded(durable_span: Option<(u64, u64)>) -> Self {
+        Self {
+            forward_next: durable_span.map(|(_, head)| head.saturating_add(1)),
+            backfill_floor: durable_span.map(|(floor, _)| floor),
+        }
+    }
+
+    /// New tip slots come first, then history below the backfill floor.
+    fn window(&self, latest: u64, slots_per_query: u64) -> Option<ScanWindow> {
+        let width = slots_per_query.max(1);
+        match self.forward_next {
+            Some(next) if next <= latest => Some(ScanWindow {
+                start: next,
+                end: latest.min(next.saturating_add(width - 1)),
+                forward: true,
+            }),
+            None => Some(ScanWindow {
+                start: latest.saturating_sub(width - 1),
+                end: latest,
+                forward: true,
+            }),
+            Some(_) => match self.backfill_floor {
+                Some(floor) if floor > 0 => Some(ScanWindow {
+                    start: floor.saturating_sub(width),
+                    end: floor - 1,
+                    forward: false,
+                }),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Merged ranges of `[start, end]` that rows prove produced or skipped. `links` are
+/// `(slot, parent_slot)` in ascending slot order; the slots between a parent and its child are skipped.
+fn proven_ranges(
+    start: u64,
+    end: u64,
+    links: impl IntoIterator<Item = (u64, u64)>,
+) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut previous_slot = None;
+    for (slot, parent_slot) in links {
+        // A link proves its gap only when no earlier row lies inside it.
+        let linked = parent_slot < slot
+            && slot - parent_slot - 1 <= MAX_SKIPPED_RUN
+            && previous_slot.is_none_or(|previous| parent_slot >= previous);
+        previous_slot = Some(slot);
+        let first = if linked { parent_slot + 1 } else { slot }.max(start);
+        let last = slot.min(end);
+        if first > last {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some((_, tip)) if tip.saturating_add(1) >= first => *tip = (*tip).max(last),
+            _ => ranges.push((first, last)),
+        }
+    }
+    ranges
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ScanPlan {
+    publish: Vec<(u64, u64)>,
+    next: u64,
+}
+
+/// Publishes proven ranges in order and stops at the first unproven run that ends after
+/// `settled`. A settled unproven run stays uncovered, so reads fall through to the source.
+fn plan_scan(start: u64, end: u64, proven: &[(u64, u64)], settled: u64) -> ScanPlan {
+    let mut publish = Vec::new();
+    let mut next = start;
+    for &(first, last) in proven {
+        if first > next && first - 1 > settled {
+            return ScanPlan { publish, next };
+        }
+        publish.push((first, last));
+        next = last.saturating_add(1);
+    }
+    if next <= end && end <= settled {
+        next = end.saturating_add(1);
+    }
+    ScanPlan { publish, next }
 }
 
 fn quote_identifier(value: &str) -> Result<String, DiskCacheError> {
@@ -653,10 +825,12 @@ mod tests {
             &[
                 BlockTimeRangeRow {
                     slot: 42,
+                    parent_slot: 41,
                     block_time: Some(1_700_000_000),
                 },
                 BlockTimeRangeRow {
                     slot: 44,
+                    parent_slot: 42,
                     block_time: None,
                 },
             ],
@@ -682,10 +856,12 @@ mod tests {
             &[
                 BlockTimeRangeRow {
                     slot: SEGMENT_SLOTS - 1,
+                    parent_slot: SEGMENT_SLOTS - 2,
                     block_time: Some(1),
                 },
                 BlockTimeRangeRow {
                     slot: SEGMENT_SLOTS,
+                    parent_slot: SEGMENT_SLOTS - 1,
                     block_time: Some(2),
                 },
             ],
@@ -708,5 +884,364 @@ mod tests {
 
         assert!(!index.publish_memory(0, 0, &[]));
         assert_eq!(index.tip_span(), Some((SEGMENT_SLOTS, SEGMENT_SLOTS)));
+    }
+
+    fn row(slot: u64, parent_slot: u64) -> BlockTimeRangeRow {
+        BlockTimeRangeRow {
+            slot,
+            parent_slot,
+            block_time: Some(1_700_000_000 + slot as i64),
+        }
+    }
+
+    #[test]
+    fn proven_ranges_cover_rows_and_the_gaps_their_parents_skip() {
+        assert_eq!(
+            proven_ranges(10, 14, [(10, 9), (13, 10), (14, 13)]),
+            vec![(10, 14)]
+        );
+    }
+
+    #[test]
+    fn proven_ranges_leave_a_missing_block_and_its_gap_uncovered() {
+        // 13 is a real block that the read did not return; 14 links to it.
+        assert_eq!(
+            proven_ranges(10, 16, [(10, 9), (11, 10), (14, 13), (15, 14)]),
+            vec![(10, 11), (14, 15)]
+        );
+        assert_eq!(proven_ranges(10, 16, [(14, 13)]), vec![(14, 14)]);
+        assert_eq!(proven_ranges(10, 16, []), Vec::<(u64, u64)>::new());
+    }
+
+    #[test]
+    fn proven_ranges_take_the_skipped_tail_from_the_successor() {
+        assert_eq!(proven_ranges(10, 15, [(10, 9), (20, 10)]), vec![(10, 15)]);
+        assert_eq!(proven_ranges(10, 15, [(20, 4)]), vec![(10, 15)]);
+        assert_eq!(
+            proven_ranges(10, 15, [(10, 9), (20, 12)]),
+            vec![(10, 10), (13, 15)]
+        );
+    }
+
+    #[test]
+    fn proven_ranges_reject_contradicting_and_oversized_links() {
+        // 12 claims parent 8, but 10 sits inside that gap.
+        assert_eq!(
+            proven_ranges(10, 12, [(10, 9), (12, 8)]),
+            vec![(10, 10), (12, 12)]
+        );
+        let far = 10 + MAX_SKIPPED_RUN + 2;
+        assert_eq!(proven_ranges(10, far, [(far, 9)]), vec![(far, far)]);
+        assert_eq!(proven_ranges(0, 3, [(0, 0), (2, 0)]), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn plan_scan_holds_at_a_young_hole_and_accepts_a_settled_one() {
+        let proven = [(10, 11), (14, 20)];
+        assert_eq!(
+            plan_scan(10, 20, &proven, 12),
+            ScanPlan {
+                publish: vec![(10, 11)],
+                next: 12,
+            }
+        );
+        assert_eq!(
+            plan_scan(10, 20, &proven, 13),
+            ScanPlan {
+                publish: vec![(10, 11), (14, 20)],
+                next: 21,
+            }
+        );
+        assert_eq!(
+            plan_scan(10, 20, &[(14, 20)], 12),
+            ScanPlan {
+                publish: Vec::new(),
+                next: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_scan_moves_past_an_unproven_tail_only_once_it_settles() {
+        assert_eq!(
+            plan_scan(10, 20, &[(10, 15)], 19),
+            ScanPlan {
+                publish: vec![(10, 15)],
+                next: 16,
+            }
+        );
+        assert_eq!(
+            plan_scan(10, 20, &[(10, 15)], 20),
+            ScanPlan {
+                publish: vec![(10, 15)],
+                next: 21,
+            }
+        );
+        assert_eq!(
+            plan_scan(10, 20, &[], 20),
+            ScanPlan {
+                publish: Vec::new(),
+                next: 21,
+            }
+        );
+        assert_eq!(
+            plan_scan(10, 20, &[], 19),
+            ScanPlan {
+                publish: Vec::new(),
+                next: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn scan_cursors_read_the_tip_first_and_then_history() {
+        let window = |start, end, forward| {
+            Some(ScanWindow {
+                start,
+                end,
+                forward,
+            })
+        };
+        assert_eq!(
+            ScanCursors::default().window(1_000, 100),
+            window(901, 1_000, true)
+        );
+        let cursors = ScanCursors::seeded(Some((500, 900)));
+        assert_eq!(cursors.window(1_000, 50), window(901, 950, true));
+        assert_eq!(cursors.window(900, 50), window(450, 499, false));
+        assert_eq!(ScanCursors::seeded(Some((0, 900))).window(900, 50), None);
+    }
+
+    #[test]
+    fn evicted_segment_is_not_covered_until_its_coverage_is_removed() {
+        let index = BlockIndex::for_range_tests(10, 12, &[10, 12]);
+        assert_eq!(index.block_time(11), BlockTimeLookup::Skipped);
+        // Model reserve_segments' window before it removes old coverage.
+        index.segments.write().unwrap().remove(&0);
+        assert_eq!(index.block_time(11), BlockTimeLookup::NotCovered);
+        assert_eq!(index.block_time(12), BlockTimeLookup::NotCovered);
+    }
+
+    #[test]
+    fn missing_block_stays_out_of_block_time_and_block_ranges() {
+        let index = test_index();
+        let rows = [row(10, 9), row(11, 10), row(14, 13), row(15, 14)];
+        let links = rows.iter().map(|row| (row.slot, row.parent_slot));
+        let plan = plan_scan(10, 15, &proven_ranges(10, 15, links), u64::MAX);
+        for &(start, end) in &plan.publish {
+            assert!(index.publish_memory(start, end, &rows));
+        }
+
+        assert_eq!(
+            index.block_time(11),
+            BlockTimeLookup::Found(Some(1_700_000_011))
+        );
+        assert_eq!(index.block_time(12), BlockTimeLookup::NotCovered);
+        assert_eq!(index.block_time(13), BlockTimeLookup::NotCovered);
+        assert_eq!(
+            index.block_time(14),
+            BlockTimeLookup::Found(Some(1_700_000_014))
+        );
+        let coverage = index.range_coverage(10, 15);
+        assert_eq!(coverage.gaps(10, 15), vec![(12, 13)]);
+        assert_eq!(coverage.slots, vec![10, 11, 14, 15]);
+    }
+
+    async fn execute(client: &clickhouse::Client, sql: &str) {
+        client
+            .query(sql)
+            .execute()
+            .await
+            .unwrap_or_else(|err| panic!("{err}: {sql}"));
+    }
+
+    async fn insert_blocks(client: &clickhouse::Client, database: &str, blocks: &[(u64, u64)]) {
+        let values = blocks
+            .iter()
+            .map(|(slot, parent)| format!("({slot}, {parent}, {})", 1_700_000_000 + slot))
+            .collect::<Vec<_>>()
+            .join(", ");
+        execute(
+            client,
+            &format!("INSERT INTO {database}.blocks_metadata (slot, parent_slot, block_time) VALUES {values}"),
+        )
+        .await;
+    }
+
+    /// Produced blocks in `first..=last` without `skipped`, each linked to the one before.
+    fn chain(first: u64, last: u64, first_parent: u64, skipped: &[u64]) -> Vec<(u64, u64)> {
+        let mut parent = first_parent;
+        let mut blocks = Vec::new();
+        for slot in (first..=last).filter(|slot| !skipped.contains(slot)) {
+            blocks.push((slot, parent));
+            parent = slot;
+        }
+        blocks
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable ClickHouse: DISK_CACHE_TEST_URL=http://127.0.0.1:18123"]
+    async fn scan_once_covers_only_proven_slots_clickhouse_integration() {
+        let url = std::env::var("DISK_CACHE_TEST_URL").expect("explicit disposable ClickHouse URL");
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let database = format!("test_block_index_source_{}", now_version());
+        let index_database = format!("{database}_block_index");
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_user("default");
+        execute(&client, &format!("CREATE DATABASE {database}")).await;
+        execute(
+            &client,
+            &format!(
+                "CREATE TABLE {database}.blocks_metadata (slot UInt64, parent_slot UInt64, \
+                 block_time Nullable(Int64)) ENGINE = ReplacingMergeTree(slot) \
+                 PARTITION BY intDiv(slot, 432000) ORDER BY slot"
+            ),
+        )
+        .await;
+        execute(&client, &format!("CREATE DATABASE {index_database}")).await;
+        execute(
+            &client,
+            &format!(
+                "CREATE TABLE {index_database}.{UNPROVEN_COVERAGE_TABLE} (x UInt8) ENGINE = Memory"
+            ),
+        )
+        .await;
+
+        let mut source = ClickHouseClient::new(
+            &url,
+            &database,
+            "default",
+            "",
+            ClickHouseClientOptions::new(
+                RoutingPolicy {
+                    transport: RoutingTransport::Http,
+                    scope: RoutingScope::Distributed,
+                },
+                None,
+                Vec::new(),
+                format!("{database}.gsfa_hot"),
+                format!("{database}.gsfa_hot"),
+            ),
+        );
+        source.use_table_names(crate::clickhouse::ClickHouseTableNames::in_database(
+            &database,
+        ));
+        source.initialize_read_cancellation().await.unwrap();
+        let index = BlockIndex::open(
+            BlockIndexConfig {
+                database: index_database.clone(),
+                max_memory_bytes: segment_memory_bytes(),
+                slots_per_query: 150,
+                max_slots_per_sec: 25_000,
+                query_timeout: Duration::from_secs(30),
+            },
+            &source,
+        )
+        .await
+        .unwrap();
+        let legacy = client
+            .query(&format!(
+                "SELECT count() FROM system.tables WHERE database = '{index_database}' \
+                 AND name = '{UNPROVEN_COVERAGE_TABLE}'"
+            ))
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(legacy, 0);
+
+        // 10_100 and 10_101 are skipped; block 10_150 lands only after the first scan.
+        let blocks = chain(9_990, 10_200, 9_980, &[10_100, 10_101]);
+        let late = blocks
+            .iter()
+            .copied()
+            .filter(|&(slot, _)| slot == 10_150)
+            .collect::<Vec<_>>();
+        let early = blocks
+            .iter()
+            .copied()
+            .filter(|&(slot, _)| slot != 10_150)
+            .collect::<Vec<_>>();
+        insert_blocks(&client, &database, &early).await;
+
+        let mut cursors = ScanCursors::default();
+        assert_eq!(
+            index.scan_once(&source, 10_200, &mut cursors).await,
+            Some((10_051, 10_200))
+        );
+        assert_eq!(index.block_time(10_100), BlockTimeLookup::Skipped);
+        assert_eq!(
+            index.block_time(10_120),
+            BlockTimeLookup::Found(Some(1_700_010_120))
+        );
+        assert_eq!(index.block_time(10_150), BlockTimeLookup::NotCovered);
+        assert_eq!(index.block_time(10_160), BlockTimeLookup::NotCovered);
+        assert_eq!(
+            cursors,
+            ScanCursors {
+                forward_next: Some(10_150),
+                backfill_floor: Some(10_051),
+            }
+        );
+
+        insert_blocks(&client, &database, &late).await;
+        assert_eq!(
+            index.scan_once(&source, 10_200, &mut cursors).await,
+            Some((10_150, 10_200))
+        );
+        assert_eq!(
+            index.block_time(10_150),
+            BlockTimeLookup::Found(Some(1_700_010_150))
+        );
+        assert_eq!(
+            index.block_time(10_160),
+            BlockTimeLookup::Found(Some(1_700_010_160))
+        );
+
+        // 10_300 never lands; 10_345..=10_355 are skipped, so the successor proves the window's tail.
+        let skipped = (10_345..=10_355).chain([10_300]).collect::<Vec<_>>();
+        let mut later = chain(10_201, 12_000, 10_200, &skipped);
+        for block in &mut later {
+            if block.0 == 10_301 {
+                block.1 = 10_300;
+            }
+        }
+        insert_blocks(&client, &database, &later).await;
+        assert_eq!(
+            index.scan_once(&source, 12_000, &mut cursors).await,
+            Some((10_201, 10_350))
+        );
+        assert_eq!(
+            index.block_time(10_299),
+            BlockTimeLookup::Found(Some(1_700_010_299))
+        );
+        assert_eq!(index.block_time(10_300), BlockTimeLookup::NotCovered);
+        assert_eq!(index.block_time(10_348), BlockTimeLookup::Skipped);
+        assert_eq!(cursors.forward_next, Some(10_351));
+
+        // Backfill below the first window: 9_990's parent proves 9_981..=9_989.
+        assert_eq!(
+            index.scan_once(&source, 10_350, &mut cursors).await,
+            Some((9_901, 10_050))
+        );
+        assert_eq!(index.block_time(9_985), BlockTimeLookup::Skipped);
+        assert_eq!(index.block_time(9_980), BlockTimeLookup::NotCovered);
+        assert_eq!(cursors.backfill_floor, Some(9_901));
+
+        // A restart rebuilds the same coverage from the local tables.
+        let reopened = BlockIndex::open(index.cfg.clone(), &source).await.unwrap();
+        reopened.load_local().await.unwrap();
+        for slot in [9_985, 10_100, 10_150, 10_299, 10_300, 10_348] {
+            assert_eq!(
+                reopened.block_time(slot),
+                index.block_time(slot),
+                "slot {slot}"
+            );
+        }
+
+        if std::env::var_os("DISK_CACHE_TEST_KEEP").is_none() {
+            execute(&client, &format!("DROP DATABASE {database}")).await;
+            execute(&client, &format!("DROP DATABASE {index_database}")).await;
+        }
     }
 }

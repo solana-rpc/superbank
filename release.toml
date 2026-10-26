@@ -1,0 +1,19 @@
+# cargo-release configuration (https://github.com/crate-ci/cargo-release).
+# Release from an up-to-date main (see CONTRIBUTING.md "Releases"):
+#   cargo release <version> --execute
+# It sets the shared workspace version, updates Cargo.lock (and, for final
+# releases, the README docker tags; see crates/superbank/Cargo.toml), commits,
+# creates the signed v<version> tag and pushes both. The tag starts
+# .github/workflows/release.yml.
+#
+# Nothing goes to crates.io: with publish = false, cargo-release still prints
+# "Publishing <crates>" but runs no `cargo publish`.
+allow-branch = ["main"]
+shared-version = true
+consolidate-commits = true
+pre-release-commit-message = "chore(release): v{{version}}"
+tag-name = "v{{version}}"
+tag-message = "Release v{{version}}"
+sign-tag = true
+publish = false
+push-remote = "origin"

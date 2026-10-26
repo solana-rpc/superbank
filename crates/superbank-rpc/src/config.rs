@@ -215,6 +215,33 @@ pub struct RpcConfig {
     )]
     pub(crate) get_inflation_reward_epoch_cache_max_bytes: u64,
 
+    /// Byte budget for complete getInflationReward answers cached per exact address set; zero
+    /// disables the cache, and so does a zero epoch cache budget.
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES",
+        default_value_t = 0
+    )]
+    pub(crate) get_inflation_reward_response_cache_max_bytes: u64,
+
+    /// Seconds a cached getInflationReward answer is served after insertion.
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_RESPONSE_CACHE_TTL_SECS",
+        default_value_t = 3_600,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    pub(crate) get_inflation_reward_response_cache_ttl_secs: u64,
+
+    /// Finalized slots past an answer's last reward block before an answer with nulls is cached.
+    #[arg(
+        long,
+        env = "GET_INFLATION_REWARD_RESPONSE_CACHE_SETTLE_SLOTS",
+        default_value_t = 4_500,
+        value_parser = clap::value_parser!(u64).range(825..)
+    )]
+    pub(crate) get_inflation_reward_response_cache_settle_slots: u64,
+
     /// Emit HTTP 503 for JSON-RPC server-side failures while keeping response bodies unchanged.
     #[arg(long, env = "SUPERBANK_RPC_EMIT_HTTP_ERRORS", default_value_t = false)]
     pub(crate) emit_http_errors: bool,
@@ -236,6 +263,28 @@ pub struct RpcConfig {
     /// Path to this RPC target cluster's genesis.bin, read at startup for epoch math.
     #[arg(long, env = "GENESIS_PATH")]
     pub(crate) genesis_path: Option<String>,
+
+    /// Trusted same-cluster RPC endpoint supporting getAgGenesisCert (Agave 4.3+).
+    #[arg(long, env = "AG_GENESIS_CERT_RPC_URL")]
+    pub(crate) ag_genesis_cert_rpc_url: Option<String>,
+
+    /// Total getAgGenesisCert source budget, including refresh admission (milliseconds).
+    #[arg(
+        long,
+        env = "AG_GENESIS_CERT_RPC_TIMEOUT_MS",
+        default_value_t = 2_000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) ag_genesis_cert_rpc_timeout_ms: u64,
+
+    /// Seconds an authoritative pre-migration null may be reused before refreshing.
+    #[arg(
+        long,
+        env = "AG_GENESIS_CERT_REFRESH_INTERVAL_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..=300)
+    )]
+    pub(crate) ag_genesis_cert_refresh_interval_secs: u64,
 
     // --- Optional Superbank gRPC streaming API ---
     #[cfg(feature = "grpc-streaming")]
@@ -1327,6 +1376,38 @@ mod config_tests {
         assert_eq!(cfg.get_inflation_reward_max_memory_bytes, 536_870_912);
         assert_eq!(cfg.get_inflation_reward_max_bytes_to_read, 536_870_912);
         assert_eq!(cfg.get_inflation_reward_epoch_cache_max_bytes, 16_777_216);
+        assert_eq!(cfg.get_inflation_reward_response_cache_max_bytes, 0);
+        assert_eq!(cfg.get_inflation_reward_response_cache_ttl_secs, 3_600);
+        assert_eq!(cfg.get_inflation_reward_response_cache_settle_slots, 4_500);
+    }
+
+    #[test]
+    fn inflation_reward_response_cache_flags_parse_and_validate() {
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-inflation-reward-response-cache-max-bytes",
+            "67108864",
+            "--get-inflation-reward-response-cache-ttl-secs",
+            "86400",
+            "--get-inflation-reward-response-cache-settle-slots",
+            "825",
+        ]);
+        assert_eq!(
+            cfg.get_inflation_reward_response_cache_max_bytes,
+            67_108_864
+        );
+        assert_eq!(cfg.get_inflation_reward_response_cache_ttl_secs, 86_400);
+        assert_eq!(cfg.get_inflation_reward_response_cache_settle_slots, 825);
+        for (flag, value) in [
+            ("--get-inflation-reward-response-cache-ttl-secs", "0"),
+            ("--get-inflation-reward-response-cache-ttl-secs", "86401"),
+            ("--get-inflation-reward-response-cache-settle-slots", "824"),
+        ] {
+            assert!(
+                RpcConfig::try_parse_from(["superbank-rpc", flag, value]).is_err(),
+                "{flag}={value} must be rejected"
+            );
+        }
     }
 
     #[test]

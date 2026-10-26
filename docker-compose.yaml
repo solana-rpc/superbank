@@ -70,6 +70,9 @@ services:
       METRICS_HOST: 0.0.0.0
       METRICS_PORT: 9900
       CLICKHOUSE_URL: http://clickhouse:8123
+      # Single-node ClickHouse defines no {cluster} macro; empty selects
+      # local-only query cancellation instead of failing startup.
+      CLICKHOUSE_CLUSTER: ""
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-superbank}

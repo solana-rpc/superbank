@@ -1,6 +1,8 @@
 use std::{fs::File, path::Path, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    ArrayRef, FixedSizeBinaryArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::{
     arrow::ArrowWriter,
@@ -84,6 +86,61 @@ async fn summary_reads_db_archive_bundle_manifest_and_table_counts() {
     assert!(output.contains("archive: custom_0_10-13"));
     assert!(output.contains("table_transactions_rows: 5"));
     assert!(output.contains("table_blocks_metadata_rows: 4"));
+}
+
+#[tokio::test]
+async fn reader_reads_hourly_manifests_for_both_cadences() {
+    use superbank_solparq::{
+        archive::{ArchiveKind, ClickHouseBounds, plan_next_archive_with_hourly_slot_duration},
+        manifest::{ArchiveManifest, MANIFEST_FORMAT_VERSION},
+        read::config::ArchiveTable,
+    };
+
+    for duration in [400, 200] {
+        let (dir, old_bundle_path) = write_test_bundle();
+        let plan = plan_next_archive_with_hourly_slot_duration(
+            ArchiveKind::Hourly,
+            ClickHouseBounds {
+                earliest_slot: 10,
+                latest_slot: 18_009,
+                distinct_slots: 4,
+            },
+            None,
+            true,
+            false,
+            duration,
+        )
+        .unwrap()
+        .unwrap();
+        let bundle_path = dir.path().join(plan.archive_id());
+        std::fs::rename(old_bundle_path, &bundle_path).unwrap();
+        let manifest_path = bundle_path.join("manifest.json");
+        let legacy: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let manifest = ArchiveManifest::new(
+            plan.archive_id(),
+            plan.kind,
+            plan.epoch,
+            plan.start_slot,
+            plan.end_slot,
+            serde_json::from_value(legacy["tables"].clone()).unwrap(),
+            vec![],
+        );
+        assert_eq!(manifest.archive_kind, "hourly");
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let summary = summarize_archive(ArchiveInput::LocalBundle {
+            dir: bundle_path,
+            table: ArchiveTable::Transactions,
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.archive_name, plan.archive_id());
+        assert_eq!(summary.format_version, Some(MANIFEST_FORMAT_VERSION));
+        assert_eq!(summary.transaction_rows, 5);
+        assert_eq!(summary.actual_min_slot, Some(10));
+        assert_eq!(summary.actual_max_slot, Some(13));
+    }
 }
 
 #[tokio::test]
@@ -381,4 +438,107 @@ fn write_archive_with_invalid_utf8_column() -> (TempDir, std::path::PathBuf) {
     row_group.close().expect("close row group");
     writer.close().expect("close parquet writer");
     (dir, archive_path)
+}
+
+#[tokio::test]
+async fn blocks_metadata_footer_columns_scan_with_nulls() {
+    let (_dir, bundle) = write_test_bundle();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slot", DataType::UInt64, false),
+        Field::new("bank_id", DataType::UInt64, true),
+        Field::new("bank_hash", DataType::FixedSizeBinary(32), true),
+        Field::new("block_producer_time_nanos", DataType::UInt64, true),
+        Field::new("block_user_agent", DataType::Utf8, true),
+    ]));
+    let hashes = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        vec![None, Some([7u8; 32]), Some([8u8; 32])].into_iter(),
+        32,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 11, 12])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![None, Some(7), Some(9)])) as ArrayRef,
+            Arc::new(hashes) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![None, Some(110), Some(120)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("agave/4.3"),
+                Some("agave/4.3"),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        File::create(bundle.join("blocks_metadata.parquet")).unwrap(),
+        schema,
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let cli = Cli::try_parse_from([
+        "reader",
+        "schema",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "blocks_metadata",
+    ])
+    .unwrap();
+    let schema_output = render(cli).await.unwrap();
+    assert!(schema_output.contains("block_producer_time_nanos"));
+    assert!(schema_output.contains("block_user_agent"));
+    let cli = Cli::try_parse_from([
+        "reader",
+        "scan",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "blocks_metadata",
+        "--slot-range",
+        "10-11",
+        "--columns",
+        "slot,bank_id,block_user_agent",
+        "--format",
+        "json",
+    ])
+    .unwrap();
+    let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
+    assert_eq!(
+        rows,
+        json!([
+            {"slot": 10},
+            {"slot": 11, "bank_id": 7, "block_user_agent": "agave/4.3"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn blocks_metadata_archive_without_footer_columns_still_scans() {
+    let (_dir, bundle) = write_test_bundle();
+    let cli = Cli::try_parse_from([
+        "reader",
+        "scan",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "blocks_metadata",
+        "--slot-range",
+        "10-11",
+        "--columns",
+        "slot,executed_transaction_count",
+        "--format",
+        "json",
+    ])
+    .unwrap();
+    let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
+    assert_eq!(
+        rows,
+        json!([
+            {"slot": 10, "executed_transaction_count": 1},
+            {"slot": 11, "executed_transaction_count": 1}
+        ])
+    );
 }

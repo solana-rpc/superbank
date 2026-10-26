@@ -12,6 +12,7 @@ This `docs/` directory contains longer-form documentation. For the main quicksta
 ## Guides
 
 - Architecture overview: [docs/architecture.md](architecture.md)
+- Interactive architecture explorer: https://solana-rpc.github.io/superbank/ (source in [site/](../site/); preview locally with `python3 -m http.server 8000 -d site`)
 - Local development: [docs/development.md](development.md)
 - Deployment notes: [docs/deployment.md](deployment.md)
 - Analyst-friendly ClickHouse views: [docs/analyst-views.md](analyst-views.md)

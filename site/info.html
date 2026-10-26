@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Superbank site info</title>
+  <meta name="description" content="The sources and versions behind the Superbank architecture, configuration and Alpenglow pages, how CI keeps them current, and how to report a problem.">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#000000">
+  <link rel="icon" type="image/png" href="assets/superbank.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="js/info-page.js"></script>
+</head>
+<body class="info-page">
+  <a class="skip-link" href="#built-title">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap site-header__inner">
+      <img class="brand__logo" src="assets/superbank.png" alt="" width="28" height="28">
+      <p class="brand__name">Superbank</p>
+      <nav class="site-nav" aria-label="Site">
+        <a class="site-nav__link" href="./">Architecture</a>
+        <a class="site-nav__link" href="config.html">Configuration</a>
+        <a class="site-nav__link" href="alpenglow.html">Alpenglow</a>
+        <a class="site-nav__link" href="info.html" aria-current="page">Info</a>
+      </nav>
+      <a class="chip-link" href="https://github.com/solana-rpc/superbank" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+    </div>
+  </header>
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap hero__inner">
+      <p class="eyebrow"><span class="eyebrow__dot" aria-hidden="true"></span>About these pages</p>
+      <h1 id="hero-title" class="hero__title">Sources and versions</h1>
+      <p class="hero__lead">What the architecture, configuration and Alpenglow pages were written from. CI rebuilds the site on every merge to <code>main</code> and fills in the commit and versions below, so this page always describes the code it was built with.</p>
+    </div>
+  </section>
+
+  <main>
+    <section class="band" aria-labelledby="built-title">
+      <div class="wrap band__inner">
+        <h2 id="built-title" tabindex="-1">Built from</h2>
+        <div id="info-built" class="info-built"><p class="notice">Loading…</p></div>
+        <noscript><p class="notice">Build details, versions and the source lists need JavaScript.</p></noscript>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="versions-title">
+      <div class="wrap band__inner">
+        <h2 id="versions-title">Versions referenced</h2>
+        <p class="info-lead">Read from the repository by the build step. Each version links to the file it was read from, at the built commit.</p>
+        <div id="info-versions"></div>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="sources-title">
+      <div class="wrap band__inner">
+        <h2 id="sources-title">Sources</h2>
+        <p class="info-lead">The repository files each page cites, taken from the pages' own data. Links open at the built commit.</p>
+        <div id="info-sources" class="info-sources"></div>
+        <h3 class="info-h3">Upstream references</h3>
+        <p class="info-lead">Cited by the Alpenglow page. Each is pinned to a tag, commit or crate version so its line anchors keep pointing at the quoted text; they are reviewed by hand, not updated by CI.</p>
+        <ul id="info-upstream" class="info-upstream"></ul>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="ci-title">
+      <div class="wrap band__inner">
+        <h2 id="ci-title">How this stays current</h2>
+        <div class="cells">
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">01</span>
+            <h3 class="cell__title">Every merge redeploys</h3>
+            <p>Each merge to <code>main</code> rebuilds and redeploys the site through the Pages workflow. The build step records the commit and reads the versions above from <code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>docker-compose.yaml</code>, the Jetstreamer submodule and the Three.js import map, so they always match <code>main</code>.</p>
+          </article>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">02</span>
+            <h3 class="cell__title">Pull requests are checked</h3>
+            <p>Pull requests that touch the site, its tests or the Rust and plugin sources run the site tests:</p>
+            <ul class="info-list">
+              <li>the configuration reference lists the same env vars and flags as the code, in both directions;</li>
+              <li>its YAML keys match <code>FileConfig</code> for superbank and superbank-verify;</li>
+              <li>every <code>#[cfg(feature)]</code> gate on an option carries its feature label;</li>
+              <li>every file a page cites exists;</li>
+              <li>the explorer and Alpenglow models follow their rules.</li>
+            </ul>
+          </article>
+          <article class="cell">
+            <span class="cell__index" aria-hidden="true">03</span>
+            <h3 class="cell__title">What is not automatic</h3>
+            <p>Descriptions, defaults, diagrams and the upstream references are written by hand from the sources above. CI catches renamed, added and removed options, but not a description that has gone stale.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="fix-title">
+      <div class="wrap band__inner">
+        <h2 id="fix-title">Found a problem?</h2>
+        <p class="info-lead">Please open a pull request with the fix. Each page's content lives in a few files:</p>
+        <ul class="info-edit">
+          <li><span>Configuration reference</span> <a href="https://github.com/solana-rpc/superbank/tree/main/site/js/config-data" target="_blank" rel="noopener noreferrer"><code>site/js/config-data/</code></a></li>
+          <li><span>Architecture explorer</span> <a href="https://github.com/solana-rpc/superbank/blob/main/site/js/content.js" target="_blank" rel="noopener noreferrer"><code>site/js/content.js</code></a> <a href="https://github.com/solana-rpc/superbank/blob/main/site/js/topology.js" target="_blank" rel="noopener noreferrer"><code>site/js/topology.js</code></a></li>
+          <li><span>Alpenglow</span> <a href="https://github.com/solana-rpc/superbank/blob/main/site/js/alpenglow-content.js" target="_blank" rel="noopener noreferrer"><code>site/js/alpenglow-content.js</code></a> <a href="https://github.com/solana-rpc/superbank/blob/main/site/js/alpenglow-model.js" target="_blank" rel="noopener noreferrer"><code>site/js/alpenglow-model.js</code></a></li>
+          <li><span>This page</span> <a href="https://github.com/solana-rpc/superbank/blob/main/scripts/site/build-info.mjs" target="_blank" rel="noopener noreferrer"><code>scripts/site/build-info.mjs</code></a></li>
+        </ul>
+        <p class="info-lead">Run <code>node --test "tests/site/*.test.mjs"</code> before opening it; the same tests run in CI.</p>
+        <p><a class="btn btn--primary info-cta" href="https://github.com/solana-rpc/superbank/compare" target="_blank" rel="noopener noreferrer">Open a pull request ↗</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <ul class="site-footer__links">
+        <li><a href="https://github.com/solana-rpc/superbank/blob/main/.github/workflows/pages.yml" target="_blank" rel="noopener noreferrer">.github/workflows/pages.yml</a></li>
+        <li><a href="https://github.com/solana-rpc/superbank/tree/main/tests/site" target="_blank" rel="noopener noreferrer">tests/site/</a></li>
+      </ul>
+    </div>
+  </footer>
+</body>
+</html>

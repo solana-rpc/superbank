@@ -59,7 +59,7 @@ pub enum Command {
     Summary(ArchiveArgs),
     /// Show the Arrow schema stored in one archive.
     Schema(ArchiveArgs),
-    /// Output transaction rows from one archive.
+    /// Output rows from one archive.
     Scan(ScanArgs),
 }
 
@@ -109,7 +109,7 @@ pub struct ScanArgs {
     #[arg(long = "slot-range", value_parser = parse_slot_range)]
     pub slot_range: Option<SlotRange>,
 
-    /// Read all transaction rows in the archive.
+    /// Read all rows in the selected table.
     #[arg(long = "all")]
     pub all: bool,
 
@@ -121,7 +121,7 @@ pub struct ScanArgs {
     #[arg(long = "limit")]
     pub limit: Option<usize>,
 
-    /// Transaction output format.
+    /// Row output format.
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Jsonl)]
     pub format: OutputFormat,
 

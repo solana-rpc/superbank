@@ -18,6 +18,7 @@ pub(crate) struct BlockResponseCacheKey {
     pub(crate) transaction_details: u8,
     pub(crate) show_rewards: bool,
     pub(crate) max_supported_transaction_version: Option<u8>,
+    pub(crate) footer: bool,
 }
 
 /// Bound on remembered `UnsupportedTransactionVersion` results. Entries hold only
@@ -186,6 +187,7 @@ mod tests {
             transaction_details: 3,
             show_rewards: false,
             max_supported_transaction_version: Some(0),
+            footer: true,
         }
     }
 

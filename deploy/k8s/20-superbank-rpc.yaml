@@ -55,6 +55,10 @@ spec:
           value: "http://clickhouse:8123"
         - name: CLICKHOUSE_DATABASE
           value: "default"
+        # Single-node ClickHouse defines no {cluster} macro; empty selects
+        # local-only query cancellation instead of failing startup.
+        - name: CLICKHOUSE_CLUSTER
+          value: ""
         - name: CLICKHOUSE_USER
           valueFrom:
             secretKeyRef:

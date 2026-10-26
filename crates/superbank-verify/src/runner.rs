@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use tracing::{info, warn};
 
+use crate::alpenglow;
 use crate::chain::{ChainWalk, ObserveResult, span_len};
 use crate::chdb::{ChDb, TxSignaturesBySlot};
 use crate::checkpoint::{self, Checkpoint, JobDescriptor};
@@ -26,7 +27,7 @@ use crate::range::RangeSpec;
 use crate::report::{
     Finding, FindingClass, FindingCode, ReportWriter, RunCounters, SlotStatus, log_finding,
 };
-use crate::verify::{BlockInfo, EntryInfo, VerifyMode, VerifyOutcome, verify_block};
+use crate::verify::{BlockInfo, EntryInfo, VerifyMode, VerifyOutcome, verify_block_in_era};
 
 struct WindowData {
     end: u64,
@@ -43,7 +44,8 @@ struct WindowData {
 pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
     let db = ChDb::new(args);
     let epochs = EpochSlots::new(args.slots_per_epoch, args.epoch_warmup);
-    let (range_start, range_end) = resolve_range(args, &db, &epochs).await?;
+    let (range_start, range_end, alpenglow_genesis_block) =
+        resolve_alpenglow_setup(args, &db, &epochs).await?;
     let mode = args.mode.to_verify_mode();
     info!(
         range_start,
@@ -69,6 +71,7 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
         transactions_table: args.transactions_table.clone(),
         ticks_per_slot: args.ticks_per_slot,
         hashes_per_tick_schedule: args.hashes_per_tick_schedule.to_spec(),
+        alpenglow_genesis_block,
         expected_genesis_hash: args.expected_genesis_hash,
         anchors: canonical_anchors(&args.anchors),
         audit_duplicate_conflicts: args.audit_duplicate_conflicts,
@@ -171,6 +174,7 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
                 mode,
                 args.ticks_per_slot,
                 &args.hashes_per_tick_schedule,
+                alpenglow_genesis_block.map(|(slot, _)| slot),
             )
         });
 
@@ -298,6 +302,16 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
     Ok(counters)
 }
 
+async fn resolve_alpenglow_setup(
+    args: &Args,
+    db: &ChDb,
+    epochs: &EpochSlots,
+) -> Result<(u64, u64, Option<(u64, [u8; 32])>)> {
+    let (range_start, range_end) = resolve_range(args, db, epochs).await?;
+    let genesis = alpenglow::resolve_genesis_block(args).await?;
+    Ok((range_start, range_end, genesis))
+}
+
 async fn fetch_window(
     db: &ChDb,
     start: u64,
@@ -358,6 +372,7 @@ fn verify_window(
     mode: VerifyMode,
     ticks_per_slot: u64,
     schedule: &crate::eras::HashesPerTickSchedule,
+    alpenglow_genesis_slot: Option<u64>,
 ) -> Vec<VerifyOutcome> {
     let empty_tx: BTreeMap<u32, Vec<[u8; 64]>> = BTreeMap::new();
     pool.install(|| {
@@ -367,13 +382,14 @@ fn verify_window(
             .map(|block| {
                 let entries = window.entries.get(&block.slot);
                 match entries.filter(|entries| !entries.is_empty()) {
-                    Some(entries) => verify_block(
+                    Some(entries) => verify_block_in_era(
                         mode,
                         block,
                         entries,
                         window.tx_signatures.get(&block.slot).unwrap_or(&empty_tx),
                         ticks_per_slot,
                         Some(schedule.value_at(block.slot)),
+                        alpenglow_genesis_slot.is_some_and(|slot| block.slot > slot),
                     ),
                     None => VerifyOutcome {
                         findings: vec![Finding::new(
@@ -556,6 +572,7 @@ mod tests {
             VerifyMode::Full,
             4,
             &crate::eras::HashesPerTickSchedule::parse("0:25").unwrap(),
+            None,
         );
         assert_eq!(outcomes.len(), 1);
         assert!(
@@ -602,10 +619,124 @@ mod tests {
             VerifyMode::Structural,
             64,
             &crate::eras::HashesPerTickSchedule::mainnet(),
+            None,
         );
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(slot_status(&outcomes[0].findings), SlotStatus::Unverifiable);
         assert_eq!(outcomes[0].findings[0].code, FindingCode::MissingEntries);
+    }
+
+    #[test]
+    fn genesis_slot_uses_poh_rules_and_successor_uses_alpenglow_rules() {
+        let (block, entries, signatures) =
+            crate::verify::test_support::build_block(10, 9, [1; 32], &[(1, 2), (1, 0)]);
+        let mut entries_by_slot = BTreeMap::new();
+        entries_by_slot.insert(10, entries);
+        let mut signatures_by_slot = TxSignaturesBySlot::new();
+        signatures_by_slot.insert(10, signatures);
+        let window = WindowData {
+            end: 10,
+            blocks: vec![block],
+            entries: entries_by_slot,
+            tx_signatures: signatures_by_slot,
+            duplicate_findings: Vec::new(),
+            parent_seed: None,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let schedule = crate::eras::HashesPerTickSchedule::parse("0:25").unwrap();
+        let alpenglow = verify_window(&window, &pool, VerifyMode::Full, 4, &schedule, Some(9));
+        assert!(
+            alpenglow[0].findings.is_empty(),
+            "{:?}",
+            alpenglow[0].findings
+        );
+        assert_eq!(alpenglow[0].entries_verified, 2);
+        let genesis = verify_window(
+            &window,
+            &pool,
+            VerifyMode::Structural,
+            4,
+            &schedule,
+            Some(10),
+        );
+        assert!(
+            genesis[0]
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickCountMismatch)
+        );
+    }
+    #[test]
+    fn mixed_window_applies_boundary_per_block_and_keeps_skipped_slot_linkage() {
+        let mut window = WindowData {
+            end: 13,
+            blocks: Vec::new(),
+            entries: BTreeMap::new(),
+            tx_signatures: TxSignaturesBySlot::new(),
+            duplicate_findings: Vec::new(),
+            parent_seed: None,
+        };
+        let mut parent_slot = 7;
+        let mut parent_hash = [1; 32];
+        for (slot, layout) in [
+            (8, vec![(25, 0); 4]),
+            (9, vec![(10, 2), (15, 0), (25, 0), (25, 0), (25, 0)]),
+            (13, vec![(1, 1), (1, 0)]),
+        ] {
+            let (block, entries, signatures) = build_block(slot, parent_slot, parent_hash, &layout);
+            parent_slot = slot;
+            parent_hash = block.blockhash;
+            window.blocks.push(block);
+            window.entries.insert(slot, entries);
+            window.tx_signatures.insert(slot, signatures);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let schedule = crate::eras::HashesPerTickSchedule::parse("0:25,10:62500").unwrap();
+        for mode in [VerifyMode::Structural, VerifyMode::Full] {
+            let outcomes = verify_window(&window, &pool, mode, 4, &schedule, Some(9));
+            assert_eq!(outcomes.len(), 3);
+            for outcome in outcomes {
+                assert!(outcome.findings.is_empty(), "{:?}", outcome.findings);
+            }
+            let mut walk = ChainWalk::new(8, None, HashMap::from([(13, parent_hash)]));
+            walk.seed(7, [1; 32]);
+            for block in &window.blocks {
+                assert!(walk.observe_block(block).findings.is_empty());
+            }
+            assert_eq!(walk.last_present(), Some(13));
+        }
+
+        // Without a trusted boundary, the historical default still rejects
+        // the short terminal-only stream rather than guessing from the data.
+        let outcomes = verify_window(&window, &pool, VerifyMode::Structural, 4, &schedule, None);
+        assert!(
+            outcomes[2]
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickCountMismatch)
+        );
+        assert!(
+            outcomes[2]
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::TickHashCountMismatch)
+        );
+
+        window.blocks[2].parent_blockhash[0] ^= 1;
+        let mut walk = ChainWalk::new(13, None, HashMap::new());
+        walk.seed(9, window.blocks[1].blockhash);
+        assert!(
+            walk.observe_block(&window.blocks[2])
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::ChainBreak)
+        );
     }
 }

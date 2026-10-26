@@ -17,7 +17,7 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use super::QueryFreshnessClass;
 use super::client::ClickHouseClient;
 use super::constants::SLOT_SHARD_DIVISOR;
-use super::inflation_cache::{InflationBoundary, complete_partition_slots};
+use super::inflation_cache::{InflationBoundary, InflationEpochMetadata, complete_partition_slots};
 #[cfg(feature = "grpc-streaming")]
 use super::queries::build_transactions_by_slot_range_query;
 use super::queries::{
@@ -41,12 +41,24 @@ use super::types::{
     StoredAccountsTransactionRecord, StoredTransactionRecord,
 };
 
-fn inflation_epoch_slot_bounds(epoch: u64, schedule: &EpochSchedule) -> Option<(u64, u64)> {
+pub(super) fn inflation_epoch_slot_bounds(
+    epoch: u64,
+    schedule: &EpochSchedule,
+) -> Option<(u64, u64)> {
     let next_epoch = epoch.checked_add(1)?;
     let following_epoch = next_epoch.checked_add(1)?;
     let start_slot = schedule.get_first_slot_in_epoch(next_epoch);
     let end_slot_exclusive = schedule.get_first_slot_in_epoch(following_epoch);
     (start_slot < end_slot_exclusive).then_some((start_slot, end_slot_exclusive))
+}
+
+pub(super) fn inflation_epoch_bounds_or_error(
+    epoch: u64,
+    schedule: &EpochSchedule,
+) -> ProcessingResult<(u64, u64)> {
+    inflation_epoch_slot_bounds(epoch, schedule).ok_or_else(|| {
+        ProcessingError::deserialization_msg(format!("epoch {epoch} is out of range"))
+    })
 }
 
 const MAX_INFLATION_REWARD_PARTITIONS: usize = 4_096;
@@ -353,11 +365,56 @@ fn inflation_rewards_period_is_active(
     current_block_height < rewards_complete_block_height
 }
 
+/// The boundary a `Complete` answer used and the last block it read.
+#[derive(Clone, Debug)]
+pub(super) struct InflationRewardProvenance {
+    pub(super) boundary: InflationBoundary,
+    /// Boundary slot, or the highest partition slot the answer read.
+    pub(super) settle_slot: u64,
+}
+
+pub(super) struct InflationRewardLookup {
+    pub(super) outcome: InflationRewardLookupOutcome,
+    pub(super) timings: QueryTimings,
+    /// Set only for `Complete` outcomes.
+    pub(super) provenance: Option<InflationRewardProvenance>,
+}
+
+impl InflationRewardLookup {
+    fn unavailable(outcome: InflationRewardLookupOutcome, timings: QueryTimings) -> Self {
+        Self {
+            outcome,
+            timings,
+            provenance: None,
+        }
+    }
+
+    fn complete(
+        rewards_by_pubkey: HashMap<[u8; 32], InflationRewardRecord>,
+        timings: QueryTimings,
+        boundary: &InflationBoundary,
+        settle_slot: u64,
+    ) -> Self {
+        Self {
+            outcome: InflationRewardLookupOutcome::Complete(
+                rewards_by_pubkey.into_values().collect(),
+            ),
+            timings,
+            provenance: Some(InflationRewardProvenance {
+                boundary: boundary.clone(),
+                settle_slot,
+            }),
+        }
+    }
+}
+
 struct FoldedInflationRewards {
     rewards_by_pubkey: HashMap<[u8; 32], InflationRewardRecord>,
     /// Distinct partition slots the sequential lookup would have read (0 when every address
     /// resolved at the boundary).
     selected_partition_slots: usize,
+    /// Highest of those partition slots.
+    last_selected_partition_slot: Option<u64>,
 }
 
 /// Applies the sequential lookup's rules to `(pubkey, slot)` rows from the folded query:
@@ -443,6 +500,7 @@ fn resolve_folded_inflation_rewards(
     Ok(FoldedInflationRewards {
         rewards_by_pubkey,
         selected_partition_slots: selected_slots.len(),
+        last_selected_partition_slot: selected_slots.iter().copied().max(),
     })
 }
 
@@ -740,7 +798,7 @@ fn build_block_time_range_query(
 
     format!(
         "SELECT
-                slot, block_time
+                slot, parent_slot, block_time
              FROM {blocks_metadata_table}
              PREWHERE
                 intDiv(slot, {slot_shard_divisor}) BETWEEN {start_bucket} AND {end_bucket}
@@ -1364,8 +1422,6 @@ impl ClickHouseClient {
         epoch: u64,
         schedule: &EpochSchedule,
     ) -> ProcessingResult<(InflationRewardLookupOutcome, QueryTimings)> {
-        const OPERATION: &str = "get_inflation_rewards_for_epoch";
-
         if addresses.is_empty() {
             return Ok((
                 InflationRewardLookupOutcome::Complete(Vec::new()),
@@ -1373,10 +1429,31 @@ impl ClickHouseClient {
             ));
         }
 
-        let (start_slot, end_slot_exclusive) = inflation_epoch_slot_bounds(epoch, schedule)
-            .ok_or_else(|| {
-                ProcessingError::deserialization_msg(format!("epoch {epoch} is out of range"))
-            })?;
+        let bounds = inflation_epoch_bounds_or_error(epoch, schedule)?;
+        let cached_epoch = self.inflation_epoch_cache.get(bounds).await;
+        let lookup = self
+            .lookup_inflation_rewards(
+                addresses,
+                epoch,
+                bounds,
+                cached_epoch,
+                self.inflation_reward_limits.query_timeout,
+            )
+            .await?;
+        Ok((lookup.outcome, lookup.timings))
+    }
+
+    /// Runs the ClickHouse lookup for non-empty `addresses` with the epoch cache entry already
+    /// read, within `query_timeout`.
+    pub(super) async fn lookup_inflation_rewards(
+        &self,
+        addresses: &[[u8; 32]],
+        epoch: u64,
+        (start_slot, end_slot_exclusive): (u64, u64),
+        cached_epoch: Option<std::sync::Arc<InflationEpochMetadata>>,
+        query_timeout: std::time::Duration,
+    ) -> ProcessingResult<InflationRewardLookup> {
+        const OPERATION: &str = "get_inflation_rewards_for_epoch";
 
         let mut deduped_addresses = Vec::with_capacity(addresses.len());
         let mut seen = HashSet::with_capacity(addresses.len());
@@ -1407,10 +1484,8 @@ impl ClickHouseClient {
                 "distributed",
             )
         };
-        let query_timeout = self.inflation_reward_limits.query_timeout;
         let read_endpoint = read_endpoint.with_timeout(query_timeout);
         let epoch_cache_key = (start_slot, end_slot_exclusive);
-        let cached_epoch = self.inflation_epoch_cache.get(epoch_cache_key).await;
         let workflow_started = Instant::now();
         let deadline = tokio::time::Instant::now() + query_timeout;
 
@@ -1468,7 +1543,7 @@ impl ClickHouseClient {
 
                 let Some(boundary) = boundary else {
                     crate::metrics::inflation_reward_lookup("unknown", "boundary_missing");
-                    return Ok((
+                    return Ok(InflationRewardLookup::unavailable(
                         InflationRewardLookupOutcome::BoundaryUnavailable { slot: start_slot },
                         timings,
                     ));
@@ -1638,11 +1713,12 @@ impl ClickHouseClient {
                     epoch_cache = "hit",
                     "Completed targeted getInflationReward lookup"
                 );
-                return Ok((
-                    InflationRewardLookupOutcome::Complete(
-                        folded.rewards_by_pubkey.into_values().collect(),
-                    ),
+                let settle_slot = folded.last_selected_partition_slot.unwrap_or(boundary.slot);
+                return Ok(InflationRewardLookup::complete(
+                    folded.rewards_by_pubkey,
                     timings,
+                    &boundary,
+                    settle_slot,
                 ));
             }
 
@@ -1725,11 +1801,11 @@ impl ClickHouseClient {
                     query_scope,
                     "Completed targeted getInflationReward lookup"
                 );
-                return Ok((
-                    InflationRewardLookupOutcome::Complete(
-                        rewards_by_pubkey.into_values().collect(),
-                    ),
+                return Ok(InflationRewardLookup::complete(
+                    rewards_by_pubkey,
                     timings,
+                    &boundary,
+                    boundary.slot,
                 ));
             }
 
@@ -1772,11 +1848,11 @@ impl ClickHouseClient {
                     query_scope,
                     "Completed targeted getInflationReward lookup"
                 );
-                return Ok((
-                    InflationRewardLookupOutcome::Complete(
-                        rewards_by_pubkey.into_values().collect(),
-                    ),
+                return Ok(InflationRewardLookup::complete(
+                    rewards_by_pubkey,
                     timings,
+                    &boundary,
+                    boundary.slot,
                 ));
             }
 
@@ -1976,7 +2052,7 @@ impl ClickHouseClient {
                     rewards_complete_block_height,
                 ) {
                     crate::metrics::inflation_reward_lookup("partitioned", "active");
-                    return Ok((
+                    return Ok(InflationRewardLookup::unavailable(
                         InflationRewardLookupOutcome::RewardsPeriodActive {
                             slot: progress.slot,
                             current_block_height,
@@ -2086,9 +2162,12 @@ impl ClickHouseClient {
                 "Completed targeted getInflationReward lookup"
             );
 
-            Ok((
-                InflationRewardLookupOutcome::Complete(rewards_by_pubkey.into_values().collect()),
+            let settle_slot = selected_slots.last().copied().unwrap_or(boundary.slot);
+            Ok(InflationRewardLookup::complete(
+                rewards_by_pubkey,
                 timings,
+                &boundary,
+                settle_slot,
             ))
         };
 
@@ -2863,8 +2942,8 @@ impl ClickHouseClient {
         .await
     }
 
-    /// Block times in `[start_slot, end_slot]`, ascending. This narrow range
-    /// read is reserved for the full-history block index.
+    /// Block times and parent links in `[start_slot, end_slot]`, ascending. This narrow range
+    /// read is reserved for the full-history block index, which bypasses the query cache.
     #[cfg(feature = "disk-cache")]
     pub(crate) async fn get_block_times_by_slot_range(
         &self,
@@ -2879,7 +2958,7 @@ impl ClickHouseClient {
             {
                 let settings_clause = self.select_settings_clause_with_timeout(
                     "get_block_times_by_slot_range_local_http",
-                    QueryFreshnessClass::Historical,
+                    QueryFreshnessClass::TipSensitive,
                     timeout,
                 );
                 let ranges = shard_slot_ranges_for_slot_range(start_slot, end_slot, |bucket| {
@@ -2926,7 +3005,7 @@ impl ClickHouseClient {
 
             let settings_clause = self.select_settings_clause_with_timeout(
                 "get_block_times_by_slot_range",
-                QueryFreshnessClass::Historical,
+                QueryFreshnessClass::TipSensitive,
                 timeout,
             );
             let query = build_block_time_range_query(
@@ -3126,6 +3205,15 @@ mod tests {
     fn normalize_slots_sorts_and_deduplicates() {
         let slots = normalize_slots(vec![5, 2, 5, 3, 2, 9, 9, 1]);
         assert_eq!(slots, vec![1, 2, 3, 5, 9]);
+    }
+
+    #[test]
+    fn block_metadata_query_selects_footer_columns() {
+        for include_rewards in [false, true] {
+            let query = build_block_metadata_query("t", 1, include_rewards, "", true);
+            assert!(query.contains("block_producer_time_nanos"), "{query}");
+            assert!(query.contains("block_user_agent"), "{query}");
+        }
     }
 
     #[test]
@@ -3526,7 +3614,7 @@ mod tests {
             "SETTINGS max_threads=2",
         );
 
-        assert!(query.contains("SELECT\n                slot, block_time"));
+        assert!(query.contains("SELECT\n                slot, parent_slot, block_time"));
         assert!(query.contains("intDiv(slot, 432000) BETWEEN 1 AND 1"));
         assert!(query.contains("AND slot BETWEEN 432001 AND 432010"));
         assert!(query.contains("ORDER BY slot ASC"));

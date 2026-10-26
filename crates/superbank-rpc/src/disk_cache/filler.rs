@@ -21,12 +21,12 @@ use super::{DiskCache, DiskCacheError, SlotStatus};
 
 const MIN_SLOTS_PER_ROUND: u64 = 64;
 const MAX_SLOTS_PER_ROUND: u64 = 4_096;
-const MAX_SKIPPED_RUN: u64 = 100_000;
+pub(super) const MAX_SKIPPED_RUN: u64 = 100_000;
 
 #[derive(Debug, Clone, Deserialize, Row)]
-struct NextBlockRow {
-    slot: u64,
-    parent_slot: u64,
+pub(super) struct NextBlockRow {
+    pub(super) slot: u64,
+    pub(super) parent_slot: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -601,7 +601,7 @@ pub(super) async fn fill_range(
     Ok(published)
 }
 
-async fn next_block_after(
+pub(super) async fn next_block_after(
     source: &ClickHouseClient,
     slot: u64,
     timeout: Duration,
@@ -1020,6 +1020,7 @@ mod tests {
             rewards_commission: Vec::new(),
             rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
+            footer: None,
         }];
         let rows = coverage_from_metadata(
             SlotRange {

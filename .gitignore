@@ -71,3 +71,6 @@ crates/superbank-solparq/*.log
 
 credentials.json
 clickhouse.sh
+
+# Written by the Pages build (scripts/site/build-info.mjs)
+site/build-info.json

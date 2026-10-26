@@ -1,0 +1,83 @@
+name: Pages
+
+on:
+  # Every merge to main redeploys, so the Info page's commit and versions
+  # (scripts/site/build-info.mjs) always describe main.
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "site/**"
+      - "tests/site/**"
+      - ".github/workflows/pages.yml"
+      # tests/site/config.test.mjs checks the config reference against these
+      # sources, so a PR that changes a flag or env var runs it too.
+      - "crates/**/src/**"
+      - "ingest/jetstreamer-clickhouse-plugin/src/**"
+      # tests/site/build-info.test.mjs reads the versions from these.
+      - "scripts/site/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docker-compose.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (site model)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Run site tests
+        run: node --test "tests/site/*.test.mjs"
+
+  build:
+    name: Build (Pages artifact)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      # Commit and versions for the Info page; fails if a version can't be read.
+      - name: Write build info
+        run: node scripts/site/build-info.mjs site/build-info.json
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: Deploy (GitHub Pages)
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

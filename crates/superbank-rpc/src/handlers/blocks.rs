@@ -25,8 +25,8 @@ use tracing::{error, warn};
 use super::block_ranges::{RangeObservation, get_block_slots_response_for_range, resolve_range};
 use crate::block_response_cache::BlockResponseCacheKey;
 use crate::clickhouse::{
-    InflationRewardLookupOutcome, InflationRewardRecord, QueryTimings, StoredBlockPayload,
-    StoredBlockRecord,
+    BlockFooterRecord, InflationRewardAnswer, InflationRewardLookupOutcome, InflationRewardRecord,
+    QueryTimings, StoredBlockPayload, StoredBlockRecord,
 };
 use crate::handlers::{
     RouteMetric,
@@ -50,12 +50,13 @@ use crate::rpc::{
 use crate::state::{AppState, LatestSlotSource};
 use crate::util::add_downstream_header;
 
-const GET_BLOCK_ALLOWED_FIELDS: [&str; 5] = [
+const GET_BLOCK_ALLOWED_FIELDS: [&str; 6] = [
     "encoding",
     "transactionDetails",
     "rewards",
     "commitment",
     "maxSupportedTransactionVersion",
+    "footer",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,16 +65,23 @@ struct GetBlockFetchPlan {
     transaction_details: TransactionDetails,
     show_rewards: bool,
     max_supported_transaction_version: Option<u8>,
+    footer: bool,
 }
 
 impl GetBlockFetchPlan {
+    /// Footer fields are included only when the request sets `footer: true`.
     fn new(config: &RpcBlockConfig) -> Self {
         Self {
             encoding: config.encoding.unwrap_or(UiTransactionEncoding::Json),
             transaction_details: config.transaction_details.unwrap_or_default(),
             show_rewards: config.rewards.unwrap_or(true),
             max_supported_transaction_version: config.max_supported_transaction_version,
+            footer: false,
         }
+    }
+
+    fn with_footer(self, footer: bool) -> Self {
+        Self { footer, ..self }
     }
 
     fn needs_blocking_hydration(self) -> bool {
@@ -101,6 +109,7 @@ impl GetBlockFetchPlan {
             transaction_details,
             show_rewards: self.show_rewards,
             max_supported_transaction_version: self.max_supported_transaction_version,
+            footer: self.footer,
         }
     }
 }
@@ -1222,6 +1231,34 @@ fn encode_block_result(
         .map_err(|err| BlockResultBuildError::Failed(err.to_string()))
 }
 
+/// Adds the SIMD-0307 `footer` object, or `null` when the block has none, to a block result.
+fn insert_footer_field(
+    result: &[u8],
+    footer: Option<&BlockFooterRecord>,
+) -> Result<Bytes, BlockResultBuildError> {
+    let value = footer.map_or(Value::Null, |footer| {
+        json!({
+            "blockProducerTimeNanos": footer.block_producer_time_nanos,
+            "blockUserAgent": footer.block_user_agent,
+        })
+    });
+    let field =
+        serde_json::to_vec(&value).map_err(|err| BlockResultBuildError::Failed(err.to_string()))?;
+    let Some((&b'{', rest)) = result.split_first() else {
+        return Err(BlockResultBuildError::Failed(
+            "block result is not a JSON object".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(result.len() + field.len() + 12);
+    out.extend_from_slice(b"{\"footer\":");
+    out.extend_from_slice(&field);
+    if rest.first() != Some(&b'}') {
+        out.push(b',');
+    }
+    out.extend_from_slice(rest);
+    Ok(Bytes::from(out))
+}
+
 fn join_error(err: tokio::task::JoinError) -> BlockResultBuildError {
     BlockResultBuildError::Failed(err.to_string())
 }
@@ -1282,6 +1319,7 @@ async fn build_block_result_chunked(
         transaction_details,
         show_rewards,
         max_supported_transaction_version,
+        footer: _,
     } = fetch_plan;
     let run_chunk = move |chunk| {
         hydrate_serialize_block_chunk(
@@ -1373,12 +1411,17 @@ async fn respond_with_hydrated_block(
         }
     };
 
+    let footer = fetch_plan.footer.then(|| payload.metadata().footer.clone());
     let build_result = async move {
         let started = Instant::now();
         let result = if fetch_plan.needs_blocking_hydration() {
             build_block_result_blocking(state, payload, fetch_plan).await
         } else {
             encode_block_result(payload, fetch_plan)
+        };
+        let result = match (result, footer) {
+            (Ok(bytes), Some(footer)) => insert_footer_field(&bytes, footer.as_ref()),
+            (result, _) => result,
         };
         metrics::get_block_phase("hydrate_serialize", started.elapsed().as_secs_f64());
         result
@@ -1446,6 +1489,30 @@ async fn respond_with_hydrated_block(
     }
 }
 
+/// Returns the block config and whether footer fields were requested (default false).
+fn parse_block_config(mut value: Value) -> Result<(RpcBlockConfig, bool), String> {
+    reject_unknown_fields(&value, &GET_BLOCK_ALLOWED_FIELDS)?;
+    if value.is_null() {
+        return Ok((RpcBlockConfig::default(), false));
+    }
+    let footer = match value
+        .as_object_mut()
+        .and_then(|object| object.remove("footer"))
+    {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(footer)) => footer,
+        Some(_) => return Err("Invalid params: footer must be a boolean".to_string()),
+    };
+    let wrapper: RpcEncodingConfigWrapper<RpcBlockConfig> = serde_json::from_value(value)
+        .map_err(|e| format!("Invalid params: failed to parse config ({e})"))?;
+    let config = wrapper.convert_to_current();
+    super::encoding::validate_transaction_encoding(
+        config.encoding.unwrap_or(UiTransactionEncoding::Json),
+        config.max_supported_transaction_version,
+    )?;
+    Ok((config, footer))
+}
+
 pub(crate) async fn handle_get_block(
     state: Arc<AppState>,
     id: Value,
@@ -1477,37 +1544,16 @@ pub(crate) async fn handle_get_block(
         }
     };
 
-    let config_wrapper = match params.into_iter().next() {
-        Some(config_value) => {
-            if let Err(message) = reject_unknown_fields(&config_value, &GET_BLOCK_ALLOWED_FIELDS) {
+    let (config, footer) =
+        match parse_block_config(params.into_iter().next().unwrap_or(Value::Null)) {
+            Ok(parsed) => parsed,
+            Err(message) => {
                 route.invalid_params();
                 return Ok(json_rpc_error_response(id, -32602, message, None));
             }
-            if config_value.is_null() {
-                RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig::default()))
-            } else {
-                match serde_json::from_value::<RpcEncodingConfigWrapper<RpcBlockConfig>>(
-                    config_value,
-                ) {
-                    Ok(wrapper) => wrapper,
-                    Err(e) => {
-                        route.invalid_params();
-                        return Ok(json_rpc_error_response(
-                            id,
-                            -32602,
-                            format!("Invalid params: failed to parse config ({e})"),
-                            None,
-                        ));
-                    }
-                }
-            }
-        }
-        None => RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig::default())),
-    };
-
-    let config = config_wrapper.convert_to_current();
+        };
     let commitment = config.commitment.unwrap_or_default();
-    let fetch_plan = GetBlockFetchPlan::new(&config);
+    let fetch_plan = GetBlockFetchPlan::new(&config).with_footer(footer);
 
     if commitment.is_processed() {
         route.invalid_params();
@@ -1576,8 +1622,10 @@ pub(crate) async fn handle_get_block(
                     payload,
                     fetch_plan,
                     BlockResponseOptions {
-                        // A confirmed head-cache block may not be finalized yet.
-                        cache_key: requested_finalized.then(|| response_cache_key.clone()),
+                        // A head-cache footer can still arrive after the block, so a footer
+                        // response is not cached for later reads.
+                        cache_key: (requested_finalized && !fetch_plan.footer)
+                            .then(|| response_cache_key.clone()),
                         timings: None,
                     },
                 )
@@ -2363,10 +2411,7 @@ pub(crate) async fn handle_get_inflation_reward(
         return Ok(json_rpc_error_response(
             id,
             -32602,
-            format!(
-                "Invalid params: too many addresses; maximum is {}",
-                max_addresses
-            ),
+            format!("Too many inputs provided; max {}", max_addresses),
             None,
         ));
     }
@@ -2469,14 +2514,35 @@ pub(crate) async fn handle_get_inflation_reward(
         None
     };
 
-    route.source_clickhouse();
-    let (lookup_outcome, timings) = match state
+    // A response-cache hit must not mark ClickHouse touched, so a lookup marks it when it starts.
+    // The route label alone keeps an abandoned or timed-out request counted as `clickhouse`.
+    if state.clickhouse.inflation_response_cache.enabled() && !requested_pubkeys.is_empty() {
+        route.label_source_clickhouse();
+    } else {
+        route.source_clickhouse();
+    }
+    let lookup = state
         .clickhouse
-        .get_inflation_rewards_for_epoch(&requested_pubkeys, epoch, &state.epoch_schedule)
-        .await
-    {
-        Ok(result) => result,
+        .get_inflation_rewards_cached(
+            &requested_pubkeys,
+            epoch,
+            &state.epoch_schedule,
+            super::mark_clickhouse_source_touched,
+            |required| inflation_reward_tip_reached(state.as_ref(), required),
+        )
+        .await;
+    // Response-cache answers carry no timings, so ClickHouse metrics see only real queries.
+    let (lookup_outcome, timings) = match lookup {
+        Ok(InflationRewardAnswer::ClickHouse { outcome, timings }) => {
+            route.source_clickhouse();
+            (outcome, Some(timings))
+        }
+        Ok(InflationRewardAnswer::ResponseCache(outcome)) => {
+            route.source_response_cache();
+            (outcome, None)
+        }
         Err(e) => {
+            route.source_clickhouse();
             metrics::backend_error("get_inflation_rewards_for_epoch");
             error!(
                 "Failed to query ClickHouse inflation rewards for epoch {}: {}",
@@ -2497,7 +2563,9 @@ pub(crate) async fn handle_get_inflation_reward(
             availability_error.message,
             availability_error.data,
         );
-        add_downstream_header(&mut resp, &timings);
+        if let Some(timings) = &timings {
+            add_downstream_header(&mut resp, timings);
+        }
         return Ok(resp);
     }
     let InflationRewardLookupOutcome::Complete(reward_rows) = lookup_outcome else {
@@ -2508,8 +2576,40 @@ pub(crate) async fn handle_get_inflation_reward(
 
     route.success();
     let mut resp = json_rpc_success_response(id, json!(rewards));
-    add_downstream_header(&mut resp, &timings);
+    if let Some(timings) = &timings {
+        add_downstream_header(&mut resp, timings);
+    }
     Ok(resp)
+}
+
+/// Bounds the tip read that decides whether a `getInflationReward` answer with nulls is stored.
+const INFLATION_REWARD_SETTLE_TIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether ClickHouse's finalized tip is at least `required`. An unknown tip counts as not
+/// reached, so the answer is served but not stored.
+async fn inflation_reward_tip_reached(state: &AppState, required: u64) -> bool {
+    // Primary slots are only ever added, so any value it once reported bounds its tip.
+    let cache = &state.latest_slot_cache;
+    if cache.value.load(std::sync::atomic::Ordering::Relaxed) >= required {
+        return true;
+    }
+    // ClickHouse holds no finalized slot the head has not seen, so a lower head tip settles it.
+    #[cfg(feature = "grpc-head-cache")]
+    if let Some(head) = state.head_cache.as_ref() {
+        let head_tip =
+            head.latest_slot_at_least(solana_commitment_config::CommitmentLevel::Finalized);
+        if head_tip > 0 && head_tip < required {
+            return false;
+        }
+    }
+    matches!(
+        tokio::time::timeout(
+            INFLATION_REWARD_SETTLE_TIP_TIMEOUT,
+            cache.get_or_refresh(&state.clickhouse),
+        )
+        .await,
+        Ok(Ok(tip)) if tip >= required
+    )
 }
 
 pub(crate) async fn handle_get_first_available_block(
@@ -2673,6 +2773,63 @@ pub(crate) async fn handle_minimum_ledger_slot(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn block_config_footer_defaults_to_false() {
+        for value in [
+            json!(null),
+            json!({}),
+            json!({"encoding": "json"}),
+            json!("base64"),
+        ] {
+            assert!(!parse_block_config(value.clone()).unwrap().1, "{value}");
+        }
+        assert!(!parse_block_config(json!({"footer": null})).unwrap().1);
+    }
+
+    #[test]
+    fn block_config_footer_parses_booleans_only() {
+        assert!(parse_block_config(json!({"footer": true})).unwrap().1);
+        assert!(!parse_block_config(json!({"footer": false})).unwrap().1);
+        for bad in [json!("false"), json!(0), json!([]), json!({})] {
+            let error = parse_block_config(json!({"footer": bad})).unwrap_err();
+            assert_eq!(error, "Invalid params: footer must be a boolean");
+        }
+        assert!(parse_block_config(json!({"foter": true})).is_err());
+    }
+
+    #[test]
+    fn footer_flag_is_part_of_the_response_cache_key() {
+        let plan = GetBlockFetchPlan::new(&RpcBlockConfig::default());
+        let with = plan
+            .with_footer(true)
+            .cache_key(9, CommitmentLevel::Finalized);
+        let without = plan
+            .with_footer(false)
+            .cache_key(9, CommitmentLevel::Finalized);
+        assert_ne!(with, without);
+        // An omitted option and `footer: false` share one key.
+        assert_eq!(without, plan.cache_key(9, CommitmentLevel::Finalized));
+    }
+
+    #[test]
+    fn footer_field_is_inserted_into_the_block_object() {
+        let record = BlockFooterRecord {
+            block_producer_time_nanos: u64::MAX,
+            block_user_agent: "a\"b".to_string(),
+        };
+        let out = insert_footer_field(br#"{"blockhash":"x"}"#, Some(&record)).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["blockhash"], "x");
+        assert_eq!(value["footer"]["blockProducerTimeNanos"], json!(u64::MAX));
+        assert_eq!(value["footer"]["blockUserAgent"], "a\"b");
+
+        let out = insert_footer_field(b"{}", None).unwrap();
+        assert_eq!(&out[..], br#"{"footer":null}"#);
+        assert!(insert_footer_field(b"[]", None).is_err());
+    }
+
     use super::{
         InflationRewardAvailabilityRoute, classify_get_block_miss,
         inflation_reward_address_limit_exceeded, inflation_reward_availability_error,

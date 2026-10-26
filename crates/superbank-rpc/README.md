@@ -3,6 +3,8 @@
 Solana-compatible JSON-RPC server backed by ClickHouse tables produced by `superbank` (or any
 writer that matches the same schemas).
 
+See the [Agave 4.3 compatibility and rollout notes](../../docs/agave-4.3-compatibility.md) for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries. Build with the pinned Rust 1.98.1 toolchain.
+
 ## Supported methods
 
 - `getSignaturesForAddress`
@@ -22,6 +24,7 @@ writer that matches the same schemas).
 - `minimumLedgerSlot`
 - `getInflationReward`
 - `getEpochSchedule`
+- `getAgGenesisCert`
 - `getTransactionsForAddress` (custom)
 
 Notes:
@@ -44,16 +47,27 @@ Notes:
   `200`, with `slot`, `currentBlockHeight`, and `rewardsCompleteBlockHeight` in `error.data`.
   Missing rewards are returned as `null` only after the address's required partition is available.
   Dedicated address, concurrency, timeout, thread, memory, and read-byte limits are enabled by
-  default.
+  default. Address-limit rejections use code `-32602` and message `Too many inputs provided; max N`, where N is the configured limit. The default remains 100; set `GET_INFLATION_REWARD_MAX_ADDRESSES=32` for Agave limit parity.
   Historical non-partitioned rewards do not require block height metadata. Partitioned rewards
   still require it to locate payout blocks and determine reward availability.
   Validated payout boundaries and, once every partition block exists, the epoch's partition
   block-height-to-slot map are cached in process (`GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES`).
   A repeated epoch then needs one ClickHouse query that reads boundary vote rewards and partition
   stake rewards together; responses are identical to the uncached path.
+- `getInflationReward` can also cache complete answers in process (`GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES`, default `0` = off). The key is the payout epoch's slot bounds, the epoch-cache boundary the answer used (slot, parent blockhash, block height and partition count), and the sorted, deduplicated address set. A reordered request, or one with duplicates, hits the same entry and still gets its own order, duplicates and nulls. Only complete answers are stored. `-32004`, `-32017` and errors never are, so a later success is served without a restart.
+  - The lookup runs after method admission, so validation and `-32005` shedding are unchanged. A hit still holds a `GET_INFLATION_REWARD_MAX_CONCURRENCY` permit while it is served. Empty address lists bypass the cache.
+  - Identical concurrent misses run one lookup. Waiters share the leader's answer, including `-32004` and `-32017`. A waiter whose leader failed retries once on its own, with what is left of its own `GET_INFLATION_REWARD_QUERY_TIMEOUT_MS` budget (at least 100 ms, or half the budget when that is shorter), so one timeout does not fail every waiter. A waiter that takes over the lookup because the leader's request was dropped also gets only what is left of its own budget, so the query timeout stays an end-to-end bound.
+  - A hit or a shared answer is labelled `source="response_cache"` on the route metrics and `response-cache` in `X-Superbank-Sources`. It records no ClickHouse timings, so `superbank_rpc_clickhouse_duration_seconds` measures only real queries. A request that runs the lookup adds `clickhouse` to the header when the lookup starts, so a request that times out during the lookup still reports it. A request without `epoch` resolves its context slot first; without the head cache that read still adds `clickhouse` to the header.
+  - Settle gate: the reward query cannot tell a block that a lagging replica has not received from an address with no reward. An answer that contains a `null` is therefore stored only when ClickHouse's finalized tip is at least `GET_INFLATION_REWARD_RESPONSE_CACHE_SETTLE_SLOTS` (default 4,500, about 30 minutes) past the last block the answer read: the boundary block, or the highest partition block it selected. The tip is the last finalized slot this process read from the primary, which bounds the primary's tip from below. When that is too low, the latest-slot cache is refreshed (at most 1 s, inside the lookup budget). A head cache tip below the target skips that read. If the tip is unknown, an answer with a `null` is served but not stored.
+  - An answer in which every address has a reward is stored at once, whatever the tip. A lagging replica can only leave rows out, and each row is checked against the block it must come from.
+  - The settle gate assumes that a block reaches ClickHouse close to its slot time. A block written much later, by a gap repair or a backfill, can be missing on a lagging replica while the tip is already past the margin. A `null` read in that window is stored for up to the TTL. Restart the process after such a repair.
+  - Staleness: an entry is served for `GET_INFLATION_REWARD_RESPONSE_CACHE_TTL_SECS` (default 3600) after insertion, and only while the epoch cache holds the same boundary. A boundary repair therefore takes effect when the epoch cache entry expires (one hour). A reward-row repair can stay hidden for up to the TTL, where the uncached path sees it within the ClickHouse query cache TTL. Restart the process after a repair to drop every entry at once.
+  - Rollback: set `GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES=0`. `GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES=0` also turns the response cache off (startup logs a warning when only the response cache was set), so it stays a full rollback. Nothing is persisted.
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
+- `getBlock` and `getTransaction` reject `base58` or `binary` with `maxSupportedTransactionVersion >= 1` using code `-32602`, before cache/storage access. `getTransactionsForAddress` applies the same check to its supported `base58` encoding.
+- `VATDebit` rewards preserve negative lamports; stored values also accept the producer spelling `validator-admission-ticket-debit`. Inflation reward queries exclude these debits.
 - Transaction v1 (SIMD-0385) is supported. Requests must set
   `maxSupportedTransactionVersion: 1`; JSON encodings report `version: 1` and expose the inline
   `message.transactionConfig`, while binary encodings preserve the signed v1 wire bytes.
@@ -356,6 +370,18 @@ This setting controls both `getEpochSchedule` responses and internal `getInflati
 epoch math. For testnet, supply its exact current genesis file: testnet uses warmup epochs,
 so the no-warmup fallback is incorrect even for recent payout boundaries.
 
+### Alpenglow genesis certificate source
+
+[`getAgGenesisCert`](https://solana.com/docs/rpc/http/getaggenesiscert) accepts no parameters (omitted, `null`, or `[]`). It returns an authoritative `null` before migration and the certificate afterward, preserving `block.slot` as a JSON `u64`, `block.blockId` as 32 byte values, `signature.signature` as 192 byte values, and `signature.bitmap` as a variable-length byte array. There is no commitment parameter or context wrapper. The certificate slot is passed through exactly as supplied.
+
+Set `AG_GENESIS_CERT_RPC_URL` to an operator-trusted HTTP(S) RPC endpoint on the **same cluster as the ClickHouse data**, supporting the Agave 4.3+ method. This endpoint is the authority for migration evidence: Superbank validates the response shape but does not independently verify the aggregate BLS signature or cluster identity. Do not point it back at this Superbank instance or through a route that forwards the call back here. Store credentialed URLs in the environment, outside git. For example, run with `--ag-genesis-cert-rpc-url https://your-cluster-rpc.example`. An empty value counts as unset. While the source is unset, the method returns `-32019` with reason `source_not_configured`. Under `--emit-http-errors` that is HTTP 503, so keep health checks and load balancers away from this method on deployments without a source.
+
+The first request bootstraps the source lazily; startup requires valid configuration but does not require a reachable provider. Requests share one in-flight fetch with a total `AG_GENESIS_CERT_RPC_TIMEOUT_MS` budget (default 2000 ms) covering admission, connection, and response body. There are no automatic retries or redirects, and responses are capped at 64 KiB, including streamed bodies. A successful `null` is cached for `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` (default 5 seconds, range 1–300); the next request after expiry refreshes it. Expired evidence is never served when refresh fails. Failures, including unsupported upstream methods, are cached for one second before retrying on demand. Once obtained, the immutable finalized-bank certificate is cached for the process lifetime and remains available during provider outages. A restart bootstraps again; there is no durable certificate copy or background polling. Changing cluster/source requires restarting with the correct endpoint.
+
+An unconfigured, unavailable, timed-out, malformed, or unsupported source returns JSON-RPC `-32019` with `error.data.reason` equal to `source_not_configured`, `upstream_unavailable`, `source_timeout`, `invalid_upstream_response`, or `upstream_unsupported`, respectively. Other upstream RPC errors use `upstream_error`. Upstream RPC errors include `upstreamCode` but do not expose provider messages or URLs. These errors never become `null`; a pre-4.3 upstream's `-32601` means unsupported evidence, not TowerBFT. With `--emit-http-errors`, source failures return HTTP 503; otherwise they return HTTP 200 with the JSON-RPC error body. Nonempty or named parameters return `-32602` without fetching the source.
+
+This source is independent of `GENESIS_PATH`, which controls epoch schedules, and of finalized block storage and speculative head buffering. The existing ClickHouse schemas hold no genesis certificate, and the Yellowstone [footer message](https://docs.rs/yellowstone-grpc-proto/14.0.1/yellowstone_grpc_proto/geyser/struct.SubscribeUpdateBlockFooter.html) carries no genesis certificate. Dates, validator versions, local latest slots, and missing footer fields are not used to infer migration. Agave's [implementation](https://github.com/anza-xyz/agave/blob/v4.3.0/rpc/src/rpc.rs) reads the certificate from its finalized bank.
+
 ## Exact method and parameter filters
 
 `superbank-rpc` can reject configured method and parameter combinations before they enter handler
@@ -446,7 +472,7 @@ to describe handler outcomes before envelope promotion.
 ## Optional gRPC head cache (`grpc-head-cache`)
 
 When compiled with `--features grpc-head-cache` and enabled at runtime, superbank-rpc subscribes to
-a Yellowstone DragonsMouth gRPC stream via `yellowstone-block-machine` and keeps a small
+a Yellowstone DragonsMouth gRPC stream of complete bank-tagged blocks and keeps a small
 in-memory cache of the most recent slots. RPC handlers can merge this "head" data with ClickHouse
 to hide the typical ingestion lag.
 
@@ -468,6 +494,8 @@ qualifying slot.
 - `getBlocksWithLimit`
 
 `getBlock` still requires `confirmed`/`finalized` commitment.
+
+`getBlock` accepts the boolean `footer` option from [SIMD-0307](https://simd.live/simd/0307-add-block-footer). The default is `false`, which deliberately differs from the SIMD's default of including footer fields, so existing callers see the previous response. With `footer: true` the response carries a `footer` object with `blockProducerTimeNanos` (a JSON number) and `blockUserAgent` (a string). The value is `null` for a block with no complete stored footer, such as a block before Alpenglow activation, a gap in footer ingestion, or a partly stored footer. An omitted option and `footer: false` return the same response. The fields come from `blocks_metadata` and are untrusted producer data. A non-boolean value returns `-32602`. The head cache taps the Dragon's Mouth `BlockFooter` update of each bank, so a block it serves returns the footer the stream supplied, including one that arrives after the block is published. A head block whose stream sent no footer, or a footer without a full 32-byte bank hash, returns `footer: null`. A footer response served from the head cache is never inserted into the `getBlock` response cache, because the footer can still arrive after the block. The response cache key includes the `footer` flag.
 
 When the head cache is disabled (or not compiled), requests with `commitment=processed` are
 rejected with JSON-RPC error `-32602` and include `requestedCommitment` in the error `data`.
@@ -548,13 +576,13 @@ Configuration:
 | `--grpc-max-decoding-bytes` | `GRPC_MAX_DECODING_BYTES` | `67108864` | Max gRPC decoding message size. |
 
 License note: superbank-rpc is licensed under AGPL-3.0-only (see `../../LICENSE`).
-The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine` (also AGPL-3.0).
+The optional `grpc-head-cache` feature pulls in `yellowstone-block-machine`, which is AGPL-3.0. The Yellowstone gRPC client and protobuf crates it also uses are Apache-2.0. A 4.3 producer must supply bank IDs. Bank replacement evicts the replaced slot and invalidates the coverage proof of descendants that name the replaced bank's hash as their parent. Descendants built on the winning bank keep their proof.
 
 ## Optional local ClickHouse forward cache (`disk-cache`)
 
 When compiled with `--features disk-cache` and enabled at runtime, superbank-rpc forwards recent **finalized** slots from the configured source ClickHouse cluster into a separate ClickHouse instance on localhost. The feature is independent from `grpc-head-cache`. The local instance is a near cache, not a second source of truth. The read tiering is:
 
-`DISK_CACHE_BLOCK_INDEX_ENABLED=true` adds a durable full-history `(slot, block_time)` store for `getBlockTime`, `getBlocks`, and `getBlocksWithLimit` in the separately owned local database `<cache_database>_block_index`. Its in-process read tier is deliberately bounded by the required `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES`: one-million-slot segments are retained only while they fit that budget, rounded down to whole segments. Startup remains asynchronous: ranges outside the hydrated window continue through the recent cache and source fallbacks. The historical worker reads finalized source metadata only, fills newest ranges first, and then proceeds toward slot zero. This feature cannot be combined with the ClickHouse Memory-engine mode.
+`DISK_CACHE_BLOCK_INDEX_ENABLED=true` adds a durable full-history `(slot, block_time)` store for `getBlockTime`, `getBlocks`, and `getBlocksWithLimit` in the separately owned local database `<cache_database>_block_index`. Its in-process read tier is deliberately bounded by the required `DISK_CACHE_BLOCK_INDEX_MAX_MEMORY_BYTES`: one-million-slot segments are retained only while they fit that budget, rounded down to whole segments. Startup remains asynchronous: ranges outside the hydrated window continue through the recent cache and source fallbacks. The historical worker reads finalized source metadata only, fills newest ranges first, and then proceeds toward slot zero. A slot counts as skipped only when the parent link of a later block proves it. A block that the source read does not return leaves its slots uncovered, so reads for them fall through to the source. The forward scan waits up to 1,500 slots behind the finalized tip for such a block before it moves on. Startup drops the unproven `coverage` table if it exists, so the index rebuilds from the tip. This feature cannot be combined with the ClickHouse Memory-engine mode.
 
 ```
 head cache (optional, unfinalized tip) -> local ClickHouse cache (finalized, recent slots) -> source ClickHouse (full history)
@@ -980,13 +1008,19 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--get-signature-statuses-max-threads` | `GET_SIGNATURE_STATUSES_MAX_THREADS` | `2` | Required `max_threads` and `max_threads_for_indexes` for distributed primary signature-status queries. Must be positive. These queries also disable hedging and parallel replicas. |
 | `--get-inflation-reward-max-memory-bytes` | `GET_INFLATION_REWARD_MAX_MEMORY_BYTES` | `536870912` | ClickHouse `max_memory_usage` applied to every reward lookup query. |
 | `--get-inflation-reward-max-bytes-to-read` | `GET_INFLATION_REWARD_MAX_BYTES_TO_READ` | `536870912` | ClickHouse `max_bytes_to_read` applied to every reward lookup query. |
-| `--get-inflation-reward-epoch-cache-max-bytes` | `GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES` | `16777216` | Byte budget for the in-process cache of validated payout-epoch boundary blocks and complete partition block-height-to-slot maps. Entries expire after one hour. Lookup outcomes (`-32004`, `-32017`), errors, and reward rows are never cached. `0` disables the cache and is a full rollback: every lookup takes the pre-cache queries, including the exact-height partition lookup instead of the whole declared partition range. |
+| `--get-inflation-reward-epoch-cache-max-bytes` | `GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES` | `16777216` | Byte budget for the in-process cache of validated payout-epoch boundary blocks and complete partition block-height-to-slot maps. Entries expire after one hour. This cache holds no reward rows, and lookup outcomes (`-32004`, `-32017`) and errors are never cached. Reward answers are cached only by the response cache below. `0` disables this cache, also turns the response cache off, and is a full rollback: every lookup takes the pre-cache queries, including the exact-height partition lookup instead of the whole declared partition range. |
+| `--get-inflation-reward-response-cache-max-bytes` | `GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES` | `0` | Byte budget for complete `getInflationReward` answers cached per exact address set (see the `getInflationReward` notes above). `0` disables the cache. It is also off while `GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES=0`, and startup logs a warning. An entry weighs 280 bytes (the inline key and value, their `Arc` headers, and 128 for cache bookkeeping), plus 32 per unique address and 64 per reward, so 64 MiB holds about 6,800 answers of 100 rewarded addresses. Actual RSS also includes allocator overhead. |
+| `--get-inflation-reward-response-cache-ttl-secs` | `GET_INFLATION_REWARD_RESPONSE_CACHE_TTL_SECS` | `3600` | Seconds a cached answer is served after insertion (1–86400). A reward-row repair in ClickHouse can stay hidden for this long; restart to drop entries sooner. |
+| `--get-inflation-reward-response-cache-settle-slots` | `GET_INFLATION_REWARD_RESPONSE_CACHE_SETTLE_SLOTS` | `4500` | Finalized slots ClickHouse must hold past the last block an answer read before an answer that contains `null` is cached. Answers where every address has a reward are cached at once. Values below 825 (300 s replica delay plus 30 s query cache, at 2.5 slots per second) are rejected. |
 | `--emit-http-errors` | `SUPERBANK_RPC_EMIT_HTTP_ERRORS` | `false` | Return HTTP `503 Service Unavailable` for selected server-side JSON-RPC failures; response bodies are unchanged. |
 | `--host` | `RPC_HOST` | `0.0.0.0` | — |
 | `--port` | `RPC_PORT` | `8899` | — |
 | `--metrics-host` | `METRICS_HOST` | `0.0.0.0` | — |
 | `--metrics-port` | `METRICS_PORT` | `9900` | — |
 | `--genesis-path` | `GENESIS_PATH` | unset | Path to the target cluster's mounted `genesis.bin`. The server fails startup if a configured file cannot be read or decoded. Leave unset only for the no-warmup fallback. |
+| `--ag-genesis-cert-rpc-url` | `AG_GENESIS_CERT_RPC_URL` | unset | Trusted same-cluster Agave 4.3+ certificate RPC source. Unset or empty keeps startup optional but `getAgGenesisCert` returns an unavailable-source error. |
+| `--ag-genesis-cert-rpc-timeout-ms` | `AG_GENESIS_CERT_RPC_TIMEOUT_MS` | `2000` | Positive total source budget, including admission; must be below `RPC_REQUEST_TIMEOUT_MS` when a source is configured. |
+| `--ag-genesis-cert-refresh-interval-secs` | `AG_GENESIS_CERT_REFRESH_INTERVAL_SECS` | `5` | Authoritative null TTL (1–300 seconds); certificates stay cached until restart, failures for 1 second. |
 | `--metrics-capture-header` | `METRICS_CAPTURE_HEADERS` | empty | Repeatable; env accepts comma-separated values. Supported: `X-Endpoint`, `X-RPC-Node`, `X-Subscription-ID`, `X-Account-ID`. Empty entries are ignored. Warning: Capturing unbounded header values can lead to high metric cardinality (for example in Prometheus). `X-Subscription-ID` and `X-Account-ID` are emitted as raw label values when enabled, so treat them as sensitive metadata and only capture trusted, bounded values. |
 | `--superbank-grpc-enabled` | `SUPERBANK_GRPC_ENABLED` | `false` | Only available with `--features grpc-streaming`; enables the gRPC endpoint at runtime. |
 | `--superbank-grpc-host` | `SUPERBANK_GRPC_HOST` | `0.0.0.0` | Only available with `--features grpc-streaming`. |
@@ -1320,7 +1354,7 @@ Route normalization metric:
   - `method`: supported JSON-RPC method name.
   - `transport`: `tcp|http` (active ClickHouse routing transport policy).
   - `scope`: `distributed|shard_direct` (active ClickHouse routing scope policy).
-  - `source`: `clickhouse|head_cache|disk_cache|response_cache|none` (primary source used for the returned response; `response_cache` is an in-process `getBlock` response or `getTransaction` primary record cache hit).
+  - `source`: `clickhouse|head_cache|disk_cache|response_cache|none` (primary source used for the returned response; `response_cache` is an in-process `getBlock` response, `getTransaction` primary record or `getInflationReward` answer cache hit).
   - `head_cache_read`: `true|false` (whether handler read from head cache on that request).
   - `disk_cache_read`: `true|false` (whether the handler read from the local ClickHouse disk cache on that request).
   - `outcome`: `success|not_found|invalid_params|rpc_error|backend_error|timeout|abandoned`. `abandoned` means the handler future was dropped before returning and before its own request timeout: the client disconnected, or a batch envelope timed out while the item was still running.
@@ -1335,7 +1369,7 @@ Request-scoped metric families:
 - For those labels, values are `missing|<raw-value>` for enabled capture; disabled capture omits the label.
 - `rpc_requests` and `rpc_response_time_seconds` use `status="abandoned"` for requests dropped before a response existed, so cancelled requests keep their latency.
 - `rpc_clickhouse_timeouts` carries `target`: `primary`, or `cache`/`background` for the local disk cache, which reuses primary operation names.
-- `rpc_get_transaction_primary_slot_age_slots` (histogram): the finalized tip minus the slot of each `getTransaction` result served by primary ClickHouse. Buckets are 0.5, 1, 2, 3, 4, 5, 10 and 50 epochs (x432,000 slots), for sizing disk-cache retention. The tip is the head cache's latest finalized slot (its processed tip when no finalized slot is retained), or, without a head cache tip, the latest-slot cache's value (refreshed by other ClickHouse tip reads, not by this metric). A result is not recorded when neither tip is available or the latest-slot cache is more than 10 minutes old; `rpc_get_transaction_primary_slot_age_skipped_total{reason="no_tip|stale_tip"}` counts those.
+- `rpc_get_transaction_primary_slot_age_slots` (histogram): the finalized tip minus the slot of each `getTransaction` result served by primary ClickHouse. Buckets are 0.5, 1, 2, 3, 4, 5, 10 and 50 epochs (x432,000 slots), for sizing disk-cache retention, then every 100 epochs from 100 to 1,000, and 1,500. The upper buckets cover the full age of the chain, so `histogram_quantile` resolves high quantiles instead of returning the 50-epoch bound. The tip is the head cache's latest finalized slot (its processed tip when no finalized slot is retained), or, without a head cache tip, the latest-slot cache's value (refreshed by other ClickHouse tip reads, not by this metric). A result is not recorded when neither tip is available or the latest-slot cache is more than 10 minutes old; `rpc_get_transaction_primary_slot_age_skipped_total{reason="no_tip|stale_tip"}` counts those.
 - `rpc_response_time_seconds`, `rpc_clickhouse_duration_seconds` and `disk_cache_key_seconds` use `le` 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 2.5, 5, 10 s. Only these three families use that set. `clickhouse_read_disconnect_probe_seconds`, `rpc_response_overhead_seconds`, `rpc_blocks_range_seconds`, `get_block_phase_seconds`, `rpc_signature_status_admission_seconds`, `disk_cache_write_latency_seconds` and `block_index_lookup_seconds` keep the 13 `le` values without 0.15, 0.2, 0.3, 0.4 and 0.75. Histograms of counts and sizes have their own buckets.
 
 `getBlock` response-cache metrics:
@@ -1343,6 +1377,12 @@ Request-scoped metric families:
 - `superbank_get_block_response_cache_access_total{operation,outcome}` with `hit`, `miss`, `insert`, and `coalesced` outcomes, plus `error_hit` and `error_insert` for remembered `-32015` results (an `error_hit` also counts as a `miss` of the success cache).
 - `superbank_get_block_response_cache_entries`, `superbank_get_block_response_cache_weighted_bytes`, and `superbank_get_block_response_cache_max_bytes`.
 - `superbank_get_block_phase_seconds{operation}` for hydration and serialization work.
+
+`getInflationReward` response-cache metrics (`GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES`, default `0` = off):
+
+- `superbank_rpc_inflation_reward_response_cache_total{outcome}`, with no request-header labels. `hit` and `miss` count lookups of a non-empty address list. Each miss then counts `coalesced` when it shared another request's in-flight lookup, or one of these for the lookup it ran: `insert` (stored), `unsettled` (an answer with `null` inside the settle margin, or with an unknown tip) or `uncacheable` (`-32004`, `-32017`, an error, or a cold answer whose boundary the epoch cache no longer holds). `retry` counts waiters that re-ran a failed leader's lookup.
+- `superbank_rpc_inflation_reward_response_cache_entries`, `superbank_rpc_inflation_reward_response_cache_weighted_bytes` and `superbank_rpc_inflation_reward_response_cache_max_bytes`.
+- Hits do not run a lookup, so `superbank_rpc_inflation_reward_lookups_total_total` and the "Completed targeted getInflationReward lookup" log line count only ClickHouse lookups.
 
 `getTransaction` primary record cache (`GET_TRANSACTION_PRIMARY_CACHE_MAX_BYTES`, default `0` = off):
 
@@ -1447,3 +1487,16 @@ local tip that trails the source (with and without a covering head cache), missi
 slots or one slot, historical position mismatch, eviction fallback, ordering, encodings and
 unsupported versions. Failed runs can leave fixture databases for inspection. Small synthetic
 fixtures establish regression behavior, not production latency or capacity.
+
+### Bank-aware head streams
+
+The head cache buffers `(slot, bank_id)` inside one subscription generation, including modern bank ID zero. It seals complete transactions and entry ranges, chooses the bank named by confirmed/finalized status, and removes losing-bank indexes. Each transaction retains its own bank's commitment token. Metadata comes from the same subscription and must match the sealed blockhash. Reconnect clears old data and fences callbacks from the prior generation. Legacy streams are identified by a CreatedBank notification without a bank ID; ambiguous protocol changes reconnect.
+
+The gRPC head-cache minimum commitment applies when publishing a frozen bank, including to concurrent requests for `processed`. A frozen block is held until its commitment token reaches the session's configured minimum; the subsequent block-machine status event initializes that token before indexes are exposed. Reconnect resets the bank session and never carries node-local IDs or proofs from the previous subscription.
+
+
+The head subscriber currently uses the pinned client's ordinary `subscribe_with_request` and an outer retry loop. A transport interruption drops its `CoverageSession`, clears all cached slots (including finalized slots), and starts a fresh protocol adapter, block machine and proof chain. Old returned records keep their original immutable content and bank token; replacement status cannot promote them, even if the node reuses the same bank ID. Requests use the configured ClickHouse fallback while the head rebuilds; recent data not yet in ClickHouse can temporarily be unavailable.
+
+Until ClickHouse ingestion passes the slots the head held before the drop, usually tens of seconds on TowerBFT, clients can see more than missing data. `isBlockhashValid` at `processed` or `confirmed` returns `false` for a blockhash newer than the ClickHouse finalized tip. `getSlot`, `getBlockHeight`, `getTransactionCount` and `getLatestBlockhash` regress to the finalized tip, and `minContextSlot` callers can get -32016. Head-only `getSignaturesForAddress` cursors return an error, and `getBlocks` without `endSlot` returns -32603. Watch `superbank_head_cache_reconnects_total` and retry these calls during that window.
+
+The client's `subscribe_with_reconnect`/`DiscardBanks` API is not integrated. Preserving cached results with that API requires handling connection generations and replacement finality/discard decisions before both the metadata tap and block machine, resetting legacy protocol evidence and invalidating range proofs at each boundary. Feeding only its replacement updates into the existing adapter would join unrelated node-local banks. The current full reset deliberately trades cache continuity for this explicit session fence; it does not provide retained finalized results or seamless replay across reconnects.

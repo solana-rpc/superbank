@@ -696,6 +696,10 @@ pub struct Metrics {
     inflation_reward_lookups: Family<OperationOutcomeLabels, Counter>,
     inflation_reward_epoch_cache: Family<OperationOutcomeLabels, Counter>,
     inflation_reward_selected_blocks: Histogram,
+    inflation_reward_response_cache: Family<DisconnectOutcomeLabels, Counter>,
+    inflation_reward_response_cache_entries: Gauge,
+    inflation_reward_response_cache_weighted_bytes: Gauge,
+    inflation_reward_response_cache_max_bytes: Gauge,
 
     route_total: Family<RouteLabels, Counter>,
     slot_source: Family<SlotSourceLabels, Counter>,
@@ -858,6 +862,10 @@ impl Metrics {
         let inflation_reward_lookups = Family::default();
         let inflation_reward_epoch_cache = Family::default();
         let inflation_reward_selected_blocks = block_slot_count_histogram();
+        let inflation_reward_response_cache = Family::default();
+        let inflation_reward_response_cache_entries = Gauge::default();
+        let inflation_reward_response_cache_weighted_bytes = Gauge::default();
+        let inflation_reward_response_cache_max_bytes = Gauge::default();
 
         let route_total = Family::default();
         let slot_source = Family::default();
@@ -1148,6 +1156,26 @@ impl Metrics {
             "rpc_inflation_reward_selected_blocks",
             "Distribution of exact reward blocks selected by getInflationReward",
             inflation_reward_selected_blocks.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache",
+            "getInflationReward exact address-set response cache outcomes",
+            inflation_reward_response_cache.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache_entries",
+            "Approximate number of getInflationReward answers cached",
+            inflation_reward_response_cache_entries.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache_weighted_bytes",
+            "Approximate weighted bytes of getInflationReward answers cached",
+            inflation_reward_response_cache_weighted_bytes.clone(),
+        );
+        registry.register(
+            "rpc_inflation_reward_response_cache_max_bytes",
+            "Configured getInflationReward response cache byte budget",
+            inflation_reward_response_cache_max_bytes.clone(),
         );
         registry.register(
             "rpc_route_total",
@@ -1513,6 +1541,10 @@ impl Metrics {
             inflation_reward_lookups,
             inflation_reward_epoch_cache,
             inflation_reward_selected_blocks,
+            inflation_reward_response_cache,
+            inflation_reward_response_cache_entries,
+            inflation_reward_response_cache_weighted_bytes,
+            inflation_reward_response_cache_max_bytes,
             route_total,
             slot_source,
             clickhouse_latency_seconds,
@@ -2196,6 +2228,27 @@ pub(crate) fn inflation_reward_selected_blocks(blocks: usize) {
     metrics.inflation_reward_selected_blocks(blocks);
 }
 
+/// Only an `outcome` label, so captured request headers never multiply the series.
+pub(crate) fn inflation_reward_response_cache(outcome: &'static str) {
+    metrics()
+        .inflation_reward_response_cache
+        .get_or_create(&DisconnectOutcomeLabels { outcome })
+        .inc();
+}
+
+pub(crate) fn inflation_reward_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
+    let metrics = metrics();
+    metrics
+        .inflation_reward_response_cache_entries
+        .set(clamp_i64(entries));
+    metrics
+        .inflation_reward_response_cache_weighted_bytes
+        .set(clamp_i64(bytes));
+    metrics
+        .inflation_reward_response_cache_max_bytes
+        .set(clamp_i64(max_bytes));
+}
+
 pub(crate) fn rpc_timeout(method: &str) {
     let metrics = metrics();
     metrics.rpc_timeout(method);
@@ -2800,9 +2853,9 @@ pub(crate) fn blocks_range_observation(
         .observe(seconds);
 }
 
-/// Slot-age buckets in epochs (432,000 slots): 0.5, 1, 2, 3, 4, 5, 10 and 50 epochs. They
-/// bracket disk-cache retention windows of a few epochs.
-const PRIMARY_SLOT_AGE_BUCKETS: [f64; 8] = [
+/// Slot-age buckets in epochs (432,000 slots): 0.5 to 50 bracket disk-cache retention windows,
+/// then every 100 epochs to 1,000 and a 1,500 bucket cover the full age of the chain.
+const PRIMARY_SLOT_AGE_BUCKETS: [f64; 19] = [
     216_000.0,
     432_000.0,
     864_000.0,
@@ -2811,6 +2864,17 @@ const PRIMARY_SLOT_AGE_BUCKETS: [f64; 8] = [
     2_160_000.0,
     4_320_000.0,
     21_600_000.0,
+    43_200_000.0,
+    86_400_000.0,
+    129_600_000.0,
+    172_800_000.0,
+    216_000_000.0,
+    259_200_000.0,
+    302_400_000.0,
+    345_600_000.0,
+    388_800_000.0,
+    432_000_000.0,
+    648_000_000.0,
 ];
 
 /// Records how far behind the finalized tip a getTransaction result served by primary
@@ -2961,6 +3025,9 @@ mod tests {
         metrics
             .get_transaction_primary_slot_age
             .observe(3_000_000.0);
+        metrics
+            .get_transaction_primary_slot_age
+            .observe(100_000_000.0);
 
         let exported = String::from_utf8(metrics.export().expect("metrics export"))
             .expect("metrics are UTF-8");
@@ -2973,6 +3040,9 @@ mod tests {
         assert!(exported.contains(&bucket("864000.0", 1)), "{exported}");
         assert!(exported.contains(&bucket("2160000.0", 1)), "{exported}");
         assert!(exported.contains(&bucket("4320000.0", 2)), "{exported}");
-        assert!(exported.contains("superbank_rpc_get_transaction_primary_slot_age_slots_count 2"));
+        assert!(exported.contains(&bucket("86400000.0", 2)), "{exported}");
+        assert!(exported.contains(&bucket("129600000.0", 3)), "{exported}");
+        assert!(exported.contains(&bucket("648000000.0", 3)), "{exported}");
+        assert!(exported.contains("superbank_rpc_get_transaction_primary_slot_age_slots_count 3"));
     }
 }

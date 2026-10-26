@@ -3,8 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+pub(crate) mod ag_genesis_cert;
 mod block_ranges;
 pub(crate) mod blocks;
+mod encoding;
 pub(crate) mod signatures;
 pub(crate) mod transactions;
 pub(crate) mod types;
@@ -406,6 +408,11 @@ impl RouteMetric {
         self.source = ROUTE_SOURCE_CLICKHOUSE;
     }
 
+    /// Labels the route `clickhouse` without marking the source touched, which cannot be undone.
+    pub(crate) fn label_source_clickhouse(&mut self) {
+        self.source = ROUTE_SOURCE_CLICKHOUSE;
+    }
+
     pub(crate) fn source_response_cache(&mut self) {
         mark_response_cache_source_touched();
         self.source = ROUTE_SOURCE_RESPONSE_CACHE;
@@ -620,6 +627,7 @@ fn metrics_method_label(method: &str) -> &'static str {
         "getHealth" => "getHealth",
         "getInflationReward" => "getInflationReward",
         "getEpochSchedule" => "getEpochSchedule",
+        "getAgGenesisCert" => "getAgGenesisCert",
         "getFirstAvailableBlock" => "getFirstAvailableBlock",
         "minimumLedgerSlot" => "minimumLedgerSlot",
         "getTransaction" => "getTransaction",
@@ -648,6 +656,7 @@ impl NormalizedJsonRpcRequest {
 #[derive(Debug)]
 struct RequestParseError {
     id: Value,
+    code: i32,
     message: &'static str,
 }
 
@@ -661,15 +670,30 @@ fn parse_json_rpc_request(value: Value) -> Result<NormalizedJsonRpcRequest, Requ
         .and_then(|object| object.get("id").cloned())
         .unwrap_or(Value::Null);
 
+    // Agave's no-parameter method rejects named params as invalid params.
+    // Keep the existing request parsing behavior for all historical methods.
+    if value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && value.get("method").and_then(Value::as_str) == Some("getAgGenesisCert")
+        && value.get("params").is_some_and(Value::is_object)
+    {
+        return Err(RequestParseError {
+            id: request_id,
+            code: -32602,
+            message: "Invalid params: expected no parameters",
+        });
+    }
+
     let request: JsonRpcInboundRequest =
         serde_json::from_value(value).map_err(|_| RequestParseError {
             id: request_id.clone(),
+            code: -32600,
             message: "Invalid Request",
         })?;
 
     if request.jsonrpc.as_deref() != Some("2.0") {
         return Err(RequestParseError {
             id: request_id,
+            code: -32600,
             message: "Invalid JSON-RPC version",
         });
     }
@@ -677,6 +701,7 @@ fn parse_json_rpc_request(value: Value) -> Result<NormalizedJsonRpcRequest, Requ
     let Some(method) = request.method else {
         return Err(RequestParseError {
             id: request_id,
+            code: -32600,
             message: "Invalid Request",
         });
     };
@@ -980,6 +1005,9 @@ async fn dispatch_json_rpc_request(
             "getEpochSchedule" => {
                 blocks::handle_get_epoch_schedule(state, id_for_dispatch, params).await
             }
+            "getAgGenesisCert" => {
+                ag_genesis_cert::handle_get_ag_genesis_cert(state, id_for_dispatch, params).await
+            }
             "getFirstAvailableBlock" => {
                 blocks::handle_get_first_available_block(state, id_for_dispatch, params).await
             }
@@ -1150,7 +1178,7 @@ async fn handle_single_request(
     let request = match parse_json_rpc_request(request_value) {
         Ok(request) => request,
         Err(err) => {
-            return Ok(json_rpc_error_response(err.id, -32600, err.message, None));
+            return Ok(json_rpc_error_response(err.id, err.code, err.message, None));
         }
     };
 
@@ -1242,7 +1270,7 @@ async fn execute_batch_requests(
                 });
             }
             Err(err) => {
-                responses[idx] = Some(json_rpc_error_value(err.id, -32600, err.message, None));
+                responses[idx] = Some(json_rpc_error_value(err.id, err.code, err.message, None));
             }
         }
     }

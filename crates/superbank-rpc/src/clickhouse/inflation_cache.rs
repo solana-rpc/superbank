@@ -29,7 +29,7 @@ const ENTRY_OVERHEAD_BYTES: u64 = 256;
 /// `(first slot of the payout epoch, first slot of the following epoch)`.
 pub(crate) type InflationEpochCacheKey = (u64, u64);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct InflationBoundary {
     pub(crate) slot: u64,
     pub(crate) parent_blockhash: [u8; 32],
@@ -98,6 +98,15 @@ impl InflationEpochCache {
             },
         );
         value
+    }
+
+    /// Reads the cached boundary without counting a lookup in the epoch cache metrics.
+    pub(crate) async fn peek_boundary(
+        &self,
+        key: InflationEpochCacheKey,
+    ) -> Option<InflationBoundary> {
+        let cache = self.inner.as_ref()?;
+        cache.get(&key).await.map(|meta| meta.boundary.clone())
     }
 
     /// Whether the cache holds anything (`GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES > 0`).

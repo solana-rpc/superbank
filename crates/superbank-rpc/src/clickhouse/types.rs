@@ -236,6 +236,14 @@ pub struct TransactionsForAddressRecord {
     pub block_time: Option<i64>,
 }
 
+/// Producer-reported footer fields (SIMD-0307). Untrusted and informational.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "disk-cache", derive(serde::Serialize, serde::Deserialize))]
+pub struct BlockFooterRecord {
+    pub block_producer_time_nanos: u64,
+    pub block_user_agent: String,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "disk-cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockMetadataRecord {
@@ -255,6 +263,8 @@ pub struct BlockMetadataRecord {
     pub rewards_commission: Vec<Option<u8>>,
     pub rewards_commission_bps: Vec<Option<u16>>,
     pub rewards_num_partitions: Option<u64>,
+    #[cfg_attr(feature = "disk-cache", serde(default))]
+    pub footer: Option<BlockFooterRecord>,
 }
 
 #[derive(Debug, Clone)]

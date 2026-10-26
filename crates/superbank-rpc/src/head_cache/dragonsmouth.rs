@@ -12,16 +12,20 @@ use futures_util::StreamExt;
 use solana_commitment_config::CommitmentLevel;
 use tokio::time::sleep;
 use tracing::{info, warn};
-use yellowstone_block_machine::dragonsmouth::{
-    stream::{BlockMachineOutput, BlockStream},
-    wrapper::RESERVED_FILTER_NAME,
+use yellowstone_block_machine::{
+    dragonsmouth::{
+        RESERVED_FILTER_NAME,
+        block_accumulator::{BankBuffer, DragonsmouthBlockCumulator},
+    },
+    stream::{BlockEventStore, BlockMachineOutput, BlockStream},
+    wrapper::BlockMachineConfig,
 };
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
     GetVersionRequest, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeUpdate,
 };
 
-use crate::clickhouse::BlockMetadataRecord;
+use crate::clickhouse::{BlockFooterRecord, BlockMetadataRecord};
 use crate::head_cache::HeadCache;
 use crate::metrics;
 
@@ -34,23 +38,24 @@ pub(crate) struct DragonsmouthHeadCacheConfig {
 }
 
 const TRANSACTIONS_FILTER_NAME: &str = "_superbank_rpc";
-const BLOCK_META_FILTER_NAME: &str = "_superbank_rpc_block_meta";
 
 pub(crate) async fn run(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCacheConfig) {
-    tokio::join!(
-        run_block_machine_stream(cache.clone(), cfg.clone()),
-        run_block_meta_stream(cache, cfg)
-    );
+    run_block_machine_stream(cache, cfg).await;
 }
+
+// Banks freeze on BlockMeta alone, so clusters that send no footers still publish.
+const BLOCK_MACHINE_CONFIG: BlockMachineConfig = BlockMachineConfig {
+    require_block_footer: false,
+};
 
 async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCacheConfig) {
     let mut backoff = Duration::from_millis(250);
     let max_backoff = Duration::from_secs(5);
 
     loop {
-        match connect_and_subscribe(&cfg, cache.clone()).await {
+        let session = CoverageSession::new(cache.clone(), cfg.min_commitment);
+        match connect_and_subscribe(&cfg, cache.clone(), session.id).await {
             Ok(mut stream) => {
-                let _session = CoverageSession::new(cache.clone());
                 info!(
                     endpoint = cfg.endpoint.as_str(),
                     min_commitment = ?cfg.min_commitment,
@@ -60,7 +65,7 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
 
                 while let Some(result) = stream.next().await {
                     match result {
-                        Ok(output) => handle_output(&cache, output),
+                        Ok(output) => handle_output(&cache, session.id, output),
                         Err(err) => {
                             warn!("head cache: block-machine error: {err:?}");
                             break;
@@ -78,220 +83,85 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
             }
         }
 
+        drop(session);
         metrics::head_cache_reconnect();
         sleep(backoff).await;
         backoff = (backoff * 2).min(max_backoff);
     }
 }
 
-async fn run_block_meta_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCacheConfig) {
-    let mut backoff = Duration::from_millis(250);
-    let max_backoff = Duration::from_secs(5);
-
-    loop {
-        let builder = match GeyserGrpcClient::build_from_shared(cfg.endpoint.clone().into_bytes()) {
-            Ok(builder) => builder,
-            Err(err) => {
-                warn!(
-                    endpoint = cfg.endpoint.as_str(),
-                    "head cache: invalid block-meta endpoint: {err}"
-                );
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
-                continue;
-            }
-        };
-
-        let builder = match builder.x_token(cfg.x_token.clone()) {
-            Ok(builder) => builder,
-            Err(err) => {
-                warn!(
-                    endpoint = cfg.endpoint.as_str(),
-                    "head cache: invalid block-meta x-token: {err}"
-                );
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
-                continue;
-            }
-        };
-
-        let builder = builder.max_decoding_message_size(cfg.max_decoding_bytes);
-        let builder = match builder.tls_config(ClientTlsConfig::new().with_native_roots()) {
-            Ok(builder) => builder,
-            Err(err) => {
-                warn!(
-                    endpoint = cfg.endpoint.as_str(),
-                    "head cache: block-meta tls config error: {err}"
-                );
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
-                continue;
-            }
-        };
-
-        let mut client = match builder.connect().await {
-            Ok(client) => client,
-            Err(err) => {
-                warn!(
-                    endpoint = cfg.endpoint.as_str(),
-                    "head cache: failed to connect block-meta stream: {err}"
-                );
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
-                continue;
-            }
-        };
-
-        let mut blocks_meta = HashMap::new();
-        blocks_meta.insert(BLOCK_META_FILTER_NAME.to_string(), Default::default());
-        let request = SubscribeRequest {
-            blocks_meta,
-            commitment: Some(grpc_commitment(cfg.min_commitment) as i32),
-            ..Default::default()
-        };
-
-        match client.subscribe_with_request(Some(request)).await {
-            Ok((_sink, mut stream)) => {
-                info!(
-                    endpoint = cfg.endpoint.as_str(),
-                    min_commitment = ?cfg.min_commitment,
-                    "head cache: subscribed to DragonsMouth block-meta stream"
-                );
-                backoff = Duration::from_millis(250);
-
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(update) => handle_block_meta_update(&cache, update),
-                        Err(err) => {
-                            warn!("head cache: block-meta stream error: {err:?}");
-                            break;
-                        }
-                    }
-                }
-
-                warn!("head cache: block-meta stream ended; reconnecting");
-            }
-            Err(err) => {
-                warn!(
-                    endpoint = cfg.endpoint.as_str(),
-                    "head cache: failed to subscribe block-meta stream: {err}"
-                );
-            }
-        }
-
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(max_backoff);
-    }
-}
-
-fn handle_output(cache: &HeadCache, output: BlockMachineOutput) {
+fn handle_output<S: BlockEventStore<EventT = SubscribeUpdate>>(
+    cache: &HeadCache,
+    session: u64,
+    output: BlockMachineOutput<S>,
+) {
     match output {
         BlockMachineOutput::FrozenBlock(block) => {
-            let slot = block.slot;
-            // Ensure we can serve immediately even if the commitment update races behind the block.
-            cache.note_slot_commitment(slot, CommitmentLevel::Processed);
-
-            let mut ingested_txs = 0u64;
-            for idx in block.transaction_idx_map.iter().copied() {
-                let Some(ev) = block.events.get(idx) else {
-                    continue;
-                };
-                let Some(oneof) = ev.update_oneof.as_ref() else {
-                    continue;
-                };
-                let yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Transaction(
-                    update,
-                ) = oneof
-                else {
-                    continue;
-                };
-                let Some(tx_info) = update.transaction.as_ref() else {
-                    continue;
-                };
-                cache.ingest_transaction(update.slot, tx_info);
-                ingested_txs = ingested_txs.saturating_add(1);
-            }
-
+            let transactions = block
+                .events
+                .iter()
+                .filter_map(|event| match event.update_oneof.as_ref() {
+                    Some(
+                        yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Transaction(
+                            update,
+                        ),
+                    ) if update.slot == block.slot && update.bank_id == block.bank_id => {
+                        update.transaction.clone()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let count = transactions.len() as u64;
+            cache.freeze_bank(
+                session,
+                block.slot,
+                block.bank_id,
+                block.blockhash,
+                transactions,
+            );
             metrics::head_cache_observe_block(
                 cache.latest_slot(),
-                ingested_txs,
+                count,
                 cache.tx_entries(),
                 cache.address_entries(),
                 cache.slot_entries(),
             );
         }
         BlockMachineOutput::SlotCommitmentUpdate(update) => {
-            cache.note_slot_commitment(update.slot, update.commitment);
-            let mut proof = cache.coverage.write().expect("head coverage lock");
-            proof.validate_parent(update.slot, update.parent_slot);
-            proof.publish(update.slot, update.commitment);
-            proof.retain(cache.latest_slot(), cache.retain_slots);
+            cache.commit_bank(
+                session,
+                update.slot,
+                update.bank_id,
+                update.commitment,
+                update.parent_slot,
+            );
         }
         BlockMachineOutput::ForkDetected(fork) => {
-            warn!(slot = fork.slot, "head cache: fork detected; dropping slot");
-            cache.remove_slot(fork.slot);
-            metrics::head_cache_drop_slot(
-                cache.latest_slot(),
-                cache.tx_entries(),
-                cache.address_entries(),
-                cache.slot_entries(),
-            );
+            for bank_id in fork.bank_ids {
+                cache.discard_bank(session, fork.slot, bank_id);
+            }
         }
-        BlockMachineOutput::DeadBlockDetect(dead) => {
-            warn!(
-                slot = dead.slot,
-                "head cache: dead block detected; dropping slot"
-            );
-            cache.remove_slot(dead.slot);
-            metrics::head_cache_drop_slot(
-                cache.latest_slot(),
-                cache.tx_entries(),
-                cache.address_entries(),
-                cache.slot_entries(),
-            );
+        BlockMachineOutput::DeadBlockDetected(dead) => {
+            for bank_id in dead.bank_ids {
+                cache.discard_bank(session, dead.slot, bank_id);
+            }
+        }
+        BlockMachineOutput::BankDiscarded(discarded) => {
+            cache.discard_bank(session, discarded.slot, discarded.bank_id);
         }
     }
 }
 
-fn handle_block_meta_update(cache: &HeadCache, update: SubscribeUpdate) {
-    let Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::BlockMeta(meta)) =
-        update.update_oneof
-    else {
-        return;
-    };
-    apply_block_meta(cache, &meta);
-}
-
-fn apply_block_meta(
-    cache: &HeadCache,
+pub(super) fn parse_block_meta(
     meta: &yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta,
-) {
+) -> Option<BlockMetadataRecord> {
     let slot = meta.slot;
-
-    if !meta.blockhash.is_empty() {
-        if let Ok(hash) = meta.blockhash.parse::<Hash>() {
-            cache.note_blockhash(slot, hash.to_bytes());
-        } else {
-            warn!(slot, "head cache: failed to parse blockhash from BlockMeta");
-        }
-    }
-
-    if let Some(height) = meta.block_height.as_ref().map(|bh| bh.block_height) {
-        cache.note_block_height(slot, height);
-    }
-    if let Some(block_time) = meta.block_time.as_ref().map(|ts| ts.timestamp) {
-        cache.note_block_time(slot, block_time);
-    }
-
-    let blockhash = match parse_hash(slot, "blockhash", meta.blockhash.as_str()) {
-        Some(hash) => hash,
-        None => return,
+    let blockhash = parse_hash(slot, "blockhash", &meta.blockhash)?;
+    let parent_blockhash = if slot == 0 && meta.parent_blockhash.is_empty() {
+        [0; 32]
+    } else {
+        parse_hash(slot, "parent_blockhash", &meta.parent_blockhash)?
     };
-    let parent_blockhash =
-        match parse_hash(slot, "parent_blockhash", meta.parent_blockhash.as_str()) {
-            Some(hash) => hash,
-            None => return,
-        };
     let (
         rewards_present,
         rewards_pubkey,
@@ -301,12 +171,8 @@ fn apply_block_meta(
         rewards_commission,
         rewards_commission_bps,
         rewards_num_partitions,
-    ) = match parse_block_rewards(slot, meta.rewards.as_ref()) {
-        Some(parts) => parts,
-        None => return,
-    };
-
-    cache.note_block_metadata(BlockMetadataRecord {
+    ) = parse_block_rewards(slot, meta.rewards.as_ref())?;
+    Some(BlockMetadataRecord {
         slot,
         parent_slot: meta.parent_slot,
         blockhash,
@@ -323,7 +189,25 @@ fn apply_block_meta(
         rewards_commission,
         rewards_commission_bps,
         rewards_num_partitions,
-    });
+        footer: None,
+    })
+}
+
+/// A footer needs the full 32-byte bank hash, as the ingestor requires before it stores one.
+fn parse_block_footer(
+    footer: &yellowstone_grpc_proto::prelude::SubscribeUpdateBlockFooter,
+) -> Option<BlockFooterRecord> {
+    if footer.bank_hash.len() != 32 {
+        warn!(
+            slot = footer.slot,
+            "head cache: ignoring a block footer without a full bank hash"
+        );
+        return None;
+    }
+    Some(BlockFooterRecord {
+        block_producer_time_nanos: footer.block_producer_time_nanos,
+        block_user_agent: String::from_utf8_lossy(&footer.block_user_agent).into_owned(),
+    })
 }
 
 fn parse_hash(slot: u64, field: &str, value: &str) -> Option<[u8; 32]> {
@@ -409,6 +293,9 @@ fn parse_block_rewards(
                 Ok(yellowstone_grpc_proto::prelude::RewardType::DeactivatedStake) => {
                     Some("DeactivatedStake".to_string())
                 }
+                Ok(yellowstone_grpc_proto::prelude::RewardType::VatDebit) => {
+                    Some("VATDebit".to_string())
+                }
                 Err(_) => {
                     warn!(
                         slot,
@@ -469,7 +356,11 @@ fn parse_block_rewards(
 async fn connect_and_subscribe(
     cfg: &DragonsmouthHeadCacheConfig,
     cache: Arc<HeadCache>,
-) -> Result<impl futures_util::Stream<Item = Result<BlockMachineOutput, String>> + Unpin, String> {
+    session: u64,
+) -> Result<
+    impl futures_util::Stream<Item = Result<BlockMachineOutput<BankBuffer>, String>> + Unpin,
+    String,
+> {
     let mut client = GeyserGrpcClient::build_from_shared(cfg.endpoint.clone().into_bytes())
         .map_err(|e| format!("invalid endpoint: {e}"))?
         .x_token(cfg.x_token.clone())
@@ -483,8 +374,7 @@ async fn connect_and_subscribe(
 
     record_upstream_node(&mut client).await;
 
-    // Subscribe to all transaction updates; the block machine will add the reserved slot/meta/entry
-    // filters needed to safely freeze blocks at the requested minimum commitment level.
+    // Subscribe to all transaction updates and the reserved reconstruction filters below.
     let mut transactions = HashMap::new();
     transactions.insert(
         TRANSACTIONS_FILTER_NAME.to_string(),
@@ -511,20 +401,41 @@ async fn connect_and_subscribe(
     request
         .entry
         .insert(RESERVED_FILTER_NAME.to_owned(), Default::default());
+    // Footers are optional for freezing a bank. They are tapped to serve getBlock footers.
+    request.block_footer.insert(
+        RESERVED_FILTER_NAME.to_owned(),
+        yellowstone_grpc_proto::prelude::SubscribeRequestFilterBlockFooter {
+            include_certificates: Some(false),
+        },
+    );
+    request.accounts.insert(
+        RESERVED_FILTER_NAME.to_owned(),
+        yellowstone_grpc_proto::prelude::SubscribeRequestFilterAccounts {
+            owner: vec!["Sysvar1111111111111111111111111111111111111".to_string()],
+            ..Default::default()
+        },
+    );
     let (_sink, source) = client
         .subscribe_with_request(Some(request))
         .await
         .map_err(|e| format!("subscribe_block error: {e}"))?;
-    let minimum = cfg.min_commitment;
-    let source = source.inspect(move |event| {
-        let _ = event
-            .as_ref()
-            .map(|update| observe_coverage(&cache, update, minimum));
-    });
-    Ok(
-        BlockStream::new(source, cfg.min_commitment)
-            .map(|result| result.map_err(|e| e.to_string())),
+    let source = source
+        .scan(super::protocol::Protocol::default(), |protocol, event| {
+            futures_util::future::ready(Some(protocol.adapt(event)))
+        })
+        .flat_map(futures_util::stream::iter)
+        .inspect(move |event| {
+            let _ = event
+                .as_ref()
+                .map(|update| observe_bank_metadata(&cache, session, update));
+        });
+    Ok(BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+        source,
+        DragonsmouthBlockCumulator::default(),
+        cfg.min_commitment,
+        BLOCK_MACHINE_CONFIG,
     )
+    .map(|result| result.map_err(|e| e.to_string())))
 }
 
 async fn record_upstream_node(client: &mut GeyserGrpcClient) {
@@ -560,69 +471,40 @@ async fn record_upstream_node(client: &mut GeyserGrpcClient) {
     }
 }
 
-struct CoverageSession(Arc<HeadCache>);
+struct CoverageSession {
+    cache: Arc<HeadCache>,
+    id: u64,
+}
 impl CoverageSession {
-    fn new(cache: Arc<HeadCache>) -> Self {
-        cache
-            .coverage
-            .write()
-            .expect("head coverage lock")
-            .connect();
-        Self(cache)
+    fn new(cache: Arc<HeadCache>, minimum: CommitmentLevel) -> Self {
+        let id = cache.start_bank_session(minimum);
+        Self { cache, id }
     }
 }
 impl Drop for CoverageSession {
     fn drop(&mut self) {
-        self.0
-            .coverage
-            .write()
-            .expect("head coverage lock")
-            .disconnect();
+        self.cache.end_bank_session(self.id);
     }
 }
 
-fn observe_coverage(cache: &HeadCache, update: &SubscribeUpdate, minimum: CommitmentLevel) {
-    use super::coverage::Link;
-    use yellowstone_grpc_proto::prelude::{SlotStatus, subscribe_update::UpdateOneof};
-    let mut proof = cache.coverage.write().expect("head coverage lock");
+fn observe_bank_metadata(cache: &HeadCache, session: u64, update: &SubscribeUpdate) {
+    use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
     match update.update_oneof.as_ref() {
         Some(UpdateOneof::BlockMeta(meta)) => {
-            let (Some(hash), Some(parent_hash)) = (
-                parse_hash(meta.slot, "blockhash", &meta.blockhash),
-                parse_hash(meta.slot, "parent_blockhash", &meta.parent_blockhash),
-            ) else {
-                proof.invalidate(meta.slot);
-                return;
-            };
-            proof.metadata(Link {
-                slot: meta.slot,
-                hash,
-                parent: meta.parent_slot,
-                parent_hash,
-            });
-            proof.retain(meta.slot, cache.retain_slots);
-        }
-        Some(UpdateOneof::Slot(slot)) => {
-            let commitment = match SlotStatus::try_from(slot.status) {
-                Ok(SlotStatus::SlotProcessed) => CommitmentLevel::Processed,
-                Ok(SlotStatus::SlotConfirmed) => CommitmentLevel::Confirmed,
-                Ok(SlotStatus::SlotFinalized) => CommitmentLevel::Finalized,
-                _ => return,
-            };
-            if super::commitment_meets(commitment, minimum) {
-                proof.observe(slot.slot, commitment, std::time::Instant::now());
+            if let Some(metadata) = parse_block_meta(meta) {
+                cache.stage_bank_metadata(session, meta.bank_id, metadata);
             }
-            proof.retain(slot.slot, cache.retain_slots);
+        }
+        Some(UpdateOneof::BlockFooter(footer)) => {
+            if let Some(record) = parse_block_footer(footer) {
+                cache.stage_bank_footer(session, footer.slot, footer.bank_id, record);
+            }
+        }
+        Some(UpdateOneof::Entry(entry)) => cache.stage_bank_entry(session, entry),
+        Some(UpdateOneof::EntryUpdateParent(marker)) => {
+            cache.discard_bank(session, marker.slot, marker.cleared_bank_id);
         }
         _ => {}
-    }
-}
-
-fn grpc_commitment(level: CommitmentLevel) -> yellowstone_grpc_proto::prelude::CommitmentLevel {
-    match level {
-        CommitmentLevel::Processed => yellowstone_grpc_proto::prelude::CommitmentLevel::Processed,
-        CommitmentLevel::Confirmed => yellowstone_grpc_proto::prelude::CommitmentLevel::Confirmed,
-        CommitmentLevel::Finalized => yellowstone_grpc_proto::prelude::CommitmentLevel::Finalized,
     }
 }
 
@@ -640,17 +522,21 @@ mod tests {
                 slot,
                 parent: Some(parent),
                 status: status as i32,
+                bank_id: Some(slot),
                 ..Default::default()
             })),
             ..Default::default()
         };
-        vec![
+        let mut events = vec![
+            status(SlotStatus::SlotCreatedBank),
             status(SlotStatus::SlotFirstShredReceived),
             status(SlotStatus::SlotCompleted),
             SubscribeUpdate {
                 update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
                     slot,
                     parent_slot: parent,
+                    bank_id: slot,
+                    entries_count: 1,
                     blockhash: Hash::new_from_array([slot as u8; 32]).to_string(),
                     parent_blockhash: Hash::new_from_array([parent as u8; 32]).to_string(),
                     ..Default::default()
@@ -660,23 +546,74 @@ mod tests {
             status(SlotStatus::SlotProcessed),
             status(SlotStatus::SlotConfirmed),
             status(SlotStatus::SlotFinalized),
-        ]
+        ];
+        for pubkey in [
+            "SysvarC1ock11111111111111111111111111111111",
+            "SysvarS1otHashes111111111111111111111111111",
+            "SysvarS1otHistory11111111111111111111111111",
+            "SysvarRecentB1ockHashes11111111111111111111",
+        ] {
+            events.insert(
+                1,
+                SubscribeUpdate {
+                    filters: vec![RESERVED_FILTER_NAME.to_string()],
+                    update_oneof: Some(UpdateOneof::Account(
+                        yellowstone_grpc_proto::prelude::SubscribeUpdateAccount {
+                            slot,
+                            bank_id: Some(slot),
+                            account: Some(
+                                yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo {
+                                    pubkey: pubkey.parse::<Pubkey>().unwrap().to_bytes().to_vec(),
+                                    owner: "Sysvar1111111111111111111111111111111111111"
+                                        .parse::<Pubkey>()
+                                        .unwrap()
+                                        .to_bytes()
+                                        .to_vec(),
+                                    ..Default::default()
+                                },
+                            ),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            );
+        }
+        events.insert(
+            5,
+            SubscribeUpdate {
+                filters: vec![RESERVED_FILTER_NAME.to_string()],
+                update_oneof: Some(UpdateOneof::Entry(
+                    yellowstone_grpc_proto::prelude::SubscribeUpdateEntry {
+                        slot,
+                        bank_id: slot,
+                        hash: vec![slot as u8; 32],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        );
+        events
     }
 
     #[tokio::test]
     async fn block_machine_subscription_publishes_matching_range_proofs() {
         let cache = Arc::new(HeadCache::new(32, 64));
-        let session = CoverageSession::new(cache.clone());
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
         let events = coverage_events(10, 9)
             .into_iter()
             .chain(coverage_events(12, 10));
-        let source =
-            futures_util::stream::iter(events.map(Ok::<_, std::io::Error>)).inspect(|event| {
-                observe_coverage(&cache, event.as_ref().unwrap(), CommitmentLevel::Processed)
-            });
-        let mut stream = BlockStream::new(source, CommitmentLevel::Processed);
+        let source = futures_util::stream::iter(events.map(Ok::<_, std::io::Error>))
+            .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        );
         while let Some(output) = stream.next().await {
-            handle_output(&cache, output.unwrap());
+            handle_output(&cache, session.id, output.unwrap());
         }
         let (tip, proof) = cache
             .coverage
@@ -708,6 +645,111 @@ mod tests {
         );
     }
 
+    fn footer_event(slot: u64, hash_len: usize, agent: &[u8]) -> SubscribeUpdate {
+        SubscribeUpdate {
+            update_oneof: Some(
+                yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::BlockFooter(
+                    yellowstone_grpc_proto::prelude::SubscribeUpdateBlockFooter {
+                        slot,
+                        bank_id: slot,
+                        bank_hash: vec![7; hash_len],
+                        block_producer_time_nanos: 1_750_000_000_000_000_001,
+                        block_user_agent: agent.to_vec(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        }
+    }
+
+    async fn published_footer(
+        events: Vec<SubscribeUpdate>,
+        slot: u64,
+    ) -> Option<BlockFooterRecord> {
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let source = futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
+            .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        );
+        while let Some(output) = stream.next().await {
+            handle_output(&cache, session.id, output.unwrap());
+        }
+        let metadata = cache
+            .slot_block_metadata
+            .get(&slot)
+            .expect("published block");
+        metadata.footer.clone()
+    }
+
+    fn expected_footer(agent: &str) -> BlockFooterRecord {
+        BlockFooterRecord {
+            block_producer_time_nanos: 1_750_000_000_000_000_001,
+            block_user_agent: agent.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn head_block_carries_a_footer_that_arrives_before_the_block_freezes() {
+        let mut events = coverage_events(10, 9);
+        events.insert(0, footer_event(10, 32, b"agave/4.4.0"));
+        assert_eq!(
+            published_footer(events, 10).await,
+            Some(expected_footer("agave/4.4.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn head_block_gains_a_footer_that_arrives_after_it_is_published() {
+        let mut events = coverage_events(10, 9);
+        events.push(footer_event(10, 32, b"agave/4.4.0"));
+        assert_eq!(
+            published_footer(events, 10).await,
+            Some(expected_footer("agave/4.4.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn head_block_without_a_footer_has_none() {
+        assert_eq!(published_footer(coverage_events(10, 9), 10).await, None);
+    }
+
+    #[tokio::test]
+    async fn head_footer_without_a_full_bank_hash_is_ignored() {
+        let mut events = coverage_events(10, 9);
+        events.insert(0, footer_event(10, 31, b"agave/4.4.0"));
+        assert_eq!(published_footer(events, 10).await, None);
+    }
+
+    #[tokio::test]
+    async fn head_footer_user_agent_is_decoded_like_the_stored_footer() {
+        let mut events = coverage_events(10, 9);
+        events.insert(0, footer_event(10, 32, &[0x61, 0xff]));
+        assert_eq!(
+            published_footer(events, 10).await,
+            Some(expected_footer("a\u{fffd}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn head_footer_of_another_bank_does_not_attach() {
+        let mut events = coverage_events(10, 9);
+        let mut other = footer_event(10, 32, b"other");
+        if let Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::BlockFooter(
+            footer,
+        )) = other.update_oneof.as_mut()
+        {
+            footer.bank_id = 99;
+        }
+        events.insert(0, other);
+        assert_eq!(published_footer(events, 10).await, None);
+    }
+
     #[test]
     fn apply_block_meta_updates_slot_metadata() {
         let cache = HeadCache::new(32, 64);
@@ -719,9 +761,8 @@ mod tests {
         let reward_pubkey = Pubkey::new_unique();
 
         cache.note_slot_commitment(slot, CommitmentLevel::Processed);
-        apply_block_meta(
-            &cache,
-            &yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta {
+        let metadata =
+            parse_block_meta(&yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta {
                 slot,
                 blockhash: hash.to_string(),
                 rewards: Some(yellowstone_grpc_proto::prelude::Rewards {
@@ -747,8 +788,10 @@ mod tests {
                 parent_blockhash: parent_hash.to_string(),
                 executed_transaction_count: 0,
                 entries_count: 3,
-            },
-        );
+                ..Default::default()
+            })
+            .expect("metadata");
+        cache.note_block_metadata(metadata);
 
         assert_eq!(
             cache.latest_blockhash_info_at_least(CommitmentLevel::Processed),
@@ -777,5 +820,331 @@ mod tests {
         assert_eq!(metadata.rewards_commission, vec![Some(7)]);
         assert_eq!(metadata.rewards_commission_bps, vec![Some(725)]);
         assert_eq!(metadata.rewards_num_partitions, Some(4));
+    }
+    #[tokio::test]
+    async fn interleaved_wire_banks_publish_only_the_confirmed_winner() {
+        use crate::solana_sdk::signature::Signature;
+        use yellowstone_grpc_proto::prelude::{
+            SlotStatus, SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
+        };
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let make_bank = |bank_id: u64, marker: u8| {
+            let mut events = coverage_events(42, 41);
+            events.retain(|event| !matches!(event.update_oneof.as_ref(), Some(UpdateOneof::Slot(slot)) if slot.status == SlotStatus::SlotConfirmed as i32 || slot.status == SlotStatus::SlotFinalized as i32));
+            for event in &mut events {
+                match event.update_oneof.as_mut().unwrap() {
+                    UpdateOneof::Slot(slot) => slot.bank_id = Some(bank_id),
+                    UpdateOneof::Account(account) => account.bank_id = Some(bank_id),
+                    UpdateOneof::Entry(entry) => {
+                        entry.bank_id = bank_id;
+                        entry.executed_transaction_count = 1;
+                    }
+                    UpdateOneof::BlockMeta(meta) => {
+                        meta.bank_id = bank_id;
+                        meta.blockhash = bs58::encode([marker; 32]).into_string();
+                        meta.executed_transaction_count = 1;
+                    }
+                    _ => {}
+                }
+            }
+            events.insert(
+                6,
+                SubscribeUpdate {
+                    filters: vec![TRANSACTIONS_FILTER_NAME.to_string()],
+                    update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                        slot: 42,
+                        bank_id,
+                        transaction: Some(super::super::banks::tests::transaction(marker)),
+                    })),
+                    ..Default::default()
+                },
+            );
+            events
+        };
+        let mut a = make_bank(1, 1).into_iter();
+        let mut b = make_bank(2, 2).into_iter();
+        let mut events = Vec::new();
+        while let (Some(left), Some(right)) = (a.next(), b.next()) {
+            events.extend([left, right]);
+        }
+        for status in [SlotStatus::SlotConfirmed, SlotStatus::SlotFinalized] {
+            events.push(SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Slot(
+                    yellowstone_grpc_proto::prelude::SubscribeUpdateSlot {
+                        slot: 42,
+                        parent: Some(41),
+                        bank_id: Some(2),
+                        status: status as i32,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            });
+        }
+        // Metadata/status arriving after selection for the loser must not overwrite the winner.
+        events.extend(make_bank(1, 1));
+        let source = futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
+            .inspect(|event| {
+                observe_bank_metadata(&cache, session.id, event.as_ref().unwrap());
+            });
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        );
+        while let Some(output) = stream.next().await {
+            handle_output(&cache, session.id, output.unwrap());
+        }
+        assert!(
+            cache
+                .get_tx(&Signature::from([1; 64]), CommitmentLevel::Processed)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_tx(&Signature::from([2; 64]), CommitmentLevel::Finalized)
+                .is_some()
+        );
+        assert_eq!(
+            cache
+                .get_block(
+                    42,
+                    CommitmentLevel::Finalized,
+                    solana_transaction_status::TransactionDetails::Full
+                )
+                .unwrap()
+                .metadata()
+                .blockhash,
+            [2; 32]
+        );
+    }
+    #[tokio::test]
+    async fn legacy_pre_alpenglow_bank_blind_stream_keeps_finalized_blocks() {
+        use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let events = coverage_events(42, 41).into_iter().map(|mut event| {
+            match event.update_oneof.as_mut().unwrap() {
+                UpdateOneof::Slot(slot) => slot.bank_id = None,
+                UpdateOneof::Account(account) => account.bank_id = None,
+                UpdateOneof::BlockMeta(meta) => meta.bank_id = 0,
+                UpdateOneof::Entry(entry) => entry.bank_id = 0,
+                _ => {}
+            }
+            Ok::<_, yellowstone_grpc_proto::tonic::Status>(event)
+        });
+        let source = futures_util::stream::iter(events)
+            .scan(
+                super::super::protocol::Protocol::default(),
+                |protocol, event| futures_util::future::ready(Some(protocol.adapt(event))),
+            )
+            .flat_map(futures_util::stream::iter)
+            .inspect(|event| {
+                observe_bank_metadata(&cache, session.id, event.as_ref().unwrap());
+            });
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        );
+        while let Some(output) = stream.next().await {
+            handle_output(&cache, session.id, output.unwrap());
+        }
+        assert!(
+            cache
+                .get_block(
+                    42,
+                    CommitmentLevel::Finalized,
+                    solana_transaction_status::TransactionDetails::None
+                )
+                .is_some()
+        );
+    }
+    #[test]
+    fn same_subscription_metadata_preserves_vat_debit_and_basis_points() {
+        let meta = yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta {
+            slot: 42,
+            bank_id: 0,
+            blockhash: bs58::encode([1; 32]).into_string(),
+            parent_blockhash: bs58::encode([2; 32]).into_string(),
+            rewards: Some(yellowstone_grpc_proto::prelude::Rewards {
+                rewards: vec![yellowstone_grpc_proto::prelude::Reward {
+                    pubkey: bs58::encode([3; 32]).into_string(),
+                    lamports: -10,
+                    post_balance: 90,
+                    reward_type: 6,
+                    commission_bps: "725".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let row = parse_block_meta(&meta).unwrap();
+        assert_eq!(row.rewards_type, vec![Some("VATDebit".into())]);
+        assert_eq!(row.rewards_lamports, vec![-10]);
+        assert_eq!(row.rewards_post_balance, vec![90]);
+        assert_eq!(row.rewards_commission_bps, vec![Some(725)]);
+    }
+    #[tokio::test]
+    async fn uncached_root_and_bank_blind_dead_event_discard_cached_processed_branch() {
+        use yellowstone_grpc_proto::prelude::{
+            SlotStatus, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        };
+        for dead in [false, true] {
+            let cache = Arc::new(HeadCache::new(32, 64));
+            let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+            let mut events = coverage_events(42, 41);
+            events.retain(|event| !matches!(event.update_oneof.as_ref(), Some(UpdateOneof::Slot(slot))
+                if slot.status == SlotStatus::SlotConfirmed as i32 || slot.status == SlotStatus::SlotFinalized as i32));
+            let status = |slot, parent, bank_id, status| SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    parent,
+                    bank_id,
+                    status: status as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            if dead {
+                events.push(status(42, Some(41), None, SlotStatus::SlotDead));
+            } else {
+                // The new root's content is absent, but its confirmed parent
+                // skips the cached branch and must still invalidate that branch.
+                events.push(status(43, Some(41), Some(43), SlotStatus::SlotCreatedBank));
+                events.push(status(43, Some(41), Some(43), SlotStatus::SlotConfirmed));
+                events.push(status(43, Some(41), Some(43), SlotStatus::SlotFinalized));
+            }
+            let source =
+                futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
+                    .inspect(|event| {
+                        observe_bank_metadata(&cache, session.id, event.as_ref().unwrap())
+                    });
+            let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+                source,
+                DragonsmouthBlockCumulator::default(),
+                CommitmentLevel::Processed,
+                BLOCK_MACHINE_CONFIG,
+            );
+            let mut saw_processed = false;
+            while let Some(output) = stream.next().await {
+                handle_output(&cache, session.id, output.unwrap());
+                saw_processed |= cache
+                    .get_block(
+                        42,
+                        CommitmentLevel::Processed,
+                        solana_transaction_status::TransactionDetails::None,
+                    )
+                    .is_some();
+            }
+            assert!(
+                saw_processed,
+                "test must exercise an exposed abandoned branch"
+            );
+            assert!(
+                cache
+                    .get_block(
+                        42,
+                        CommitmentLevel::Processed,
+                        solana_transaction_status::TransactionDetails::None
+                    )
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .get_block(
+                        43,
+                        CommitmentLevel::Finalized,
+                        solana_transaction_status::TransactionDetails::None
+                    )
+                    .is_none()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn uncached_old_root_and_bank_blind_minority_dead_preserve_winning_branch() {
+        use yellowstone_grpc_proto::prelude::{
+            SlotStatus, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        };
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let mut events = coverage_events(42, 41);
+        events.retain(|event| !matches!(event.update_oneof.as_ref(), Some(UpdateOneof::Slot(slot))
+            if slot.status == SlotStatus::SlotConfirmed as i32 || slot.status == SlotStatus::SlotFinalized as i32));
+        events.extend(coverage_events(43, 41));
+        for (slot, parent, bank_id, status) in [
+            (40, Some(39), Some(40), SlotStatus::SlotCreatedBank),
+            (40, Some(39), Some(40), SlotStatus::SlotFinalized),
+            (42, Some(41), None, SlotStatus::SlotDead),
+        ] {
+            events.push(SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    parent,
+                    bank_id,
+                    status: status as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+        }
+        let source = futures_util::stream::iter(events.into_iter().map(Ok::<_, std::io::Error>))
+            .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        );
+        let mut saw_winner = false;
+        while let Some(output) = stream.next().await {
+            handle_output(&cache, session.id, output.unwrap());
+            let winner = cache.get_block(
+                43,
+                CommitmentLevel::Finalized,
+                solana_transaction_status::TransactionDetails::None,
+            );
+            if let Some(block) = winner {
+                assert_eq!(block.metadata().blockhash, [43; 32]);
+                saw_winner = true;
+            } else {
+                assert!(
+                    !saw_winner,
+                    "late old-root or minority Dead must preserve winning branch"
+                );
+            }
+        }
+        assert!(saw_winner);
+        assert!(
+            cache
+                .get_block(
+                    40,
+                    CommitmentLevel::Processed,
+                    solana_transaction_status::TransactionDetails::None
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_block(
+                    42,
+                    CommitmentLevel::Processed,
+                    solana_transaction_status::TransactionDetails::None
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_block(
+                    43,
+                    CommitmentLevel::Finalized,
+                    solana_transaction_status::TransactionDetails::None
+                )
+                .is_some()
+        );
     }
 }

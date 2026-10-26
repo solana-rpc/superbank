@@ -3,7 +3,10 @@ use std::{collections::HashSet, ffi::OsString, path::PathBuf, str::FromStr};
 use anyhow::{Result, anyhow};
 use clap::{ArgAction, Parser, ValueEnum, error::ErrorKind};
 
-use crate::archive::{ArchiveKind, ArchiveSlotRange, DEFAULT_CUSTOM_SLOTS};
+use crate::archive::{
+    ArchiveKind, ArchiveSlotRange, DEFAULT_CUSTOM_SLOTS, DEFAULT_HOURLY_SLOT_DURATION_MS,
+    hourly_slot_count,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -52,6 +55,9 @@ pub struct Config {
     pub token_owner_activity_table: String,
     pub repair_mismatches: bool,
     pub archive_kinds: Vec<ArchiveKind>,
+    /// Nominal cluster slot cadence for hourly planning; 400 ms preserves the
+    /// historical 9,000-slot window. Does not affect epoch/custom/explicit ranges.
+    pub hourly_slot_duration_ms: u64,
     /// Snap `custom:<slots>` archives onto fixed slot-count boundaries (e.g.
     /// custom:1000 -> 1000, 2000, 3000) instead of starting at the earliest
     /// available slot. Each archive then covers a whole `[k*slots, (k+1)*slots)`
@@ -128,6 +134,7 @@ impl Config {
     }
 
     fn from_cli(cli: Cli) -> Result<Self> {
+        hourly_slot_count(cli.hourly_slot_duration_ms)?;
         let archive_kinds = parse_archive_kinds(&cli.archive_range_type, cli.custom_slot_range)?;
         if !cli.server_mode && archive_kinds.len() > 1 {
             return Err(anyhow!(
@@ -206,6 +213,7 @@ impl Config {
             token_owner_activity_table: cli.token_owner_activity_table,
             repair_mismatches: cli.repair_mismatches,
             archive_kinds,
+            hourly_slot_duration_ms: cli.hourly_slot_duration_ms,
             custom_aligned: cli.custom_aligned,
             archive_location: cli.archive_location,
             output_location: cli.archive_file_output_location,
@@ -377,6 +385,15 @@ struct Cli {
         required = true
     )]
     archive_range_type: Vec<String>,
+
+    /// Nominal slot duration for hourly archives (400 ms = 9000 slots; 200 ms = 18000).
+    /// Must be positive and divide 3600000 ms exactly. Alpenglow does not change it.
+    #[arg(
+        long = "hourly-slot-duration-ms",
+        env = "SOLPARQ_HOURLY_SLOT_DURATION_MS",
+        default_value_t = DEFAULT_HOURLY_SLOT_DURATION_MS
+    )]
+    hourly_slot_duration_ms: u64,
 
     #[arg(long, env = "SOLPARQ_CUSTOM_SLOT_RANGE", default_value_t = DEFAULT_CUSTOM_SLOTS)]
     custom_slot_range: u64,

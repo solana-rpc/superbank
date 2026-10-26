@@ -1,5 +1,8 @@
 name: Release
 
+# Started by the signed v<version> tag that `cargo release` pushes (see
+# CONTRIBUTING.md). The tag must equal the workspace version in Cargo.toml at
+# that commit; this is checked before anything else runs.
 on:
   push:
     tags:
@@ -17,52 +20,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  e2e:
-    name: E2E - Tilt + k6
-    uses: ./.github/workflows/e2e.yml
-
-  goreleaser:
-    name: GoReleaser
-    needs: [e2e]
+  version:
+    name: Check tag matches Cargo version
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
-          toolchain: stable
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev llvm-dev pkg-config libudev-dev libusb-1.0-0-dev
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          version: "25.3"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          shared-key: release-goreleaser
-
-      - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild
-
-      - name: Export Rust version
-        run: echo "RUST_VERSION=$(rustc --version)" >> "${GITHUB_ENV}"
+          toolchain: 1.98.1
 
       - name: Verify tag matches Cargo package versions
         run: |
@@ -91,6 +59,54 @@ jobs:
               sys.exit(1)
           PY
 
+  e2e:
+    name: E2E - Tilt + k6
+    needs: [version]
+    uses: ./.github/workflows/e2e.yml
+
+  goreleaser:
+    name: GoReleaser
+    needs: [version, e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev llvm-dev pkg-config libudev-dev libusb-1.0-0-dev
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          version: "25.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: release-goreleaser
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Export Rust version
+        run: echo "RUST_VERSION=$(rustc --version)" >> "${GITHUB_ENV}"
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
         with:
@@ -98,3 +114,5 @@ jobs:
           args: release --clean --config .goreleaser.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Two tags can share a commit (an rc and its final release); name the one being released.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}

@@ -10,6 +10,9 @@
 # DISK_CACHE_GET_TX_UNKNOWN_TIMEOUT_MS=150 replaces it while the signature index is
 # being rebuilt (more than 4 unknown partitions, e.g. after a restart).
 #
+# The AG_GENESIS_CERT_RPC_* certificate source settings are CLI/env only.
+# See crates/superbank-rpc/README.md.
+#
 # Optional superbank-rpc exact request filters. Pass this same file to
 # superbank-rpc with --config / SUPERBANK_CONFIG. Each entry contains the
 # method followed by its complete params array. Matching calls return HTTP 405
@@ -30,12 +33,19 @@ grpc-max-decoding-bytes: 67108864
 grpc-http2-adaptive-window: false
 grpc-idle-timeout-secs: 30
 grpc-health-watch-enabled: true
+# Bank-status events on this subscription are required, even without slot notifications.
+# See crates/superbank/README.md for how unresolved bank identity holds flushes.
 grpc-slot-notifications: true
 
 # Fumarole source options (required when source is "fumarole")
 # fumarole-endpoint: "https://your.fumarole.endpoint:443"
 # fumarole-x-token: "your-token"
 # fumarole-consumer-group: "superbank-mainnet"
+# Optionally configure one evidenced historical bound (no zero placeholder); the stream stops after it:
+# fumarole-alpenglow-genesis-slot: <trusted-certificate-slot>
+# Before activation, record trusted same-cluster finalized getSlot BEFORE an
+# authoritative null getAgGenesisCert, then attest that finalized slot here:
+# fumarole-preactivation-through-slot: <recorded-finalized-slot>
 # fumarole-create-consumer-group: false
 # fumarole-from-slot: 0
 # fumarole-data-plane-tcp-connections: 4
@@ -82,6 +92,9 @@ grpc-slot-notifications: true
 # bigtable-insert-concurrency: 1
 # bigtable-decode-concurrency: 8
 # bigtable-progress-every-slots: 10000
+
+# The superbank-solparq archiver is CLI/env only. SOLPARQ_HOURLY_SLOT_DURATION_MS
+# defaults to 400 (9000 slots per hour); set 200 for a 200 ms cluster.
 
 # solparq source options (required when source is "solparq"): restore
 # superbank-solparq Parquet archive bundles back into ClickHouse. Loading is

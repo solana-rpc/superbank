@@ -10,6 +10,8 @@ At a high level:
 - `superbank-rpc` reads ClickHouse to serve supported JSON-RPC methods and, when enabled, historical
   gRPC block/transaction streams.
 
+For an interactive, configurable view of this architecture, see the [architecture explorer](https://solana-rpc.github.io/superbank/).
+
 This document describes the logical architecture and data model contracts in this repository. It
 does not guarantee any specific deployment topology or production readiness.
 

@@ -158,6 +158,14 @@ struct CliArgs {
     #[arg(long, env = "FUMAROLE_CONSUMER_GROUP")]
     fumarole_consumer_group: Option<String>,
 
+    /// Optional trusted Alpenglow genesis slot; when set, the Fumarole stream stops after this slot
+    #[arg(long, env = "FUMAROLE_ALPENGLOW_GENESIS_SLOT")]
+    fumarole_alpenglow_genesis_slot: Option<u64>,
+
+    /// Optional preactivation attestation: finalized slot observed before a trusted getAgGenesisCert returned null; when set, the Fumarole stream stops after this slot
+    #[arg(long, env = "FUMAROLE_PREACTIVATION_THROUGH_SLOT")]
+    fumarole_preactivation_through_slot: Option<u64>,
+
     /// Create the Fumarole consumer group before subscribing
     #[arg(
         long,
@@ -556,6 +564,8 @@ pub(crate) struct Args {
     pub(crate) fumarole_endpoint: Option<String>,
     pub(crate) fumarole_x_token: Option<String>,
     pub(crate) fumarole_consumer_group: Option<String>,
+    pub(crate) fumarole_alpenglow_genesis_slot: Option<u64>,
+    pub(crate) fumarole_preactivation_through_slot: Option<u64>,
     pub(crate) fumarole_create_consumer_group: bool,
     pub(crate) fumarole_data_plane_tcp_connections: u8,
     pub(crate) fumarole_concurrent_download_limit_per_tcp: usize,
@@ -646,6 +656,10 @@ struct FileConfig {
     fumarole_x_token: Option<String>,
     #[serde(alias = "fumarole_consumer_group")]
     fumarole_consumer_group: Option<String>,
+    #[serde(alias = "fumarole_alpenglow_genesis_slot")]
+    fumarole_alpenglow_genesis_slot: Option<u64>,
+    #[serde(alias = "fumarole_preactivation_through_slot")]
+    fumarole_preactivation_through_slot: Option<u64>,
     #[serde(alias = "fumarole_create_consumer_group")]
     fumarole_create_consumer_group: Option<bool>,
     #[serde(alias = "fumarole_data_plane_tcp_connections")]
@@ -827,6 +841,18 @@ pub(crate) fn resolve_args() -> Result<Args> {
             "fumarole_consumer_group",
             cli.fumarole_consumer_group,
             file_config.fumarole_consumer_group,
+        ),
+        fumarole_alpenglow_genesis_slot: merge_option(
+            &matches,
+            "fumarole_alpenglow_genesis_slot",
+            cli.fumarole_alpenglow_genesis_slot,
+            file_config.fumarole_alpenglow_genesis_slot,
+        ),
+        fumarole_preactivation_through_slot: merge_option(
+            &matches,
+            "fumarole_preactivation_through_slot",
+            cli.fumarole_preactivation_through_slot,
+            file_config.fumarole_preactivation_through_slot,
         ),
         fumarole_create_consumer_group: merge_value(
             &matches,
@@ -1272,53 +1298,8 @@ fn validate_args(args: &Args) -> Result<()> {
 
     match args.source {
         IngestSource::Fumarole => {
-            if args.fumarole_endpoint.as_deref().is_none_or(str::is_empty) {
-                return Err(anyhow!(
-                    "fumarole source requires --fumarole-endpoint / FUMAROLE_ENDPOINT / config fumarole_endpoint"
-                ));
-            }
-            if args
-                .fumarole_consumer_group
-                .as_deref()
-                .is_none_or(str::is_empty)
-            {
-                return Err(anyhow!(
-                    "fumarole source requires --fumarole-consumer-group / FUMAROLE_CONSUMER_GROUP / config fumarole_consumer_group"
-                ));
-            }
-            if args.grpc_max_decoding_bytes == 0 {
-                return Err(anyhow!(
-                    "fumarole max-decoding-bytes must be greater than 0"
-                ));
-            }
-            if args.grpc_idle_timeout_secs == 0 {
-                return Err(anyhow!("fumarole idle-timeout-secs must be greater than 0"));
-            }
-            if args.fumarole_data_plane_tcp_connections == 0 {
-                return Err(anyhow!(
-                    "fumarole data-plane-tcp-connections must be greater than 0"
-                ));
-            }
-            if args.fumarole_data_plane_tcp_connections > 20 {
-                return Err(anyhow!(
-                    "fumarole data-plane-tcp-connections must be less than or equal to 20"
-                ));
-            }
-            if args.fumarole_concurrent_download_limit_per_tcp == 0 {
-                return Err(anyhow!(
-                    "fumarole concurrent-download-limit-per-tcp must be greater than 0"
-                ));
-            }
-            if args.fumarole_data_channel_capacity == 0 {
-                return Err(anyhow!(
-                    "fumarole data-channel-capacity must be greater than 0"
-                ));
-            }
-            if args.fumarole_commit_interval_secs == 0 {
-                return Err(anyhow!(
-                    "fumarole commit-interval-secs must be greater than 0"
-                ));
-            }
+            validate_fumarole_era_bound(args)?;
+            validate_fumarole_options(args)?;
         }
         IngestSource::Grpc => {
             if args.endpoint.is_none() {
@@ -1495,6 +1476,68 @@ fn validate_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+fn validate_fumarole_options(args: &Args) -> Result<()> {
+    if args.fumarole_endpoint.as_deref().is_none_or(str::is_empty) {
+        return Err(anyhow!(
+            "fumarole source requires --fumarole-endpoint / FUMAROLE_ENDPOINT / config fumarole_endpoint"
+        ));
+    }
+    if args
+        .fumarole_consumer_group
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        return Err(anyhow!(
+            "fumarole source requires --fumarole-consumer-group / FUMAROLE_CONSUMER_GROUP / config fumarole_consumer_group"
+        ));
+    }
+    if args.grpc_max_decoding_bytes == 0 {
+        return Err(anyhow!(
+            "fumarole max-decoding-bytes must be greater than 0"
+        ));
+    }
+    if args.grpc_idle_timeout_secs == 0 {
+        return Err(anyhow!("fumarole idle-timeout-secs must be greater than 0"));
+    }
+    if args.fumarole_data_plane_tcp_connections == 0 {
+        return Err(anyhow!(
+            "fumarole data-plane-tcp-connections must be greater than 0"
+        ));
+    }
+    if args.fumarole_data_plane_tcp_connections > 20 {
+        return Err(anyhow!(
+            "fumarole data-plane-tcp-connections must be less than or equal to 20"
+        ));
+    }
+    if args.fumarole_concurrent_download_limit_per_tcp == 0 {
+        return Err(anyhow!(
+            "fumarole concurrent-download-limit-per-tcp must be greater than 0"
+        ));
+    }
+    if args.fumarole_data_channel_capacity == 0 {
+        return Err(anyhow!(
+            "fumarole data-channel-capacity must be greater than 0"
+        ));
+    }
+    if args.fumarole_commit_interval_secs == 0 {
+        return Err(anyhow!(
+            "fumarole commit-interval-secs must be greater than 0"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fumarole_era_bound(args: &Args) -> Result<()> {
+    if args.fumarole_alpenglow_genesis_slot.is_some()
+        && args.fumarole_preactivation_through_slot.is_some()
+    {
+        return Err(anyhow!(
+            "fumarole source accepts at most one historical bound: --fumarole-alpenglow-genesis-slot or --fumarole-preactivation-through-slot"
+        ));
+    }
+    Ok(())
+}
+
 const DRAGONSMOUTH_FROM_SLOT_LABEL: &str =
     "--dragonsmouth-from-slot / DRAGONSMOUTH_FROM_SLOT / config dragonsmouth-from-slot";
 const FUMAROLE_FROM_SLOT_LABEL: &str =
@@ -1659,6 +1702,13 @@ fn merge_option<T>(
     } else {
         cli
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_args() -> Args {
+    let mut args = tests::fumarole_args();
+    args.source = IngestSource::Grpc;
+    args
 }
 
 #[cfg(test)]
@@ -2105,7 +2155,22 @@ rpc-from-slot: 456
         );
     }
 
-    fn fumarole_args() -> Args {
+    #[test]
+    fn historical_bound_is_optional_and_exclusive() {
+        let mut args = fumarole_args();
+        args.fumarole_alpenglow_genesis_slot = None;
+        assert!(validate_fumarole_era_bound(&args).is_ok());
+        // Trusted fixture: finalized tip 42 was observed before an authoritative null.
+        args.fumarole_preactivation_through_slot = Some(42);
+        assert!(validate_fumarole_era_bound(&args).is_ok());
+        args.fumarole_alpenglow_genesis_slot = Some(100);
+        assert!(validate_fumarole_era_bound(&args).is_err());
+        let config: FileConfig =
+            serde_yaml::from_str("fumarole-preactivation-through-slot: 42").unwrap();
+        assert_eq!(config.fumarole_preactivation_through_slot, Some(42));
+    }
+
+    pub(super) fn fumarole_args() -> Args {
         Args {
             source: IngestSource::Fumarole,
             endpoint: None,
@@ -2113,6 +2178,8 @@ rpc-from-slot: 456
             fumarole_endpoint: Some("https://fumarole.example:443".to_string()),
             fumarole_x_token: Some("secret".to_string()),
             fumarole_consumer_group: Some("superbank-mainnet".to_string()),
+            fumarole_alpenglow_genesis_slot: Some(1000),
+            fumarole_preactivation_through_slot: None,
             fumarole_create_consumer_group: false,
             fumarole_data_plane_tcp_connections: 4,
             fumarole_concurrent_download_limit_per_tcp: FUMAROLE_CONCURRENT_DOWNLOAD_LIMIT_PER_TCP,

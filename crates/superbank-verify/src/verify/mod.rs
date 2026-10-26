@@ -59,6 +59,7 @@ pub(crate) fn b58(bytes: &[u8]) -> String {
 /// within the block) to that transaction's complete signature list; it is only
 /// consulted in full mode. Chain linkage against the parent block is checked
 /// separately by the chain walk, which owns cross-block state.
+#[cfg(test)]
 pub(crate) fn verify_block(
     mode: VerifyMode,
     block: &BlockInfo,
@@ -67,8 +68,34 @@ pub(crate) fn verify_block(
     ticks_per_slot: u64,
     hashes_per_tick: Option<u64>,
 ) -> VerifyOutcome {
+    verify_block_in_era(
+        mode,
+        block,
+        entries,
+        tx_signatures,
+        ticks_per_slot,
+        hashes_per_tick,
+        false,
+    )
+}
+
+pub(crate) fn verify_block_in_era(
+    mode: VerifyMode,
+    block: &BlockInfo,
+    entries: &[EntryInfo],
+    tx_signatures: &BTreeMap<u32, Vec<Signature64>>,
+    ticks_per_slot: u64,
+    hashes_per_tick: Option<u64>,
+    alpenglow: bool,
+) -> VerifyOutcome {
     let mut outcome = VerifyOutcome {
-        findings: structural::check_structure(block, entries, ticks_per_slot, hashes_per_tick),
+        findings: structural::check_structure_in_era(
+            block,
+            entries,
+            ticks_per_slot,
+            hashes_per_tick,
+            alpenglow,
+        ),
         ..VerifyOutcome::default()
     };
 
@@ -370,5 +397,70 @@ mod tests {
             .collect();
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].entry_index, Some(1));
+    }
+    #[test]
+    fn alpenglow_full_mode_keeps_hash_and_signature_mixin_checks() {
+        let (block, mut entries, mut sigs) = build_block(13, 9, [3; 32], &[(1, 2), (1, 1), (1, 0)]);
+        let outcome =
+            verify_block_in_era(VerifyMode::Full, &block, &entries, &sigs, 64, None, true);
+        assert!(outcome.findings.is_empty(), "{:?}", outcome.findings);
+        assert_eq!(outcome.entries_verified, 3);
+        assert_eq!(outcome.hashes_computed, 3);
+
+        sigs.get_mut(&0).unwrap()[0][0] ^= 1;
+        let outcome =
+            verify_block_in_era(VerifyMode::Full, &block, &entries, &sigs, 64, None, true);
+        assert_eq!(outcome.findings.len(), 1);
+        assert_eq!(outcome.findings[0].code, FindingCode::EntryHashMismatch);
+        assert_eq!(outcome.findings[0].entry_index, Some(0));
+
+        sigs.get_mut(&0).unwrap()[0][0] ^= 1;
+        entries[2].hash[0] ^= 1;
+        let outcome =
+            verify_block_in_era(VerifyMode::Full, &block, &entries, &sigs, 64, None, true);
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::EntryHashMismatch)
+        );
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::BlockhashMismatch)
+        );
+    }
+
+    #[test]
+    fn alpenglow_empty_block_verifies_in_both_modes() {
+        let (block, entries, sigs) = build_block(13, 9, [3; 32], &[(1, 0)]);
+        for mode in [VerifyMode::Structural, VerifyMode::Full] {
+            let outcome = verify_block_in_era(mode, &block, &entries, &sigs, 64, None, true);
+            assert!(outcome.findings.is_empty(), "{:?}", outcome.findings);
+            assert_eq!(outcome.hashes_computed, u64::from(mode == VerifyMode::Full));
+        }
+    }
+
+    #[test]
+    fn self_consistent_alpenglow_chains_still_reject_invalid_entry_rules() {
+        for (layout, code) in [
+            (vec![(2, 1), (1, 0)], FindingCode::TickHashCountMismatch),
+            (vec![(1, 1), (2, 0)], FindingCode::TickHashCountMismatch),
+            (vec![(1, 0), (1, 0)], FindingCode::TickCountMismatch),
+            (vec![(1, 0), (1, 1)], FindingCode::TrailingEntry),
+        ] {
+            let (block, entries, sigs) = build_block(13, 9, [3; 32], &layout);
+            let outcome =
+                verify_block_in_era(VerifyMode::Full, &block, &entries, &sigs, 64, None, true);
+            assert!(outcome.findings.iter().any(|f| f.code == code));
+            assert_eq!(outcome.entries_verified, entries.len() as u64);
+            assert!(
+                !outcome
+                    .findings
+                    .iter()
+                    .any(|f| f.code == FindingCode::EntryHashMismatch)
+            );
+        }
     }
 }

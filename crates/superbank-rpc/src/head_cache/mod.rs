@@ -17,9 +17,11 @@ use crate::clickhouse::{
     StoredBlockRecord, StoredTransactionRecord, extract_memo,
 };
 
+mod banks;
 mod convert;
 pub(crate) mod coverage;
 pub(crate) mod dragonsmouth;
+mod protocol;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SlotIndex {
@@ -35,6 +37,7 @@ pub(crate) struct HeadSigKey {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HeadTxMeta {
+    bank_commitment: Option<Arc<std::sync::atomic::AtomicU8>>,
     pub(crate) signature_str: Arc<str>,
     pub(crate) pos: SlotIndex,
     pub(crate) err: Option<serde_json::Value>,
@@ -54,6 +57,7 @@ pub(crate) struct TransactionCountOverlay {
 /// This is optimized for read concurrency (DashMap + immutable `Arc` values) and
 /// fast merges in the RPC handlers.
 pub(crate) struct HeadCache {
+    banks: std::sync::RwLock<banks::BankState>,
     pub(crate) coverage: std::sync::RwLock<coverage::HeadCoverage>,
     retain_slots: u64,
     max_per_address: usize,
@@ -94,6 +98,7 @@ pub(crate) struct HeadCache {
 impl HeadCache {
     pub(crate) fn new(retain_slots: u64, max_per_address: usize) -> Self {
         Self {
+            banks: std::sync::RwLock::default(),
             coverage: std::sync::RwLock::default(),
             retain_slots: retain_slots.max(1),
             max_per_address: max_per_address.max(1),
@@ -127,6 +132,7 @@ impl HeadCache {
         self.latest_slot.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub(crate) fn note_block_height(&self, slot: u64, block_height: u64) {
         self.slot_block_height.insert(slot, block_height);
         if let Some(mut metadata) = self.slot_block_metadata.get_mut(&slot) {
@@ -134,6 +140,7 @@ impl HeadCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn note_blockhash(&self, slot: u64, blockhash: [u8; 32]) {
         self.slot_blockhash.insert(slot, blockhash);
         if let Some(mut metadata) = self.slot_block_metadata.get_mut(&slot) {
@@ -141,6 +148,7 @@ impl HeadCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn note_block_time(&self, slot: u64, block_time: i64) {
         self.slot_block_time.insert(slot, block_time);
         if let Some(mut metadata) = self.slot_block_metadata.get_mut(&slot) {
@@ -175,6 +183,7 @@ impl HeadCache {
         &self,
         min_commitment: CommitmentLevel,
     ) -> Option<u64> {
+        let _view = self.banks.read().expect("head bank lock");
         let mut latest: Option<u64> = None;
         for entry in self.slot_block_height.iter() {
             let slot = *entry.key();
@@ -191,6 +200,7 @@ impl HeadCache {
         &self,
         min_commitment: CommitmentLevel,
     ) -> Option<(u64, [u8; 32], u64)> {
+        let _view = self.banks.read().expect("head bank lock");
         let latest_slot = self.latest_slot();
         if latest_slot != 0 && commitment_meets(self.slot_commitment(latest_slot), min_commitment) {
             let blockhash = self.slot_blockhash.get(&latest_slot).map(|v| *v.value());
@@ -224,6 +234,7 @@ impl HeadCache {
         min_block_height: u64,
         min_commitment: CommitmentLevel,
     ) -> Option<bool> {
+        let _view = self.banks.read().expect("head bank lock");
         let mut found_at_commitment = false;
         for entry in self.slot_blockhash.iter() {
             if *entry.value() != blockhash {
@@ -261,6 +272,7 @@ impl HeadCache {
     }
 
     pub(crate) fn latest_slot_at_least(&self, min_commitment: CommitmentLevel) -> u64 {
+        let _view = self.banks.read().expect("head bank lock");
         if min_commitment == CommitmentLevel::Processed {
             return self.latest_slot();
         }
@@ -281,6 +293,7 @@ impl HeadCache {
         min_commitment: CommitmentLevel,
         clickhouse_slot: u64,
     ) -> Option<TransactionCountOverlay> {
+        let _view = self.banks.read().expect("head bank lock");
         let mut candidate_tips = self
             .slot_block_metadata
             .iter()
@@ -347,6 +360,7 @@ impl HeadCache {
     }
 
     pub(crate) fn signature_position(&self, signature: &Signature) -> Option<SlotIndex> {
+        let _view = self.banks.read().expect("head bank lock");
         self.meta_by_signature.get(signature).map(|meta| meta.pos)
     }
 
@@ -355,8 +369,9 @@ impl HeadCache {
         signature: &Signature,
         min_commitment: CommitmentLevel,
     ) -> Option<Arc<StoredTransactionRecord>> {
+        let _view = self.banks.read().expect("head bank lock");
         let meta = self.meta_by_signature.get(signature)?;
-        if !commitment_meets(self.slot_commitment(meta.pos.slot), min_commitment) {
+        if !commitment_meets(self.meta_commitment(&meta), min_commitment) {
             return None;
         }
         self.tx_by_signature.get(signature).map(|v| v.clone())
@@ -367,15 +382,23 @@ impl HeadCache {
         signature: &Signature,
         min_commitment: CommitmentLevel,
     ) -> Option<Arc<HeadTxMeta>> {
+        let _view = self.banks.read().expect("head bank lock");
         let meta = self.meta_by_signature.get(signature)?;
-        if !commitment_meets(self.slot_commitment(meta.pos.slot), min_commitment) {
+        if !commitment_meets(self.meta_commitment(&meta), min_commitment) {
             return None;
         }
         Some(meta.clone())
     }
 
-    pub(crate) fn confirmation_status_string(&self, slot: u64) -> &'static str {
-        commitment_to_str(self.slot_commitment(slot))
+    fn meta_commitment(&self, meta: &HeadTxMeta) -> CommitmentLevel {
+        meta.bank_commitment.as_ref().map_or_else(
+            || self.slot_commitment(meta.pos.slot),
+            |commitment| banks::decode_commitment(commitment.load(Ordering::Acquire)),
+        )
+    }
+
+    pub(crate) fn confirmation_status_string(&self, meta: &HeadTxMeta) -> &'static str {
+        commitment_to_str(self.meta_commitment(meta))
     }
 
     pub(crate) fn get_block(
@@ -384,6 +407,7 @@ impl HeadCache {
         min_commitment: CommitmentLevel,
         transaction_details: TransactionDetails,
     ) -> Option<StoredBlockPayload> {
+        let _view = self.banks.read().expect("head bank lock");
         if !commitment_meets(self.slot_commitment(slot), min_commitment) {
             return None;
         }
@@ -456,6 +480,7 @@ impl HeadCache {
         limit: usize,
         min_commitment: CommitmentLevel,
     ) -> Vec<Arc<HeadTxMeta>> {
+        let _view = self.banks.read().expect("head bank lock");
         let Some(keys) = self.sigs_by_address.get(address) else {
             return Vec::new();
         };
@@ -526,8 +551,14 @@ impl HeadCache {
 
         if let Some((_, sigs)) = self.sigs_by_slot.remove(&slot) {
             for sig in sigs {
-                self.tx_by_signature.remove(&sig);
-                self.meta_by_signature.remove(&sig);
+                if self
+                    .meta_by_signature
+                    .get(&sig)
+                    .is_some_and(|meta| meta.pos.slot == slot)
+                {
+                    self.tx_by_signature.remove(&sig);
+                    self.meta_by_signature.remove(&sig);
+                }
             }
         }
 
@@ -552,10 +583,36 @@ impl HeadCache {
         }
     }
 
-    pub(crate) fn ingest_transaction(
+    fn projection_wins(
+        old: &HeadTxMeta,
+        slot: u64,
+        bank_commitment: Option<&Arc<std::sync::atomic::AtomicU8>>,
+    ) -> bool {
+        let rank_of = |token: Option<&Arc<std::sync::atomic::AtomicU8>>| {
+            token.map_or(0, |token| token.load(Ordering::Acquire))
+        };
+        old.pos.slot == slot
+            || rank_of(bank_commitment) == 0
+            || rank_of(old.bank_commitment.as_ref()) != 0
+    }
+
+    // Cheap probe that runs before the costly record conversion.
+    fn keeps_existing_projection(
+        &self,
+        signature: &Signature,
+        slot: u64,
+        bank_commitment: Option<&Arc<std::sync::atomic::AtomicU8>>,
+    ) -> bool {
+        self.meta_by_signature
+            .get(signature)
+            .is_some_and(|old| Self::projection_wins(&old, slot, bank_commitment))
+    }
+
+    fn ingest_bank_transaction(
         &self,
         slot: u64,
         tx_info: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo,
+        bank_commitment: Option<Arc<std::sync::atomic::AtomicU8>>,
     ) {
         // Skip transactions that are already outside the retained window. This avoids doing
         // conversion work and prevents address indexes from accumulating stale keys.
@@ -574,6 +631,10 @@ impl HeadCache {
             }
         };
         let signature = Signature::from(signature_bytes);
+
+        if self.keeps_existing_projection(&signature, slot, bank_commitment.as_ref()) {
+            return;
+        }
 
         let mut record = match convert::stored_record_from_transaction_info(slot, tx_info) {
             Ok(record) => record,
@@ -602,6 +663,7 @@ impl HeadCache {
 
         let signature_str: Arc<str> = bs58::encode(signature_bytes).into_string().into();
         let meta = Arc::new(HeadTxMeta {
+            bank_commitment,
             signature_str,
             pos,
             err: err_value,
@@ -609,13 +671,34 @@ impl HeadCache {
             block_time,
         });
 
-        // Insert meta first; if this races, keep the first writer and skip indexing.
-        match self.meta_by_signature.entry(signature) {
-            Entry::Occupied(_) => return,
-            Entry::Vacant(v) => {
-                v.insert(meta.clone());
+        // Bank publication is serialized by the bank write lock. A canonical
+        // winner may reclaim a signature from a processed abandoned slot; it
+        // cannot replace an already confirmed/finalized projection.
+        let old_slot = match self.meta_by_signature.entry(signature) {
+            Entry::Occupied(occ) => {
+                let old = occ.get();
+                if Self::projection_wins(old, slot, meta.bank_commitment.as_ref()) {
+                    return;
+                }
+                let old_slot = old.pos.slot;
+                occ.remove();
+                Some(old_slot)
+            }
+            Entry::Vacant(_) => None,
+        };
+        if let Some(old_slot) = old_slot {
+            if let Some(mut signatures) = self.sigs_by_slot.get_mut(&old_slot) {
+                signatures.retain(|candidate| *candidate != signature);
+            }
+            if let Some(addresses) = self.addrs_by_slot.get(&old_slot) {
+                for address in addresses.iter() {
+                    if let Some(mut keys) = self.sigs_by_address.get_mut(address) {
+                        keys.retain(|key| key.signature != signature || key.pos.slot != old_slot);
+                    }
+                }
             }
         }
+        self.meta_by_signature.insert(signature, meta.clone());
 
         let record = Arc::new(record);
         self.tx_by_signature.insert(signature, record.clone());
@@ -690,6 +773,7 @@ impl HeadCache {
 
         let pos = SlotIndex { slot, idx };
         let meta = Arc::new(HeadTxMeta {
+            bank_commitment: None,
             signature_str,
             pos,
             err: err_value,
@@ -728,7 +812,10 @@ impl HeadCache {
 
     fn index_address(&self, address: Pubkey, key: HeadSigKey, min_slot: u64) {
         let mut entry = self.sigs_by_address.entry(address).or_default();
-        entry.push_front(key);
+        // Keep newest-first by (slot, idx) even when an older slot is reclaimed late.
+        let order = |k: &HeadSigKey| (k.pos.slot, k.pos.idx);
+        let at = entry.partition_point(|k| order(k) > order(&key));
+        entry.insert(at, key);
         while let Some(back) = entry.back()
             && back.pos.slot < min_slot
         {
@@ -991,6 +1078,7 @@ mod tests {
             rewards_commission: Vec::new(),
             rewards_commission_bps: Vec::new(),
             rewards_num_partitions: None,
+            footer: None,
         }
     }
 

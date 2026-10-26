@@ -19,6 +19,17 @@ pub(crate) fn parse_commitment_level(value: &str) -> Result<CommitmentLevel> {
     Ok(level)
 }
 
+/// Persistent slot-keyed tables cannot safely retain competing processed banks.
+pub(crate) fn parse_durable_commitment(value: &str) -> Result<CommitmentLevel> {
+    let level = parse_commitment_level(value)?;
+    if level != CommitmentLevel::Finalized {
+        return Err(anyhow!(
+            "gRPC and Fumarole ClickHouse ingestion requires finalized commitment; serve processed data from the RPC head cache"
+        ));
+    }
+    Ok(level)
+}
+
 pub(crate) fn parse_commitment_config(value: &str) -> Result<CommitmentConfig> {
     let normalized = value.trim().to_lowercase();
     let config = match normalized.as_str() {
@@ -29,4 +40,20 @@ pub(crate) fn parse_commitment_config(value: &str) -> Result<CommitmentConfig> {
     };
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_ingestion_rejects_unfinalized_banks() {
+        assert_eq!(
+            parse_durable_commitment(" finalized ").unwrap(),
+            CommitmentLevel::Finalized
+        );
+        assert!(parse_durable_commitment("processed").is_err());
+        assert!(parse_durable_commitment("confirmed").is_err());
+        assert!(parse_durable_commitment("unknown").is_err());
+    }
 }
