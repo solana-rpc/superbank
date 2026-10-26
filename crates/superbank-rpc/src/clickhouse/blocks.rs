@@ -70,13 +70,30 @@ enum InflationRewardSelection {
     StakeOnly,
 }
 
+/// Lowercased stored Staking and DeactivatedStake spellings: proto names and Display names.
+const INFLATION_STAKE_REWARD_TYPES: &[&str] = &["staking", "deactivatedstake", "deactivated-stake"];
+const INFLATION_VOTE_REWARD_TYPES: &[&str] = &["voting"];
+
 impl InflationRewardSelection {
-    fn sql_predicate(self) -> &'static str {
+    /// Matches Agave's getInflationReward filter; VATDebit, Fee and Rent never match.
+    fn stored_reward_types(self) -> Vec<&'static str> {
         match self {
-            Self::VoteOnly => "lowerUTF8(ifNull(reward.4, '')) = 'voting'",
-            Self::VoteAndStake => "lowerUTF8(ifNull(reward.4, '')) IN ('staking', 'voting')",
-            Self::StakeOnly => "lowerUTF8(ifNull(reward.4, '')) = 'staking'",
+            Self::VoteOnly => INFLATION_VOTE_REWARD_TYPES.to_vec(),
+            Self::VoteAndStake => {
+                [INFLATION_STAKE_REWARD_TYPES, INFLATION_VOTE_REWARD_TYPES].concat()
+            }
+            Self::StakeOnly => INFLATION_STAKE_REWARD_TYPES.to_vec(),
         }
+    }
+
+    fn sql_predicate(self) -> String {
+        let literals = self
+            .stored_reward_types()
+            .iter()
+            .map(|reward_type| format!("'{reward_type}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("lowerUTF8(ifNull(reward.4, '')) IN ({literals})")
     }
 }
 
@@ -219,7 +236,7 @@ fn build_inflation_rewards_query(
         table,
         addresses,
         slots,
-        selection.sql_predicate(),
+        &selection.sql_predicate(),
         "pubkey",
         settings_clause,
     )
@@ -3111,6 +3128,7 @@ mod tests {
     #[cfg(feature = "disk-cache")]
     use super::build_block_time_range_query;
     use solana_epoch_schedule::EpochSchedule;
+    use solana_transaction_status::RewardType;
 
     use super::super::inflation_cache::InflationEpochCache;
     use super::{
@@ -3129,6 +3147,7 @@ mod tests {
     use super::{
         ShardSlotRange, build_block_metadata_range_query, shard_slot_ranges_for_slot_range,
     };
+    use crate::hydration::parse_reward_type;
 
     #[test]
     fn shard_indices_for_slot_range_returns_single_shard_for_single_bucket() {
@@ -3331,7 +3350,7 @@ mod tests {
 
         assert!(query.contains("PREWHERE slot IN (121392000, 121392003, 121392017)"));
         assert!(query.contains(
-            "((slot = 121392000 AND lowerUTF8(ifNull(reward.4, '')) = 'voting') OR (slot != 121392000 AND lowerUTF8(ifNull(reward.4, '')) = 'staking'))"
+            "((slot = 121392000 AND lowerUTF8(ifNull(reward.4, '')) IN ('voting')) OR (slot != 121392000 AND lowerUTF8(ifNull(reward.4, '')) IN ('staking', 'deactivatedstake', 'deactivated-stake')))"
         ));
         assert!(query.contains("GROUP BY pubkey, slot"));
         assert!(query.contains("tupleElement(latest, 1) AS effective_slot"));
@@ -3485,9 +3504,114 @@ mod tests {
         assert!(query.contains("AS rewards_commission_bps"));
         assert!(query.contains("CAST(NULL, 'Nullable(UInt16)')"));
         assert!(query.contains("tupleElement(latest, 5) AS commission_bps"));
-        assert!(query.contains("= 'staking'"));
+        assert!(query.contains(
+            "lowerUTF8(ifNull(reward.4, '')) IN ('staking', 'deactivatedstake', 'deactivated-stake')"
+        ));
         assert!(query.contains("max_threads=2"));
         assert!(query.contains("max_memory_usage=536870912"));
+    }
+
+    /// Agave v4.4 `get_inflation_reward` reward-type filters (rpc/src/rpc.rs).
+    fn agave_returns(selection: InflationRewardSelection, reward_type: RewardType) -> bool {
+        let (vote, stake) = match reward_type {
+            RewardType::Voting => (true, false),
+            RewardType::Staking | RewardType::DeactivatedStake => (false, true),
+            RewardType::Fee | RewardType::Rent | RewardType::VATDebit => (false, false),
+        };
+        match selection {
+            InflationRewardSelection::VoteOnly => vote,
+            InflationRewardSelection::VoteAndStake => vote || stake,
+            InflationRewardSelection::StakeOnly => stake,
+        }
+    }
+
+    #[test]
+    fn inflation_reward_selections_match_agave_for_every_stored_spelling() {
+        // gRPC/Fumarole store proto names; RPC, Bigtable and Jetstreamer store Display names.
+        let spellings = [
+            "Fee",
+            "fee",
+            "Rent",
+            "rent",
+            "Staking",
+            "staking",
+            "Voting",
+            "voting",
+            "DeactivatedStake",
+            "deactivated-stake",
+            "VATDebit",
+            "validator-admission-ticket-debit",
+        ];
+        for variant in [
+            RewardType::Fee,
+            RewardType::Rent,
+            RewardType::Staking,
+            RewardType::Voting,
+            RewardType::DeactivatedStake,
+            RewardType::VATDebit,
+        ] {
+            assert!(
+                spellings.contains(&variant.to_string().as_str()),
+                "{variant}"
+            );
+            assert!(
+                spellings.contains(&format!("{variant:?}").as_str()),
+                "{variant:?}"
+            );
+        }
+        for selection in [
+            InflationRewardSelection::VoteOnly,
+            InflationRewardSelection::VoteAndStake,
+            InflationRewardSelection::StakeOnly,
+        ] {
+            let accepted = selection.stored_reward_types();
+            for spelling in spellings {
+                let reward_type = parse_reward_type(&Some(spelling.to_string()))
+                    .expect("known spelling")
+                    .expect("present");
+                assert_eq!(
+                    accepted.contains(&spelling.to_lowercase().as_str()),
+                    agave_returns(selection, reward_type),
+                    "{selection:?} {spelling}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inflation_reward_predicates_select_deactivated_stake_but_never_vat() {
+        assert_eq!(
+            InflationRewardSelection::StakeOnly.sql_predicate(),
+            "lowerUTF8(ifNull(reward.4, '')) IN ('staking', 'deactivatedstake', 'deactivated-stake')"
+        );
+        assert_eq!(
+            InflationRewardSelection::VoteAndStake.sql_predicate(),
+            "lowerUTF8(ifNull(reward.4, '')) IN ('staking', 'deactivatedstake', 'deactivated-stake', 'voting')"
+        );
+        assert_eq!(
+            InflationRewardSelection::VoteOnly.sql_predicate(),
+            "lowerUTF8(ifNull(reward.4, '')) IN ('voting')"
+        );
+        let folded = build_inflation_folded_rewards_query("t", &[[1u8; 32]], 10, &[11], "");
+        for query in [
+            folded,
+            build_inflation_rewards_query(
+                "t",
+                &[[1u8; 32]],
+                &[10],
+                InflationRewardSelection::VoteAndStake,
+                "",
+            ),
+        ] {
+            for excluded in [
+                "'vatdebit'",
+                "'validator-admission-ticket-debit'",
+                "'fee'",
+                "'rent'",
+            ] {
+                assert!(!query.contains(excluded), "{excluded}");
+            }
+        }
     }
 
     #[test]

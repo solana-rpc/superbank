@@ -325,6 +325,74 @@ async fn boundary_unavailable_is_never_cached() {
     assert_eq!(third["result"][0]["amount"], 42);
 }
 
+const STAKE_TYPES: &str =
+    "lowerUTF8(ifNull(reward.4, '')) IN ('staking', 'deactivatedstake', 'deactivated-stake')";
+const VOTE_TYPES: &str = "lowerUTF8(ifNull(reward.4, '')) IN ('voting')";
+
+fn assert_never_selects_vat(query: &str) {
+    for excluded in [
+        "'vatdebit'",
+        "'validator-admission-ticket-debit'",
+        "'fee'",
+        "'rent'",
+    ] {
+        assert!(!query.contains(excluded), "{excluded} in {query}");
+    }
+}
+
+#[tokio::test]
+async fn non_partitioned_boundary_query_selects_both_deactivated_stake_spellings() {
+    let mock = Mock::new();
+    let state = initialized_state(&mock).await;
+    mock.add(handlers::provide([boundary(None)]));
+    let boundary_rewards = mock.add(handlers::record_ddl());
+    assert_eq!(
+        rewards_body(&state).await["result"],
+        json!([null, null, null])
+    );
+    let query = boundary_rewards.query().await;
+    assert!(
+        query.contains("IN ('staking', 'deactivatedstake', 'deactivated-stake', 'voting')"),
+        "{query}"
+    );
+    assert_never_selects_vat(&query);
+}
+
+#[tokio::test]
+async fn partitioned_queries_select_deactivated_stake_only_from_partition_blocks() {
+    const PARTITIONS: u64 = 4;
+    let mock = Mock::new();
+    let state = initialized_state(&mock).await;
+
+    // Cold sequential path: boundary votes only, then stake types from partition blocks.
+    mock.add(handlers::provide([partitioned_boundary(PARTITIONS)]));
+    let boundary_rewards = mock.add(handlers::record_ddl());
+    mock.add(handlers::provide(partition_slots(PARTITIONS)));
+    let partition_rewards = mock.add(handlers::record_ddl());
+    let cold = rewards_body(&state).await;
+    assert_eq!(cold["result"], json!([null, null, null]));
+    let boundary_query = boundary_rewards.query().await;
+    assert!(boundary_query.contains(VOTE_TYPES), "{boundary_query}");
+    assert!(!boundary_query.contains("staking"), "{boundary_query}");
+    assert!(!boundary_query.contains("deactivated"), "{boundary_query}");
+    let partition_query = partition_rewards.query().await;
+    assert!(partition_query.contains(STAKE_TYPES), "{partition_query}");
+    assert!(!partition_query.contains("'voting'"), "{partition_query}");
+    assert_never_selects_vat(&partition_query);
+
+    // Warm folded path keeps the same per-slot reward types.
+    let folded_rewards = mock.add(handlers::record_ddl());
+    assert_eq!(rewards_body(&state).await, cold);
+    let folded_query = folded_rewards.query().await;
+    assert!(
+        folded_query.contains(&format!(
+            "((slot = {BOUNDARY_SLOT} AND {VOTE_TYPES}) OR (slot != {BOUNDARY_SLOT} AND {STAKE_TYPES}))"
+        )),
+        "{folded_query}"
+    );
+    assert_never_selects_vat(&folded_query);
+}
+
 #[tokio::test]
 async fn partitioned_boundary_without_block_height_is_not_cached() {
     let mock = Mock::new();
