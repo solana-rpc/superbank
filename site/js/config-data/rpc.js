@@ -806,6 +806,11 @@ export default {
           default: '75',
           text: 'Never backfill slots this close to the finalized tip, so ingestion has had time to land them.',
         }),
+        opt('DISK_CACHE_GIVEN_UP_RETRY_SECS', {
+          type: 'u64 (seconds)',
+          default: '600',
+          text: 'Wait before the forwarder retries a slot it gave up on, in case the source has since backfilled it. Zero keeps given-up slots missing until they leave the retention window.',
+        }),
       ],
     },
     {
