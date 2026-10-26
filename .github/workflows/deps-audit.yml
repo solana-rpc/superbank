@@ -31,4 +31,6 @@ jobs:
           # RUSTSEC-2026-0194/RUSTSEC-2026-0195 are quick-xml 0.39 DoS/perf issues reached only
           # through the locked parquet 59.0.0 -> object_store 0.13.2 -> quick-xml 0.39.4 chain.
           # Reassess these exclusions when updating that dependency chain.
-          ignore: RUSTSEC-2024-0375,RUSTSEC-2025-0012,RUSTSEC-2025-0141,RUSTSEC-2024-0388,RUSTSEC-2024-0384,RUSTSEC-2024-0436,RUSTSEC-2025-0134,RUSTSEC-2021-0145,RUSTSEC-2026-0097,RUSTSEC-2026-0194,RUSTSEC-2026-0195
+          # RUSTSEC-2026-0391/0398/0403 hit zstd 0.13.3, which tonic and parquet 59 require; zstd 0.13 has no fix.
+          # Neither crate calls the affected with_context, seekable or write::Decoder APIs. Drop them once both move to zstd 0.14.
+          ignore: RUSTSEC-2024-0375,RUSTSEC-2025-0012,RUSTSEC-2025-0141,RUSTSEC-2024-0388,RUSTSEC-2024-0384,RUSTSEC-2024-0436,RUSTSEC-2025-0134,RUSTSEC-2021-0145,RUSTSEC-2026-0097,RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0391,RUSTSEC-2026-0398,RUSTSEC-2026-0403
