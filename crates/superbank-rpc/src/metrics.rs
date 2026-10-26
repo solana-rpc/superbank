@@ -789,6 +789,8 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_backfill_inflight_ranges: Gauge,
     #[cfg(feature = "disk-cache")]
+    disk_cache_given_up_slots: Gauge,
+    #[cfg(feature = "disk-cache")]
     disk_cache_fill_errors_total: Counter,
     #[cfg(feature = "disk-cache")]
     disk_cache_poisoned_slots_total: Counter,
@@ -956,6 +958,8 @@ impl Metrics {
         let disk_cache_backfill_slots_remaining = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_backfill_inflight_ranges = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_given_up_slots = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_fill_errors_total = Counter::default();
         #[cfg(feature = "disk-cache")]
@@ -1449,6 +1453,11 @@ impl Metrics {
                 disk_cache_backfill_inflight_ranges.clone(),
             );
             registry.register(
+                "disk_cache_given_up_slots",
+                "Incomplete slots inside the retention window the forwarder has given up on",
+                disk_cache_given_up_slots.clone(),
+            );
+            registry.register(
                 "disk_cache_fill_errors",
                 "ClickHouse fetch failures in the backfill/repair filler",
                 disk_cache_fill_errors_total.clone(),
@@ -1619,6 +1628,8 @@ impl Metrics {
             disk_cache_backfill_slots_remaining,
             #[cfg(feature = "disk-cache")]
             disk_cache_backfill_inflight_ranges,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_given_up_slots,
             #[cfg(feature = "disk-cache")]
             disk_cache_fill_errors_total,
             #[cfg(feature = "disk-cache")]
@@ -2609,6 +2620,14 @@ pub(crate) fn disk_cache_backfill_inflight(ranges: usize) {
 }
 
 #[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_given_up_slots(slots: usize) {
+    let metrics = metrics();
+    metrics
+        .disk_cache_given_up_slots
+        .set(i64::try_from(slots).unwrap_or(i64::MAX));
+}
+
+#[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_fill_error() {
     let metrics = metrics();
     metrics.disk_cache_fill_errors_total.inc();
@@ -2834,9 +2853,9 @@ pub(crate) fn blocks_range_observation(
         .observe(seconds);
 }
 
-/// Slot-age buckets in epochs (432,000 slots): 0.5, 1, 2, 3, 4, 5, 10 and 50 epochs. They
-/// bracket disk-cache retention windows of a few epochs.
-const PRIMARY_SLOT_AGE_BUCKETS: [f64; 8] = [
+/// Slot-age buckets in epochs (432,000 slots): 0.5 to 50 bracket disk-cache retention windows,
+/// then every 100 epochs to 1,000 and a 1,500 bucket cover the full age of the chain.
+const PRIMARY_SLOT_AGE_BUCKETS: [f64; 19] = [
     216_000.0,
     432_000.0,
     864_000.0,
@@ -2845,6 +2864,17 @@ const PRIMARY_SLOT_AGE_BUCKETS: [f64; 8] = [
     2_160_000.0,
     4_320_000.0,
     21_600_000.0,
+    43_200_000.0,
+    86_400_000.0,
+    129_600_000.0,
+    172_800_000.0,
+    216_000_000.0,
+    259_200_000.0,
+    302_400_000.0,
+    345_600_000.0,
+    388_800_000.0,
+    432_000_000.0,
+    648_000_000.0,
 ];
 
 /// Records how far behind the finalized tip a getTransaction result served by primary
@@ -2995,6 +3025,9 @@ mod tests {
         metrics
             .get_transaction_primary_slot_age
             .observe(3_000_000.0);
+        metrics
+            .get_transaction_primary_slot_age
+            .observe(100_000_000.0);
 
         let exported = String::from_utf8(metrics.export().expect("metrics export"))
             .expect("metrics are UTF-8");
@@ -3007,6 +3040,9 @@ mod tests {
         assert!(exported.contains(&bucket("864000.0", 1)), "{exported}");
         assert!(exported.contains(&bucket("2160000.0", 1)), "{exported}");
         assert!(exported.contains(&bucket("4320000.0", 2)), "{exported}");
-        assert!(exported.contains("superbank_rpc_get_transaction_primary_slot_age_slots_count 2"));
+        assert!(exported.contains(&bucket("86400000.0", 2)), "{exported}");
+        assert!(exported.contains(&bucket("129600000.0", 3)), "{exported}");
+        assert!(exported.contains(&bucket("648000000.0", 3)), "{exported}");
+        assert!(exported.contains("superbank_rpc_get_transaction_primary_slot_age_slots_count 3"));
     }
 }
