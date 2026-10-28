@@ -24,6 +24,7 @@ use crate::{
         ArchiveManifest, ArchiveManifestTable, MANIFEST_FILE_NAME, ManifestProducer,
         REPORT_FORMAT_VERSION, SkippedArchiveTable,
     },
+    poh::{self, PohReport},
     storage::{self, ArchiveDestination},
 };
 
@@ -732,6 +733,29 @@ impl ArchiveRunReport {
                 "validation_footer_missing_ranges: {}",
                 ValidationReport::format_ranges(&validation.footer_missing_ranges)
             ));
+            if let Some(poh) = &validation.poh {
+                lines.push(format!("validation_poh_mode: {}", poh.mode));
+                lines.push(format!(
+                    "validation_poh_slots: ok={} failed={} unverifiable={} missing={} skipped={}",
+                    poh.slots_ok,
+                    poh.slots_failed,
+                    poh.slots_unverifiable,
+                    poh.slots_missing,
+                    poh.slots_skipped
+                ));
+                lines.push(format!(
+                    "validation_poh_failed_ranges: {}",
+                    ValidationReport::format_ranges(&poh.failed_ranges)
+                ));
+                lines.push(format!(
+                    "validation_poh_unverifiable_ranges: {}",
+                    ValidationReport::format_ranges(&poh.unverifiable_ranges)
+                ));
+                lines.push(format!(
+                    "validation_poh_missing_ranges: {}",
+                    ValidationReport::format_ranges(&poh.missing_ranges)
+                ));
+            }
             if let Some(error) = &validation.rpc_check_error {
                 lines.push(format!("validation_rpc_check_error: {error}"));
             }
@@ -1086,6 +1110,17 @@ async fn run_once_for_kind_inner(config: &Config, kind: ArchiveKind) -> Result<A
         }
     };
 
+    // PoH last: it is the most expensive check, and its result only matters
+    // when nothing else already blocks this range.
+    if !validation.blocks_archive(config.allow_rpc_validation_failure) {
+        let poh_started = Instant::now();
+        validation.poh = poh::verify_archive_range(config, plan.start_slot, plan.end_slot).await?;
+        if let Some(poh) = &validation.poh {
+            phase_durations.push(PhaseDuration::new("poh_verify", poh_started.elapsed()));
+            log_poh_result(kind, poh);
+        }
+    }
+
     debug!(
         archive_kind = kind.to_string(),
         missing_blocks = validation.missing_blocks.len(),
@@ -1424,6 +1459,31 @@ fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {
     );
 }
 
+fn log_poh_result(kind: ArchiveKind, poh: &PohReport) {
+    if poh.blocks_archive() {
+        warn!(
+            archive_kind = kind.to_string(),
+            mode = poh.mode,
+            slots_failed = poh.slots_failed,
+            slots_unverifiable = poh.slots_unverifiable,
+            slots_missing = poh.slots_missing,
+            failed_ranges = ValidationReport::format_ranges(&poh.failed_ranges),
+            unverifiable_ranges = ValidationReport::format_ranges(&poh.unverifiable_ranges),
+            missing_ranges = ValidationReport::format_ranges(&poh.missing_ranges),
+            "PoH verification blocks the archive"
+        );
+    } else {
+        info!(
+            archive_kind = kind.to_string(),
+            mode = poh.mode,
+            slots_ok = poh.slots_ok,
+            slots_unverifiable = poh.slots_unverifiable,
+            slots_missing = poh.slots_missing,
+            "PoH verification passed"
+        );
+    }
+}
+
 /// The RPC backfill source carries no Alpenglow footer, so post-genesis slots stay footer gaps.
 fn warn_backfill_without_footers(kind: ArchiveKind, footer_check: FooterCheck, slots: &[u64]) {
     let Some(genesis_slot) = footer_check.genesis_slot else {
@@ -1471,11 +1531,16 @@ fn server_mode_skip_reason(validation: &ValidationReport, config: &Config) -> &'
 
 fn confirm_validation_warnings(plan: &ArchivePlan, validation: &ValidationReport) -> Result<bool> {
     eprintln!(
-        "WARNING: validation found issues for {} (missing_blocks={}, transaction_mismatches={}, footer_missing_slots={}, rpc_check_error={}).",
+        "WARNING: validation found issues for {} (missing_blocks={}, transaction_mismatches={}, footer_missing_slots={}, poh_failed_slots={}, poh_unverifiable_slots={}, rpc_check_error={}).",
         plan.file_name(),
         validation.missing_blocks.len(),
         validation.transaction_mismatches.len(),
         validation.footer_missing_slots(),
+        validation.poh.as_ref().map_or(0, |poh| poh.slots_failed),
+        validation
+            .poh
+            .as_ref()
+            .map_or(0, |poh| poh.slots_unverifiable + poh.slots_missing),
         validation.rpc_check_error.as_deref().unwrap_or("none")
     );
 

@@ -140,6 +140,7 @@ mod tests {
             rpc_check_error: None,
             footer_missing_ranges: Vec::new(),
             footer_coverage_required: false,
+            poh: None,
         }
     }
 

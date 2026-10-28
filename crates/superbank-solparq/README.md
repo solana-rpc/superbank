@@ -705,6 +705,19 @@ The gaps appear as `footer_missing_ranges` in `report.json`, the text report and
 
 Gap backfill uses the RPC source, which carries no footer. Backfilled blocks after the genesis slot stay footer gaps, and solparq logs a warning for them.
 
+### Proof-of-History check
+
+`--poh-verify-mode` (`SOLPARQ_POH_VERIFY_MODE`) runs [superbank-verify](../superbank-verify/README.md) over the archive's slot range in ClickHouse before anything is written, including to S3. The archive is a `SELECT ... WHERE slot BETWEEN start AND end` over the same tables, so a clean run covers the data that goes into the Parquet files. It is off by default.
+
+- `structural`: tick counts, entry and transaction-index structure, last entry hash equals the blockhash, and blockhash linkage, including to the block before the range.
+- `full`: everything above plus recomputing every entry hash. It costs about 4M SHA-256 hashes per slot at the current 62,500 hashes per tick, so measure one hourly window on your hardware before enabling it in server mode. `--poh-verify-threads` (`SOLPARQ_POH_VERIFY_THREADS`, default `0` = all cores) bounds it.
+
+The check runs last, after repair, backfill and re-validation, and only when nothing else already blocks the range. Slots after `--alpenglow-genesis-slot` use Alpenglow rules (one Alpentick, `num_hashes = 1`). Cluster parameters are mainnet's.
+
+A failed slot (`entry_hash_mismatch`, `chain_break`, `tick_count_mismatch`, ...) blocks the archive like a missing block; `--force-archive` still overrides it and `--allow-rpc-validation-failure` does not. Slots the check cannot verify also block: blocks without `entries` rows (ranges ingested over JSON-RPC or Bigtable, and gap backfill) and slots missing from the chain. `--poh-verify-allow-unverifiable` (`SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE`) lets those through while failures still block.
+
+Results appear under `validation.poh` in `report.json` (slot counts, `failed_ranges`, `unverifiable_ranges`, `missing_ranges` and finding counts), as `validation_poh_*` lines in the text report, as the `poh_failed` and `poh_unverifiable` validation metric categories, and as the `poh-verification` skip reason. Each finding is also logged with its slot.
+
 ### Backfilling gaps before archiving
 
 By default a missing block just produces a warning (skip in server mode, prompt
@@ -866,6 +879,9 @@ Common defaults:
 - `--allow-rpc-validation-failure` unset (off)
 - `--alpenglow-genesis-slot` unset (no footer check)
 - `--footer-coverage-policy report`
+- `--poh-verify-mode off`
+- `--poh-verify-allow-unverifiable` unset (off)
+- `--poh-verify-threads 0` (all cores)
 - `--backfill-gaps` unset (off)
 - `--backfill-superbank-bin superbank`
 - `--backfill-include-undercounts` on (only applies when `--backfill-gaps` is set)

@@ -23,6 +23,15 @@ pub enum FooterCoveragePolicy {
     Require,
 }
 
+/// Proof-of-History check run by superbank-verify before an archive is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum PohVerifyMode {
+    Off,
+    Structural,
+    Full,
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Config {
     pub bucket_name: String,
@@ -89,6 +98,14 @@ pub struct Config {
     /// Trusted Alpenglow genesis certificate slot. Slots after it need a stored footer.
     pub alpenglow_genesis_slot: Option<u64>,
     pub footer_coverage_policy: FooterCoveragePolicy,
+    /// Run superbank-verify over the archive range after validation passes; a
+    /// failure blocks the archive like a missing block. Off by default.
+    pub poh_verify_mode: PohVerifyMode,
+    /// Slots the PoH check could not verify (no entries rows, chain gaps) do
+    /// not block the archive; PoH failures still do.
+    pub poh_verify_allow_unverifiable: bool,
+    /// Hash recomputation threads for the PoH check (0 = all available cores).
+    pub poh_verify_threads: usize,
     /// Backfill blocks missing from the archive's slot range (detected by
     /// validation) from Solana RPC before archiving, by invoking the `superbank`
     /// RPC ingestor as a subprocess. Off by default.
@@ -234,6 +251,9 @@ impl Config {
             allow_rpc_validation_failure: cli.allow_rpc_validation_failure,
             alpenglow_genesis_slot: cli.alpenglow_genesis_slot,
             footer_coverage_policy: cli.footer_coverage_policy,
+            poh_verify_mode: cli.poh_verify_mode,
+            poh_verify_allow_unverifiable: cli.poh_verify_allow_unverifiable,
+            poh_verify_threads: cli.poh_verify_threads,
             backfill_gaps: cli.backfill_gaps,
             backfill_superbank_bin: cli.backfill_superbank_bin,
             backfill_include_undercounts: cli.backfill_include_undercounts,
@@ -518,6 +538,35 @@ struct Cli {
         default_value = "report"
     )]
     footer_coverage_policy: FooterCoveragePolicy,
+
+    /// Verify Proof-of-History over the archive range with superbank-verify
+    /// before writing it: `structural` checks ticks, entries and blockhash
+    /// linkage; `full` also recomputes every entry hash. A failure blocks the
+    /// archive. Runs only when the other validation checks pass.
+    #[arg(
+        long = "poh-verify-mode",
+        env = "SOLPARQ_POH_VERIFY_MODE",
+        value_enum,
+        default_value = "off"
+    )]
+    poh_verify_mode: PohVerifyMode,
+
+    /// Archive even when the PoH check leaves slots unverifiable (no entries
+    /// rows, e.g. RPC-backfilled blocks) or missing; failures still block.
+    #[arg(
+        long = "poh-verify-allow-unverifiable",
+        env = "SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE",
+        default_value_t = false
+    )]
+    poh_verify_allow_unverifiable: bool,
+
+    /// Hash recomputation threads for the PoH check (0 = all available cores).
+    #[arg(
+        long = "poh-verify-threads",
+        env = "SOLPARQ_POH_VERIFY_THREADS",
+        default_value_t = 0
+    )]
+    poh_verify_threads: usize,
 
     /// Backfill blocks missing from the archive's slot range from Solana RPC
     /// before archiving, by invoking the `superbank` RPC ingestor as a

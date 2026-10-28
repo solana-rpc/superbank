@@ -155,6 +155,10 @@ enum ValidationCategory {
     TransactionMismatch,
     /// Alpenglow block stored without a complete footer.
     FooterMissing,
+    /// superbank-verify found a PoH, tick or chain-linkage failure.
+    PohFailed,
+    /// superbank-verify could not check the slot (no entries rows, chain gap).
+    PohUnverifiable,
 }
 
 impl ValidationCategory {
@@ -164,6 +168,8 @@ impl ValidationCategory {
             ValidationCategory::NotProduced => "not_produced",
             ValidationCategory::TransactionMismatch => "transaction_mismatch",
             ValidationCategory::FooterMissing => "footer_missing",
+            ValidationCategory::PohFailed => "poh_failed",
+            ValidationCategory::PohUnverifiable => "poh_unverifiable",
         }
     }
 }
@@ -1035,6 +1041,20 @@ impl AppState {
                 validation.footer_missing_slots(),
                 validation.footer_missing_ranges.len() as u64,
             );
+            if let Some(poh) = &validation.poh {
+                self.observe_validation_category(
+                    kind_label,
+                    ValidationCategory::PohFailed,
+                    poh.slots_failed,
+                    poh.failed_ranges.len() as u64,
+                );
+                self.observe_validation_category(
+                    kind_label,
+                    ValidationCategory::PohUnverifiable,
+                    poh.slots_unverifiable + poh.slots_missing,
+                    (poh.unverifiable_ranges.len() + poh.missing_ranges.len()) as u64,
+                );
+            }
             // Split mismatches by direction: undercount needs re-ingestion,
             // overcount is dedup-fixable.
             let undercount_slots: u64 = validation
@@ -1288,6 +1308,14 @@ fn classify_skip_reason(report: &ArchiveRunReport) -> Option<String> {
         return Some("user-declined".to_string());
     }
     if reason.contains("validation warnings") {
+        if report
+            .validation
+            .as_ref()
+            .and_then(|validation| validation.poh.as_ref())
+            .is_some_and(|poh| poh.blocks_archive())
+        {
+            return Some("poh-verification".to_string());
+        }
         if report
             .validation
             .as_ref()

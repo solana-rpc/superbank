@@ -189,6 +189,20 @@ pub(crate) struct RunCounters {
     pub(crate) entries_verified: u64,
     pub(crate) hashes_computed: u64,
     pub(crate) findings: BTreeMap<String, u64>,
+    /// Which slots were not ok; only collected when `Args::collect_problem_slots`
+    /// is set (the solparq gate) and never checkpointed.
+    #[serde(skip)]
+    pub(crate) problem_slots: Option<ProblemSlots>,
+}
+
+/// Slots that kept a run from a clean result, for callers that need them by
+/// range rather than as counts.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ProblemSlots {
+    pub(crate) failed: Vec<u64>,
+    pub(crate) unverifiable: Vec<u64>,
+    /// Inclusive spans neither present nor claimed skipped by the chain.
+    pub(crate) missing: Vec<(u64, u64)>,
 }
 
 impl RunCounters {
@@ -199,6 +213,23 @@ impl RunCounters {
             SlotStatus::Unverifiable => self.slots_unverifiable += 1,
             SlotStatus::Skipped => self.slots_skipped += 1,
             SlotStatus::Missing => self.slots_missing += 1,
+        }
+    }
+
+    pub(crate) fn note_problem_slot(&mut self, slot: u64, status: SlotStatus) {
+        let Some(problems) = self.problem_slots.as_mut() else {
+            return;
+        };
+        match status {
+            SlotStatus::Failed => problems.failed.push(slot),
+            SlotStatus::Unverifiable => problems.unverifiable.push(slot),
+            SlotStatus::Ok | SlotStatus::Skipped | SlotStatus::Missing => {}
+        }
+    }
+
+    pub(crate) fn note_missing_span(&mut self, span: (u64, u64)) {
+        if let Some(problems) = self.problem_slots.as_mut() {
+            problems.missing.push(span);
         }
     }
 

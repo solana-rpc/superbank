@@ -9,6 +9,7 @@ use tokio::{fs, io::AsyncWriteExt};
 use crate::{
     archive::ClickHouseBounds,
     config::{Config, FooterCoveragePolicy},
+    poh::PohReport,
 };
 
 #[derive(Debug, Clone)]
@@ -689,6 +690,8 @@ pub struct ValidationReport {
     pub footer_missing_ranges: Vec<SlotRange>,
     /// Footer gaps block the archive (`--footer-coverage-policy require`).
     pub footer_coverage_required: bool,
+    /// superbank-verify result (`--poh-verify-mode`); `None` when it did not run.
+    pub poh: Option<PohReport>,
 }
 
 impl ValidationReport {
@@ -744,6 +747,7 @@ impl ValidationReport {
             rpc_check_error,
             footer_missing_ranges: Vec::new(),
             footer_coverage_required: false,
+            poh: None,
         }
     }
 
@@ -765,13 +769,14 @@ impl ValidationReport {
     }
 
     /// Verified data problems that always block archiving: blocks Solana
-    /// produced but we are missing, transaction-count mismatches, and footer
-    /// gaps when footers are required. Excludes
+    /// produced but we are missing, transaction-count mismatches, footer
+    /// gaps when footers are required, and a blocking PoH result. Excludes
     /// the RPC cross-check *failure*, which is a "couldn't verify" condition
     /// rather than a detected gap.
     pub fn has_data_warnings(&self) -> bool {
         self.missing_blocks.len() + self.transaction_mismatches.len() + self.blocking_footer_gaps()
             > 0
+            || self.poh.as_ref().is_some_and(PohReport::blocks_archive)
     }
 
     fn blocking_footer_gaps(&self) -> usize {
@@ -856,7 +861,7 @@ impl TransactionMismatch {
     }
 }
 
-fn slot_ranges(slots: &[u64]) -> Vec<SlotRange> {
+pub(crate) fn slot_ranges(slots: &[u64]) -> Vec<SlotRange> {
     if slots.is_empty() {
         return Vec::new();
     }

@@ -26,8 +26,8 @@ pub(crate) const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpK
 /// The verifier intentionally bounds slots, not bytes: ClickHouse rows can
 /// vary with transaction and entry density. These limits cap the number of
 /// complete result sets retained by the fetch pipeline.
-const DEFAULT_WINDOW_SLOTS: u64 = 64;
-const DEFAULT_FETCH_AHEAD: usize = 1;
+pub(crate) const DEFAULT_WINDOW_SLOTS: u64 = 64;
+pub(crate) const DEFAULT_FETCH_AHEAD: usize = 1;
 const MAX_WINDOW_SLOTS: u64 = 128;
 const MAX_FETCH_AHEAD: usize = 2;
 const MAX_IN_FLIGHT_WINDOW_SLOTS: u64 = 512;
@@ -402,6 +402,8 @@ pub(crate) struct Args {
     pub(crate) metrics_cluster_label: Option<String>,
     pub(crate) progress_every_slots: u64,
     pub(crate) export_fixture: Option<(u64, PathBuf)>,
+    /// Record which slots failed or stayed unverifiable/missing (library callers).
+    pub(crate) collect_problem_slots: bool,
 }
 
 pub(crate) enum ResolveError {
@@ -653,6 +655,7 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
             config.progress_every_slots,
         ),
         export_fixture,
+        collect_problem_slots: false,
     };
 
     validate_args(&args)?;
@@ -684,7 +687,7 @@ fn resolve_export_fixture(
     }
 }
 
-fn validate_args(args: &Args) -> Result<()> {
+pub(crate) fn validate_args(args: &Args) -> Result<()> {
     if args.export_fixture.is_none() {
         match (args.range.is_some(), args.full) {
             (true, true) => bail!("--range and --full are mutually exclusive"),
