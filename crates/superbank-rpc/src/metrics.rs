@@ -789,6 +789,8 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_backfill_inflight_ranges: Gauge,
     #[cfg(feature = "disk-cache")]
+    disk_cache_given_up_slots: Gauge,
+    #[cfg(feature = "disk-cache")]
     disk_cache_fill_errors_total: Counter,
     #[cfg(feature = "disk-cache")]
     disk_cache_poisoned_slots_total: Counter,
@@ -810,6 +812,10 @@ pub struct Metrics {
     block_index_errors_total: Family<OperationLabels, Counter>,
     #[cfg(feature = "disk-cache")]
     block_index_lookup_seconds: Family<BlockIndexLookupLabels, Histogram>,
+    #[cfg(feature = "disk-cache")]
+    get_transaction_disk_cache_slot_age: Histogram,
+    #[cfg(feature = "disk-cache")]
+    get_transaction_disk_cache_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
     get_transaction_primary_slot_age: Histogram,
     get_transaction_primary_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
 }
@@ -956,6 +962,8 @@ impl Metrics {
         let disk_cache_backfill_slots_remaining = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_backfill_inflight_ranges = Gauge::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_given_up_slots = Gauge::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_fill_errors_total = Counter::default();
         #[cfg(feature = "disk-cache")]
@@ -1449,6 +1457,11 @@ impl Metrics {
                 disk_cache_backfill_inflight_ranges.clone(),
             );
             registry.register(
+                "disk_cache_given_up_slots",
+                "Incomplete slots inside the retention window the forwarder has given up on",
+                disk_cache_given_up_slots.clone(),
+            );
+            registry.register(
                 "disk_cache_fill_errors",
                 "ClickHouse fetch failures in the backfill/repair filler",
                 disk_cache_fill_errors_total.clone(),
@@ -1474,6 +1487,28 @@ impl Metrics {
                 disk_cache_get_tx_reason_total.clone(),
             );
         }
+
+        #[cfg(feature = "disk-cache")]
+        let get_transaction_disk_cache_slot_age = Histogram::new(
+            DISK_CACHE_SLOT_AGE_FINE_BUCKETS
+                .into_iter()
+                .chain(PRIMARY_SLOT_AGE_BUCKETS),
+        );
+        #[cfg(feature = "disk-cache")]
+        registry.register(
+            "rpc_get_transaction_disk_cache_slot_age_slots",
+            "Finalized tip minus slot of getTransaction results served by the local disk cache",
+            get_transaction_disk_cache_slot_age.clone(),
+        );
+        #[cfg(feature = "disk-cache")]
+        let get_transaction_disk_cache_slot_age_skipped_total =
+            Family::<SlotAgeSkipLabels, Counter>::default();
+        #[cfg(feature = "disk-cache")]
+        registry.register(
+            "rpc_get_transaction_disk_cache_slot_age_skipped",
+            "Disk-cache getTransaction results not recorded in the slot-age histogram, by reason",
+            get_transaction_disk_cache_slot_age_skipped_total.clone(),
+        );
 
         let get_transaction_primary_slot_age = Histogram::new(PRIMARY_SLOT_AGE_BUCKETS);
         registry.register(
@@ -1620,6 +1655,8 @@ impl Metrics {
             #[cfg(feature = "disk-cache")]
             disk_cache_backfill_inflight_ranges,
             #[cfg(feature = "disk-cache")]
+            disk_cache_given_up_slots,
+            #[cfg(feature = "disk-cache")]
             disk_cache_fill_errors_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_poisoned_slots_total,
@@ -1641,6 +1678,10 @@ impl Metrics {
             block_index_errors_total,
             #[cfg(feature = "disk-cache")]
             block_index_lookup_seconds,
+            #[cfg(feature = "disk-cache")]
+            get_transaction_disk_cache_slot_age,
+            #[cfg(feature = "disk-cache")]
+            get_transaction_disk_cache_slot_age_skipped_total,
             get_transaction_primary_slot_age,
             get_transaction_primary_slot_age_skipped_total,
         }
@@ -2609,6 +2650,14 @@ pub(crate) fn disk_cache_backfill_inflight(ranges: usize) {
 }
 
 #[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_given_up_slots(slots: usize) {
+    let metrics = metrics();
+    metrics
+        .disk_cache_given_up_slots
+        .set(i64::try_from(slots).unwrap_or(i64::MAX));
+}
+
+#[cfg(feature = "disk-cache")]
 pub(crate) fn disk_cache_fill_error() {
     let metrics = metrics();
     metrics.disk_cache_fill_errors_total.inc();
@@ -2834,9 +2883,9 @@ pub(crate) fn blocks_range_observation(
         .observe(seconds);
 }
 
-/// Slot-age buckets in epochs (432,000 slots): 0.5, 1, 2, 3, 4, 5, 10 and 50 epochs. They
-/// bracket disk-cache retention windows of a few epochs.
-const PRIMARY_SLOT_AGE_BUCKETS: [f64; 8] = [
+/// Slot-age buckets in epochs (432,000 slots): 0.5 to 50 bracket disk-cache retention windows,
+/// then every 100 epochs to 1,000 and a 1,500 bucket cover the full age of the chain.
+const PRIMARY_SLOT_AGE_BUCKETS: [f64; 19] = [
     216_000.0,
     432_000.0,
     864_000.0,
@@ -2845,6 +2894,24 @@ const PRIMARY_SLOT_AGE_BUCKETS: [f64; 8] = [
     2_160_000.0,
     4_320_000.0,
     21_600_000.0,
+    43_200_000.0,
+    86_400_000.0,
+    129_600_000.0,
+    172_800_000.0,
+    216_000_000.0,
+    259_200_000.0,
+    302_400_000.0,
+    345_600_000.0,
+    388_800_000.0,
+    432_000_000.0,
+    648_000_000.0,
+];
+
+/// Bounds placed before the primary epoch bounds: 1,000 slots, just past a 600-slot head-cache
+/// window that serves younger hits, then 10 min, 30 min, 1 h, 3 h, 6 h and 12 h at 400 ms slots.
+#[cfg(feature = "disk-cache")]
+const DISK_CACHE_SLOT_AGE_FINE_BUCKETS: [f64; 7] = [
+    1_000.0, 1_500.0, 4_500.0, 9_000.0, 27_000.0, 54_000.0, 108_000.0,
 ];
 
 /// Records how far behind the finalized tip a getTransaction result served by primary
@@ -2865,6 +2932,25 @@ struct SlotAgeSkipLabels {
 pub(crate) fn get_transaction_primary_slot_age_skipped(reason: &'static str) {
     metrics()
         .get_transaction_primary_slot_age_skipped_total
+        .get_or_create(&SlotAgeSkipLabels { reason })
+        .inc();
+}
+
+/// Records how far behind the finalized tip a getTransaction result served by the local disk
+/// cache is, in slots.
+#[cfg(feature = "disk-cache")]
+pub(crate) fn get_transaction_disk_cache_slot_age(slots: u64) {
+    metrics()
+        .get_transaction_disk_cache_slot_age
+        .observe(slots as f64);
+}
+
+/// Counts a disk-cache getTransaction result left out of the slot-age histogram because no
+/// usable finalized tip was cached (`no_tip`, `stale_tip`).
+#[cfg(feature = "disk-cache")]
+pub(crate) fn get_transaction_disk_cache_slot_age_skipped(reason: &'static str) {
+    metrics()
+        .get_transaction_disk_cache_slot_age_skipped_total
         .get_or_create(&SlotAgeSkipLabels { reason })
         .inc();
 }
@@ -2995,6 +3081,9 @@ mod tests {
         metrics
             .get_transaction_primary_slot_age
             .observe(3_000_000.0);
+        metrics
+            .get_transaction_primary_slot_age
+            .observe(100_000_000.0);
 
         let exported = String::from_utf8(metrics.export().expect("metrics export"))
             .expect("metrics are UTF-8");
@@ -3007,6 +3096,34 @@ mod tests {
         assert!(exported.contains(&bucket("864000.0", 1)), "{exported}");
         assert!(exported.contains(&bucket("2160000.0", 1)), "{exported}");
         assert!(exported.contains(&bucket("4320000.0", 2)), "{exported}");
-        assert!(exported.contains("superbank_rpc_get_transaction_primary_slot_age_slots_count 2"));
+        assert!(exported.contains(&bucket("86400000.0", 2)), "{exported}");
+        assert!(exported.contains(&bucket("129600000.0", 3)), "{exported}");
+        assert!(exported.contains(&bucket("648000000.0", 3)), "{exported}");
+        assert!(exported.contains("superbank_rpc_get_transaction_primary_slot_age_slots_count 3"));
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[test]
+    fn get_transaction_disk_cache_slot_age_adds_fine_buckets_to_epoch_buckets() {
+        let metrics = Metrics::new();
+        metrics.get_transaction_disk_cache_slot_age.observe(1_200.0);
+        metrics
+            .get_transaction_disk_cache_slot_age
+            .observe(30_000.0);
+
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        let name = "superbank_rpc_get_transaction_disk_cache_slot_age_slots";
+        let expected: Vec<f64> = DISK_CACHE_SLOT_AGE_FINE_BUCKETS
+            .into_iter()
+            .chain(PRIMARY_SLOT_AGE_BUCKETS)
+            .collect();
+        assert_eq!(exported_buckets(&exported, name), expected);
+        let bucket = |le: &str, count: u64| format!("{name}_bucket{{le=\"{le}\"}} {count}");
+        assert!(exported.contains(&bucket("1000.0", 0)), "{exported}");
+        assert!(exported.contains(&bucket("1500.0", 1)), "{exported}");
+        assert!(exported.contains(&bucket("27000.0", 1)), "{exported}");
+        assert!(exported.contains(&bucket("54000.0", 2)), "{exported}");
+        assert!(exported.contains(&format!("{name}_count 2")), "{exported}");
     }
 }

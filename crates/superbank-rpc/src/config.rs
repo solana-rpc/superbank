@@ -92,6 +92,11 @@ pub struct RpcConfig {
     )]
     pub(crate) get_transaction_primary_cache_ttl_secs: u64,
 
+    /// Primary getTransaction ClickHouse `max_threads` and `max_threads_for_indexes`;
+    /// zero keeps the server's setting.
+    #[arg(long, env = "GET_TRANSACTION_MAX_THREADS", default_value_t = 0)]
+    pub(crate) get_transaction_max_threads: usize,
+
     /// Let confirmed getBlock requests read and populate the finalized response
     /// cache when their data is provably finalized (set false to disable).
     #[arg(
@@ -982,6 +987,13 @@ pub struct RpcConfig {
     #[arg(long, env = "DISK_CACHE_REPAIR_MIN_LAG_SLOTS", default_value_t = 75)]
     pub(crate) disk_cache_repair_min_lag_slots: u64,
 
+    #[cfg(feature = "disk-cache")]
+    /// Seconds before the forwarder retries a slot it gave up on, in case the
+    /// source has since backfilled it; `0` keeps given-up slots missing until
+    /// they leave the retention window.
+    #[arg(long, env = "DISK_CACHE_GIVEN_UP_RETRY_SECS", default_value_t = 600)]
+    pub(crate) disk_cache_given_up_retry_secs: u64,
+
     // Recognize removed RocksDB settings for one release so operators receive a
     // useful error instead of silently believing they still take effect.
     #[cfg(feature = "disk-cache")]
@@ -1352,6 +1364,7 @@ mod config_tests {
         assert_eq!(cfg.get_block_response_cache_max_bytes, 0);
         assert_eq!(cfg.get_transaction_primary_cache_max_bytes, 0);
         assert_eq!(cfg.get_transaction_primary_cache_ttl_secs, 600);
+        assert_eq!(cfg.get_transaction_max_threads, 0);
         assert!(cfg.get_block_response_cache_share_confirmed);
         assert!(cfg.get_block_response_cache_unsupported_version);
         assert_eq!(cfg.get_block_hydration_parallelism, 4);
@@ -1482,6 +1495,17 @@ mod config_tests {
         ]);
 
         assert!(cfg.clickhouse_get_transaction_single_round_trip);
+    }
+
+    #[test]
+    fn get_transaction_max_threads_flag_and_env_parse() {
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--get-transaction-max-threads", "4"]);
+        assert_eq!(cfg.get_transaction_max_threads, 4);
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _env = EnvVarGuard::set("GET_TRANSACTION_MAX_THREADS", "2");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.get_transaction_max_threads, 2);
     }
 
     #[test]
@@ -1935,6 +1959,7 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_backfill_query_timeout_ms, 30_000);
         assert_eq!(cfg.disk_cache_repair_interval_ms, 5_000);
         assert_eq!(cfg.disk_cache_repair_min_lag_slots, 75);
+        assert_eq!(cfg.disk_cache_given_up_retry_secs, 600);
     }
 
     #[test]
@@ -1965,6 +1990,8 @@ mod disk_cache_config_tests {
             "200",
             "--disk-cache-backfill-concurrency",
             "12",
+            "--disk-cache-given-up-retry-secs",
+            "0",
         ]);
 
         assert!(cfg.disk_cache_enabled);
@@ -1983,6 +2010,7 @@ mod disk_cache_config_tests {
         assert_eq!(cfg.disk_cache_block_index_query_timeout_ms, 120_000);
         assert_eq!(cfg.disk_cache_backfill_max_slots_per_sec, 200);
         assert_eq!(cfg.disk_cache_backfill_concurrency, 12);
+        assert_eq!(cfg.disk_cache_given_up_retry_secs, 0);
     }
 
     #[test]

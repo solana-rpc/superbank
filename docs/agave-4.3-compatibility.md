@@ -13,7 +13,7 @@ For a step-by-step view of one block's banks, commitment and arrival in the head
 | `getBlock` footer | Accepts the SIMD-0307 boolean `footer` option. The default is `false`, a deliberate deviation from the SIMD default, so responses keep the previous shape unless `footer: true` is set. Head-cache blocks carry the footer from the Dragon's Mouth `BlockFooter` update, and return `null` when the stream sent none. Apply the `blocks_metadata.sql` footer columns before upgrading the RPC, because every `getBlock` metadata read selects them. |
 | Confidential-token `jsonParsed` | Uses Agave 4.3's corrected proof-account and signer mapping, including the `proofContextStateAccount` name for confidential supply-key rotation. Consumers must accommodate corrected JSON keys. |
 | Bigtable v1 | The 4.3 storage-proto decoder preserves v1, empty/nonempty inline configuration, lifetime specifiers, and signed bytes. Previously ingested rows are not automatically repaired. |
-| VAT rewards | Preserves negative lamports, balances, and `VATDebit`. Readers accept `VATDebit` and `validator-admission-ticket-debit`; JSON emits `VATDebit` and gRPC emits reward enum value 6. Inflation-reward queries continue to select only staking/voting rewards. |
+| VAT rewards | Preserves negative lamports, balances, and `VATDebit`. Readers accept `VATDebit` and `validator-admission-ticket-debit`; JSON emits `VATDebit` and gRPC emits reward enum value 6. Inflation-reward queries never select `VATDebit`. Like Agave's `getInflationReward`, they select `Voting`, `Staking`, and `DeactivatedStake` rewards, and accept both stored `DeactivatedStake` spellings. |
 
 The existing String reward-type columns and Int64 reward amounts accommodate VAT without a DDL migration. Old commission rows continue to omit unavailable `commissionBps`; no basis-point value is inferred from a percentage.
 
@@ -54,6 +54,7 @@ The checks below cover the Agave 4.3 contract. They need a disposable ClickHouse
 | Disk-cache preservation | Production Native fill and cache reopen preserve raw reward arrays and canonical transaction/block responses for both stored VAT spellings. |
 | Archive preservation | Production Solparq local-bundle export and ingestor restore preserve raw columns and hydrated blocks, including historical absent basis points. |
 | Inflation exclusion | Real query and RPC handler retain staking/voting rewards when the same address also has VAT; a VAT-only address returns null. |
+| Inflation reward types | Real query and RPC handler return `DeactivatedStake` and `deactivated-stake` rewards at a non-partitioned boundary and from partition blocks, on the sequential and cached paths. They ignore stake rewards at a partitioned boundary, and never return `VATDebit` or `Fee`. |
 
 Reproduce the integration checks against a disposable loopback server:
 

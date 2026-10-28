@@ -301,6 +301,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             args.get_signature_statuses_max_concurrency,
             args.get_signature_statuses_max_threads,
         )
+        .with_get_transaction_max_threads(args.get_transaction_max_threads)
         .with_query_timeout(Duration::from_millis(args.clickhouse_query_timeout_ms))
         .with_tcp_access_check_timeout(Duration::from_millis(
             args.clickhouse_tcp_access_check_timeout_ms,
@@ -898,6 +899,7 @@ async fn start_disk_cache(
             query_timeout: Duration::from_millis(args.disk_cache_backfill_query_timeout_ms),
             repair_interval: Duration::from_millis(args.disk_cache_repair_interval_ms),
             repair_min_lag_slots: args.disk_cache_repair_min_lag_slots,
+            given_up_retry: Duration::from_secs(args.disk_cache_given_up_retry_secs),
             ..Default::default()
         });
 
