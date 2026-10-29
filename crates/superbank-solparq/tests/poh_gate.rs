@@ -48,6 +48,8 @@ fn config_defaults_poh_gate_off_and_parses_settings() {
     assert_eq!(config.poh_verify_threads, 0);
 
     let config = parse_config(&[
+        "--alpenglow-genesis-slot",
+        "459652999",
         "--poh-verify-mode",
         "full",
         "--poh-verify-allow-unverifiable",
@@ -60,6 +62,19 @@ fn config_defaults_poh_gate_off_and_parses_settings() {
     assert_eq!(config.poh_verify_threads, 4);
 
     assert!(parse_config(&["--poh-verify-mode", "fast"]).is_err());
+}
+
+#[test]
+fn config_rejects_poh_check_without_alpenglow_boundary() {
+    // Historical rules would fail every post-Alpenglow slot and stall archiving.
+    for mode in ["structural", "full"] {
+        let err = parse_config(&["--poh-verify-mode", mode]).unwrap_err();
+        assert!(
+            err.to_string().contains("--alpenglow-genesis-slot"),
+            "{err}"
+        );
+    }
+    assert!(parse_config(&["--poh-verify-mode", "off"]).is_ok());
 }
 
 #[test]

@@ -277,7 +277,7 @@ export default {
         }),
         opt('SOLPARQ_ALPENGLOW_GENESIS_SLOT', '--alpenglow-genesis-slot', {
           type: 'u64',
-          text: 'Trusted `getAgGenesisCert` `block.slot` for the cluster (mainnet `459652999`). Validation reports stored blocks after it that lack a complete Alpenglow footer. Unset skips the check.',
+          text: 'Trusted `getAgGenesisCert` `block.slot` for the cluster (mainnet `459652999`). Validation reports stored blocks after it that lack a complete Alpenglow footer, and the PoH check applies Alpenglow rules after it. Unset skips the footer check; `--poh-verify-mode` needs it.',
           relations: [{ type: 'see', to: 'SOLPARQ_FOOTER_COVERAGE_POLICY' }],
         }),
         opt('SOLPARQ_FOOTER_COVERAGE_POLICY', '--footer-coverage-policy', {
@@ -289,8 +289,8 @@ export default {
         opt('SOLPARQ_POH_VERIFY_MODE', '--poh-verify-mode', {
           type: 'off | structural | full',
           default: 'off',
-          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules. Uses mainnet cluster parameters.',
-          relations: [{ type: 'see', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules, so any mode other than `off` needs it. Uses mainnet cluster parameters.',
+          relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
         }),
         opt('SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE', '--poh-verify-allow-unverifiable', {
           type: 'bool',

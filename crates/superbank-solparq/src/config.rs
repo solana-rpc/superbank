@@ -162,7 +162,7 @@ impl Config {
     }
 
     fn from_cli(cli: Cli) -> Result<Self> {
-        validate_cadence_and_footer_policy(&cli)?;
+        validate_cadence_and_alpenglow_settings(&cli)?;
         let archive_kinds = parse_archive_kinds(&cli.archive_range_type, cli.custom_slot_range)?;
         if !cli.server_mode && archive_kinds.len() > 1 {
             return Err(anyhow!(
@@ -542,7 +542,8 @@ struct Cli {
     /// Verify Proof-of-History over the archive range with superbank-verify
     /// before writing it: `structural` checks ticks, entries and blockhash
     /// linkage; `full` also recomputes every entry hash. A failure blocks the
-    /// archive. Runs only when the other validation checks pass.
+    /// archive. Runs only when the other validation checks pass. Needs
+    /// `--alpenglow-genesis-slot`.
     #[arg(
         long = "poh-verify-mode",
         env = "SOLPARQ_POH_VERIFY_MODE",
@@ -736,13 +737,20 @@ fn require_s3_value(value: Option<String>, name: &str) -> Result<String> {
     Ok(value)
 }
 
-fn validate_cadence_and_footer_policy(cli: &Cli) -> Result<()> {
+fn validate_cadence_and_alpenglow_settings(cli: &Cli) -> Result<()> {
     hourly_slot_count(cli.hourly_slot_duration_ms)?;
     if cli.footer_coverage_policy == FooterCoveragePolicy::Require
         && cli.alpenglow_genesis_slot.is_none()
     {
         return Err(anyhow!(
             "--footer-coverage-policy require needs --alpenglow-genesis-slot"
+        ));
+    }
+    // Without a boundary every slot is checked with historical PoH rules, so
+    // every post-Alpenglow window would fail and stall archiving.
+    if cli.poh_verify_mode != PohVerifyMode::Off && cli.alpenglow_genesis_slot.is_none() {
+        return Err(anyhow!(
+            "--poh-verify-mode needs --alpenglow-genesis-slot (mainnet: 459652999)"
         ));
     }
     Ok(())
