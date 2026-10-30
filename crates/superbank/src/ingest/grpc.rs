@@ -2895,6 +2895,42 @@ mod tests {
     }
 
     #[test]
+    fn agave44_deep_cpi_survives_yellowstone_wire_and_mapping() {
+        use prost::Message as _;
+        use yellowstone_grpc_proto::prelude::{InnerInstruction, InnerInstructions};
+
+        let mut tx = build_test_transaction_info(None);
+        let heights = vec![
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+            None,
+        ];
+        let meta = tx.meta.as_mut().unwrap();
+        meta.inner_instructions_none = false;
+        meta.inner_instructions = vec![InnerInstructions {
+            index: 0,
+            instructions: heights
+                .iter()
+                .map(|&stack_height| InnerInstruction {
+                    program_id_index: 1,
+                    accounts: vec![0],
+                    data: vec![7],
+                    stack_height,
+                })
+                .collect(),
+        }];
+        let bytes = tx.encode_to_vec();
+        let decoded = SubscribeUpdateTransactionInfo::decode(bytes.as_slice()).unwrap();
+        let row = map_transaction(42, None, &decoded).unwrap();
+        assert_eq!(row.meta_inner_instructions_stack_height, vec![heights]);
+    }
+
+    #[test]
     fn map_transaction_preserves_empty_v1_config_and_deactivated_stake() {
         let mut tx_info = build_test_transaction_info(None);
         let message = tx_info

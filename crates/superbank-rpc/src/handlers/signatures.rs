@@ -111,10 +111,10 @@ pub(crate) async fn handle_get_signature_statuses(
 
     metrics::signature_status_batch_size("input", signatures.len());
 
-    let search_transaction_history = match params.get(1).filter(|value| !value.is_null()) {
+    let config = match params.get(1).filter(|value| !value.is_null()) {
         Some(config_value) => {
             match serde_json::from_value::<GetSignatureStatusesConfig>(config_value.clone()) {
-                Ok(config) => config.search_transaction_history.unwrap_or(false),
+                Ok(config) => config,
                 Err(_) => {
                     route.invalid_params();
                     return Ok(json_rpc_error_response(
@@ -126,8 +126,11 @@ pub(crate) async fn handle_get_signature_statuses(
                 }
             }
         }
-        None => false,
+        None => GetSignatureStatusesConfig::default(),
     };
+    let search_transaction_history = config.search_transaction_history.unwrap_or(false);
+    #[cfg(feature = "grpc-head-cache")]
+    let commitment = config.commitment.unwrap_or(CommitmentLevel::Processed);
 
     let mut inputs: Vec<Option<String>> = Vec::with_capacity(signatures.len());
     let mut unique_valid: Vec<String> = Vec::new();
@@ -151,25 +154,10 @@ pub(crate) async fn handle_get_signature_statuses(
         inputs.push(Some(sig_string));
     }
 
-    let (context_slot, context_source) = match state
-        .resolve_latest_slot_with_source(
-            "get_signature_statuses_context",
-            CommitmentLevel::Finalized,
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            metrics::backend_error("get_latest_finalized_slot");
-            error!("Failed to fetch latest slot for signature statuses: {}", e);
-            return Ok(json_rpc_internal_error_response(id));
-        }
+    let context_slot = match signature_status_context(&state, &mut route, &id, &config).await {
+        Ok(slot) => slot,
+        Err(response) => return Ok(*response),
     };
-    match context_source {
-        LatestSlotSource::ClickHouse => route.source_clickhouse(),
-        #[cfg(feature = "grpc-head-cache")]
-        LatestSlotSource::HeadCache => route.source_head_cache(),
-    }
 
     // The head's trusted finalized tip before its status lookup bounds what that lookup
     // can have seen (see `head_extends_disk`).
@@ -188,7 +176,7 @@ pub(crate) async fn handle_get_signature_statuses(
                 let Ok(sig) = Signature::from_str(sig_str) else {
                     continue;
                 };
-                if let Some(meta) = cache.get_meta(&sig, CommitmentLevel::Processed) {
+                if let Some(meta) = cache.get_meta(&sig, commitment) {
                     head.insert(
                         sig_str.clone(),
                         (
@@ -199,7 +187,7 @@ pub(crate) async fn handle_get_signature_statuses(
                     );
                 }
             }
-            let ctx = context_slot.max(cache.latest_slot());
+            let ctx = context_slot.max(cache.latest_slot_at_least(commitment));
             (head, ctx)
         } else {
             (HashMap::new(), context_slot)
@@ -402,6 +390,45 @@ pub(crate) async fn handle_get_signature_statuses(
     }
     route.success();
     Ok(resp)
+}
+
+async fn signature_status_context(
+    state: &AppState,
+    route: &mut RouteMetric,
+    id: &Value,
+    config: &GetSignatureStatusesConfig,
+) -> Result<u64, Box<Response>> {
+    let commitment = config.commitment.unwrap_or(CommitmentLevel::Processed);
+    let (context_slot, source) = state
+        .resolve_latest_slot_with_source("get_signature_statuses_context", commitment)
+        .await
+        .map_err(|error| {
+            metrics::backend_error("get_latest_finalized_slot");
+            error!(
+                "Failed to fetch latest slot for signature statuses: {}",
+                error
+            );
+            Box::new(json_rpc_internal_error_response(id.clone()))
+        })?;
+    match source {
+        LatestSlotSource::ClickHouse => route.source_clickhouse(),
+        #[cfg(feature = "grpc-head-cache")]
+        LatestSlotSource::HeadCache => route.source_head_cache(),
+    }
+    if config
+        .min_context_slot
+        .is_some_and(|minimum| context_slot < minimum)
+    {
+        route.rpc_error();
+        return Err(Box::new(json_rpc_error_response(
+            id.clone(),
+            solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED
+                as i32,
+            "Minimum context slot has not been reached",
+            Some(json!({ "contextSlot": context_slot })),
+        )));
+    }
+    Ok(context_slot)
 }
 
 /// What this request's local read proved absent, for the history absence cache.

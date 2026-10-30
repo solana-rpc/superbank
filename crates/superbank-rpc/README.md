@@ -3,7 +3,7 @@
 Solana-compatible JSON-RPC server backed by ClickHouse tables produced by `superbank` (or any
 writer that matches the same schemas).
 
-See the [Agave 4.3 compatibility and rollout notes](../../docs/agave-4.3-compatibility.md) for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries. Build with the pinned Rust 1.98.1 toolchain.
+See the [Agave 4.4 compatibility and rollout notes](../../docs/agave-4.4-compatibility.md) for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries. Build with the pinned Rust 1.98.1 toolchain.
 
 ## Supported methods
 
@@ -93,12 +93,13 @@ Notes:
 - Methods that need a latest finalized context return a backend/internal JSON-RPC error when
   ClickHouse has no finalized slot available. This includes `getSlot`, `getBlockHeight`,
   `getTransactionCount`, `getLatestBlockhash`, `getSignatureStatuses`, and min-context checks.
+- `getSignatureStatuses` accepts `commitment` (default `processed`) and `minContextSlot`. Its response context and head-cache lookup use the requested commitment. Without a usable head tip, context falls back to finalized ClickHouse data. An unmet minimum returns `-32016` with `data.contextSlot`.
 - `getSignatureStatuses` looks up recent statuses in the enabled cache tiers: the short-lived head
   cache and, when compiled with `--features disk-cache` and enabled, the finalized disk cache. The
   ClickHouse-backed history tier is searched only when the second param sets
   `searchTransactionHistory: true`; without it, a signature outside the enabled cache retention
   still returns `null`.
-- `getTransaction` accepts the standard Solana config fields plus an optional Superbank extension:
+- `getTransaction` accepts `minContextSlot` and checks the requested commitment context before serving any cache or storage result. An unmet minimum returns `-32016` with `data.contextSlot`; transactions older than the minimum remain returnable. It also accepts an optional Superbank extension:
   - `slot`: optional `u64`; when supplied, ClickHouse is queried directly for that exact slot and
     the response is `null` if the signature is not present in that slot.
 - `getSignaturesForAddress` accepts standard Solana config fields plus optional Superbank extensions:
