@@ -6,6 +6,7 @@ Build superbank, superbank-solparq and superbank-rpc first. Run with
 DISK_CACHE_TEST_URL=http://127.0.0.1:18196 python3 scripts/test/agave43-archive-roundtrip.py
 Only uniquely named test databases are created/dropped. No external RPC is used.
 """
+import base64
 import contextlib
 import http.server
 import json
@@ -67,7 +68,15 @@ def seed(database):
         rewards = (f"[toFixedString('vat',32),toFixedString('stake',32)],[-10,100],"
                    f"[90,200],['{spelling}','Staking'],[NULL,7],{bps}")
         query(f"INSERT INTO {database}.blocks_metadata (slot,parent_slot,blockhash,parent_blockhash,block_height,executed_transaction_count,rewards_present,rewards_pubkey,rewards_lamports,rewards_post_balance,rewards_type,rewards_commission,rewards_commission_bps) VALUES ({slot},{slot-1},toFixedString('hash',32),toFixedString('hash',32),{slot},1,1,{rewards})")
-        query(f"INSERT INTO {database}.transactions (signature,slot,slot_idx,tx_signatures,tx_account_keys,tx_num_required_signatures,meta_status_ok,meta_pre_balances,meta_post_balances,meta_rewards_present,meta_reward_pubkey,meta_reward_lamports,meta_reward_post_balance,meta_reward_type,meta_reward_commission,meta_reward_commission_bps) VALUES (toFixedString('sig-{slot}',64),{slot},0,[toFixedString('sig-{slot}',64)],[toFixedString('key',32)],1,1,[1],[1],1,{rewards})")
+        columns, values = '', ''
+        accounts, balances = "[toFixedString('key',32)]", '[1]'
+        if slot == 10:
+            accounts = "[toFixedString('key',32),toFixedString('program',32)]"
+            balances = '[1,1]'
+            columns = ',tx_version,tx_num_readonly_unsigned_accounts,tx_instructions_program_id_index,tx_instructions_accounts,tx_instructions_data,meta_inner_instructions_present,meta_inner_instructions_index,meta_inner_instructions_program_id_index,meta_inner_instructions_accounts,meta_inner_instructions_data,meta_inner_instructions_stack_height'
+            # V1 prefix/header/accounts/signature/instruction framing use 175 bytes.
+            values = ",1,1,[1],[[0]],[repeat('*',3921)],1,[0],[[1,1,1,1,1,1,1]],[[[0],[0],[0],[0],[0],[0],[0]]],[['a','b','c','d','e','f','g']],[[2,3,4,5,6,7,8]]"
+        query(f"INSERT INTO {database}.transactions (signature,slot,slot_idx,tx_signatures,tx_account_keys,tx_num_required_signatures,meta_status_ok,meta_pre_balances,meta_post_balances,meta_rewards_present,meta_reward_pubkey,meta_reward_lamports,meta_reward_post_balance,meta_reward_type,meta_reward_commission,meta_reward_commission_bps{columns}) VALUES (toFixedString('sig-{slot}',64),{slot},0,[toFixedString('sig-{slot}',64)],{accounts},1,1,{balances},{balances},1,{rewards}{values})")
 
 
 class Reference(http.server.BaseHTTPRequestHandler):
@@ -155,6 +164,16 @@ def responses(database, directory):
                 assert rewards[1]['commission'] == 7, rewards
                 assert rewards[1].get('commissionBps') == (None if slot == 12 else 725), rewards
             result.append(block)
+            if slot == 10:
+                for encoding in ('json', 'jsonParsed', 'base64'):
+                    large = rpc(endpoint, 'getBlock', [slot, {'encoding': encoding, 'maxSupportedTransactionVersion': 1}])
+                    transaction = large['transactions'][0]
+                    assert transaction['version'] == 1, transaction
+                    inner = transaction['meta']['innerInstructions'][0]['instructions']
+                    assert [instruction['stackHeight'] for instruction in inner] == list(range(2, 9)), inner
+                    if encoding == 'base64':
+                        assert len(base64.b64decode(transaction['transaction'][0])) == 4096
+                    result.append(large)
     return result
 
 
@@ -187,7 +206,7 @@ def main():
             after = query(f'SELECT {fields} FROM {restored}.{table} ORDER BY slot FORMAT JSONEachRow')
             assert after == before, table
         assert responses(restored, directory) == expected
-        print('PASS: production archive/restore preserves reward columns and hydrated blocks')
+        print('PASS: production archive/restore preserves rewards, 4096-byte v1 transactions and deep CPI metadata')
         print('Artifacts:', directory)
     finally:
         reference.shutdown()

@@ -63,6 +63,7 @@ async fn transaction_response(
 }
 
 async fn assert_transaction_fallback(source: &ClickHouseClient, cache: &DiskCache) {
+    Box::pin(assert_transaction_minimum_context(source, cache)).await;
     for encoding in ["json", "jsonParsed", "base58", "base64"] {
         let config = serde_json::json!({"slot": 45, "encoding": encoding, "maxSupportedTransactionVersion": 0});
         let expected = transaction_response(source, None, signature(45), config.clone()).await;
@@ -70,6 +71,29 @@ async fn assert_transaction_fallback(source: &ClickHouseClient, cache: &DiskCach
         assert_eq!(expected["result"]["slot"], 45);
         let actual = transaction_response(source, Some(cache), signature(45), config).await;
         assert_eq!(actual, expected);
+    }
+}
+
+async fn assert_transaction_minimum_context(source: &ClickHouseClient, cache: &DiskCache) {
+    for (sig, found) in [(signature(45), true), (signature(999_999), false)] {
+        let accepted = Box::pin(transaction_response(
+            source,
+            Some(cache),
+            sig,
+            serde_json::json!({"slot": 45, "minContextSlot": 1}),
+        ))
+        .await;
+        assert!(accepted.get("error").is_none(), "{accepted}");
+        assert_eq!(!accepted["result"].is_null(), found);
+        let rejected = Box::pin(transaction_response(
+            source,
+            Some(cache),
+            sig,
+            serde_json::json!({"slot": 45, "minContextSlot": 2}),
+        ))
+        .await;
+        assert_eq!(rejected["error"]["code"], -32016);
+        assert_eq!(rejected["error"]["data"]["contextSlot"], 1);
     }
 }
 

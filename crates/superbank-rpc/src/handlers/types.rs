@@ -151,10 +151,12 @@ pub(crate) struct GetTransactionsForAddressOptions {
 
 pub(crate) const MAX_GET_BLOCKS_RANGE: u64 = 500_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct GetSignatureStatusesConfig {
-    #[serde(rename = "searchTransactionHistory")]
     pub(crate) search_transaction_history: Option<bool>,
+    pub(crate) commitment: Option<solana_commitment_config::CommitmentLevel>,
+    pub(crate) min_context_slot: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

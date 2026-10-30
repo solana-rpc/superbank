@@ -540,6 +540,94 @@ mod tests {
     }
 
     #[test]
+    fn agave44_maximum_v1_and_deep_cpi_survive_hydration_and_streaming() {
+        use base64::Engine as _;
+        use solana_transaction_status::UiTransactionEncoding;
+
+        let mut record = record_with_accounts(vec![[1; 32], [2; 32]]);
+        record.tx_version = Some(1);
+        record.tx_num_readonly_unsigned_accounts = 1;
+        record.tx_instructions_program_id_index = vec![1];
+        record.tx_instructions_accounts = vec![vec![0]];
+        record.tx_instructions_data = vec![vec![]];
+        record.meta_pre_balances = vec![10_000, 1];
+        record.meta_post_balances = vec![5_000, 1];
+        let overhead = wincode::serialize(&build_versioned_transaction(&record).unwrap())
+            .unwrap()
+            .len();
+        record.tx_instructions_data[0] =
+            vec![42; solana_message::v1::MAX_TRANSACTION_SIZE - overhead];
+        let heights = vec![
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+            None,
+        ];
+        record.meta_inner_instructions_present = true;
+        record.meta_inner_instructions_index = vec![0];
+        record.meta_inner_instructions_program_id_index = vec![vec![1; heights.len()]];
+        record.meta_inner_instructions_accounts = vec![vec![vec![0]; heights.len()]];
+        record.meta_inner_instructions_data = vec![vec![vec![7]; heights.len()]];
+        record.meta_inner_instructions_stack_height = vec![heights.clone()];
+
+        let tx = build_versioned_transaction(&record).unwrap();
+        tx.sanitize().unwrap();
+        let expected = wincode::serialize(&tx).unwrap();
+        assert_eq!(expected.len(), solana_message::v1::MAX_TRANSACTION_SIZE);
+        assert_eq!(serialize_transaction(tx).unwrap(), expected);
+        let meta = build_transaction_status_meta(&record).unwrap().unwrap();
+        let bytes = encode_transaction_status_meta(&meta).unwrap();
+        let decoded = storage_proto::TransactionStatusMeta::decode(bytes.as_slice()).unwrap();
+        assert_eq!(
+            decoded.inner_instructions[0]
+                .instructions
+                .iter()
+                .map(|ix| ix.stack_height)
+                .collect::<Vec<_>>(),
+            heights
+        );
+
+        for encoding in [
+            UiTransactionEncoding::Json,
+            UiTransactionEncoding::JsonParsed,
+            UiTransactionEncoding::Base64,
+        ] {
+            let hydrated =
+                crate::hydration::hydrate_transaction_record(&record, encoding, Some(1)).unwrap();
+            let json = serde_json::to_value(hydrated).unwrap();
+            assert_eq!(json["version"], 1);
+            assert_eq!(
+                json["meta"]["innerInstructions"][0]["instructions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|ix| ix["stackHeight"].as_u64())
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                    Some(7),
+                    Some(8),
+                    None,
+                ]
+            );
+            if encoding == UiTransactionEncoding::Base64 {
+                let wire = base64::engine::general_purpose::STANDARD
+                    .decode(json["transaction"][0].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(wire, expected);
+            }
+        }
+    }
+
+    #[test]
     fn metadata_wire_matches_agave_for_absent_and_populated_fields() {
         use solana_account_decoder_client_types::token::UiTokenAmount;
         use solana_message::{compiled_instruction::CompiledInstruction, v0::LoadedAddresses};
