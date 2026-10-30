@@ -296,7 +296,7 @@ export default {
       id: 'clickhouse',
       title: 'ClickHouse connection',
       items: [
-        opt('CLICKHOUSE_URL', { type: 'url', default: 'http://localhost:8123', text: 'HTTP endpoint of the source ClickHouse cluster.' }),
+        opt('CLICKHOUSE_URL', { type: 'url', default: 'http://localhost:8123', text: 'HTTP or HTTPS endpoint of the source ClickHouse cluster. An `https://` URL uses TLS with the system CA roots and never falls back to plain HTTP.' }),
         opt('CLICKHOUSE_DATABASE', { type: 'string', default: 'default', text: 'Database for the connection.' }),
         opt('CLICKHOUSE_USER', { type: 'string', default: 'default', text: 'ClickHouse user.' }),
         opt('CLICKHOUSE_PASSWORD', { type: 'string', default: '', secret: true, text: 'ClickHouse password.' }),
@@ -319,7 +319,7 @@ export default {
         opt('CLICKHOUSE_CLUSTER', {
           type: 'string',
           default: '{cluster}',
-          text: 'Cluster used to cancel primary status queries and, in shard-direct scope, for discovery. Macros such as `{cluster}` resolve on the server; empty selects local-only cancellation on a standalone node.',
+          text: 'Cluster used to cancel primary status queries and, in shard-direct scope, for discovery. Macros such as `{cluster}` resolve on the server; empty selects local-only cancellation on a standalone node. Use `default` for a ClickHouse Cloud service.',
         }),
         opt('CLICKHOUSE_STARTUP_VERIFICATION_TIMEOUT_MS', {
           type: 'u64 (ms)',
