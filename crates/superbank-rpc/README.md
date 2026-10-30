@@ -342,6 +342,21 @@ For the Agave 4.2 rollout, apply transaction-column and materialized-view DDL fi
 deploy ingestion with transaction version 1 enabled. Rolling back the RPC binary is safe only
 before v1 or `DeactivatedStake` rows have arrived. The optional ClickHouse forward cache detects
 later source schema changes and rebuilds its owned local database automatically.
+
+## HTTPS endpoints and ClickHouse Cloud
+
+`CLICKHOUSE_URL` accepts `https://` as well as `http://`. An `https://` URL connects over TLS (rustls) and never falls back to plain HTTP. The server certificate is checked against the system CA roots. If the host has no CA roots, the server uses the bundled WebPKI roots and logs a warning. Shard-direct targets use the scheme of `CLICKHOUSE_URL`. The `disk-cache` target uses the scheme of `DISK_CACHE_CLICKHOUSE_URL`, which defaults to plain HTTP on loopback.
+
+To read a ClickHouse Cloud service (HTTPS port 8443):
+
+- Keep `CLICKHOUSE_SCOPE=distributed`, the default. Shard-direct scope and TCP transport need a sharded cluster topology, and a Cloud service has none.
+- Set `CLICKHOUSE_CLUSTER=default`. A Cloud service lists its replicas in the `default` cluster, so cancellation checks reach every replica behind the endpoint. An empty value pins the checks to the replica that answered first, and later checks fail when the load balancer picks another replica. Discovery runs once at startup, so restart the server after the service changes its replica count.
+- Use the single-node layout of `ddl/local` with the default table names (`default.transactions`, `default.blocks_metadata`, `default.gsfa`, `default.signatures`, `default.token_owner_activity`). For another database, set `CLICKHOUSE_TRANSACTION_TABLE`, `CLICKHOUSE_BLOCKS_METADATA_TABLE`, `CLICKHOUSE_GSFA_TABLE`, `CLICKHOUSE_SIGNATURE_STATUSES_TABLE` and `CLICKHOUSE_TOKEN_OWNER_ACTIVITY_TABLE`.
+- Grant the user `SELECT` on the database and `REMOTE` for `clusterAllReplicas`. Do not give it a `readonly=1` profile. Every read sets `readonly=2`, and a `readonly=1` user rejects that.
+- Leave `CLICKHOUSE_GSFA_HOT_ADDRESSES` empty and `CLICKHOUSE_SIGNATURES_OWNER_SHARD_ROUTING` off. Both depend on the clustered layout.
+
+The connection pool closes idle connections after 2 seconds, below the ClickHouse `keep_alive_timeout`. Over TLS every new connection costs a handshake, so a lightly loaded server sees more connection latency than over plain HTTP.
+
 ## Run
 
 ```bash
