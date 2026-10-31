@@ -128,8 +128,8 @@ export default {
         }),
         opt('SOLPARQ_HOURLY_SLOT_DURATION_MS', '--hourly-slot-duration-ms', {
           type: 'u64 (ms)',
-          default: '400',
-          text: 'Nominal slot duration used to size `hourly` archives: 400 gives 9000 slots, 200 gives 18000. Must be positive and divide 3600000 exactly. Alpenglow does not change it.',
+          default: '200',
+          text: 'Nominal slot duration used to size `hourly` archives: 200 gives 18000 slots, 400 gives 9000. Must be positive and divide 3600000 exactly. Alpenglow does not change it.',
           relations: [{ type: 'see', to: 'SOLPARQ_ARCHIVE_RANGE_TYPE' }],
         }),
         opt('SOLPARQ_CUSTOM_SLOT_RANGE', '--custom-slot-range', {
@@ -274,6 +274,35 @@ export default {
           default: 'false',
           text: 'Keep archiving when the produced-slots cross-check cannot run (for example a provider without `getBlocks`). Verified problems such as missing blocks or transaction mismatches still block, and missing-block detection is unavailable for that run.',
           relations: [{ type: 'see', to: 'SOLPARQ_FORCE_ARCHIVE' }],
+        }),
+        opt('SOLPARQ_ALPENGLOW_GENESIS_SLOT', '--alpenglow-genesis-slot', {
+          type: 'u64',
+          text: 'Trusted `getAgGenesisCert` `block.slot` for the cluster (mainnet `459652999`). Validation reports stored blocks after it that lack a complete Alpenglow footer, and the PoH check applies Alpenglow rules after it. Unset skips the footer check; `--poh-verify-mode` needs it.',
+          relations: [{ type: 'see', to: 'SOLPARQ_FOOTER_COVERAGE_POLICY' }],
+        }),
+        opt('SOLPARQ_FOOTER_COVERAGE_POLICY', '--footer-coverage-policy', {
+          type: 'report | require',
+          default: 'report',
+          text: '`report` lists footer gaps and archives anyway. `require` blocks the archive on footer gaps, like other data problems; `--force-archive` still overrides it. `require` needs `--alpenglow-genesis-slot`.',
+          relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+        }),
+        opt('SOLPARQ_POH_VERIFY_MODE', '--poh-verify-mode', {
+          type: 'off | structural | full',
+          default: 'off',
+          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules, so any mode other than `off` needs it. Uses mainnet cluster parameters.',
+          relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+        }),
+        opt('SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE', '--poh-verify-allow-unverifiable', {
+          type: 'bool',
+          default: 'false',
+          text: 'Archive even when the PoH check leaves slots unverifiable (blocks without `entries` rows, such as RPC-backfilled ones) or missing from the chain. PoH failures still block.',
+          relations: [{ type: 'see', to: 'SOLPARQ_POH_VERIFY_MODE' }],
+        }),
+        opt('SOLPARQ_POH_VERIFY_THREADS', '--poh-verify-threads', {
+          type: 'usize',
+          default: '0',
+          text: 'Threads for PoH hash recomputation. `0` uses every available core.',
+          relations: [{ type: 'see', to: 'SOLPARQ_POH_VERIFY_MODE' }],
         }),
         opt('SOLPARQ_REPAIR_MISMATCHES', '--repair-mismatches', {
           type: 'bool',

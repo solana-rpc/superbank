@@ -1,7 +1,7 @@
 use std::{fs::File, path::Path, sync::Arc};
 
 use arrow_array::{
-    ArrayRef, FixedSizeBinaryArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    ArrayRef, FixedSizeBinaryArray, RecordBatch, StringArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::{
@@ -541,4 +541,102 @@ async fn blocks_metadata_archive_without_footer_columns_still_scans() {
             {"slot": 11, "executed_transaction_count": 1}
         ])
     );
+}
+
+/// Legacy, v0 and v1 rows as ClickHouse exports them: `tx_version` and the v1 config are nullable.
+#[tokio::test]
+async fn transactions_v1_config_columns_scan_unchanged() {
+    let (_dir, bundle) = write_test_bundle();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("slot", DataType::UInt64, false),
+        Field::new("slot_idx", DataType::UInt32, false),
+        Field::new("signature", DataType::Utf8, false),
+        Field::new("tx_version", DataType::UInt8, true),
+        Field::new("tx_config_priority_fee", DataType::UInt64, true),
+        Field::new("tx_config_compute_unit_limit", DataType::UInt32, true),
+        Field::new(
+            "tx_config_loaded_accounts_data_size_limit",
+            DataType::UInt32,
+            true,
+        ),
+        Field::new("tx_config_heap_size", DataType::UInt32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 10, 11, 11])) as ArrayRef,
+            Arc::new(UInt32Array::from(vec![0, 1, 0, 1])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                "legacy",
+                "v0",
+                "v1-full",
+                "v1-partial",
+            ])) as ArrayRef,
+            Arc::new(UInt8Array::from(vec![None, Some(0), Some(1), Some(1)])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![None, None, Some(5), None])) as ArrayRef,
+            Arc::new(UInt32Array::from(vec![None, None, Some(19), Some(200_000)])) as ArrayRef,
+            Arc::new(UInt32Array::from(vec![None, None, Some(32_000), None])) as ArrayRef,
+            Arc::new(UInt32Array::from(vec![None, None, Some(262_144), None])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        File::create(bundle.join("transactions.parquet")).unwrap(),
+        schema,
+        None,
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let cli = Cli::try_parse_from([
+        "reader",
+        "scan",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "transactions",
+        "--slot-range",
+        "10-11",
+        "--columns",
+        "signature,tx_version,tx_config_priority_fee,tx_config_compute_unit_limit,tx_config_loaded_accounts_data_size_limit,tx_config_heap_size",
+        "--format",
+        "json",
+    ])
+    .unwrap();
+    let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
+    // An unset v1 config field stays null; it is never filled with a runtime default.
+    assert_eq!(
+        rows,
+        json!([
+            {"signature": "legacy"},
+            {"signature": "v0", "tx_version": 0},
+            {"signature": "v1-full", "tx_version": 1, "tx_config_priority_fee": 5,
+             "tx_config_compute_unit_limit": 19, "tx_config_loaded_accounts_data_size_limit": 32000,
+             "tx_config_heap_size": 262144},
+            {"signature": "v1-partial", "tx_version": 1, "tx_config_compute_unit_limit": 200000}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn transactions_archive_without_v1_config_columns_still_scans() {
+    let (_dir, bundle) = write_test_bundle();
+    let cli = Cli::try_parse_from([
+        "reader",
+        "scan",
+        "--archive",
+        bundle.to_str().unwrap(),
+        "--table",
+        "transactions",
+        "--slot-range",
+        "10-10",
+        "--columns",
+        "slot,signature",
+        "--format",
+        "json",
+    ])
+    .unwrap();
+    let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
+    assert!(!rows.as_array().unwrap().is_empty());
 }

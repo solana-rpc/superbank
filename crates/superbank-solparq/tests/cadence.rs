@@ -28,20 +28,20 @@ fn config(extra: &[&str]) -> anyhow::Result<Config> {
 }
 
 #[test]
-fn default_cadence_preserves_historical_hourly_plan() {
+fn default_cadence_is_two_hundred_ms() {
     let config = config(&[]).expect("default config");
-    assert_eq!(config.hourly_slot_duration_ms, 400);
+    assert_eq!(config.hourly_slot_duration_ms, 200);
     assert_eq!(
         hourly_slot_count(config.hourly_slot_duration_ms).unwrap(),
-        HOURLY_SLOTS
+        18_000
     );
     let bounds = ClickHouseBounds {
         earliest_slot: 427_236_024,
-        latest_slot: 427_245_023,
-        distinct_slots: 9_000,
+        latest_slot: 427_254_023,
+        distinct_slots: 18_000,
     };
-    let historical = plan_next_archive(ArchiveKind::Hourly, bounds, None, true, false)
-        .expect("historical planning");
+    let default = plan_next_archive(ArchiveKind::Hourly, bounds, None, true, false)
+        .expect("default planning");
     let configured = plan_next_archive_with_hourly_slot_duration(
         ArchiveKind::Hourly,
         bounds,
@@ -51,9 +51,35 @@ fn default_cadence_preserves_historical_hourly_plan() {
         config.hourly_slot_duration_ms,
     )
     .expect("configured planning");
-    assert_eq!(configured, historical);
+    assert_eq!(configured, default);
     assert_eq!(
         configured.unwrap().file_name(),
+        "hourly_988_427236024-427254023.parquet"
+    );
+}
+
+#[test]
+fn historical_cadence_keeps_the_nine_thousand_slot_plan() {
+    let config = config(&["--hourly-slot-duration-ms", "400"]).expect("400 ms config");
+    assert_eq!(
+        hourly_slot_count(config.hourly_slot_duration_ms).unwrap(),
+        HOURLY_SLOTS
+    );
+    let plan = plan_next_archive_with_hourly_slot_duration(
+        ArchiveKind::Hourly,
+        ClickHouseBounds {
+            earliest_slot: 427_236_024,
+            latest_slot: 427_245_023,
+            distinct_slots: 9_000,
+        },
+        None,
+        true,
+        false,
+        config.hourly_slot_duration_ms,
+    )
+    .expect("historical planning");
+    assert_eq!(
+        plan.unwrap().file_name(),
         "hourly_988_427236024-427245023.parquet"
     );
 }

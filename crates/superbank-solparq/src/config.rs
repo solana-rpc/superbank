@@ -15,6 +15,23 @@ pub enum ArchiveLocation {
     S3,
 }
 
+/// What validation does with Alpenglow blocks that lack a complete stored footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum FooterCoveragePolicy {
+    Report,
+    Require,
+}
+
+/// Proof-of-History check run by superbank-verify before an archive is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum PohVerifyMode {
+    Off,
+    Structural,
+    Full,
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Config {
     pub bucket_name: String,
@@ -78,6 +95,17 @@ pub struct Config {
     /// (missing blocks, transaction mismatches) still block; only the
     /// "couldn't verify" condition is treated as non-blocking. Off by default.
     pub allow_rpc_validation_failure: bool,
+    /// Trusted Alpenglow genesis certificate slot. Slots after it need a stored footer.
+    pub alpenglow_genesis_slot: Option<u64>,
+    pub footer_coverage_policy: FooterCoveragePolicy,
+    /// Run superbank-verify over the archive range after validation passes; a
+    /// failure blocks the archive like a missing block. Off by default.
+    pub poh_verify_mode: PohVerifyMode,
+    /// Slots the PoH check could not verify (no entries rows, chain gaps) do
+    /// not block the archive; PoH failures still do.
+    pub poh_verify_allow_unverifiable: bool,
+    /// Hash recomputation threads for the PoH check (0 = all available cores).
+    pub poh_verify_threads: usize,
     /// Backfill blocks missing from the archive's slot range (detected by
     /// validation) from Solana RPC before archiving, by invoking the `superbank`
     /// RPC ingestor as a subprocess. Off by default.
@@ -134,7 +162,7 @@ impl Config {
     }
 
     fn from_cli(cli: Cli) -> Result<Self> {
-        hourly_slot_count(cli.hourly_slot_duration_ms)?;
+        validate_cadence_and_alpenglow_settings(&cli)?;
         let archive_kinds = parse_archive_kinds(&cli.archive_range_type, cli.custom_slot_range)?;
         if !cli.server_mode && archive_kinds.len() > 1 {
             return Err(anyhow!(
@@ -221,6 +249,11 @@ impl Config {
             s3_write_checksums: cli.archive_s3_write_checksums,
             force_archive: cli.force_archive,
             allow_rpc_validation_failure: cli.allow_rpc_validation_failure,
+            alpenglow_genesis_slot: cli.alpenglow_genesis_slot,
+            footer_coverage_policy: cli.footer_coverage_policy,
+            poh_verify_mode: cli.poh_verify_mode,
+            poh_verify_allow_unverifiable: cli.poh_verify_allow_unverifiable,
+            poh_verify_threads: cli.poh_verify_threads,
             backfill_gaps: cli.backfill_gaps,
             backfill_superbank_bin: cli.backfill_superbank_bin,
             backfill_include_undercounts: cli.backfill_include_undercounts,
@@ -489,6 +522,53 @@ struct Cli {
     )]
     allow_rpc_validation_failure: bool,
 
+    /// Trusted Alpenglow genesis certificate slot (`getAgGenesisCert` `block.slot`).
+    /// Validation checks the stored footer of every block after it. Unset skips the check.
+    #[arg(
+        long = "alpenglow-genesis-slot",
+        env = "SOLPARQ_ALPENGLOW_GENESIS_SLOT"
+    )]
+    alpenglow_genesis_slot: Option<u64>,
+
+    /// `report` lists Alpenglow blocks without a complete footer; `require` also blocks the archive.
+    #[arg(
+        long = "footer-coverage-policy",
+        env = "SOLPARQ_FOOTER_COVERAGE_POLICY",
+        value_enum,
+        default_value = "report"
+    )]
+    footer_coverage_policy: FooterCoveragePolicy,
+
+    /// Verify Proof-of-History over the archive range with superbank-verify
+    /// before writing it: `structural` checks ticks, entries and blockhash
+    /// linkage; `full` also recomputes every entry hash. A failure blocks the
+    /// archive. Runs only when the other validation checks pass. Needs
+    /// `--alpenglow-genesis-slot`.
+    #[arg(
+        long = "poh-verify-mode",
+        env = "SOLPARQ_POH_VERIFY_MODE",
+        value_enum,
+        default_value = "off"
+    )]
+    poh_verify_mode: PohVerifyMode,
+
+    /// Archive even when the PoH check leaves slots unverifiable (no entries
+    /// rows, e.g. RPC-backfilled blocks) or missing; failures still block.
+    #[arg(
+        long = "poh-verify-allow-unverifiable",
+        env = "SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE",
+        default_value_t = false
+    )]
+    poh_verify_allow_unverifiable: bool,
+
+    /// Hash recomputation threads for the PoH check (0 = all available cores).
+    #[arg(
+        long = "poh-verify-threads",
+        env = "SOLPARQ_POH_VERIFY_THREADS",
+        default_value_t = 0
+    )]
+    poh_verify_threads: usize,
+
     /// Backfill blocks missing from the archive's slot range from Solana RPC
     /// before archiving, by invoking the `superbank` RPC ingestor as a
     /// subprocess. Uses `--solana-rpc-url` and the configured ClickHouse
@@ -655,6 +735,25 @@ fn require_s3_value(value: Option<String>, name: &str) -> Result<String> {
         return Err(anyhow!("{name} is required when archive-location-type=s3"));
     }
     Ok(value)
+}
+
+fn validate_cadence_and_alpenglow_settings(cli: &Cli) -> Result<()> {
+    hourly_slot_count(cli.hourly_slot_duration_ms)?;
+    if cli.footer_coverage_policy == FooterCoveragePolicy::Require
+        && cli.alpenglow_genesis_slot.is_none()
+    {
+        return Err(anyhow!(
+            "--footer-coverage-policy require needs --alpenglow-genesis-slot"
+        ));
+    }
+    // Without a boundary every slot is checked with historical PoH rules, so
+    // every post-Alpenglow window would fail and stall archiving.
+    if cli.poh_verify_mode != PohVerifyMode::Off && cli.alpenglow_genesis_slot.is_none() {
+        return Err(anyhow!(
+            "--poh-verify-mode needs --alpenglow-genesis-slot (mainnet: 459652999)"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_table_name(value: &str) -> Result<()> {
