@@ -495,6 +495,106 @@ fn parent_block(blockhash: [u8; 32]) -> ParentBlock {
 }
 
 #[tokio::test]
+async fn declared_vote_only_rewards_do_not_read_or_cache_a_zero_parent_hash() {
+    for cache_enabled in [false, true] {
+        let mock = Mock::new();
+        let mut state = if cache_enabled {
+            cached_state(&mock).await
+        } else {
+            uncached_state(&mock).await
+        };
+        Arc::get_mut(&mut state).unwrap().clickhouse.http_query_sem = Arc::new(Semaphore::new(1));
+        for _ in 0..2 {
+            let mut boundary = partitioned_boundary(4);
+            boundary.parent_blockhash = Array([0; 32]);
+            mock.add(handlers::provide([boundary]));
+            mock.add(handlers::provide([reward(2, BOUNDARY_SLOT, 77)]));
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                raw_response(&state, &request_for(&[2, 2])),
+            )
+            .await
+            .expect("vote-only lookup must finish without parent recovery");
+            assert_eq!(response.status, StatusCode::OK, "{}", body_json(&response));
+            let body = body_json(&response);
+            assert_eq!(body["result"][0]["amount"], 77);
+            assert_eq!(body["result"][0]["effectiveSlot"], BOUNDARY_SLOT);
+            assert_eq!(body["result"][0], body["result"][1]);
+            assert!(
+                state
+                    .clickhouse
+                    .inflation_epoch_cache
+                    .peek_boundary((BOUNDARY_SLOT, BOUNDARY_SLOT + 432_000))
+                    .await
+                    .is_none()
+            );
+            state
+                .clickhouse
+                .inflation_response_cache
+                .run_pending_tasks()
+                .await;
+            assert_eq!(state.clickhouse.inflation_response_cache.entry_count(), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_request_after_vote_only_recovers_the_parent_before_caching() {
+    const PARTITIONS: u64 = 4;
+    let mock = Mock::new();
+    let mut state = cached_state(&mock).await;
+    Arc::get_mut(&mut state).unwrap().clickhouse.http_query_sem = Arc::new(Semaphore::new(1));
+    let mut boundary = partitioned_boundary(PARTITIONS);
+    boundary.parent_blockhash = Array([0; 32]);
+    mock.add(handlers::provide([boundary]));
+    mock.add(handlers::provide([reward(2, BOUNDARY_SLOT, 77)]));
+    let vote_only = raw_response(&state, &request_for(&[2])).await;
+    assert_eq!(vote_only.status, StatusCode::OK);
+
+    let stake_slot = partition_slot_for(3, PARTITIONS);
+    let mut boundary = partitioned_boundary(PARTITIONS);
+    boundary.parent_blockhash = Array([0; 32]);
+    mock.add(handlers::provide([boundary]));
+    mock.add(handlers::provide([reward(2, BOUNDARY_SLOT, 77)]));
+    mock.add(handlers::provide([parent_block([1; 32])]));
+    mock.add(handlers::provide(partition_slots(PARTITIONS)));
+    mock.add(handlers::provide([reward(3, stake_slot, 88)]));
+    let mixed = tokio::time::timeout(
+        Duration::from_secs(1),
+        raw_response(&state, &request_for(&[2, 3, 4, 2])),
+    )
+    .await
+    .expect("deferred parent recovery must share the workflow's only permit");
+    assert_eq!(mixed.status, StatusCode::OK, "{}", body_json(&mixed));
+    let body = body_json(&mixed);
+    assert_eq!(body["result"][0], body_json(&vote_only)["result"][0]);
+    assert_eq!(body["result"][1]["effectiveSlot"], stake_slot);
+    assert_eq!(body["result"][1]["amount"], 88);
+    assert_eq!(body["result"][2], Value::Null);
+    assert_eq!(body["result"][3], body["result"][0]);
+    let cached_boundary = state
+        .clickhouse
+        .inflation_epoch_cache
+        .peek_boundary((BOUNDARY_SLOT, BOUNDARY_SLOT + 432_000))
+        .await
+        .expect("recovered boundary should be cached");
+    assert_eq!(cached_boundary.parent_blockhash, [1; 32]);
+
+    let reordered = raw_response(&state, &request_for(&[4, 3, 2, 3])).await;
+    assert_eq!(reordered.status, StatusCode::OK);
+    assert_eq!(reordered.sources, "response-cache");
+    assert_eq!(
+        body_json(&reordered)["result"],
+        json!([
+            null,
+            body["result"][1],
+            body["result"][0],
+            body["result"][1]
+        ])
+    );
+}
+
+#[tokio::test]
 async fn zero_parent_hash_is_recovered_for_derived_and_declared_partitions() {
     const PARTITIONS: u64 = 4;
     let stake_slot = partition_slot_for(2, PARTITIONS);
@@ -511,12 +611,14 @@ async fn zero_parent_hash_is_recovered_for_derived_and_declared_partitions() {
         if !declared {
             mock.add(handlers::provide(boundary_stake(false)));
             mock.add(handlers::provide(layout(PARTITIONS)));
+        } else {
+            mock.add(handlers::provide(Vec::<Reward>::new()));
         }
         mock.add(handlers::provide([parent_block([1; 32])]));
         if !declared {
             mock.add(handlers::provide(samples(PARTITIONS)));
+            mock.add(handlers::provide(Vec::<Reward>::new()));
         }
-        mock.add(handlers::provide(Vec::<Reward>::new()));
         mock.add(handlers::provide(partition_slots(PARTITIONS)));
         mock.add(handlers::provide([reward(2, stake_slot, 77)]));
         let cold = rewards_body(&state).await;
@@ -563,6 +665,7 @@ async fn missing_or_zero_parent_blockhash_is_not_cached() {
         let mut boundary = partitioned_boundary(PARTITIONS);
         boundary.parent_blockhash = Array([0; 32]);
         mock.add(handlers::provide([boundary]));
+        mock.add(handlers::provide(Vec::<Reward>::new()));
         let parent_query = if let Some(parent) = parent {
             mock.add(handlers::provide([parent]));
             None
@@ -586,8 +689,8 @@ async fn missing_or_zero_parent_blockhash_is_not_cached() {
     let mut boundary = partitioned_boundary(PARTITIONS);
     boundary.parent_blockhash = Array([0; 32]);
     mock.add(handlers::provide([boundary]));
-    mock.add(handlers::provide([parent_block([1; 32])]));
     mock.add(handlers::provide(Vec::<Reward>::new()));
+    mock.add(handlers::provide([parent_block([1; 32])]));
     mock.add(handlers::provide(partition_slots(PARTITIONS)));
     mock.add(handlers::provide([reward(2, stake_slot, 77)]));
     let repaired = rewards_body(&state).await;

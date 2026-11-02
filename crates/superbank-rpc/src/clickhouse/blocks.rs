@@ -760,15 +760,11 @@ fn validate_inflation_partition_samples(
 
 async fn recover_inflation_parent_blockhash(
     primary: &ClickHouseClient,
-    boundary: &mut InflationBoundaryRow,
+    boundary_slot: u64,
+    parent_slot: u64,
     settings_clause: &str,
     timings: &mut QueryTimings,
-) -> ProcessingResult<()> {
-    if boundary.parent_blockhash.0 != [0; 32] {
-        return Ok(());
-    }
-
-    let parent_slot = boundary.parent_slot;
+) -> ProcessingResult<[u8; 32]> {
     let parent_epoch = parent_slot / SLOT_SHARD_DIVISOR;
     let query = format!(
         "SELECT blockhash, block_height
@@ -790,12 +786,10 @@ async fn recover_inflation_parent_blockhash(
     timings.add(parent_timings);
     let parent = parent.filter(|parent| parent.blockhash.0 != [0; 32]).ok_or_else(|| {
         ProcessingError::database_msg(format!(
-            "inflation boundary slot {} has no parent blockhash and parent slot {parent_slot} has no usable blockhash",
-            boundary.slot
+            "inflation boundary slot {boundary_slot} has no parent blockhash and parent slot {parent_slot} has no usable blockhash"
         ))
     })?;
-    boundary.parent_blockhash = parent.blockhash;
-    Ok(())
+    Ok(parent.blockhash.0)
 }
 
 /// Derives the partition count of a boundary that declares none. Returns `None` when the boundary
@@ -914,7 +908,16 @@ async fn derive_inflation_partition_count(
         return Ok(Err("derived partition run is empty".to_string()));
     };
 
-    recover_inflation_parent_blockhash(primary, boundary, settings_clause, timings).await?;
+    if boundary.parent_blockhash.0 == [0; 32] {
+        boundary.parent_blockhash.0 = recover_inflation_parent_blockhash(
+            primary,
+            boundary.slot,
+            boundary.parent_slot,
+            settings_clause,
+            timings,
+        )
+        .await?;
+    }
     let sample_query =
         build_inflation_partition_sample_query(table, first_slot, last_slot, settings_clause);
     let sample_started = Instant::now();
@@ -1956,8 +1959,9 @@ impl ClickHouseClient {
             };
         let execute = async {
             let mut timings = QueryTimings::zero();
+            let mut boundary_parent_slot = None;
 
-            let boundary = if let Some(cached) = &cached_epoch {
+            let mut boundary = if let Some(cached) = &cached_epoch {
                 cached.boundary.clone()
             } else {
                 let boundary_query = build_inflation_boundary_query(
@@ -2004,6 +2008,7 @@ impl ClickHouseClient {
                         boundary.slot
                     )));
                 }
+                boundary_parent_slot = Some(boundary.parent_slot);
 
                 let num_partitions = match boundary.rewards_num_partitions {
                     Some(num_partitions) => {
@@ -2021,13 +2026,6 @@ impl ClickHouseClient {
                                 "inflation epoch {epoch} declares unsupported reward partition count {num_partitions}"
                             )));
                         }
-                        recover_inflation_parent_blockhash(
-                            self,
-                            &mut boundary,
-                            &settings_clause,
-                            &mut timings,
-                        )
-                        .await?;
                         Some(num_partitions)
                     }
                     // Some stored boundaries lack the `numRewardPartitions` that Agave reports;
@@ -2078,9 +2076,11 @@ impl ClickHouseClient {
                     block_height: boundary.block_height,
                     num_partitions,
                 };
-                // A partitioned boundary without a block height cannot serve partition lookups and
-                // may be repaired on the primary, so only fully usable boundaries are cached.
-                if boundary.num_partitions.is_none() || boundary.block_height.is_some() {
+                // Partition routing needs both a block height and a usable parent hash.
+                // Keep incomplete metadata out of the cache so later reads can observe repairs.
+                if boundary.num_partitions.is_none()
+                    || (boundary.block_height.is_some() && boundary.parent_blockhash != [0; 32])
+                {
                     self.inflation_epoch_cache
                         .insert_boundary(epoch_cache_key, boundary.clone())
                         .await;
@@ -2350,6 +2350,26 @@ impl ClickHouseClient {
                     &boundary,
                     boundary.slot,
                 ));
+            }
+
+            if boundary.parent_blockhash == [0; 32] {
+                let parent_slot = boundary_parent_slot.ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "inflation boundary slot {} has no parent slot for blockhash recovery",
+                        boundary.slot
+                    ))
+                })?;
+                boundary.parent_blockhash = recover_inflation_parent_blockhash(
+                    self,
+                    boundary.slot,
+                    parent_slot,
+                    &settings_clause,
+                    &mut timings,
+                )
+                .await?;
+                self.inflation_epoch_cache
+                    .insert_boundary(epoch_cache_key, boundary.clone())
+                    .await;
             }
 
             let partition_plan = plan_inflation_reward_partitions(
@@ -3696,19 +3716,18 @@ mod tests {
             blockhash: Array([7; 32]),
             block_height: Some(1_000),
         }]));
-        let mut boundary = super::InflationBoundaryRow {
-            slot: 19_008_002,
-            parent_slot: 19_007_998,
-            parent_blockhash: Array([0; 32]),
-            block_height: Some(1_001),
-            rewards_num_partitions: Some(4),
-        };
         let mut timings = super::QueryTimings::zero();
         let settings = primary.inflation_reward_settings_clause("get_inflation_rewards_for_epoch");
-        super::recover_inflation_parent_blockhash(primary, &mut boundary, &settings, &mut timings)
-            .await
-            .unwrap();
-        assert_eq!(boundary.parent_blockhash.0, [7; 32]);
+        let parent_hash = super::recover_inflation_parent_blockhash(
+            primary,
+            19_008_002,
+            19_007_998,
+            &settings,
+            &mut timings,
+        )
+        .await
+        .unwrap();
+        assert_eq!(parent_hash, [7; 32]);
         assert_eq!(timings.rows_returned, 1);
     }
 
