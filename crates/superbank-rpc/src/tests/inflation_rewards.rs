@@ -481,6 +481,132 @@ fn add_derivation(mock: &Mock, partitions: u64) {
     mock.add(handlers::provide(samples(partitions)));
 }
 
+#[derive(Serialize, clickhouse::Row)]
+struct ParentBlock {
+    blockhash: Array<u8, 32>,
+    block_height: Option<u64>,
+}
+
+fn parent_block(blockhash: [u8; 32]) -> ParentBlock {
+    ParentBlock {
+        blockhash: Array(blockhash),
+        block_height: Some(BOUNDARY_HEIGHT - 1),
+    }
+}
+
+#[tokio::test]
+async fn zero_parent_hash_is_recovered_for_derived_and_declared_partitions() {
+    const PARTITIONS: u64 = 4;
+    let stake_slot = partition_slot_for(2, PARTITIONS);
+    for declared in [false, true] {
+        let mock = Mock::new();
+        let state = initialized_state(&mock).await;
+        let mut boundary = if declared {
+            partitioned_boundary(PARTITIONS)
+        } else {
+            undeclared_boundary()
+        };
+        boundary.parent_blockhash = Array([0; 32]);
+        mock.add(handlers::provide([boundary]));
+        if !declared {
+            mock.add(handlers::provide(boundary_stake(false)));
+            mock.add(handlers::provide(layout(PARTITIONS)));
+        }
+        mock.add(handlers::provide([parent_block([1; 32])]));
+        if !declared {
+            mock.add(handlers::provide(samples(PARTITIONS)));
+        }
+        mock.add(handlers::provide(Vec::<Reward>::new()));
+        mock.add(handlers::provide(partition_slots(PARTITIONS)));
+        mock.add(handlers::provide([reward(2, stake_slot, 77)]));
+        let cold = rewards_body(&state).await;
+        assert_eq!(cold["result"][0]["effectiveSlot"], stake_slot);
+        assert_eq!(cold["result"][0]["amount"], 77);
+        assert_eq!(cold["result"][1], Value::Null);
+        assert_eq!(cold["result"][0], cold["result"][2]);
+        mock.add(handlers::provide([reward(2, stake_slot, 77)]));
+        assert_eq!(rewards_body(&state).await, cold);
+    }
+}
+
+#[tokio::test]
+async fn zero_parent_hash_is_recovered_without_the_epoch_cache_or_extra_admission() {
+    const PARTITIONS: u64 = 4;
+    let stake_slot = partition_slot_for(2, PARTITIONS);
+    let mock = Mock::new();
+    let mut state = uncached_state(&mock).await;
+    Arc::get_mut(&mut state).unwrap().clickhouse.http_query_sem = Arc::new(Semaphore::new(1));
+    for _ in 0..2 {
+        let mut boundary = undeclared_boundary();
+        boundary.parent_blockhash = Array([0; 32]);
+        mock.add(handlers::provide([boundary]));
+        mock.add(handlers::provide(boundary_stake(false)));
+        mock.add(handlers::provide(layout(PARTITIONS)));
+        mock.add(handlers::provide([parent_block([1; 32])]));
+        mock.add(handlers::provide(samples(PARTITIONS)));
+        mock.add(handlers::provide(Vec::<Reward>::new()));
+        mock.add(handlers::provide(partition_slots(PARTITIONS)));
+        mock.add(handlers::provide([reward(2, stake_slot, 77)]));
+        let body = tokio::time::timeout(Duration::from_secs(1), rewards_body(&state))
+            .await
+            .expect("parent recovery must share the workflow's only permit");
+        assert_eq!(body["result"][0]["effectiveSlot"], stake_slot);
+    }
+}
+
+#[tokio::test]
+async fn missing_or_zero_parent_blockhash_is_not_cached() {
+    const PARTITIONS: u64 = 4;
+    let mock = Mock::new();
+    let state = initialized_state(&mock).await;
+    for parent in [None, Some(parent_block([0; 32]))] {
+        let mut boundary = partitioned_boundary(PARTITIONS);
+        boundary.parent_blockhash = Array([0; 32]);
+        mock.add(handlers::provide([boundary]));
+        let parent_query = if let Some(parent) = parent {
+            mock.add(handlers::provide([parent]));
+            None
+        } else {
+            Some(mock.add(handlers::record_ddl()))
+        };
+        let response = handle_json_rpc_value(state.clone(), &request()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = parse_json_value_response(response).await;
+        assert_eq!(body["error"]["code"], -32603);
+        if let Some(parent_query) = parent_query {
+            let query = parent_query.query().await;
+            assert!(query.contains("FROM default.blocks_metadata"), "{query}");
+            assert!(query.contains("slot = 19007999"), "{query}");
+            assert!(query.contains("intDiv(slot, 432000) = 43"), "{query}");
+            assert!(query.contains("max_threads=2"), "{query}");
+            assert!(query.contains("max_bytes_to_read="), "{query}");
+        }
+    }
+    let stake_slot = partition_slot_for(2, PARTITIONS);
+    let mut boundary = partitioned_boundary(PARTITIONS);
+    boundary.parent_blockhash = Array([0; 32]);
+    mock.add(handlers::provide([boundary]));
+    mock.add(handlers::provide([parent_block([1; 32])]));
+    mock.add(handlers::provide(Vec::<Reward>::new()));
+    mock.add(handlers::provide(partition_slots(PARTITIONS)));
+    mock.add(handlers::provide([reward(2, stake_slot, 77)]));
+    let repaired = rewards_body(&state).await;
+    assert_eq!(repaired["result"][0]["effectiveSlot"], stake_slot);
+}
+
+#[tokio::test]
+async fn zero_parent_hash_is_unused_for_non_partitioned_rewards() {
+    let mock = Mock::new();
+    let state = initialized_state(&mock).await;
+    let mut boundary = undeclared_boundary();
+    boundary.parent_blockhash = Array([0; 32]);
+    mock.add(handlers::provide([boundary]));
+    mock.add(handlers::provide(boundary_stake(true)));
+    mock.add(handlers::provide([reward(2, BOUNDARY_SLOT, 42)]));
+    let body = rewards_body(&state).await;
+    assert_eq!(body["result"][0]["amount"], 42);
+}
+
 #[tokio::test]
 async fn undeclared_partition_count_is_derived_and_matches_a_declared_count() {
     const PARTITIONS: u64 = 4;
