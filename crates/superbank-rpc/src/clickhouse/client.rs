@@ -4,8 +4,8 @@
  */
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::solana_sdk::pubkey::Pubkey;
@@ -18,6 +18,7 @@ use futures_util::future::join_all;
 use hyper_util::client::legacy::{Client as HyperClient, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use reqwest::Url;
+use rustls_platform_verifier::BuilderVerifierExt;
 use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -498,14 +499,48 @@ struct TableDefinitionRow {
 const HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
+/// TLS settings for `https://` ClickHouse endpoints, built once per process.
+static CLICKHOUSE_TLS_CONFIG: LazyLock<rustls::ClientConfig> = LazyLock::new(clickhouse_tls_config);
+
+/// Uses the system CA roots, or the bundled WebPKI roots when the host has none.
+fn clickhouse_tls_config() -> rustls::ClientConfig {
+    let builder = || {
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("the aws-lc-rs provider supports the default TLS versions")
+    };
+    match builder().with_platform_verifier() {
+        Ok(builder) => builder.with_no_client_auth(),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "ClickHouse TLS: no system CA roots; using the bundled WebPKI roots"
+            );
+            let roots = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+    }
+}
+
+fn is_https_url(url: &str) -> bool {
+    url.get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
 /// Builds a ClickHouse HTTP client over an explicitly-configured hyper connection pool.
 ///
 /// The `clickhouse` crate's default HTTP client sets no connect timeout, so a new connection
 /// attempt can hang during ClickHouse backpressure. Build the underlying hyper client explicitly
 /// so connects fail fast, while preserving the crate's idle-timeout behavior.
 ///
-/// NB: this mirrors the crate default's plain-HTTP connector. superbank builds `clickhouse`
-/// without a TLS feature, so ClickHouse connections are HTTP-only, the same as before.
+/// An `https://` URL connects over rustls and refuses plain HTTP. Any other URL keeps the plain
+/// HTTP connector.
 pub(super) fn build_clickhouse_http_client(
     url: &str,
     database: &str,
@@ -516,15 +551,23 @@ pub(super) fn build_clickhouse_http_client(
     let mut connector = HttpConnector::new();
     connector.set_keepalive(Some(HTTP_TCP_KEEPALIVE));
     connector.set_connect_timeout(Some(connect_timeout));
-    connector.enforce_http(true);
+    let pool = HyperClient::builder(TokioExecutor::new())
+        .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT)
+        .clone();
 
-    let mut client = HttpClient::with_http_client(
-        HyperClient::builder(TokioExecutor::new())
-            .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT)
-            .build(connector),
-    )
-    .with_url(url)
-    .with_database(database);
+    let client = if is_https_url(url) {
+        connector.enforce_http(false);
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(CLICKHOUSE_TLS_CONFIG.clone())
+            .https_only()
+            .enable_http1()
+            .wrap_connector(connector);
+        HttpClient::with_http_client(pool.build(connector))
+    } else {
+        connector.enforce_http(true);
+        HttpClient::with_http_client(pool.build(connector))
+    };
+    let mut client = client.with_url(url).with_database(database);
 
     if !username.is_empty() {
         client = client.with_user(username);
@@ -2640,6 +2683,71 @@ mod tests {
         assert_eq!(shard.read_endpoint.verification_timeouts(), budgets);
         client.set_http_client_for_tests(clickhouse::Client::default());
         assert_eq!(client.read_endpoint.verification_timeouts(), budgets);
+    }
+
+    /// Returns the first bytes the client sends to a local listener for a `SELECT 1`.
+    async fn first_bytes_sent(scheme: &str) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let client =
+            super::build_clickhouse_http_client(&url, "default", "", "", Duration::from_secs(1));
+        let query = tokio::spawn(async move { client.query("SELECT 1").fetch_one::<u8>().await });
+        let bytes = tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0_u8; 4];
+            socket.read_exact(&mut bytes).await.unwrap();
+            bytes
+        })
+        .await
+        .expect("the client must connect and send to the listener");
+        query.abort();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn https_url_starts_a_tls_handshake() {
+        // A TLS record starts with content type 0x16 (handshake) and major version 3.
+        let bytes = first_bytes_sent("https").await;
+        assert_eq!(&bytes[..2], &[0x16, 0x03]);
+    }
+
+    #[tokio::test]
+    async fn http_url_sends_plain_http() {
+        assert_eq!(first_bytes_sent("http").await, b"POST");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SUPERBANK_HTTPS_CLICKHOUSE_TEST_URL=https://[user[:password]@]host:port"]
+    async fn https_endpoint_answers_a_query() {
+        let raw = std::env::var("SUPERBANK_HTTPS_CLICKHOUSE_TEST_URL")
+            .expect("set SUPERBANK_HTTPS_CLICKHOUSE_TEST_URL");
+        let mut url = reqwest::Url::parse(&raw).expect("valid URL");
+        let user = url.username().to_string();
+        let password = url.password().unwrap_or_default().to_string();
+        url.set_username("").unwrap();
+        url.set_password(None).unwrap();
+        let client = super::build_clickhouse_http_client(
+            url.as_str().trim_end_matches('/'),
+            "default",
+            &user,
+            &password,
+            Duration::from_secs(5),
+        );
+        let value = client
+            .query("SELECT toUInt8(1)")
+            .fetch_one::<u8>()
+            .await
+            .expect("query over HTTPS");
+        assert_eq!(value, 1);
+    }
+
+    #[test]
+    fn https_scheme_detection_ignores_case() {
+        assert!(super::is_https_url("https://example.clickhouse.cloud:8443"));
+        assert!(super::is_https_url("HTTPS://example.clickhouse.cloud:8443"));
+        assert!(!super::is_https_url("http://127.0.0.1:8123"));
+        assert!(!super::is_https_url("https"));
     }
 
     #[tokio::test]
