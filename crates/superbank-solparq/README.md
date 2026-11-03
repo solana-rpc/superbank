@@ -671,6 +671,8 @@ The produced-slots check calls Solana `getBlocks`. Some RPC providers disable
 `--server-mode` archiving is skipped (it requires `--force-archive`), even when
 the block and transaction-count checks are clean.
 
+Rate limits and short outages do not fail the check at once. solparq tries each `getBlocks` call up to 4 times. It retries on HTTP 429, HTTP 5xx, JSON-RPC error code 429, timeouts and connection failures. It waits 1 s, 2 s, then 4 s between tries, or the `Retry-After` value when the server sends one, capped at 10 s. Each retry logs a `Solana RPC getBlocks failed; retrying` warning. Other RPC errors, such as `Bad method`, fail at once. When all tries fail, `rpc_check_error` ends with `(after N attempts)`.
+
 Set `--allow-rpc-validation-failure` (`SOLPARQ_ALLOW_RPC_VALIDATION_FAILURE`) to
 let archiving proceed when *only* the RPC cross-check failed. Unlike
 `--force-archive`, this still blocks on verified data problems (missing blocks,

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, path::Path};
+use std::{collections::HashSet, fmt, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -1061,6 +1061,92 @@ async fn fetch_solana_produced_slots(
     start_slot: u64,
     end_slot: u64,
 ) -> Result<Vec<u64>> {
+    fetch_solana_produced_slots_with_retry(rpc_url, start_slot, end_slot, RpcRetryPolicy::DEFAULT)
+        .await
+}
+
+/// Bounded backoff for the `getBlocks` cross-check, so a short rate-limit burst does not skip the run.
+#[derive(Debug, Clone, Copy)]
+struct RpcRetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl RpcRetryPolicy {
+    const DEFAULT: Self = Self {
+        max_attempts: 4,
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(10),
+    };
+
+    /// Delay before retry `attempt` (1-based): `Retry-After` if given, else exponential; both capped.
+    fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        let backoff = self
+            .base_delay
+            .saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+        retry_after.unwrap_or(backoff).min(self.max_delay)
+    }
+}
+
+/// One failed `getBlocks` attempt: the error, whether a retry may help, and any `Retry-After`.
+struct RpcAttemptError {
+    error: anyhow::Error,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+async fn fetch_solana_produced_slots_with_retry(
+    rpc_url: &str,
+    start_slot: u64,
+    end_slot: u64,
+    policy: RpcRetryPolicy,
+) -> Result<Vec<u64>> {
+    let client = reqwest::Client::new();
+    let mut slots = Vec::new();
+    let mut cursor = start_slot;
+    while cursor <= end_slot {
+        let chunk_end = end_slot.min(cursor.saturating_add(499_999));
+        let mut attempt = 1;
+        let chunk = loop {
+            match get_blocks_once(&client, rpc_url, cursor, chunk_end).await {
+                Ok(chunk) => break chunk,
+                Err(failure) if failure.retryable && attempt < policy.max_attempts => {
+                    let delay = policy.delay(attempt, failure.retry_after);
+                    tracing::warn!(
+                        start_slot = cursor,
+                        end_slot = chunk_end,
+                        attempt,
+                        max_attempts = policy.max_attempts,
+                        delay_ms = delay.as_millis() as u64,
+                        error = format!("{:#}", failure.error),
+                        "Solana RPC getBlocks failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                // Callers keep only `to_string()`, so flatten the chain to keep the RPC error visible.
+                Err(failure) if attempt > 1 => {
+                    return Err(anyhow!("{:#} (after {attempt} attempts)", failure.error));
+                }
+                Err(failure) => return Err(failure.error),
+            }
+        };
+        slots.extend(chunk);
+        if chunk_end == u64::MAX {
+            break;
+        }
+        cursor = chunk_end + 1;
+    }
+    Ok(slots)
+}
+
+async fn get_blocks_once(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    start_slot: u64,
+    end_slot: u64,
+) -> std::result::Result<Vec<u64>, RpcAttemptError> {
     #[derive(Serialize)]
     struct RpcRequest<'a> {
         jsonrpc: &'a str,
@@ -1073,37 +1159,82 @@ async fn fetch_solana_produced_slots(
         result: Option<Vec<u64>>,
         error: Option<serde_json::Value>,
     }
+    let fail =
+        |error: anyhow::Error, retryable: bool, retry_after: Option<Duration>| RpcAttemptError {
+            error,
+            retryable,
+            retry_after,
+        };
 
-    let client = reqwest::Client::new();
-    let mut slots = Vec::new();
-    let mut cursor = start_slot;
-    while cursor <= end_slot {
-        let chunk_end = end_slot.min(cursor.saturating_add(499_999));
-        let response = client
-            .post(rpc_url)
-            .json(&RpcRequest {
-                jsonrpc: "2.0",
-                id: 1,
-                method: "getBlocks",
-                params: [cursor, chunk_end],
-            })
-            .send()
-            .await
-            .with_context(|| format!("query Solana RPC getBlocks {cursor}-{chunk_end}"))?;
-        let parsed = response
-            .json::<RpcResponse>()
-            .await
-            .context("parse Solana RPC getBlocks response")?;
-        if let Some(error) = parsed.error {
-            return Err(anyhow!("Solana RPC getBlocks error: {error}"));
+    // The RPC URL carries a token in its path; strip it from reqwest errors before they reach logs.
+    let response = client
+        .post(rpc_url)
+        .json(&RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getBlocks",
+            params: [start_slot, end_slot],
+        })
+        .send()
+        .await
+        .map_err(|err| {
+            let retryable = err.is_timeout() || err.is_connect();
+            fail(
+                anyhow::Error::new(err.without_url()).context(format!(
+                    "query Solana RPC getBlocks {start_slot}-{end_slot}"
+                )),
+                retryable,
+                None,
+            )
+        })?;
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let status_retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+    let body = response.bytes().await.map_err(|err| {
+        fail(
+            anyhow::Error::new(err.without_url()).context("read Solana RPC getBlocks response"),
+            status_retryable,
+            retry_after,
+        )
+    })?;
+    let parsed = match serde_json::from_slice::<RpcResponse>(&body) {
+        Ok(parsed) => parsed,
+        Err(err) if status.is_success() => {
+            return Err(fail(
+                anyhow::Error::new(err).context("parse Solana RPC getBlocks response"),
+                false,
+                None,
+            ));
         }
-        slots.extend(parsed.result.unwrap_or_default());
-        if chunk_end == u64::MAX {
-            break;
+        Err(_) => {
+            return Err(fail(
+                anyhow!("Solana RPC getBlocks HTTP {status}"),
+                status_retryable,
+                retry_after,
+            ));
         }
-        cursor = chunk_end + 1;
+    };
+    if let Some(error) = parsed.error {
+        let rpc_rate_limited = error.get("code").and_then(serde_json::Value::as_i64) == Some(429);
+        return Err(fail(
+            anyhow!("Solana RPC getBlocks error: {error}"),
+            status_retryable || rpc_rate_limited,
+            retry_after,
+        ));
     }
-    Ok(slots)
+    if !status.is_success() {
+        return Err(fail(
+            anyhow!("Solana RPC getBlocks HTTP {status}"),
+            status_retryable,
+            retry_after,
+        ));
+    }
+    Ok(parsed.result.unwrap_or_default())
 }
 
 /// Query the current Solana network tip via `getSlot` at the given commitment.
@@ -1409,5 +1540,173 @@ mod redaction_tests {
         // treated as an s3() call.
         let sql = "SELECT hs3(col) FROM t";
         assert_eq!(redact_s3_credentials(sql), sql);
+    }
+}
+
+#[cfg(test)]
+mod rpc_retry_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::*;
+
+    const FAST: RpcRetryPolicy = RpcRetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+
+    /// Serves one canned `(status, extra_headers, body)` per connection, repeating the last one.
+    async fn serve(
+        responses: Vec<(u16, &'static str, &'static str)>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let (status, headers, body) = responses[index.min(responses.len() - 1)];
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let read = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.ok();
+            }
+        });
+        (url, hits)
+    }
+
+    const RATE_LIMITED: &str = r#"{"jsonrpc":"2.0","error":{"code":429,"message":"Too many requests from your IP"},"id":null}"#;
+    const BLOCKS: &str = r#"{"jsonrpc":"2.0","result":[10,11,13],"id":1}"#;
+
+    #[tokio::test]
+    async fn retries_http_429_then_succeeds() {
+        let (url, hits) = serve(vec![
+            (429, "", RATE_LIMITED),
+            (429, "", RATE_LIMITED),
+            (200, "", BLOCKS),
+        ])
+        .await;
+        let slots = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap();
+        assert_eq!(slots, vec![10, 11, 13]);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retries_json_rpc_429_inside_http_200() {
+        let (url, hits) = serve(vec![(200, "", RATE_LIMITED), (200, "", BLOCKS)]).await;
+        let slots = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap();
+        assert_eq!(slots, vec![10, 11, 13]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_server_errors_without_json_body() {
+        let (url, hits) = serve(vec![(503, "", "upstream down"), (200, "", BLOCKS)]).await;
+        let slots = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap();
+        assert_eq!(slots, vec![10, 11, 13]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_attempts_and_keeps_rpc_error() {
+        let (url, hits) = serve(vec![(429, "", RATE_LIMITED)]).await;
+        let err = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap_err();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Solana RPC getBlocks error:"),
+            "{message}"
+        );
+        assert!(message.contains("Too many requests"), "{message}");
+        assert!(message.ends_with("(after 3 attempts)"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_other_rpc_errors() {
+        let (url, hits) = serve(vec![(
+            200,
+            "",
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#,
+        )])
+        .await;
+        let err = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap_err();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(err.to_string().contains("Method not found"));
+        assert!(!err.to_string().contains("attempts"));
+    }
+
+    #[tokio::test]
+    async fn connect_failure_does_not_leak_url_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/secret-token", listener.local_addr().unwrap());
+        drop(listener);
+        let err = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("(after 3 attempts)"), "{message}");
+        assert!(!message.contains("secret-token"), "{message}");
+    }
+
+    #[test]
+    fn delay_prefers_retry_after_and_caps_it() {
+        let policy = RpcRetryPolicy::DEFAULT;
+        assert_eq!(policy.delay(1, None), Duration::from_secs(1));
+        assert_eq!(policy.delay(2, None), Duration::from_secs(2));
+        assert_eq!(policy.delay(3, None), Duration::from_secs(4));
+        assert_eq!(policy.delay(10, None), Duration::from_secs(10));
+        assert_eq!(
+            policy.delay(1, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            policy.delay(1, Some(Duration::from_secs(60))),
+            Duration::from_secs(10)
+        );
     }
 }
