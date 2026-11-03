@@ -39,10 +39,11 @@ hourly_988_427236024-427245023/
 
 `transactions` and `blocks_metadata` are required. Other Superbank tables are
 included when they exist on the ClickHouse server and are recorded as skipped in
-`manifest.json` when absent. This lets RPC/Bigtable deployments archive cleanly
-without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
-entries for later PoH-specific tooling.
-`blocks_metadata.parquet` carries the Alpenglow footer columns `bank_id`, `bank_hash`, `block_producer_time_nanos` and `block_user_agent`. They are `NULL` for blocks stored without a footer, and for archives made before the columns existed. The archive manifest format is version 3; older bundles remain readable and restore with those columns `NULL`. Block data and its footer are written in one `blocks_metadata` row. Replay may not provide historical footers. Set `--alpenglow-genesis-slot` so validation reports Alpenglow blocks without a complete footer; see [Alpenglow footer coverage](#alpenglow-footer-coverage) and the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
+`manifest.json` when absent. Fumarole/gRPC/Jetstreamer deployments preserve
+`entries` for PoH checks. RPC/Bigtable deployments have no `entries` and no
+footers, so they must turn the default Alpenglow checks down; see
+[Alpenglow defaults](#alpenglow-defaults).
+`blocks_metadata.parquet` carries the Alpenglow footer columns `bank_id`, `bank_hash`, `block_producer_time_nanos` and `block_user_agent`. They are `NULL` for blocks stored without a footer, and for archives made before the columns existed. The archive manifest format is version 3; older bundles remain readable and restore with those columns `NULL`. Block data and its footer are written in one `blocks_metadata` row. Replay may not provide historical footers. By default, validation blocks the archive when an Alpenglow block has no complete footer; see [Alpenglow footer coverage](#alpenglow-footer-coverage) and the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
 
 `transactions.parquet` carries `tx_version` and the v1 transaction config columns `tx_config_priority_fee`, `tx_config_compute_unit_limit`, `tx_config_loaded_accounts_data_size_limit` and `tx_config_heap_size`. They are `NULL` for legacy and v0 transactions, for v1 fields the transaction did not set, and for archives made before the columns existed. Restore names each archived column, so a destination without the v1 columns fails instead of dropping them.
 
@@ -133,6 +134,13 @@ The companion archive reader is built separately:
 
 ```bash
 cargo build -p superbank-solparq --bin superbank-solparq-read --release
+```
+
+`tests/poh_boundary.rs` runs the default PoH check against ClickHouse over a range that spans mainnet's Alpenglow genesis slot. It is ignored by default. Each test creates and drops its own database, so point it at a disposable loopback server:
+
+```bash
+SOLPARQ_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  cargo test -p superbank-solparq --test poh_boundary -- --ignored
 ```
 
 ## Release
@@ -415,7 +423,7 @@ separate actionable gaps from expected leader gaps and other problems:
 - `transaction_mismatch` — block transaction count does not match the archived
   transaction rows (**other data issue**).
 - `footer_missing` — an Alpenglow block is stored without a complete footer.
-  Only reported with `--alpenglow-genesis-slot`.
+  Not reported with `--alpenglow-genesis-slot none`.
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
@@ -656,8 +664,10 @@ Before writing an archive, `superbank-solparq` checks:
   `blocks_metadata`.
 - Each block's `executed_transaction_count` matches transaction rows in the
   `transactions` table.
-- With `--alpenglow-genesis-slot`, each stored block after that slot has a
-  complete footer. See [Alpenglow footer coverage](#alpenglow-footer-coverage).
+- Each stored block after `--alpenglow-genesis-slot` has a complete footer.
+  See [Alpenglow footer coverage](#alpenglow-footer-coverage).
+- Proof-of-History structure over the range. See
+  [Proof-of-History check](#proof-of-history-check).
 
 If warnings are found in regular mode, `superbank-solparq` asks for confirmation before
 creating the archive. Use `--force-archive` to archive despite warnings.
@@ -684,11 +694,13 @@ logged and exposed via the `missing_block` / `rpc_errors` validation metrics.
 Prefer pointing `--solana-rpc-url` at an endpoint that supports `getBlocks` when
 you want full verification.
 
-The default Solana RPC endpoint is:
+The default Solana RPC endpoint is the public Solana Foundation endpoint of `--solana-cluster`:
 
-```text
-https://api.mainnet-beta.solana.com
-```
+| `--solana-cluster` | Default `--solana-rpc-url` |
+| --- | --- |
+| `mainnet` (default) | `https://api.mainnet-beta.solana.com` |
+| `devnet` | `https://api.devnet.solana.com` |
+| `testnet` | `https://api.testnet.solana.com` |
 
 Override it with:
 
@@ -696,25 +708,51 @@ Override it with:
 --solana-rpc-url https://your.rpc.endpoint
 ```
 
+### Alpenglow defaults
+
+The defaults target an archiver fed by gRPC, Fumarole or Jetstreamer, which store `entries` and footers:
+
+- `--solana-cluster mainnet` (`SOLPARQ_SOLANA_CLUSTER`): the cluster being archived. Set `devnet` or `testnet` for those clusters.
+- `--alpenglow-genesis-slot`: the boundary of `--solana-cluster`, from the table below.
+- `--footer-coverage-policy require`: footer gaps block the archive.
+- `--poh-verify-mode structural`: PoH structure is checked before each archive.
+
+| `--solana-cluster` | Alpenglow genesis slot |
+| --- | --- |
+| `mainnet` | `459652999` |
+| `devnet` | `504148999` |
+| `testnet` | `444625255` |
+
+These are the `block.slot` values that each cluster's public Solana Foundation RPC returned for `getAgGenesisCert` on 2026-11-03.
+
+`--solana-cluster` also selects the PoH check's cluster parameters: the genesis hash and the `update_hashes_per_tick*` history. On devnet and testnet, slots before the `update_hashes_per_tick` feature are not checked for hash counts, because their genesis value is not recorded here.
+
+Other deployments change these settings:
+
+- RPC/Bigtable sources: set `--footer-coverage-policy report` and `--poh-verify-mode off`. Those sources write no footers and no `entries`, so the defaults would block every archive after the boundary.
+- Other clusters, such as a local test validator: set `--alpenglow-genesis-slot` to the cluster's slot, or to `none` together with `--footer-coverage-policy report` and `--poh-verify-mode off`.
+
+solparq rejects `none` at startup while `require` or a PoH mode other than `off` is set. The footer check reads the `bank_hash`, `block_producer_time_nanos` and `block_user_agent` columns. Apply the current `blocks_metadata` DDL before running the defaults.
+
 ### Alpenglow footer coverage
 
-Set `--alpenglow-genesis-slot` (`SOLPARQ_ALPENGLOW_GENESIS_SLOT`) to the `block.slot` of a trusted same-cluster `getAgGenesisCert` response. Mainnet's is `459652999`. Validation then lists every stored block after that slot whose `bank_hash`, `block_producer_time_nanos` or `block_user_agent` is `NULL`. It reads `blocks_metadata` with `FINAL`. Blocks up to the genesis slot are not checked, because they never carry a footer, so a range that spans the slot is checked only after it. solparq never infers the slot from an epoch, a date or a validator version.
+`--alpenglow-genesis-slot` (`SOLPARQ_ALPENGLOW_GENESIS_SLOT`) is the `block.slot` of a trusted same-cluster `getAgGenesisCert` response. The default comes from `--solana-cluster`; see [Alpenglow defaults](#alpenglow-defaults). Validation lists every stored block after that slot whose `bank_hash`, `block_producer_time_nanos` or `block_user_agent` is `NULL`. It reads `blocks_metadata` with `FINAL`. Blocks up to the genesis slot are not checked, because they never carry a footer, so a range that spans the slot is checked only after it. solparq never infers the slot from an epoch, a date or a validator version.
 
 The gaps appear as `footer_missing_ranges` in `report.json`, the text report and the gap summary log, and as the `footer_missing` validation metric category. `--footer-coverage-policy` (`SOLPARQ_FOOTER_COVERAGE_POLICY`) decides what they do:
 
-- `report` (default): the archive proceeds.
-- `require`: footer gaps block the archive like other data problems. `--force-archive` still overrides them, and `--allow-rpc-validation-failure` does not. `require` needs `--alpenglow-genesis-slot`.
+- `report`: the archive proceeds.
+- `require` (default): footer gaps block the archive like other data problems. `--force-archive` still overrides them, and `--allow-rpc-validation-failure` does not. `require` needs `--alpenglow-genesis-slot`.
 
 Gap backfill uses the RPC source, which carries no footer. Backfilled blocks after the genesis slot stay footer gaps, and solparq logs a warning for them.
 
 ### Proof-of-History check
 
-`--poh-verify-mode` (`SOLPARQ_POH_VERIFY_MODE`) runs [superbank-verify](../superbank-verify/README.md) over the archive's slot range in ClickHouse before anything is written, including to S3. The archive is a `SELECT ... WHERE slot BETWEEN start AND end` over the same tables, so a clean run covers the data that goes into the Parquet files. It is off by default.
+`--poh-verify-mode` (`SOLPARQ_POH_VERIFY_MODE`) runs [superbank-verify](../superbank-verify/README.md) over the archive's slot range in ClickHouse before anything is written, including to S3. The archive is a `SELECT ... WHERE slot BETWEEN start AND end` over the same tables, so a clean run covers the data that goes into the Parquet files. The default is `structural`.
 
 - `structural`: tick counts, entry and transaction-index structure, last entry hash equals the blockhash, and blockhash linkage, including to the block before the range.
 - `full`: everything above plus recomputing every entry hash. It costs about 4M SHA-256 hashes per slot at the current 62,500 hashes per tick, so measure one hourly window on your hardware before enabling it in server mode. `--poh-verify-threads` (`SOLPARQ_POH_VERIFY_THREADS`, default `0` = all cores) bounds it.
 
-The check runs last, after repair, backfill and re-validation, and only when nothing else already blocks the range. Slots after `--alpenglow-genesis-slot` use Alpenglow rules (one Alpentick, `num_hashes = 1`), and any mode other than `off` needs that flag: without a boundary every slot would be checked with historical PoH rules, so every post-Alpenglow window would fail. solparq rejects the combination at startup. Ranges entirely before the boundary are unaffected by its value. Cluster parameters are mainnet's.
+The check runs last, after repair, backfill and re-validation, and only when nothing else already blocks the range. It also fails a slot when ClickHouse holds duplicate rows for it whose contents differ (`duplicate_conflict`), because the archive could export either copy. Slots after `--alpenglow-genesis-slot` use Alpenglow rules (one Alpentick, `num_hashes = 1`), and any mode other than `off` needs that flag: without a boundary every slot would be checked with historical PoH rules, so every post-Alpenglow window would fail. solparq rejects the combination at startup. Ranges entirely before the boundary are unaffected by its value. Cluster parameters come from `--solana-cluster`.
 
 A failed slot (`entry_hash_mismatch`, `chain_break`, `tick_count_mismatch`, ...) blocks the archive like a missing block; `--force-archive` still overrides it and `--allow-rpc-validation-failure` does not. Slots the check cannot verify also block: blocks without `entries` rows (ranges ingested over JSON-RPC or Bigtable, and gap backfill) and slots missing from the chain. `--poh-verify-allow-unverifiable` (`SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE`) lets those through while failures still block.
 
@@ -879,9 +917,11 @@ Common defaults:
 - `--delete-archived-data-from-slot-zero` unset (off; server mode only)
 - `--repair-mismatches` unset (off)
 - `--allow-rpc-validation-failure` unset (off)
-- `--alpenglow-genesis-slot` unset (no footer check)
-- `--footer-coverage-policy report`
-- `--poh-verify-mode off`
+- `--solana-cluster mainnet`
+- `--alpenglow-genesis-slot` from `--solana-cluster` (mainnet `459652999`, devnet `504148999`, testnet `444625255`; `none` disables the boundary)
+- `--solana-rpc-url` from `--solana-cluster`
+- `--footer-coverage-policy require`
+- `--poh-verify-mode structural`
 - `--poh-verify-allow-unverifiable` unset (off)
 - `--poh-verify-threads 0` (all cores)
 - `--backfill-gaps` unset (off)

@@ -264,10 +264,17 @@ export default {
       id: 'validation',
       title: 'Validation, repair and backfill',
       items: [
+        opt('SOLPARQ_SOLANA_CLUSTER', '--solana-cluster', {
+          type: 'mainnet | devnet | testnet',
+          default: 'mainnet',
+          text: 'Solana cluster being archived. It sets the default `--alpenglow-genesis-slot` (mainnet `459652999`, devnet `504148999`, testnet `444625255`) and `--solana-rpc-url`, and the PoH check\'s genesis hash and hashes-per-tick history.',
+          relations: [{ type: 'see', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+        }),
         opt('SOLPARQ_SOLANA_RPC_URL', '--solana-rpc-url', {
           type: 'url',
           default: 'https://api.mainnet-beta.solana.com',
-          text: 'Solana RPC used for the produced-slots cross-check, and by gap backfill.',
+          text: 'Solana RPC used for the produced-slots cross-check, and by gap backfill. The default is the public Solana Foundation endpoint of `--solana-cluster`; the value shown is mainnet\'s.',
+          relations: [{ type: 'see', to: 'SOLPARQ_SOLANA_CLUSTER' }],
         }),
         opt('SOLPARQ_ALLOW_RPC_VALIDATION_FAILURE', '--allow-rpc-validation-failure', {
           type: 'bool',
@@ -276,20 +283,21 @@ export default {
           relations: [{ type: 'see', to: 'SOLPARQ_FORCE_ARCHIVE' }],
         }),
         opt('SOLPARQ_ALPENGLOW_GENESIS_SLOT', '--alpenglow-genesis-slot', {
-          type: 'u64',
-          text: 'Trusted `getAgGenesisCert` `block.slot` for the cluster (mainnet `459652999`). Validation reports stored blocks after it that lack a complete Alpenglow footer, and the PoH check applies Alpenglow rules after it. Unset skips the footer check; `--poh-verify-mode` needs it.',
+          type: 'u64 | none',
+          default: '459652999',
+          text: 'Trusted `getAgGenesisCert` `block.slot` for the cluster. The default comes from `--solana-cluster`; the value shown is mainnet\'s. Validation reports stored blocks after it that lack a complete Alpenglow footer, and the PoH check applies Alpenglow rules after it. `none` skips the footer check, and needs `--footer-coverage-policy report` and `--poh-verify-mode off`.',
           relations: [{ type: 'see', to: 'SOLPARQ_FOOTER_COVERAGE_POLICY' }],
         }),
         opt('SOLPARQ_FOOTER_COVERAGE_POLICY', '--footer-coverage-policy', {
           type: 'report | require',
-          default: 'report',
-          text: '`report` lists footer gaps and archives anyway. `require` blocks the archive on footer gaps, like other data problems; `--force-archive` still overrides it. `require` needs `--alpenglow-genesis-slot`.',
+          default: 'require',
+          text: '`report` lists footer gaps and archives anyway. `require` blocks the archive on footer gaps, like other data problems; `--force-archive` still overrides it. `require` needs `--alpenglow-genesis-slot`. RPC/Bigtable sources write no footers, so set `report` for them.',
           relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
         }),
         opt('SOLPARQ_POH_VERIFY_MODE', '--poh-verify-mode', {
           type: 'off | structural | full',
-          default: 'off',
-          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules, so any mode other than `off` needs it. Uses mainnet cluster parameters.',
+          default: 'structural',
+          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Conflicting duplicate rows for a slot also fail it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules, so any mode other than `off` needs it. Cluster parameters come from `--solana-cluster`. RPC/Bigtable sources store no `entries`, so set `off` for them.',
           relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
         }),
         opt('SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE', '--poh-verify-allow-unverifiable', {

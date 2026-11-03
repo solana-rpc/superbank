@@ -122,22 +122,58 @@ fn footer_gaps_block_the_archive_under_require_policy() {
 
 #[test]
 fn config_parses_footer_settings_and_rejects_require_without_genesis() {
+    // Mainnet's boundary and the require policy are the defaults.
     let config = parse_config(&[]).expect("defaults");
-    assert_eq!(config.alpenglow_genesis_slot, None);
-    assert_eq!(config.footer_coverage_policy, FooterCoveragePolicy::Report);
-    assert_eq!(FooterCheck::from_config(&config), FooterCheck::default());
+    assert_eq!(config.alpenglow_genesis_slot, Some(459_652_999));
+    assert_eq!(config.footer_coverage_policy, FooterCoveragePolicy::Require);
+    assert_eq!(FooterCheck::from_config(&config), footer_check(true));
+
+    assert_eq!(config.solana_rpc_url, "https://api.mainnet-beta.solana.com");
+
+    for (cluster, slot, rpc) in [
+        ("devnet", 504_148_999, "https://api.devnet.solana.com"),
+        ("testnet", 444_625_255, "https://api.testnet.solana.com"),
+    ] {
+        let config = parse_config(&["--solana-cluster", cluster]).expect(cluster);
+        assert_eq!(config.alpenglow_genesis_slot, Some(slot), "{cluster}");
+        assert_eq!(config.solana_rpc_url, rpc, "{cluster}");
+        // Explicit values still win over the cluster defaults.
+        let config = parse_config(&[
+            "--solana-cluster",
+            cluster,
+            "--alpenglow-genesis-slot",
+            "7",
+            "--solana-rpc-url",
+            "http://127.0.0.1:8899",
+        ])
+        .expect(cluster);
+        assert_eq!(config.alpenglow_genesis_slot, Some(7));
+        assert_eq!(config.solana_rpc_url, "http://127.0.0.1:8899");
+    }
+    assert!(parse_config(&["--solana-cluster", "localnet"]).is_err());
+
+    let config = parse_config(&["--footer-coverage-policy", "report"]).expect("report");
+    assert_eq!(FooterCheck::from_config(&config), footer_check(false));
 
     let config = parse_config(&[
         "--alpenglow-genesis-slot",
-        "459652999",
+        "none",
         "--footer-coverage-policy",
-        "require",
+        "report",
+        "--poh-verify-mode",
+        "off",
     ])
-    .expect("require with genesis");
-    assert_eq!(FooterCheck::from_config(&config), footer_check(true));
+    .expect("no boundary");
+    assert_eq!(FooterCheck::from_config(&config), FooterCheck::default());
 
     // Requiring footers with no boundary would silently check nothing.
-    let err = parse_config(&["--footer-coverage-policy", "require"]).unwrap_err();
+    let err = parse_config(&[
+        "--alpenglow-genesis-slot",
+        "none",
+        "--poh-verify-mode",
+        "off",
+    ])
+    .unwrap_err();
     assert!(
         err.to_string().contains("--alpenglow-genesis-slot"),
         "{err}"

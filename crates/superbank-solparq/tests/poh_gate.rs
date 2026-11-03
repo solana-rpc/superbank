@@ -41,9 +41,10 @@ fn parse_config(extra: &[&str]) -> anyhow::Result<Config> {
 }
 
 #[test]
-fn config_defaults_poh_gate_off_and_parses_settings() {
+fn config_defaults_poh_gate_structural_and_parses_settings() {
     let config = parse_config(&[]).expect("defaults");
-    assert_eq!(config.poh_verify_mode, PohVerifyMode::Off);
+    assert_eq!(config.poh_verify_mode, PohVerifyMode::Structural);
+    assert_eq!(config.alpenglow_genesis_slot, Some(459_652_999));
     assert!(!config.poh_verify_allow_unverifiable);
     assert_eq!(config.poh_verify_threads, 0);
 
@@ -68,13 +69,31 @@ fn config_defaults_poh_gate_off_and_parses_settings() {
 fn config_rejects_poh_check_without_alpenglow_boundary() {
     // Historical rules would fail every post-Alpenglow slot and stall archiving.
     for mode in ["structural", "full"] {
-        let err = parse_config(&["--poh-verify-mode", mode]).unwrap_err();
+        let err = parse_config(&[
+            "--alpenglow-genesis-slot",
+            "none",
+            "--footer-coverage-policy",
+            "report",
+            "--poh-verify-mode",
+            mode,
+        ])
+        .unwrap_err();
         assert!(
             err.to_string().contains("--alpenglow-genesis-slot"),
             "{err}"
         );
     }
-    assert!(parse_config(&["--poh-verify-mode", "off"]).is_ok());
+    let config = parse_config(&[
+        "--alpenglow-genesis-slot",
+        "none",
+        "--footer-coverage-policy",
+        "report",
+        "--poh-verify-mode",
+        "off",
+    ])
+    .expect("all checks off");
+    assert_eq!(config.alpenglow_genesis_slot, None);
+    assert!(parse_config(&["--alpenglow-genesis-slot", "soon"]).is_err());
 }
 
 #[test]
