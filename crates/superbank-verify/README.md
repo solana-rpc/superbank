@@ -107,9 +107,10 @@ block is reported as unverifiable, not silently ignored).
 ### Library use
 
 The crate also builds a library. `superbank_verify::verify_slot_range` runs the
-same pipeline over one inclusive slot range with mainnet cluster parameters and
-no checkpoint, findings file or metrics server, and returns slot counts plus
-the failed, unverifiable and missing slots. superbank-solparq uses it for its
+same pipeline over one inclusive slot range with the cluster parameters of a
+`SlotRangeCluster` (mainnet, devnet or testnet) and no checkpoint, findings file or metrics server, and returns slot counts plus
+the failed, unverifiable and missing slots. It always audits conflicting
+duplicate rows. superbank-solparq uses it for its
 pre-archive `--poh-verify-mode` check. It needs a multi-thread Tokio runtime.
 
 ### Exit codes

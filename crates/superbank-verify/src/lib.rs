@@ -26,7 +26,9 @@ use axum::{Router, routing::get};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-pub use slot_range::{SlotRangeCheck, SlotRangeMode, SlotRangeVerification, verify_slot_range};
+pub use slot_range::{
+    SlotRangeCheck, SlotRangeCluster, SlotRangeMode, SlotRangeVerification, verify_slot_range,
+};
 
 /// Run the `superbank-verify` CLI and return its process exit code.
 pub async fn run_cli() -> i32 {
