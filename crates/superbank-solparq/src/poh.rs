@@ -88,6 +88,7 @@ pub async fn verify_archive_range(
         start_slot,
         end_slot,
         mode,
+        cluster: superbank_verify::SlotRangeCluster::Mainnet,
         clickhouse_url: config.clickhouse_url(),
         clickhouse_database: config.db_database.clone(),
         clickhouse_user: config.db_user.clone(),

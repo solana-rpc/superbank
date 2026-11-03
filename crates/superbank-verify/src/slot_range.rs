@@ -5,8 +5,7 @@
 
 //! Library entry point: verify one inclusive slot range with the same runner
 //! as the CLI, without checkpoints, a findings file, or a metrics server.
-//! Cluster parameters are mainnet's (64 ticks per slot, the built-in
-//! hashes_per_tick history, mainnet genesis hash).
+//! [`SlotRangeCluster`] selects the genesis hash and hashes_per_tick history.
 
 use std::collections::BTreeMap;
 
@@ -38,6 +37,39 @@ impl SlotRangeMode {
     }
 }
 
+/// Solana cluster whose PoH parameters apply: 64 ticks per slot, 432000-slot
+/// epochs, its genesis hash and its `update_hashes_per_tick*` history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlotRangeCluster {
+    #[default]
+    Mainnet,
+    Devnet,
+    Testnet,
+}
+
+impl SlotRangeCluster {
+    fn genesis_hash(self) -> &'static str {
+        match self {
+            SlotRangeCluster::Mainnet => MAINNET_GENESIS_HASH,
+            SlotRangeCluster::Devnet => "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+            SlotRangeCluster::Testnet => "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY",
+        }
+    }
+
+    fn hashes_per_tick_schedule(self) -> HashesPerTickSchedule {
+        match self {
+            SlotRangeCluster::Mainnet => HashesPerTickSchedule::mainnet(),
+            SlotRangeCluster::Devnet => HashesPerTickSchedule::devnet(),
+            SlotRangeCluster::Testnet => HashesPerTickSchedule::testnet(),
+        }
+    }
+
+    /// From `getEpochSchedule`: only testnet has warmup epochs.
+    fn epoch_warmup(self) -> bool {
+        self == SlotRangeCluster::Testnet
+    }
+}
+
 /// One range to verify and where to read it from.
 #[derive(Debug, Clone)]
 pub struct SlotRangeCheck {
@@ -45,6 +77,7 @@ pub struct SlotRangeCheck {
     /// Inclusive.
     pub end_slot: u64,
     pub mode: SlotRangeMode,
+    pub cluster: SlotRangeCluster,
     pub clickhouse_url: String,
     pub clickhouse_database: String,
     pub clickhouse_user: String,
@@ -135,17 +168,18 @@ fn slot_range_args(check: &SlotRangeCheck) -> Result<Args> {
         full: false,
         mode: check.mode.to_mode_arg(),
         slots_per_epoch: 432_000,
-        epoch_warmup: true,
+        epoch_warmup: check.cluster.epoch_warmup(),
         ticks_per_slot: 64,
-        expected_genesis_hash: Some(parse_hash32(MAINNET_GENESIS_HASH)?),
-        hashes_per_tick_schedule: HashesPerTickSchedule::mainnet(),
+        expected_genesis_hash: Some(parse_hash32(check.cluster.genesis_hash())?),
+        hashes_per_tick_schedule: check.cluster.hashes_per_tick_schedule(),
         alpenglow_rpc_url: None,
         // Only the slot drives verification; the block id is recorded in
         // checkpoints, which this entry point never writes.
         alpenglow_genesis_block: check.alpenglow_genesis_slot.map(|slot| (slot, [0; 32])),
         window_slots: DEFAULT_WINDOW_SLOTS,
         fetch_ahead: DEFAULT_FETCH_AHEAD,
-        audit_duplicate_conflicts: false,
+        // Fetches read one arbitrary duplicate row; conflicting duplicates fail the slot.
+        audit_duplicate_conflicts: true,
         verify_threads: check.verify_threads,
         checkpoint_file: None,
         resume: false,
@@ -182,6 +216,7 @@ mod tests {
             start_slot,
             end_slot,
             mode: SlotRangeMode::Full,
+            cluster: SlotRangeCluster::Mainnet,
             clickhouse_url: "http://localhost:8123".to_string(),
             clickhouse_database: "default".to_string(),
             clickhouse_user: "default".to_string(),
@@ -207,7 +242,30 @@ mod tests {
             Some(100)
         );
         assert!(args.collect_problem_slots);
+        assert!(args.audit_duplicate_conflicts);
         assert!(args.checkpoint_file.is_none() && args.report_file.is_none());
+    }
+
+    #[test]
+    fn cluster_selects_genesis_hash_and_hashes_per_tick_history() {
+        for (cluster, warmup, slot, hashes) in [
+            (SlotRangeCluster::Mainnet, false, 253_584_001, 17_500),
+            (SlotRangeCluster::Devnet, false, 274_752_000, 17_500),
+            (SlotRangeCluster::Testnet, true, 248_492_264, 17_500),
+        ] {
+            let args = slot_range_args(&SlotRangeCheck {
+                cluster,
+                ..check(10, 20)
+            })
+            .unwrap();
+            assert_eq!(
+                args.expected_genesis_hash,
+                Some(parse_hash32(cluster.genesis_hash()).unwrap())
+            );
+            assert_eq!(args.epoch_warmup, warmup, "{cluster:?}");
+            assert_eq!(args.hashes_per_tick_schedule.value_at(slot), hashes);
+            assert_eq!(args.hashes_per_tick_schedule.value_at(slot - 1), 12_500);
+        }
     }
 
     #[test]
