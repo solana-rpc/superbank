@@ -95,11 +95,11 @@ struct CliArgs {
     )]
     slots_per_epoch: u64,
 
-    /// Whether the cluster uses warmup epochs (mainnet-beta: true)
+    /// Whether the cluster uses warmup epochs (mainnet-beta and devnet: false; testnet: true)
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_EPOCH_WARMUP",
-        default_value_t = true,
+        default_value_t = false,
         default_missing_value = "true",
         num_args = 0..=1,
         require_equals = true,
@@ -820,7 +820,7 @@ mod tests {
         let args = resolve(&["superbank-verify", "--full"]).unwrap();
         assert_eq!(args.mode, ModeArg::Structural);
         assert_eq!(args.slots_per_epoch, 432_000);
-        assert!(args.epoch_warmup);
+        assert!(!args.epoch_warmup);
         assert_eq!(args.ticks_per_slot, 64);
         assert_eq!(
             args.expected_genesis_hash,

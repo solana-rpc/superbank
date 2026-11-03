@@ -31,7 +31,7 @@ superbank-verify --full
 # Full PoH recomputation for a slot range
 superbank-verify --range 250000000:250001000 --mode full
 
-# Epochs 700-701 (mainnet warmup schedule is applied for epochs < 14)
+# Epochs 700-701 (mainnet has no warmup epochs; set --epoch-warmup=true for testnet)
 superbank-verify --range 700-701 --mode full
 
 # Multi-day genesis-to-tip run with resume + JSONL findings report
@@ -167,9 +167,9 @@ golden vectors.
   `duplicate_conflict`; otherwise the baseline verifier does not scan for
   them.
 - Configure the Alpenglow genesis boundary before verifying postmigration ranges. Without it the verifier applies the legacy PoH rules to every slot.
-- `getEpochSchedule` in superbank-rpc ignores mainnet's warmup epochs; this
-  crate carries its own epoch math (`src/epoch.rs`) instead of sharing that
-  code.
+- This crate carries its own epoch math (`src/epoch.rs`). `--epoch-warmup`
+  defaults to `false`, which matches mainnet-beta and devnet. Testnet needs
+  `--epoch-warmup=true`.
 
 ### Trusted migration evidence
 

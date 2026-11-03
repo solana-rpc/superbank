@@ -62,8 +62,8 @@ export default {
         opt('SLOTS_PER_EPOCH', { type: 'u64', default: '432000', text: 'Slots per normal epoch, used to resolve epoch ranges.' }),
         opt('EPOCH_WARMUP', {
           type: 'bool',
-          default: 'true',
-          text: 'Whether the cluster uses warmup epochs (true for mainnet-beta).',
+          default: 'false',
+          text: 'Whether the cluster uses warmup epochs: false for mainnet-beta and devnet, true for testnet. Only affects epoch ranges.',
         }),
         opt('TICKS_PER_SLOT', { type: 'u64', default: '64', text: 'Ticks per slot; 64 for all of mainnet history. Must be at least 1.' }),
         opt('EXPECTED_GENESIS_HASH', {

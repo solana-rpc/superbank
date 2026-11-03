@@ -17,7 +17,7 @@ audit-duplicate-conflicts: false
 
 # Cluster shape (defaults are mainnet-beta).
 slots-per-epoch: 432000
-epoch-warmup: true
+epoch-warmup: false  # true for testnet
 ticks-per-slot: 64
 expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 # hashes_per_tick eras "<from_slot>:<value>,..." (0 disables the check for an
