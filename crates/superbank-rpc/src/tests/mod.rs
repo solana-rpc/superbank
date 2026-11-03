@@ -3,6 +3,7 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod agave44_transaction;
 mod block_ranges;
 mod cache_refresh;
 mod latest_slot;
@@ -5519,7 +5520,7 @@ async fn get_signature_statuses_rejects_invalid_config() {
 
 #[tokio::test]
 async fn get_signature_statuses_ignores_unknown_config_fields() {
-    for commitment in [
+    for unknown in [
         json!("processed"),
         json!("confirmed"),
         json!("finalized"),
@@ -5536,7 +5537,7 @@ async fn get_signature_statuses_ignores_unknown_config_fields() {
                 json!(["not_base58"]),
                 json!({
                     "searchTransactionHistory": false,
-                    "commitment": commitment
+                    "futureConfig": unknown
                 }),
             ]),
         )
@@ -8049,6 +8050,7 @@ async fn get_block_clickhouse_partial_payload_repair() {
     execute(&http, &url, format!("DROP DATABASE {database}")).await;
 }
 
+mod agave44_statuses;
 mod agave_43;
 
 #[cfg(feature = "grpc-head-cache")]

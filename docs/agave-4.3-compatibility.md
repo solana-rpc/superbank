@@ -1,8 +1,10 @@
 # Agave 4.3 compatibility
 
-The main ingestor and RPC server build on the Agave **4.4.0-beta.0** crates with Rust **1.98.1**. The behavior reference is the tagged [Agave v4.3.0 source](https://github.com/anza-xyz/agave/tree/v4.3.0), not whichever version happens to serve a public endpoint. This is compatibility for Superbank's existing methods, not an implementation of every validator RPC.
+The main ingestor and RPC server build on the Agave **4.4.0** crates with Rust **1.98.1**. The behavior reference is the tagged [Agave v4.3.0 source](https://github.com/anza-xyz/agave/tree/v4.3.0), not whichever version happens to serve a public endpoint. This is compatibility for Superbank's existing methods, not an implementation of every validator RPC.
 
 For a step-by-step view of one block's banks, commitment and arrival in the head cache, ClickHouse and the disk cache under Alpenglow and Tower BFT, see the [Alpenglow block lifecycle](https://solana-rpc.github.io/superbank/alpenglow.html).
+
+See [Agave 4.4 compatibility](agave-4.4-compatibility.md) for the current request-context contract and producer qualification requirements.
 
 ## Behavior changes
 
@@ -19,7 +21,7 @@ The existing String reward-type columns and Int64 reward amounts accommodate VAT
 
 ## Ingestion and streaming boundaries
 
-JSON-RPC and Bigtable ingestion use Agave 4.3 types. Yellowstone gRPC ingestion, Fumarole block assembly, and the head cache preserve VAT reward value 6 with the stable Yellowstone 14 schema. Prost retains this i32 value when decoding and re-encoding. The `grpc-streaming` feature uses Agave's `solana-storage-proto = 4.3.0` generated output types, including `VATDebit = 6`, without changing existing field numbers or values. Only the Superbank service envelope is compiled locally.
+JSON-RPC and Bigtable ingestion use the pinned Agave 4.4 types. Yellowstone gRPC ingestion, Fumarole block assembly, and the head cache preserve VAT reward value 6 with the stable Yellowstone 14 schema. Prost retains this i32 value when decoding and re-encoding. The `grpc-streaming` feature uses Agave's `solana-storage-proto = 4.4.0` generated output types, including `VATDebit = 6`, without changing existing field numbers or values. Only the Superbank service envelope is compiled locally.
 
 Synthetic wire fixtures exercise these conversions. They do **not** certify a deployed Yellowstone/Fumarole producer: record its exact version and replay captured payloads before qualifying a production rollout. Never infer producer correctness or cluster feature activation from the Agave version alone.
 

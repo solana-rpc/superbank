@@ -3,7 +3,7 @@
 Solana-compatible JSON-RPC server backed by ClickHouse tables produced by `superbank` (or any
 writer that matches the same schemas).
 
-See the [Agave 4.3 compatibility and rollout notes](../../docs/agave-4.3-compatibility.md) for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries. Build with the pinned Rust 1.98.1 toolchain.
+See the [Agave 4.4 compatibility and rollout notes](../../docs/agave-4.4-compatibility.md) for request validation, parsed JSON changes, VAT rewards, and ingestion boundaries. Build with the pinned Rust 1.98.1 toolchain.
 
 ## Supported methods
 
@@ -65,6 +65,7 @@ Notes:
   - Staleness: an entry is served for `GET_INFLATION_REWARD_RESPONSE_CACHE_TTL_SECS` (default 3600) after insertion, and only while the epoch cache holds the same boundary. A boundary repair therefore takes effect when the epoch cache entry expires (one hour). A reward-row repair can stay hidden for up to the TTL, where the uncached path sees it within the ClickHouse query cache TTL. Restart the process after a repair to drop every entry at once.
   - Rollback: set `GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES=0`. `GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES=0` also turns the response cache off (startup logs a warning when only the response cache was set), so it stays a full rollback. Nothing is persisted.
 - `getInflationReward` derives a partition count that the stored boundary lacks. Agave reports `numRewardPartitions` for every partitioned payout boundary, but some ingested boundaries store `rewards_num_partitions` as NULL (on mainnet, payout epochs 707-917). When such a boundary has a block height, a first query checks whether the boundary block holds `staking` rewards. Agave pays stake rewards in the boundary only when the epoch is not partitioned, so a boundary with stake rewards takes the non-partitioned path. Otherwise a second query counts the `staking` rewards in each block at heights `boundary + 1` to `boundary + 4097`. If no block holds any, the epoch is not partitioned, but only when the block at `boundary + 1` is stored. If stake rewards follow, they must form one run of heights that starts at `boundary + 1` and ends before a stored block without stake rewards, and no stake rewards may follow that block. A third query reads up to four stake reward pubkeys from every block of the run, and each pubkey must hash to that block's partition with the boundary's parent blockhash. The run length is then cached and used exactly like a declared count. Any violation returns internal error (`-32603`), increments `superbank_rpc_inflation_reward_lookups_total_total{operation="partitioned",outcome="invalid_derived_partitions"}`, and caches nothing. These queries run under the method's limits, once per epoch per cache TTL. On mainnet the boundary check reads up to about 20 MB for a non-partitioned epoch (payout epochs up to 706) and under 0.1 MB for payout epoch 707. For payout epoch 707 (314 partitions) the layout and sample queries then read about 27 MB and 60 MB. With `GET_INFLATION_REWARD_EPOCH_CACHE_MAX_BYTES=0`, every lookup of such a boundary repeats these queries. A boundary without a block height keeps the non-partitioned path.
+- A partitioned payout boundary with an all-zero `parent_blockhash` reads the blockhash at its stored `parent_slot` before validating or selecting partitions. With a declared partition count, a request satisfied by boundary vote rewards returns without this read. Unresolved addresses need the hash for stake routing. Deriving a missing partition count also needs the hash to validate reward samples. The read uses the primary distributed metadata table, including in shard-direct mode, because the parent can reside on a different shard. It shares the method's admission, timeout and ClickHouse resource limits. The recovered hash is cached with the validated epoch metadata. A partitioned boundary with an unresolved hash and any answer based on it stay out of the caches. When recovery is required, a missing parent block or an all-zero parent blockhash returns internal error (`-32603`). Non-partitioned rewards do not need this read. With the epoch cache disabled, each lookup that needs the hash repeats the parent read.
 - Reward objects expose the optional Agave `commissionBps` field when the ingested source supplied
   it. Legacy rows ingested before the basis-point columns were deployed omit the field; Superbank
   does not infer it from the legacy percentage `commission` value.
@@ -93,12 +94,13 @@ Notes:
 - Methods that need a latest finalized context return a backend/internal JSON-RPC error when
   ClickHouse has no finalized slot available. This includes `getSlot`, `getBlockHeight`,
   `getTransactionCount`, `getLatestBlockhash`, `getSignatureStatuses`, and min-context checks.
+- `getSignatureStatuses` accepts `commitment` (default `processed`) and `minContextSlot`. Its response context and head-cache lookup use the requested commitment. Without a usable head tip, context falls back to finalized ClickHouse data. An unmet minimum returns `-32016` with `data.contextSlot`.
 - `getSignatureStatuses` looks up recent statuses in the enabled cache tiers: the short-lived head
   cache and, when compiled with `--features disk-cache` and enabled, the finalized disk cache. The
   ClickHouse-backed history tier is searched only when the second param sets
   `searchTransactionHistory: true`; without it, a signature outside the enabled cache retention
   still returns `null`.
-- `getTransaction` accepts the standard Solana config fields plus an optional Superbank extension:
+- `getTransaction` accepts `minContextSlot` and checks the requested commitment context before serving any cache or storage result. An unmet minimum returns `-32016` with `data.contextSlot`; transactions older than the minimum remain returnable. It also accepts an optional Superbank extension:
   - `slot`: optional `u64`; when supplied, ClickHouse is queried directly for that exact slot and
     the response is `null` if the signature is not present in that slot.
 - `getSignaturesForAddress` accepts standard Solana config fields plus optional Superbank extensions:

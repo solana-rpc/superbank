@@ -661,3 +661,67 @@ fn finalized_minimum_publishes_banks_older_than_the_retention_window() {
             .is_some()
     );
 }
+
+async fn rpc_statuses(
+    state: std::sync::Arc<crate::state::AppState>,
+    commitment: &str,
+    minimum: u64,
+) -> serde_json::Value {
+    let signatures: Vec<_> = (1..=3)
+        .map(|marker| Signature::from([marker; 64]).to_string())
+        .collect();
+    let response = crate::handlers::signatures::handle_get_signature_statuses(
+        state,
+        serde_json::json!(1),
+        Some(vec![
+            serde_json::json!(signatures),
+            serde_json::json!({"commitment": commitment, "minContextSlot": minimum}),
+        ]),
+    )
+    .await
+    .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn status_rpc_does_not_promote_replaced_or_reconnected_bank_results() {
+    let cache = std::sync::Arc::new(HeadCache::new(32, 64));
+    let mut state = crate::tests::test_state();
+    std::sync::Arc::get_mut(&mut state).unwrap().head_cache = Some(cache.clone());
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    let before = rpc_statuses(state.clone(), "processed", 42).await;
+    assert_eq!(
+        before["result"]["value"][0]["confirmationStatus"],
+        "processed"
+    );
+
+    freeze(&cache, session, 42, 2, 2);
+    cache.commit_bank(session, 42, 2, CommitmentLevel::Confirmed, Some(41));
+    let winner = rpc_statuses(state.clone(), "confirmed", 42).await;
+    assert_eq!(winner["result"]["context"]["slot"], 42);
+    assert!(winner["result"]["value"][0].is_null());
+    assert_eq!(
+        winner["result"]["value"][1]["confirmationStatus"],
+        "confirmed"
+    );
+
+    cache.end_bank_session(session);
+    let disconnected = rpc_statuses(state.clone(), "confirmed", 42).await;
+    assert_eq!(disconnected["error"]["code"], -32016);
+    assert_eq!(disconnected["error"]["data"]["contextSlot"], 1);
+
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 2, 3);
+    let unconfirmed = rpc_statuses(state.clone(), "confirmed", 42).await;
+    assert_eq!(unconfirmed["error"]["code"], -32016);
+    let processed = rpc_statuses(state, "processed", 42).await;
+    assert!(processed["result"]["value"][1].is_null());
+    assert_eq!(
+        processed["result"]["value"][2]["confirmationStatus"],
+        "processed"
+    );
+}
