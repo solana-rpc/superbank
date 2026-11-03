@@ -758,15 +758,50 @@ fn validate_inflation_partition_samples(
     Ok(())
 }
 
+async fn recover_inflation_parent_blockhash(
+    primary: &ClickHouseClient,
+    boundary_slot: u64,
+    parent_slot: u64,
+    settings_clause: &str,
+    timings: &mut QueryTimings,
+) -> ProcessingResult<[u8; 32]> {
+    let parent_epoch = parent_slot / SLOT_SHARD_DIVISOR;
+    let query = format!(
+        "SELECT blockhash, block_height
+         FROM {table}
+         PREWHERE intDiv(slot, {slot_shard_divisor}) = {parent_epoch} AND slot = {parent_slot}
+         LIMIT 1
+         {settings_clause}",
+        table = primary.blocks_metadata_table,
+        slot_shard_divisor = SLOT_SHARD_DIVISOR,
+    );
+    let (parent, parent_timings) = fetch_blockhash_height_row(
+        &primary.client,
+        &primary
+            .read_endpoint
+            .with_timeout(primary.inflation_reward_limits.query_timeout),
+        &query,
+    )
+    .await?;
+    timings.add(parent_timings);
+    let parent = parent.filter(|parent| parent.blockhash.0 != [0; 32]).ok_or_else(|| {
+        ProcessingError::database_msg(format!(
+            "inflation boundary slot {boundary_slot} has no parent blockhash and parent slot {parent_slot} has no usable blockhash"
+        ))
+    })?;
+    Ok(parent.blockhash.0)
+}
+
 /// Derives the partition count of a boundary that declares none. Returns `None` when the boundary
 /// holds stake rewards, or when the next block is stored and no stake rewards follow the boundary.
 #[allow(clippy::too_many_arguments)]
 async fn derive_inflation_partition_count(
+    primary: &ClickHouseClient,
     query_client: &clickhouse::Client,
     read_endpoint: &ReadEndpoint,
     table: &str,
     settings_clause: &str,
-    boundary: &InflationBoundaryRow,
+    boundary: &mut InflationBoundaryRow,
     boundary_block_height: u64,
     end_slot_exclusive: u64,
     timings: &mut QueryTimings,
@@ -873,6 +908,16 @@ async fn derive_inflation_partition_count(
         return Ok(Err("derived partition run is empty".to_string()));
     };
 
+    if boundary.parent_blockhash.0 == [0; 32] {
+        boundary.parent_blockhash.0 = recover_inflation_parent_blockhash(
+            primary,
+            boundary.slot,
+            boundary.parent_slot,
+            settings_clause,
+            timings,
+        )
+        .await?;
+    }
     let sample_query =
         build_inflation_partition_sample_query(table, first_slot, last_slot, settings_clause);
     let sample_started = Instant::now();
@@ -1914,8 +1959,9 @@ impl ClickHouseClient {
             };
         let execute = async {
             let mut timings = QueryTimings::zero();
+            let mut boundary_parent_slot = None;
 
-            let boundary = if let Some(cached) = &cached_epoch {
+            let mut boundary = if let Some(cached) = &cached_epoch {
                 cached.boundary.clone()
             } else {
                 let boundary_query = build_inflation_boundary_query(
@@ -1948,7 +1994,7 @@ impl ClickHouseClient {
                     rows_returned: u64::from(boundary.is_some()),
                 });
 
-                let Some(boundary) = boundary else {
+                let Some(mut boundary) = boundary else {
                     crate::metrics::inflation_reward_lookup("unknown", "boundary_missing");
                     return Ok(InflationRewardLookup::unavailable(
                         InflationRewardLookupOutcome::BoundaryUnavailable { slot: start_slot },
@@ -1962,6 +2008,7 @@ impl ClickHouseClient {
                         boundary.slot
                     )));
                 }
+                boundary_parent_slot = Some(boundary.parent_slot);
 
                 let num_partitions = match boundary.rewards_num_partitions {
                     Some(num_partitions) => {
@@ -1986,11 +2033,12 @@ impl ClickHouseClient {
                     None => match boundary.block_height {
                         Some(boundary_block_height) => {
                             let derived = derive_inflation_partition_count(
+                                self,
                                 &query_client,
                                 &read_endpoint,
                                 &blocks_metadata_table,
                                 &settings_clause,
-                                &boundary,
+                                &mut boundary,
                                 boundary_block_height,
                                 end_slot_exclusive,
                                 &mut timings,
@@ -2028,9 +2076,11 @@ impl ClickHouseClient {
                     block_height: boundary.block_height,
                     num_partitions,
                 };
-                // A partitioned boundary without a block height cannot serve partition lookups and
-                // may be repaired on the primary, so only fully usable boundaries are cached.
-                if boundary.num_partitions.is_none() || boundary.block_height.is_some() {
+                // Partition routing needs both a block height and a usable parent hash.
+                // Keep incomplete metadata out of the cache so later reads can observe repairs.
+                if boundary.num_partitions.is_none()
+                    || (boundary.block_height.is_some() && boundary.parent_blockhash != [0; 32])
+                {
                     self.inflation_epoch_cache
                         .insert_boundary(epoch_cache_key, boundary.clone())
                         .await;
@@ -2300,6 +2350,26 @@ impl ClickHouseClient {
                     &boundary,
                     boundary.slot,
                 ));
+            }
+
+            if boundary.parent_blockhash == [0; 32] {
+                let parent_slot = boundary_parent_slot.ok_or_else(|| {
+                    ProcessingError::database_msg(format!(
+                        "inflation boundary slot {} has no parent slot for blockhash recovery",
+                        boundary.slot
+                    ))
+                })?;
+                boundary.parent_blockhash = recover_inflation_parent_blockhash(
+                    self,
+                    boundary.slot,
+                    parent_slot,
+                    &settings_clause,
+                    &mut timings,
+                )
+                .await?;
+                self.inflation_epoch_cache
+                    .insert_boundary(epoch_cache_key, boundary.clone())
+                    .await;
             }
 
             let partition_plan = plan_inflation_reward_partitions(
@@ -3580,6 +3650,86 @@ mod tests {
         ShardSlotRange, build_block_metadata_range_query, shard_slot_ranges_for_slot_range,
     };
     use crate::hydration::parse_reward_type;
+
+    #[tokio::test]
+    async fn inflation_parent_hash_recovery_uses_the_primary_in_shard_direct_mode() {
+        use super::super::sharding::{RoutingScope, ShardTarget, ShardTopology};
+        use clickhouse::test::{Mock, handlers};
+        use serde::Serialize;
+        use serde_big_array::Array;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize},
+        };
+
+        #[derive(Serialize, clickhouse::Row)]
+        struct Discovery {
+            node: String,
+            expected: u64,
+            coordinator: u8,
+        }
+        #[derive(Serialize, clickhouse::Row)]
+        struct Probe {
+            node: String,
+            active_id: String,
+        }
+        #[derive(Serialize, clickhouse::Row)]
+        struct ParentBlock {
+            blockhash: Array<u8, 32>,
+            block_height: Option<u64>,
+        }
+
+        let primary_mock = Mock::new();
+        let payout_shard_mock = Mock::new();
+        let mut state = crate::tests::test_state_with_clickhouse_url(primary_mock.url());
+        let primary = &mut Arc::get_mut(&mut state).unwrap().clickhouse;
+        primary_mock.add(handlers::provide([Discovery {
+            node: "parent-fixture".into(),
+            expected: 1,
+            coordinator: 1,
+        }]));
+        primary_mock.add(handlers::provide([Probe {
+            node: "parent-fixture".into(),
+            active_id: String::new(),
+        }]));
+        primary.initialize_read_cancellation().await.unwrap();
+        primary.routing_policy.scope = RoutingScope::ShardDirect;
+        primary.blocks_metadata_local_table = Some("default.blocks_metadata_local".into());
+        primary.shard_topology = Some(Arc::new(ShardTopology {
+            total_weight: 1,
+            replicas: vec![vec![ShardTarget {
+                shard_num: 1,
+                tcp_pool: Arc::new(clickhouse_rs::Pool::new("tcp://127.0.0.1:9000")),
+                http_client: primary.client.clone().with_url(payout_shard_mock.url()),
+                read_endpoint: primary.read_endpoint.clone(),
+                host: "payout-shard".into(),
+                tcp_port: 9000,
+            }]],
+            active_replicas: vec![Arc::new(AtomicUsize::new(0))],
+            replica_health: vec![vec![Arc::new(AtomicBool::new(true))]],
+            weights: vec![1],
+            allow_query_settings: primary.allow_query_settings,
+            query_cache: primary.query_cache.clone(),
+            query_timeout: primary.query_timeout,
+        }));
+        primary_mock.add(handlers::provide([ParentBlock {
+            blockhash: Array([7; 32]),
+            block_height: Some(1_000),
+        }]));
+        let mut timings = super::QueryTimings::zero();
+        let settings = primary.inflation_reward_settings_clause("get_inflation_rewards_for_epoch");
+        let parent_hash = super::recover_inflation_parent_blockhash(
+            primary,
+            19_008_002,
+            19_007_998,
+            &settings,
+            &mut timings,
+        )
+        .await
+        .unwrap();
+        assert_eq!(parent_hash, [7; 32]);
+        assert_eq!(timings.rows_returned, 1);
+    }
 
     #[test]
     fn shard_indices_for_slot_range_returns_single_shard_for_single_bucket() {

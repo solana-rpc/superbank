@@ -82,6 +82,10 @@ k6 run tests/k6/scenarios/validation/superbank-rpc-validate-get-transactions-for
   -e REFERENCE_RPC_URL=http://localhost:8898 \
   -e ADDRESS_FILE=./tests/k6/data/pools/addresses.txt
 
+# Agave 4.4 context checks (target must have a populated context)
+k6 run tests/k6/scenarios/validation/superbank-rpc-validate-agave44.js -e RPC_URL=http://localhost:8899
+# Add -e REFERENCE_RPC_URL=https://your-agave-44-reference for a version-gated 4.4.0 comparison.
+
 # Agave 4.3 request errors (match the configured address limit; 0 disables this check)
 k6 run tests/k6/scenarios/validation/superbank-rpc-validate-agave43.js -e RPC_URL=http://localhost:8899 -e INFLATION_REWARD_MAX_ADDRESSES=100
 

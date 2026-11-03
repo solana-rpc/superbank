@@ -48,10 +48,11 @@ use crate::clickhouse::SlotBoundary;
 #[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
 use std::collections::HashSet;
 
-const GET_TRANSACTION_ALLOWED_FIELDS: [&str; 4] = [
+const GET_TRANSACTION_ALLOWED_FIELDS: [&str; 5] = [
     "encoding",
     "commitment",
     "maxSupportedTransactionVersion",
+    "minContextSlot",
     "slot",
 ];
 const GET_TRANSACTION_INVALID_SIGNATURE_MESSAGE: &str =
@@ -358,6 +359,67 @@ pub(crate) async fn respond_with_hydrated_transaction(
     }
 }
 
+async fn validate_get_transaction_context(
+    state: &AppState,
+    route: &mut RouteMetric,
+    id: &Value,
+    commitment: CommitmentConfig,
+    min_context_slot: Option<u64>,
+) -> Option<Response> {
+    if commitment.is_processed() {
+        #[cfg(feature = "grpc-head-cache")]
+        {
+            if state.head_cache.is_none() {
+                route.invalid_params();
+                return Some(json_rpc_error_response(
+                    id.clone(),
+                    -32602,
+                    "Only confirmed or finalized commitments are supported",
+                    Some(json!({ "requestedCommitment": commitment.commitment })),
+                ));
+            }
+        }
+        #[cfg(not(feature = "grpc-head-cache"))]
+        {
+            route.invalid_params();
+            return Some(json_rpc_error_response(
+                id.clone(),
+                -32602,
+                "Only confirmed or finalized commitments are supported",
+                Some(json!({ "requestedCommitment": commitment.commitment })),
+            ));
+        }
+    }
+
+    let min_context_slot = min_context_slot?;
+    let (context_slot, context_source) = match state
+        .resolve_latest_slot_with_source("get_transaction_min_context", commitment.commitment)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            metrics::backend_error("get_latest_finalized_slot");
+            error!("Failed to fetch latest slot for minContextSlot check: {error}");
+            return Some(json_rpc_internal_error_response(id.clone()));
+        }
+    };
+    match context_source {
+        LatestSlotSource::ClickHouse => route.source_clickhouse(),
+        #[cfg(feature = "grpc-head-cache")]
+        LatestSlotSource::HeadCache => route.source_head_cache(),
+    }
+    if context_slot < min_context_slot {
+        route.rpc_error();
+        return Some(json_rpc_error_response(
+            id.clone(),
+            JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32,
+            "Minimum context slot has not been reached",
+            Some(json!({ "contextSlot": context_slot })),
+        ));
+    }
+    None
+}
+
 pub(crate) async fn handle_get_transaction(
     state: Arc<AppState>,
     id: Value,
@@ -440,29 +502,16 @@ pub(crate) async fn handle_get_transaction(
     let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Json);
     let commitment = config.commitment.unwrap_or(CommitmentConfig::default());
 
-    if commitment.is_processed() {
-        #[cfg(feature = "grpc-head-cache")]
-        {
-            if state.head_cache.is_none() {
-                route.invalid_params();
-                return Ok(json_rpc_error_response(
-                    id,
-                    -32602,
-                    "Only confirmed or finalized commitments are supported",
-                    Some(json!({ "requestedCommitment": commitment.commitment })),
-                ));
-            }
-        }
-        #[cfg(not(feature = "grpc-head-cache"))]
-        {
-            route.invalid_params();
-            return Ok(json_rpc_error_response(
-                id,
-                -32602,
-                "Only confirmed or finalized commitments are supported",
-                Some(json!({ "requestedCommitment": commitment.commitment })),
-            ));
-        }
+    if let Some(response) = validate_get_transaction_context(
+        state.as_ref(),
+        &mut route,
+        &id,
+        commitment,
+        config.min_context_slot,
+    )
+    .await
+    {
+        return Ok(response);
     }
 
     #[cfg(feature = "grpc-head-cache")]
