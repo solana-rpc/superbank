@@ -1,4 +1,4 @@
-//! The default pre-archive PoH gate run against ClickHouse over a range that spans mainnet's
+//! The pre-archive PoH gate run against ClickHouse over a range that spans mainnet's
 //! Alpenglow genesis slot. Needs a disposable server: see `poh_boundary_clickhouse_url`.
 
 use std::path::Path;
@@ -216,6 +216,7 @@ fn chain_at(g: u64, alpenglow_at: impl Fn(u64) -> bool) -> Vec<Block> {
 }
 
 const RANGE: (u64, u64) = (G - 2, G + 3);
+const STRUCTURAL: &[&str] = &["--poh-verify-mode", "structural"];
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires disposable ClickHouse: SOLPARQ_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123"]
@@ -225,13 +226,13 @@ async fn default_gate_passes_a_range_spanning_the_alpenglow_genesis_slot() {
         db.insert_block(&block).await;
     }
 
-    // No PoH or Alpenglow flags: the defaults are mainnet's G and `structural`.
-    let config = db.config(&[]);
+    // Historical blocks carry label hashes, so ranges that include them run `structural`.
+    let config = db.config(STRUCTURAL);
     assert_eq!(config.alpenglow_genesis_slot, Some(G));
     let poh = verify_archive_range(&config, RANGE.0, RANGE.1)
         .await
         .unwrap()
-        .expect("PoH check runs by default");
+        .unwrap();
     assert_eq!(poh.mode, "structural");
     assert_eq!(
         (poh.slots_ok, poh.slots_skipped, poh.slots_failed),
@@ -240,12 +241,12 @@ async fn default_gate_passes_a_range_spanning_the_alpenglow_genesis_slot() {
     );
     assert!(!poh.blocks_archive(), "{poh:?}");
 
-    // `full` recomputes the Alpenglow hashes; the parent seed at G is only linked, not hashed.
-    let config = db.config(&["--poh-verify-mode", "full"]);
-    let poh = verify_archive_range(&config, G + 1, G + 3)
+    // No flags: mainnet's G and `full`, which recomputes the Alpenglow hashes. G is only linked.
+    let poh = verify_archive_range(&db.config(&[]), G + 1, G + 3)
         .await
         .unwrap()
-        .unwrap();
+        .expect("PoH check runs by default");
+    assert_eq!(poh.mode, "full");
     assert_eq!((poh.slots_ok, poh.slots_failed), (2, 0), "{poh:?}");
     assert!(!poh.blocks_archive(), "{poh:?}");
 
@@ -261,7 +262,7 @@ async fn rules_switch_exactly_after_the_genesis_slot() {
         db.insert_block(&block).await;
     }
 
-    let poh = verify_archive_range(&db.config(&[]), RANGE.0, RANGE.1)
+    let poh = verify_archive_range(&db.config(STRUCTURAL), RANGE.0, RANGE.1)
         .await
         .unwrap()
         .unwrap();
@@ -292,7 +293,7 @@ async fn conflicting_duplicate_rows_block_the_archive() {
     )])
     .await;
 
-    let poh = verify_archive_range(&db.config(&[]), RANGE.0, RANGE.1)
+    let poh = verify_archive_range(&db.config(STRUCTURAL), RANGE.0, RANGE.1)
         .await
         .unwrap()
         .unwrap();
@@ -317,7 +318,7 @@ async fn devnet_and_testnet_defaults_use_their_own_genesis_slot() {
             db.insert_block(&block).await;
         }
 
-        let config = db.config(&["--solana-cluster", cluster]);
+        let config = db.config(&["--solana-cluster", cluster, STRUCTURAL[0], STRUCTURAL[1]]);
         assert_eq!(config.alpenglow_genesis_slot, Some(g), "{cluster}");
         let poh = verify_archive_range(&config, g - 2, g + 3)
             .await
@@ -335,6 +336,8 @@ async fn devnet_and_testnet_defaults_use_their_own_genesis_slot() {
             cluster,
             "--alpenglow-genesis-slot",
             "459652999",
+            STRUCTURAL[0],
+            STRUCTURAL[1],
         ]);
         let poh = verify_archive_range(&config, g - 2, g + 3)
             .await

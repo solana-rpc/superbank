@@ -41,9 +41,9 @@ fn parse_config(extra: &[&str]) -> anyhow::Result<Config> {
 }
 
 #[test]
-fn config_defaults_poh_gate_structural_and_parses_settings() {
+fn config_defaults_poh_gate_full_and_parses_settings() {
     let config = parse_config(&[]).expect("defaults");
-    assert_eq!(config.poh_verify_mode, PohVerifyMode::Structural);
+    assert_eq!(config.poh_verify_mode, PohVerifyMode::Full);
     assert_eq!(config.alpenglow_genesis_slot, Some(459_652_999));
     assert!(!config.poh_verify_allow_unverifiable);
     assert_eq!(config.poh_verify_threads, 0);

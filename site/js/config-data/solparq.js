@@ -296,8 +296,8 @@ export default {
         }),
         opt('SOLPARQ_POH_VERIFY_MODE', '--poh-verify-mode', {
           type: 'off | structural | full',
-          default: 'structural',
-          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Conflicting duplicate rows for a slot also fail it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules, so any mode other than `off` needs it. Cluster parameters come from `--solana-cluster`. RPC/Bigtable sources store no `entries`, so set `off` for them.',
+          default: 'full',
+          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. After the Alpenglow genesis slot every entry has one hash, so `full` is cheap; before it a slot costs about 4M hashes, so set `structural` for historical ranges. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Conflicting duplicate rows for a slot also fail it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules, so any mode other than `off` needs it. Cluster parameters come from `--solana-cluster`. RPC/Bigtable sources store no `entries`, so set `off` for them.',
           relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
         }),
         opt('SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE', '--poh-verify-allow-unverifiable', {

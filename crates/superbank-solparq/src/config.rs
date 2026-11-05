@@ -138,7 +138,7 @@ pub struct Config {
     pub alpenglow_genesis_slot: Option<u64>,
     pub footer_coverage_policy: FooterCoveragePolicy,
     /// Run superbank-verify over the archive range after validation passes; a
-    /// failure blocks the archive like a missing block. `structural` by default.
+    /// failure blocks the archive like a missing block. `full` by default.
     pub poh_verify_mode: PohVerifyMode,
     /// Slots the PoH check could not verify (no entries rows, chain gaps) do
     /// not block the archive; PoH failures still do.
@@ -602,7 +602,7 @@ struct Cli {
         long = "poh-verify-mode",
         env = "SOLPARQ_POH_VERIFY_MODE",
         value_enum,
-        default_value = "structural"
+        default_value = "full"
     )]
     poh_verify_mode: PohVerifyMode,
 

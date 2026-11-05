@@ -136,7 +136,7 @@ The companion archive reader is built separately:
 cargo build -p superbank-solparq --bin superbank-solparq-read --release
 ```
 
-`tests/poh_boundary.rs` runs the default PoH check against ClickHouse over a range that spans mainnet's Alpenglow genesis slot. It is ignored by default. Each test creates and drops its own database, so point it at a disposable loopback server:
+`tests/poh_boundary.rs` runs the PoH check against ClickHouse over ranges that span each cluster's Alpenglow genesis slot. It is ignored by default. Each test creates and drops its own database, so point it at a disposable loopback server:
 
 ```bash
 SOLPARQ_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123 \
@@ -715,7 +715,7 @@ The defaults target an archiver fed by gRPC, Fumarole or Jetstreamer, which stor
 - `--solana-cluster mainnet` (`SOLPARQ_SOLANA_CLUSTER`): the cluster being archived. Set `devnet` or `testnet` for those clusters.
 - `--alpenglow-genesis-slot`: the boundary of `--solana-cluster`, from the table below.
 - `--footer-coverage-policy require`: footer gaps block the archive.
-- `--poh-verify-mode structural`: PoH structure is checked before each archive.
+- `--poh-verify-mode full`: PoH structure and every entry hash are checked before each archive.
 
 | `--solana-cluster` | Alpenglow genesis slot |
 | --- | --- |
@@ -747,10 +747,14 @@ Gap backfill uses the RPC source, which carries no footer. Backfilled blocks aft
 
 ### Proof-of-History check
 
-`--poh-verify-mode` (`SOLPARQ_POH_VERIFY_MODE`) runs [superbank-verify](../superbank-verify/README.md) over the archive's slot range in ClickHouse before anything is written, including to S3. The archive is a `SELECT ... WHERE slot BETWEEN start AND end` over the same tables, so a clean run covers the data that goes into the Parquet files. The default is `structural`.
+`--poh-verify-mode` (`SOLPARQ_POH_VERIFY_MODE`) runs [superbank-verify](../superbank-verify/README.md) over the archive's slot range in ClickHouse before anything is written, including to S3. The archive is a `SELECT ... WHERE slot BETWEEN start AND end` over the same tables, so a clean run covers the data that goes into the Parquet files. The default is `full`.
 
 - `structural`: tick counts, entry and transaction-index structure, last entry hash equals the blockhash, and blockhash linkage, including to the block before the range.
-- `full`: everything above plus recomputing every entry hash. It costs about 4M SHA-256 hashes per slot at the current 62,500 hashes per tick, so measure one hourly window on your hardware before enabling it in server mode. `--poh-verify-threads` (`SOLPARQ_POH_VERIFY_THREADS`, default `0` = all cores) bounds it.
+- `full`: everything above plus recomputing every entry hash. The cost depends on the era:
+  - After `--alpenglow-genesis-slot`, every entry has `num_hashes = 1`, so `full` costs one SHA-256 hash per entry. On staging, 2,000 mainnet slots (702,053 entries) took 22 s with a debug build reading ClickHouse over the network.
+  - Before the genesis slot, a slot costs about 4M SHA-256 hashes at 62,500 hashes per tick. Set `structural` when archiving historical ranges, or measure one window on your hardware first.
+
+  `--poh-verify-threads` (`SOLPARQ_POH_VERIFY_THREADS`, default `0` = all cores) bounds the hashing.
 
 The check runs last, after repair, backfill and re-validation, and only when nothing else already blocks the range. It also fails a slot when ClickHouse holds duplicate rows for it whose contents differ (`duplicate_conflict`), because the archive could export either copy. Slots after `--alpenglow-genesis-slot` use Alpenglow rules (one Alpentick, `num_hashes = 1`), and any mode other than `off` needs that flag: without a boundary every slot would be checked with historical PoH rules, so every post-Alpenglow window would fail. solparq rejects the combination at startup. Ranges entirely before the boundary are unaffected by its value. Cluster parameters come from `--solana-cluster`.
 
@@ -921,7 +925,7 @@ Common defaults:
 - `--alpenglow-genesis-slot` from `--solana-cluster` (mainnet `459652999`, devnet `504148999`, testnet `444625255`; `none` disables the boundary)
 - `--solana-rpc-url` from `--solana-cluster`
 - `--footer-coverage-policy require`
-- `--poh-verify-mode structural`
+- `--poh-verify-mode full`
 - `--poh-verify-allow-unverifiable` unset (off)
 - `--poh-verify-threads 0` (all cores)
 - `--backfill-gaps` unset (off)
