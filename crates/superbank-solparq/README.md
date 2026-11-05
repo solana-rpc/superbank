@@ -887,6 +887,15 @@ That deletes matching slots from:
 
 Optional tables are deleted only when they were available for the archive run.
 
+### Cleanup keeps the next window's parent
+
+The [Proof-of-History check](#proof-of-history-check) links the first block of a window to its parent block, the last block of the window before. Cleanup keeps that parent in ClickHouse so the next window stays verifiable:
+
+- The delete range ends one slot before the highest block at or before its end. That block and its rows in every table stay.
+- On the next cleanup, the range widens down to the block an earlier cleanup kept. That block is the parent of the first block at or after the range start. The range widens only when a stored archive of any configured type covers the block, so a slot that no archive holds is never deleted.
+
+Each deployment keeps one block per archive type at most. A cleanup made before this rule may already have deleted a parent. The next window of that type then reports `missing_parent` and is unverifiable. Restore the parent block, or let that one window through with `--poh-verify-allow-unverifiable`.
+
 ## Options
 
 Required:

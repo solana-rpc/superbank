@@ -4,7 +4,12 @@
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
-use superbank_solparq::{config::Config, poh::verify_archive_range};
+use superbank_solparq::{
+    archive::delete_range_keeping_parent,
+    clickhouse::{ClickHouseClient, SlotRange},
+    config::Config,
+    poh::verify_archive_range,
+};
 
 const G: u64 = 459_652_999;
 const HISTORICAL_TICKS_PER_SLOT: u64 = 64;
@@ -118,6 +123,52 @@ impl TestDb {
             rows.join(", ")
         ))
         .await;
+    }
+
+    /// Synchronous `ALTER ... DELETE` over the three tables the tests create.
+    async fn delete_slots(&self, range: SlotRange) {
+        for table in ["blocks_metadata", "entries", "transactions"] {
+            self.exec(&format!("SYSTEM START MERGES {}.{table}", self.name))
+                .await;
+            self.exec(&format!(
+                "ALTER TABLE {}.{table} DELETE WHERE slot BETWEEN {} AND {} SETTINGS mutations_sync = 2",
+                self.name, range.start_slot, range.end_slot
+            ))
+            .await;
+        }
+    }
+
+    /// Cleanup as solparq runs it for a safe range, with `archived` as the stored archives.
+    async fn cleanup(&self, safe: SlotRange, archived: &[(u64, u64)]) -> Option<SlotRange> {
+        let client = ClickHouseClient::from_config(&self.config(&[])).unwrap();
+        let last = client
+            .last_block_at_or_before("blocks_metadata", safe.end_slot)
+            .await
+            .unwrap();
+        let kept = client
+            .first_block_parent_from("blocks_metadata", safe.start_slot)
+            .await
+            .unwrap();
+        let range = delete_range_keeping_parent(safe, last, kept, archived)?;
+        self.delete_slots(range).await;
+        Some(range)
+    }
+
+    async fn block_slots(&self) -> Vec<u64> {
+        let body = self
+            .http
+            .post(&self.url)
+            .body(format!(
+                "SELECT slot FROM {}.blocks_metadata FINAL ORDER BY slot FORMAT TSV",
+                self.name
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        body.lines().map(|line| line.parse().unwrap()).collect()
     }
 
     async fn drop(self) {
@@ -347,4 +398,80 @@ async fn devnet_and_testnet_defaults_use_their_own_genesis_slot() {
 
         db.drop().await;
     }
+}
+
+/// Blocks G..=G+30, each the parent of the next; windows are 10 slots from G+1.
+async fn alpenglow_run_db(tag: &str) -> TestDb {
+    let db = TestDb::create(tag).await;
+    let mut parent = Block {
+        slot: G,
+        parent_slot: G - 1,
+        parent_blockhash: [0; 32],
+        entries: vec![(1, label(G, 0))],
+    };
+    db.insert_block(&parent).await;
+    for slot in G + 1..=G + 30 {
+        let block = Block::alpenglow(slot, &parent);
+        db.insert_block(&block).await;
+        parent = block;
+    }
+    db
+}
+
+fn window(n: u64) -> SlotRange {
+    SlotRange::new(G + 1 + 10 * n, G + 10 + 10 * n)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires disposable ClickHouse: SOLPARQ_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123"]
+async fn deleting_the_whole_archived_window_leaves_the_next_window_unverifiable() {
+    // The staging failure: cleanup removed the parent of the next window's first block.
+    let db = alpenglow_run_db("bug").await;
+    db.delete_slots(window(0)).await;
+    let next = window(1);
+    let poh = verify_archive_range(&db.config(&[]), next.start_slot, next.end_slot)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(poh.blocks_archive(), "{poh:?}");
+    assert_eq!(poh.findings.get("missing_parent"), Some(&1), "{poh:?}");
+    db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires disposable ClickHouse: SOLPARQ_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123"]
+async fn cleanup_keeps_each_next_window_verifiable_and_drops_old_parents() {
+    let db = alpenglow_run_db("keep").await;
+    let config = db.config(&[]);
+
+    // Cycle 1: window 0 archived. G is the parent of its first block but no archive holds it.
+    let deleted = db
+        .cleanup(window(0), &[(window(0).start_slot, window(0).end_slot)])
+        .await;
+    assert_eq!(deleted, Some(SlotRange::new(G + 1, G + 9)));
+    let poh = verify_archive_range(&config, window(1).start_slot, window(1).end_slot)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!poh.blocks_archive(), "{poh:?}");
+    assert_eq!(poh.slots_ok, 10, "{poh:?}");
+
+    // Cycle 2: window 1 archived. G+10 was kept last time and window 0 covers it, so it goes.
+    let archived = [
+        (window(0).start_slot, window(0).end_slot),
+        (window(1).start_slot, window(1).end_slot),
+    ];
+    let deleted = db.cleanup(window(1), &archived).await;
+    assert_eq!(deleted, Some(SlotRange::new(G + 10, G + 19)));
+    let poh = verify_archive_range(&config, window(2).start_slot, window(2).end_slot)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!poh.blocks_archive(), "{poh:?}");
+
+    // G was never archived, so it stays; G+20 is window 2's parent; nothing else leaks.
+    let mut expected = vec![G];
+    expected.extend(G + 20..=G + 30);
+    assert_eq!(db.block_slots().await, expected);
+    db.drop().await;
 }

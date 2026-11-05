@@ -409,6 +409,30 @@ pub fn safe_delete_archived_data_range(
     )))
 }
 
+/// Keep `last_block` (the next window's parent) and widen down to `kept_block` when an
+/// archive covers it. See "Cleanup keeps the next window's parent" in the README.
+pub fn delete_range_keeping_parent(
+    range: crate::clickhouse::SlotRange,
+    last_block: Option<u64>,
+    kept_block: Option<u64>,
+    archived_ranges: &[(u64, u64)],
+) -> Option<crate::clickhouse::SlotRange> {
+    let mut start_slot = range.start_slot;
+    if let Some(kept) = kept_block
+        && kept < start_slot
+        && archived_ranges
+            .iter()
+            .any(|&(start, end)| start <= kept && kept <= end)
+    {
+        start_slot = kept;
+    }
+    let end_slot = match last_block {
+        Some(block) if block <= range.end_slot => block.checked_sub(1)?,
+        _ => range.end_slot,
+    };
+    (start_slot <= end_slot).then(|| crate::clickhouse::SlotRange::new(start_slot, end_slot))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveRunReport {
     pub timestamp_unix: u64,
@@ -1413,6 +1437,12 @@ async fn maybe_delete_archived_data_range(
     let latest_archive_names = storage::latest_archive_names(config).await?;
     let safe_delete_range =
         safe_delete_archived_data_range(config, plan.end_slot, &latest_archive_names)?;
+    let safe_delete_range = match safe_delete_range {
+        Some(range) => {
+            keep_next_window_parent(config, client, available_archive_tables, range).await?
+        }
+        None => None,
+    };
     if let Some(range) = safe_delete_range {
         info!(
             archive_kind = kind.to_string(),
@@ -1439,6 +1469,47 @@ async fn maybe_delete_archived_data_range(
         );
         Ok(false)
     }
+}
+
+/// Apply [`delete_range_keeping_parent`] with the block slots and archive ranges it needs.
+async fn keep_next_window_parent(
+    config: &Config,
+    client: &ClickHouseClient,
+    available_archive_tables: &[ArchiveDbTable],
+    range: SlotRange,
+) -> Result<Option<SlotRange>> {
+    let Some(blocks) = available_archive_tables
+        .iter()
+        .find(|table| table.kind == ArchiveTableKind::BlocksMetadata)
+    else {
+        return Ok(Some(range));
+    };
+    let last_block = client
+        .last_block_at_or_before(&blocks.table_name, range.end_slot)
+        .await?;
+    let kept_block = client
+        .first_block_parent_from(&blocks.table_name, range.start_slot)
+        .await?;
+    let mut archived_ranges = Vec::new();
+    for kind in config.archive_kinds.iter().copied() {
+        archived_ranges.extend(
+            storage::archive_names(config, kind)
+                .await?
+                .iter()
+                .filter_map(|name| parse_archive_name(name))
+                .map(|parsed| (parsed.start_slot, parsed.end_slot)),
+        );
+    }
+    let adjusted = delete_range_keeping_parent(range, last_block, kept_block, &archived_ranges);
+    debug!(
+        safe_start_slot = range.start_slot,
+        safe_end_slot = range.end_slot,
+        kept_parent_slot = last_block.unwrap_or_default(),
+        previous_parent_slot = kept_block.unwrap_or_default(),
+        adjusted = adjusted.map(|range| range.to_string()).unwrap_or_default(),
+        "keeping the next archive window's parent block in ClickHouse"
+    );
+    Ok(adjusted)
 }
 
 fn log_validation_gaps(kind: ArchiveKind, validation: &ValidationReport) {

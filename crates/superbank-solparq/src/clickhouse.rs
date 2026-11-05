@@ -443,6 +443,39 @@ impl ClickHouseClient {
             .collect())
     }
 
+    /// Highest block slot at or before `slot`: the parent of a window that starts after `slot`.
+    pub async fn last_block_at_or_before(
+        &self,
+        blocks_table: &str,
+        slot: u64,
+    ) -> Result<Option<u64>> {
+        #[derive(Deserialize)]
+        struct SlotRow {
+            last_slot: Option<u64>,
+        }
+        let sql =
+            format!("SELECT maxOrNull(slot) AS last_slot FROM {blocks_table} WHERE slot <= {slot}");
+        let rows = self.query_json_rows::<SlotRow>(&sql).await?;
+        Ok(rows.into_iter().next().and_then(|row| row.last_slot))
+    }
+
+    /// `parent_slot` of the first block at or after `slot`.
+    pub async fn first_block_parent_from(
+        &self,
+        blocks_table: &str,
+        slot: u64,
+    ) -> Result<Option<u64>> {
+        #[derive(Deserialize)]
+        struct ParentRow {
+            parent_slot: u64,
+        }
+        let sql = format!(
+            "SELECT parent_slot FROM {blocks_table} WHERE slot >= {slot} ORDER BY slot LIMIT 1"
+        );
+        let rows = self.query_json_rows::<ParentRow>(&sql).await?;
+        Ok(rows.into_iter().next().map(|row| row.parent_slot))
+    }
+
     /// Stored post-genesis blocks whose footer is incomplete. `FINAL` reads the row a replay left last.
     async fn fetch_footer_gap_slots(
         &self,

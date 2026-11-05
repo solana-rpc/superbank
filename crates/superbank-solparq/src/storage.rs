@@ -68,6 +68,14 @@ pub async fn latest_archive_name(config: &Config, kind: ArchiveKind) -> Result<O
     Ok(archives.pop())
 }
 
+/// Every stored archive name of `kind`, in no particular order.
+pub async fn archive_names(config: &Config, kind: ArchiveKind) -> Result<Vec<String>> {
+    match config.archive_location {
+        ArchiveLocation::Local => list_local_archive_names(&config.output_location, kind).await,
+        ArchiveLocation::S3 => list_s3_archive_names(config, kind).await,
+    }
+}
+
 pub async fn latest_archive_names(config: &Config) -> Result<Vec<(ArchiveKind, Option<String>)>> {
     let mut latest = Vec::with_capacity(config.archive_kinds.len());
     for kind in config.archive_kinds.iter().copied() {
