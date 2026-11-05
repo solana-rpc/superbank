@@ -101,7 +101,7 @@ async fn reader_reads_hourly_manifests_for_both_cadences() {
         let plan = plan_next_archive_with_hourly_slot_duration(
             ArchiveKind::Hourly,
             ClickHouseBounds {
-                earliest_slot: 10,
+                earliest_slot: 9,
                 latest_slot: 18_009,
                 distinct_slots: 4,
             },

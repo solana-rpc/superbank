@@ -115,10 +115,13 @@ impl ArchiveKind {
         }
     }
 
+    /// The earliest block stays unarchived: its parent was never ingested, so the PoH
+    /// check could not link it. The first window starts after it.
     fn first_start_slot(self, earliest_slot: u64) -> u64 {
+        let after_earliest = earliest_slot.saturating_add(1);
         match self {
-            ArchiveKind::Epoch => align_up(earliest_slot, EPOCH_SLOTS),
-            ArchiveKind::Hourly | ArchiveKind::Custom { .. } => earliest_slot,
+            ArchiveKind::Epoch => align_up(after_earliest, EPOCH_SLOTS),
+            ArchiveKind::Hourly | ArchiveKind::Custom { .. } => after_earliest,
         }
     }
 }

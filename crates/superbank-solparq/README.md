@@ -569,9 +569,12 @@ Before creating an archive, validation logs a gap summary even when
 - `footer_missing_ranges`: Alpenglow blocks stored without a complete footer.
 
 By default, each archive type continues from the highest existing archive of
-that same type. If no archive exists for that type, `superbank-solparq` starts from the
-oldest transaction slot available in ClickHouse. To ignore existing archives and
-plan from the oldest ClickHouse slot at startup, use:
+that same type. If no archive exists for that type, or the last one ends before
+the data in ClickHouse, `superbank-solparq` starts one slot after the oldest
+transaction slot in ClickHouse. That oldest block stays unarchived, because its
+parent was never ingested and the [Proof-of-History check](#proof-of-history-check)
+cannot link it. To ignore existing archives and plan from the oldest ClickHouse
+slot at startup, use:
 
 ```bash
 --no-continue-from-last-archive
@@ -626,7 +629,7 @@ cargo run -p superbank-solparq -- \
   --archive-file-output-location ./archives
 ```
 
-The duration must be positive and divide `3600000` ms exactly. An hourly window covers `[start, start + 3600000 / duration - 1]`, inclusive, and waits until ClickHouse reaches that end slot. Skipped slots do not shrink the window. This is a nominal hour by slot cadence, starting from the earliest available slot or the preceding archive's end plus one; it is not aligned to UTC hours or measured from block timestamps. The setting leaves epoch slot counts, custom windows, explicit `--archive-slot-range` boundaries, and the archive check interval unchanged.
+The duration must be positive and divide `3600000` ms exactly. An hourly window covers `[start, start + 3600000 / duration - 1]`, inclusive, and waits until ClickHouse reaches that end slot. Skipped slots do not shrink the window. This is a nominal hour by slot cadence, starting one slot after the earliest available slot or at the preceding archive's end plus one; it is not aligned to UTC hours or measured from block timestamps. The setting leaves epoch slot counts, custom windows, explicit `--archive-slot-range` boundaries, and the archive check interval unchanged.
 
 [Solana's Alpenglow guide](https://solana.com/upgrades/alpenglow) describes reduced slot times as a separate staged change. Do not infer cadence from consensus activation or a client version. Set `400` for historical 400 ms data; stop and restart the archiver with the new duration when reaching the cluster's cadence transition. A window spanning that transition can represent a different elapsed duration; use a one-shot explicit slot range to close the old history at the transition boundary before continuing with the new cadence.
 
@@ -634,7 +637,7 @@ Archive IDs remain `hourly_<epoch>_<start>-<end>` and manifests keep their exist
 
 ### Aligned custom archives
 
-By default a `custom` archive starts at the earliest slot available in ClickHouse
+By default a `custom` archive starts one slot after the earliest slot available in ClickHouse
 and steps forward in fixed-size windows from there. Pass `--custom-aligned`
 (env `SOLPARQ_CUSTOM_ALIGNED`, off by default) to instead snap custom windows onto
 fixed slot-count boundaries — `custom:1000` produces `1000, 2000, 3000, …` so each
@@ -647,7 +650,8 @@ boundaries. Notes:
 - Only the `custom` kind is affected (`hourly` never aligns; `epoch` always aligns
   to its own boundary).
 - Aligning skips any leading partial window: if the earliest slot is `10_500`, the
-  first `custom:1000` archive is `11000-11999` and slots `10_500–10_999` are not
+  first `custom:1000` archive is `11000-11999`. An earliest slot on a boundary,
+  such as `11_000`, also moves the first archive to the next boundary, `12000-12999` and slots `10_500–10_999` are not
   archived by this kind — the same trade-off `epoch` already makes for a partial
   leading epoch. `--delete-archived-data-range` preserves this never-archived
   leading window by flooring the delete at the lowest archived start slot; pass

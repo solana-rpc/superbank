@@ -36,7 +36,7 @@ fn default_cadence_is_two_hundred_ms() {
         18_000
     );
     let bounds = ClickHouseBounds {
-        earliest_slot: 427_236_024,
+        earliest_slot: 427_236_023,
         latest_slot: 427_254_023,
         distinct_slots: 18_000,
     };
@@ -68,7 +68,7 @@ fn historical_cadence_keeps_the_nine_thousand_slot_plan() {
     let plan = plan_next_archive_with_hourly_slot_duration(
         ArchiveKind::Hourly,
         ClickHouseBounds {
-            earliest_slot: 427_236_024,
+            earliest_slot: 427_236_023,
             latest_slot: 427_245_023,
             distinct_slots: 9_000,
         },
@@ -88,7 +88,7 @@ fn historical_cadence_keeps_the_nine_thousand_slot_plan() {
 fn two_hundred_ms_hour_waits_for_inclusive_end_despite_skipped_slots() {
     let config = config(&["--hourly-slot-duration-ms", "200"]).expect("200 ms config");
     let mut bounds = ClickHouseBounds {
-        earliest_slot: 427_236_024,
+        earliest_slot: 427_236_023,
         latest_slot: 427_254_022,
         distinct_slots: 17_000,
     };

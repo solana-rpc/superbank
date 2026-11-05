@@ -26,7 +26,7 @@ fn hourly_plan_uses_prompt_filename_convention() {
     let plan = plan_next_archive(
         ArchiveKind::Hourly,
         ClickHouseBounds {
-            earliest_slot: 427_236_024,
+            earliest_slot: 427_236_023,
             latest_slot: 427_254_023,
             distinct_slots: 18_000,
         },
@@ -95,9 +95,9 @@ fn plan_can_start_from_oldest_slot_when_continuation_is_disabled() {
     let plan = plan_next_archive(
         kind,
         ClickHouseBounds {
-            earliest_slot: 10_000,
+            earliest_slot: 9_999,
             latest_slot: 12_999,
-            distinct_slots: 3_000,
+            distinct_slots: 3_001,
         },
         Some("custom_0_10000-10999.parquet"),
         false,
@@ -144,7 +144,7 @@ fn custom_aligned_waits_until_full_window_available() {
     let plan = plan_next_archive(
         kind,
         ClickHouseBounds {
-            earliest_slot: 1_000,
+            earliest_slot: 999,
             latest_slot: 1_499,
             distinct_slots: 500,
         },
@@ -159,9 +159,9 @@ fn custom_aligned_waits_until_full_window_available() {
     let plan = plan_next_archive(
         kind,
         ClickHouseBounds {
-            earliest_slot: 1_000,
+            earliest_slot: 999,
             latest_slot: 2_050,
-            distinct_slots: 1_051,
+            distinct_slots: 1_052,
         },
         None,
         true,
@@ -2224,4 +2224,31 @@ fn metrics_expose_gap_backfill_outcome() {
     assert!(
         text.contains("solparq_gap_backfills_total{archive_kind=\"epoch\",outcome=\"partial\"} 1")
     );
+}
+
+#[test]
+fn first_window_starts_after_the_earliest_block() {
+    // The earliest block's parent was never ingested, so the PoH check could not link it.
+    let bounds = ClickHouseBounds {
+        earliest_slot: 1_000,
+        latest_slot: 5_000,
+        distinct_slots: 4_001,
+    };
+    let kind = ArchiveKind::Custom { slots: 1_000 };
+    let plan = plan_next_archive(kind, bounds, None, true, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.start_slot, plan.end_slot), (1_001, 2_000));
+
+    // Aligned: an earliest slot on a boundary moves the first window to the next boundary.
+    let plan = plan_next_archive(kind, bounds, None, true, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.start_slot, plan.end_slot), (2_000, 2_999));
+
+    // A previous archive that ends before the data restarts the same way.
+    let plan = plan_next_archive(kind, bounds, Some("custom_0_100-199.parquet"), true, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.start_slot, 1_001);
 }
