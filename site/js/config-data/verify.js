@@ -59,30 +59,36 @@ export default {
           default: 'structural',
           text: '`structural` checks chain and counts without recomputing hashes; `full` recomputes every hash.',
         }),
+        opt('SOLANA_CLUSTER', {
+          type: 'mainnet | devnet | testnet',
+          default: 'mainnet',
+          text: 'Cluster of the stored data. Sets the defaults for epoch warmup, the expected genesis hash, the `hashes_per_tick` history and the Alpenglow genesis block. `mainnet-beta` is accepted for `mainnet`.',
+        }),
         opt('SLOTS_PER_EPOCH', { type: 'u64', default: '432000', text: 'Slots per normal epoch, used to resolve epoch ranges.' }),
         opt('EPOCH_WARMUP', {
           type: 'bool',
-          default: 'true',
-          text: 'Whether the cluster uses warmup epochs (true for mainnet-beta).',
+          default: 'cluster: true for testnet, else false',
+          text: 'Whether the cluster uses warmup epochs. Only testnet has them.',
         }),
         opt('TICKS_PER_SLOT', { type: 'u64', default: '64', text: 'Ticks per slot; 64 for all of mainnet history. Must be at least 1.' }),
         opt('EXPECTED_GENESIS_HASH', {
           type: 'string (base58)',
-          default: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d',
+          default: "the cluster's genesis hash",
           text: "Expected genesis blockhash, checked against slot 0's `parent_blockhash`. An empty string disables the check; any other value must decode to 32 bytes.",
         }),
         opt('HASHES_PER_TICK_SCHEDULE', {
           type: 'string',
-          text: 'The `hashes_per_tick` eras as `{from_slot}:{value},...`; 0 disables the tick-hash-count check for that era. Unset uses the built-in mainnet history.',
+          text: 'The `hashes_per_tick` eras as `{from_slot}:{value},...`; 0 disables the tick-hash-count check for that era. Unset uses the built-in history of the cluster.',
         }),
         opt('ALPENGLOW_RPC_URL', {
           type: 'url',
-          text: 'Trusted Agave 4.3+ RPC on the same cluster as the stored data, asked for `getAgGenesisCert`. The certificate slot is the last PoH slot; Alpenglow entry rules apply after it. Without a boundary every slot is checked with PoH rules.',
+          text: 'Trusted Agave 4.3+ RPC on the same cluster as the stored data, asked for `getAgGenesisCert`. The certificate slot is the last PoH slot; Alpenglow entry rules apply after it. The certificate must match the resolved boundary.',
           relations: [{ type: 'see', to: 'SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK' }],
         }),
         opt('ALPENGLOW_GENESIS_BLOCK', {
-          type: 'string ({slot}:{base58-block-id})',
-          text: "Offline Alpenglow boundary from the genesis certificate. With `--alpenglow-rpc-url` also set, the fetched certificate must match it. The boundary is part of checkpoint identity, so changing or removing it rejects `--resume`.",
+          type: 'string ({slot}:{base58-block-id} | none)',
+          default: "the cluster's genesis certificate block",
+          text: "Alpenglow boundary from the genesis certificate. `none` applies PoH rules to every slot. With `--alpenglow-rpc-url` also set, the fetched certificate must match it. The boundary is part of checkpoint identity, so changing or removing it rejects `--resume`.",
         }),
         opt('ANCHOR', {
           flag: '--anchor',
@@ -92,8 +98,8 @@ export default {
         }),
         opt('AUDIT_DUPLICATE_CONFLICTS', {
           type: 'bool',
-          default: 'false',
-          text: 'Forensic audit that scans raw ClickHouse rows for conflicting duplicates and reports them as `duplicate_conflict`. Adds extra scans for every window.',
+          default: 'true',
+          text: 'Scans raw ClickHouse rows for conflicting duplicates and fails the slot with `duplicate_conflict`. Adds extra scans for every window.',
         }),
         opt('VERIFY_THREADS', {
           type: 'usize',

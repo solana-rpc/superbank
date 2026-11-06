@@ -13,10 +13,9 @@ use anyhow::{Result, bail};
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::cli::{
-    Args, DEFAULT_FETCH_AHEAD, DEFAULT_WINDOW_SLOTS, MAINNET_GENESIS_HASH, ModeArg, parse_hash32,
-    validate_args,
+    Args, DEFAULT_FETCH_AHEAD, DEFAULT_WINDOW_SLOTS, ModeArg, parse_hash32, validate_args,
 };
-use crate::eras::HashesPerTickSchedule;
+use crate::cluster::SolanaCluster;
 use crate::range::RangeSpec;
 use crate::{metrics, runner};
 
@@ -37,38 +36,8 @@ impl SlotRangeMode {
     }
 }
 
-/// Solana cluster whose PoH parameters apply: 64 ticks per slot, 432000-slot
-/// epochs, its genesis hash and its `update_hashes_per_tick*` history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SlotRangeCluster {
-    #[default]
-    Mainnet,
-    Devnet,
-    Testnet,
-}
-
-impl SlotRangeCluster {
-    fn genesis_hash(self) -> &'static str {
-        match self {
-            SlotRangeCluster::Mainnet => MAINNET_GENESIS_HASH,
-            SlotRangeCluster::Devnet => "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
-            SlotRangeCluster::Testnet => "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY",
-        }
-    }
-
-    fn hashes_per_tick_schedule(self) -> HashesPerTickSchedule {
-        match self {
-            SlotRangeCluster::Mainnet => HashesPerTickSchedule::mainnet(),
-            SlotRangeCluster::Devnet => HashesPerTickSchedule::devnet(),
-            SlotRangeCluster::Testnet => HashesPerTickSchedule::testnet(),
-        }
-    }
-
-    /// From `getEpochSchedule`: only testnet has warmup epochs.
-    fn epoch_warmup(self) -> bool {
-        self == SlotRangeCluster::Testnet
-    }
-}
+/// Cluster selection for [`verify_slot_range`].
+pub type SlotRangeCluster = SolanaCluster;
 
 /// One range to verify and where to read it from.
 #[derive(Debug, Clone)]
@@ -86,6 +55,7 @@ pub struct SlotRangeCheck {
     pub entries_table: String,
     pub transactions_table: String,
     /// Trusted Alpenglow genesis certificate slot; later slots use Alpenglow rules.
+    /// `SolanaCluster::alpenglow_genesis_slot` gives each cluster's value.
     pub alpenglow_genesis_slot: Option<u64>,
     /// Hash recomputation threads (0 = all available cores).
     pub verify_threads: usize,
@@ -173,9 +143,7 @@ fn slot_range_args(check: &SlotRangeCheck) -> Result<Args> {
         expected_genesis_hash: Some(parse_hash32(check.cluster.genesis_hash())?),
         hashes_per_tick_schedule: check.cluster.hashes_per_tick_schedule(),
         alpenglow_rpc_url: None,
-        // Only the slot drives verification; the block id is recorded in
-        // checkpoints, which this entry point never writes.
-        alpenglow_genesis_block: check.alpenglow_genesis_slot.map(|slot| (slot, [0; 32])),
+        alpenglow_genesis_block: alpenglow_genesis_block(check)?,
         window_slots: DEFAULT_WINDOW_SLOTS,
         fetch_ahead: DEFAULT_FETCH_AHEAD,
         // Fetches read one arbitrary duplicate row; conflicting duplicates fail the slot.
@@ -205,6 +173,20 @@ fn slot_range_args(check: &SlotRangeCheck) -> Result<Args> {
     };
     validate_args(&args)?;
     Ok(args)
+}
+
+/// Only the slot drives verification. The block id is the cluster's when the
+/// slot matches, else zero; it is only recorded in checkpoints, never written here.
+fn alpenglow_genesis_block(check: &SlotRangeCheck) -> Result<Option<(u64, [u8; 32])>> {
+    let Some(slot) = check.alpenglow_genesis_slot else {
+        return Ok(None);
+    };
+    let known = check.cluster.alpenglow_genesis_block()?;
+    Ok(Some(if known.0 == slot {
+        known
+    } else {
+        (slot, [0; 32])
+    }))
 }
 
 #[cfg(test)]
@@ -272,6 +254,21 @@ mod tests {
     fn single_slot_is_valid_and_reversed_range_is_rejected() {
         assert!(slot_range_args(&check(10, 10)).is_ok());
         assert!(slot_range_args(&check(11, 10)).is_err());
+    }
+
+    #[test]
+    fn cluster_genesis_slot_carries_its_block_id() {
+        let mainnet = SlotRangeCheck {
+            alpenglow_genesis_slot: Some(SlotRangeCluster::Mainnet.alpenglow_genesis_slot()),
+            ..check(10, 20)
+        };
+        let args = slot_range_args(&mainnet).unwrap();
+        assert_eq!(
+            args.alpenglow_genesis_block,
+            Some(SlotRangeCluster::Mainnet.alpenglow_genesis_block().unwrap())
+        );
+        let args = slot_range_args(&check(10, 20)).unwrap();
+        assert_eq!(args.alpenglow_genesis_block, Some((100, [0; 32])));
     }
 
     #[tokio::test(flavor = "current_thread")]

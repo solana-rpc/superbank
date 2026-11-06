@@ -12,6 +12,7 @@ mod chain;
 mod chdb;
 mod checkpoint;
 mod cli;
+mod cluster;
 mod epoch;
 mod eras;
 mod fixture;
@@ -26,6 +27,7 @@ use axum::{Router, routing::get};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+pub use cluster::SolanaCluster;
 pub use slot_range::{
     SlotRangeCheck, SlotRangeCluster, SlotRangeMode, SlotRangeVerification, verify_slot_range,
 };
