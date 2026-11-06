@@ -116,7 +116,7 @@ grpc-slot-notifications: true
 # solparq-from-slot: 0
 # solparq-to-slot: 0
 # Restrict to specific archived tables (default: every table in the bundle).
-# solparq-tables: "transactions,blocks_metadata"
+# solparq-tables: ["transactions", "blocks_metadata"] # or "transactions,blocks_metadata"
 # Raw ClickHouse SETTINGS clause appended to restore statements to bound memory.
 # solparq-clickhouse-settings: ""
 
