@@ -27,6 +27,28 @@
 
 use anyhow::{Result, anyhow};
 
+// Devnet and testnet: the same feature accounts, read on 2026-11-03. Their genesis value is
+// unknown here, so slots before `update_hashes_per_tick` (12500) are not enforced (0).
+const DEVNET_HASHES_PER_TICK: &[(u64, u64)] = &[
+    (0, 0),
+    (241_920_000, 12_500),
+    (274_752_000, 17_500),
+    (276_048_000, 27_500),
+    (276_480_000, 47_500),
+    (277_344_000, 57_500),
+    (279_504_000, 62_500),
+];
+
+const TESTNET_HASHES_PER_TICK: &[(u64, u64)] = &[
+    (0, 0),
+    (217_388_260, 12_500),
+    (248_492_264, 17_500),
+    (248_924_256, 27_500),
+    (249_788_256, 47_500),
+    (250_220_256, 57_500),
+    (251_084_256, 62_500),
+];
+
 const MAINNET_HASHES_PER_TICK: &[(u64, u64)] = &[
     (0, 12_500),
     (253_584_001, 17_500),
@@ -48,6 +70,18 @@ impl HashesPerTickSchedule {
     pub(crate) fn mainnet() -> Self {
         Self {
             eras: MAINNET_HASHES_PER_TICK.to_vec(),
+        }
+    }
+
+    pub(crate) fn devnet() -> Self {
+        Self {
+            eras: DEVNET_HASHES_PER_TICK.to_vec(),
+        }
+    }
+
+    pub(crate) fn testnet() -> Self {
+        Self {
+            eras: TESTNET_HASHES_PER_TICK.to_vec(),
         }
     }
 
@@ -126,6 +160,20 @@ mod tests {
         assert_eq!(schedule.value_at(257_040_000), 57_500);
         assert_eq!(schedule.value_at(257_904_000), 62_500);
         assert_eq!(schedule.value_at(u64::MAX), 62_500);
+    }
+
+    #[test]
+    fn devnet_and_testnet_era_boundaries_are_exact() {
+        let devnet = HashesPerTickSchedule::devnet();
+        assert_eq!(devnet.value_at(241_919_999), 0);
+        assert_eq!(devnet.value_at(241_920_000), 12_500);
+        assert_eq!(devnet.value_at(279_503_999), 57_500);
+        assert_eq!(devnet.value_at(279_504_000), 62_500);
+        let testnet = HashesPerTickSchedule::testnet();
+        assert_eq!(testnet.value_at(217_388_259), 0);
+        assert_eq!(testnet.value_at(217_388_260), 12_500);
+        assert_eq!(testnet.value_at(251_084_255), 57_500);
+        assert_eq!(testnet.value_at(u64::MAX), 62_500);
     }
 
     #[test]

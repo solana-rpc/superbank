@@ -3,10 +3,10 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
-//! Epoch <-> slot mapping. Mainnet-beta uses a warmup schedule: epochs 0..=13
-//! are 32, 64, ..., 262144 slots long and normal 432000-slot epochs begin at
-//! epoch 14 / slot 524256. (`superbank-rpc`'s getEpochSchedule currently
-//! ignores warmup; this crate deliberately does not share that code.)
+//! Epoch <-> slot mapping. Mainnet-beta and devnet have no warmup: epoch N
+//! starts at N * 432000. Testnet warms up: epochs 0..=13 are 32, 64, ...,
+//! 262144 slots long and normal 432000-slot epochs begin at epoch 14 / slot
+//! 524256. Values match each cluster's `getEpochSchedule`.
 
 use solana_epoch_schedule::EpochSchedule;
 
@@ -41,7 +41,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mainnet_warmup_constants() {
+    fn testnet_warmup_constants() {
         let epochs = EpochSlots::new(432_000, true);
         assert_eq!(epochs.schedule.first_normal_epoch, 14);
         assert_eq!(epochs.schedule.first_normal_slot, 524_256);
@@ -63,6 +63,14 @@ mod tests {
         assert_eq!(epochs.epoch_of_slot(32), 1);
         assert_eq!(epochs.epoch_of_slot(524_255), 13);
         assert_eq!(epochs.epoch_of_slot(524_256), 14);
+    }
+
+    #[test]
+    fn mainnet_has_no_warmup() {
+        // getEpochInfo on mainnet-beta, 2026-11-03: epoch 1075 starts at slot 464400000.
+        let epochs = EpochSlots::new(432_000, false);
+        assert_eq!(epochs.first_slot_in_epoch(1075), 464_400_000);
+        assert_eq!(epochs.epoch_of_slot(464_400_000), 1075);
     }
 
     #[test]

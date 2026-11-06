@@ -119,7 +119,7 @@ fn reconcile_genesis_block(
 ) -> Result<Option<(u64, Hash32)>> {
     ensure!(
         offline.is_none_or(|block| remote == Some(block)),
-        "trusted Agave genesis certificate does not match --alpenglow-genesis-block"
+        "trusted Agave genesis certificate does not match --alpenglow-genesis-block or the --solana-cluster default"
     );
     Ok(remote)
 }
