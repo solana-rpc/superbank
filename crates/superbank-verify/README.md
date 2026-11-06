@@ -159,8 +159,11 @@ CLI flags > environment variables > YAML config (`--config` /
 the repo root and `superbank-verify --help` for the full reference. ClickHouse
 connection uses the same `CLICKHOUSE_URL` / `CLICKHOUSE_DATABASE` /
 `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` variables as the other binaries;
-table names default to `default.blocks_metadata`, `default.entries`,
-`default.transactions`.
+table names default to `blocks_metadata`, `entries` and `transactions` in the selected database. Explicit database-qualified table names still override the database.
+
+Logs default to `info`, which shows progress and the final summary. Set `RUST_LOG` to override the log filter.
+
+Checkpoints include the table names. To resume a checkpoint created with the database-qualified defaults, pass `--blocks-table default.blocks_metadata --entries-table default.entries --transactions-table default.transactions`.
 
 ## Test fixtures
 

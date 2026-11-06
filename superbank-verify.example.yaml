@@ -59,9 +59,9 @@ clickhouse-url: "http://localhost:8123"
 clickhouse-database: "default"
 clickhouse-user: "default"
 clickhouse-password: ""
-blocks-table: "default.blocks_metadata"
-entries-table: "default.entries"
-transactions-table: "default.transactions"
+blocks-table: "blocks_metadata"
+entries-table: "entries"
+transactions-table: "transactions"
 
 # Metrics / health.
 metrics-host: "0.0.0.0"

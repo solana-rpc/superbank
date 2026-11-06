@@ -159,9 +159,9 @@ export default {
         shared('CLICKHOUSE_DATABASE', '--clickhouse-database', { type: 'string', default: 'default', text: 'ClickHouse database.' }),
         shared('CLICKHOUSE_USER', '--clickhouse-user', { type: 'string', default: 'default', text: 'ClickHouse user.' }),
         shared('CLICKHOUSE_PASSWORD', '--clickhouse-password', { type: 'string', default: '', secret: true, text: 'ClickHouse password.' }),
-        opt('BLOCKS_TABLE', { type: 'string', default: 'default.blocks_metadata', text: 'Blocks metadata table, database-qualified.' }),
-        opt('ENTRIES_TABLE', { type: 'string', default: 'default.entries', text: 'Entries table, database-qualified.' }),
-        opt('TRANSACTIONS_TABLE', { type: 'string', default: 'default.transactions', text: 'Transactions table, database-qualified.' }),
+        opt('BLOCKS_TABLE', { type: 'string', default: 'blocks_metadata', text: 'Blocks metadata table in CLICKHOUSE_DATABASE; a database-qualified name overrides it.' }),
+        opt('ENTRIES_TABLE', { type: 'string', default: 'entries', text: 'Entries table in CLICKHOUSE_DATABASE; a database-qualified name overrides it.' }),
+        opt('TRANSACTIONS_TABLE', { type: 'string', default: 'transactions', text: 'Transactions table in CLICKHOUSE_DATABASE; a database-qualified name overrides it.' }),
       ],
     },
     {
@@ -205,7 +205,8 @@ export default {
       items: [
         envOnly('RUST_LOG', MAIN, {
           type: 'tracing filter',
-          text: 'Log level filter (`tracing_subscriber` `EnvFilter` syntax) and the only control of the log level. Unset logs errors only, so set it (for example `info`) to see progress lines.',
+          default: 'info',
+          text: 'Log level filter (`tracing_subscriber` `EnvFilter` syntax) and the only control of the log level. Unset logs progress and the final summary at `info`.',
         }),
       ],
     },

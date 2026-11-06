@@ -238,7 +238,7 @@ struct CliArgs {
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_BLOCKS_TABLE",
-        default_value = "default.blocks_metadata"
+        default_value = "blocks_metadata"
     )]
     blocks_table: String,
 
@@ -246,7 +246,7 @@ struct CliArgs {
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_ENTRIES_TABLE",
-        default_value = "default.entries"
+        default_value = "entries"
     )]
     entries_table: String,
 
@@ -254,7 +254,7 @@ struct CliArgs {
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_TRANSACTIONS_TABLE",
-        default_value = "default.transactions"
+        default_value = "transactions"
     )]
     transactions_table: String,
 
@@ -854,6 +854,38 @@ mod tests {
             args.alpenglow_genesis_block,
             Some(SolanaCluster::Mainnet.alpenglow_genesis_block().unwrap())
         );
+    }
+
+    #[test]
+    fn table_defaults_follow_the_selected_database() {
+        let args = resolve(&[
+            "superbank-verify",
+            "--full",
+            "--clickhouse-database",
+            "archive",
+        ])
+        .unwrap();
+        assert_eq!(args.clickhouse_database, "archive");
+        assert_eq!(args.blocks_table, "blocks_metadata");
+        assert_eq!(args.entries_table, "entries");
+        assert_eq!(args.transactions_table, "transactions");
+
+        let args = resolve(&[
+            "superbank-verify",
+            "--full",
+            "--clickhouse-database",
+            "archive",
+            "--blocks-table",
+            "other.blocks",
+            "--entries-table",
+            "other.entries",
+            "--transactions-table",
+            "other.transactions",
+        ])
+        .unwrap();
+        assert_eq!(args.blocks_table, "other.blocks");
+        assert_eq!(args.entries_table, "other.entries");
+        assert_eq!(args.transactions_table, "other.transactions");
     }
 
     #[test]
