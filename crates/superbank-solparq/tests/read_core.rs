@@ -33,6 +33,12 @@ fn parse_archive_name_accepts_solparq_file_names() {
     );
 
     assert_eq!(parse_archive_name("not-an-archive.parquet"), None);
+    // Bundle directories carry no extension; their table files never parse as archives.
+    assert_eq!(
+        parse_archive_name("custom_1078_465951000-465953999").map(|parsed| parsed.end_slot),
+        Some(465_953_999)
+    );
+    assert_eq!(parse_archive_name("transactions.parquet"), None);
 }
 
 #[tokio::test]
@@ -639,4 +645,43 @@ async fn transactions_archive_without_v1_config_columns_still_scans() {
     .unwrap();
     let rows: Value = serde_json::from_str(&render(cli).await.unwrap()).unwrap();
     assert!(!rows.as_array().unwrap().is_empty());
+}
+
+#[test]
+fn s3_listing_groups_bundle_files_into_one_archive() {
+    use chrono::{TimeZone, Utc};
+    use superbank_solparq::read::source::group_listed_objects;
+
+    let at = |minute| Utc.with_ymd_and_hms(2026, 11, 6, 3, minute, 0).unwrap();
+    let bundle = "archives/staging/custom/custom_1078_465951000-465953999";
+    let listed = vec![
+        (format!("{bundle}/transactions.parquet"), 700, at(1)),
+        (format!("{bundle}/blocks_metadata.parquet"), 5, at(2)),
+        (format!("{bundle}/manifest.json"), 1, at(3)),
+        (format!("{bundle}/SHA256SUMS.txt"), 1, at(3)),
+        (
+            "archives/staging/hourly_988_427236024-427254023.parquet".to_string(),
+            50,
+            at(4),
+        ),
+        ("archives/staging/notes.txt".to_string(), 9, at(5)),
+    ];
+    let archives = group_listed_objects(listed);
+    assert_eq!(archives.len(), 2, "{archives:?}");
+
+    let grouped = archives
+        .iter()
+        .find(|archive| archive.path == bundle)
+        .unwrap();
+    assert_eq!(grouped.name, "custom_1078_465951000-465953999");
+    assert_eq!(grouped.size_bytes, 707);
+    assert_eq!(grouped.modified_utc, Some(at(3)));
+    let parsed = grouped.parsed_name.as_ref().expect("bundle name parses");
+    assert_eq!((parsed.kind_label.as_str(), parsed.epoch), ("custom", 1078));
+
+    let legacy = archives
+        .iter()
+        .find(|archive| archive.path != bundle)
+        .unwrap();
+    assert_eq!(legacy.parsed_name.as_ref().unwrap().start_slot, 427_236_024);
 }
