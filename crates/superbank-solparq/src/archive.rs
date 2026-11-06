@@ -689,11 +689,12 @@ impl ArchiveRunReport {
                     .disk_usage
                     .iter()
                     .map(|disk| format!(
-                        "{}:{}:{}/{}",
+                        "{}:{}:{}/{} data={}",
                         disk.name,
                         disk.path,
                         disk.used_bytes(),
-                        disk.total_bytes
+                        disk.total_bytes,
+                        disk.data_bytes
                     ))
                     .collect::<Vec<_>>()
                     .join(",")

@@ -540,11 +540,16 @@ impl ClickHouseClient {
             path: String,
             free_space: u64,
             total_space: u64,
+            data_bytes: u64,
         }
 
         let rows = self
             .query_json_rows::<DiskRow>(
-                "SELECT name, path, free_space, total_space FROM system.disks ORDER BY name",
+                "SELECT d.name AS name, d.path AS path, d.free_space AS free_space, \
+                 d.total_space AS total_space, ifNull(p.bytes, 0) AS data_bytes \
+                 FROM system.disks AS d LEFT JOIN \
+                 (SELECT disk_name, sum(bytes_on_disk) AS bytes FROM system.parts \
+                 WHERE active GROUP BY disk_name) AS p ON p.disk_name = d.name ORDER BY name",
             )
             .await?;
         Ok(rows
@@ -554,6 +559,7 @@ impl ClickHouseClient {
                 path: row.path,
                 free_bytes: row.free_space,
                 total_bytes: row.total_space,
+                data_bytes: row.data_bytes,
             })
             .collect())
     }
@@ -634,8 +640,12 @@ impl ClickHouseClient {
 pub struct DiskUsage {
     pub name: String,
     pub path: String,
+    /// Filesystem free and total space; other workloads on the same filesystem count as used.
     pub free_bytes: u64,
     pub total_bytes: u64,
+    /// Active parts of every ClickHouse table on this disk, system tables included.
+    #[serde(default)]
+    pub data_bytes: u64,
 }
 
 impl DiskUsage {

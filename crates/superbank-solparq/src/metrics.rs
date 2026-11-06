@@ -287,6 +287,7 @@ struct Metrics {
     disk_free_bytes: Family<DiskLabels, Gauge>,
     disk_used_bytes: Family<DiskLabels, Gauge>,
     disk_total_bytes: Family<DiskLabels, Gauge>,
+    disk_data_bytes: Family<DiskLabels, Gauge>,
     db_table_bytes: Family<DbTableLabels, Gauge>,
     db_table_rows: Family<DbTableLabels, Gauge>,
     // Counters.
@@ -348,6 +349,7 @@ impl Metrics {
         let disk_free_bytes = Family::<DiskLabels, Gauge>::default();
         let disk_used_bytes = Family::<DiskLabels, Gauge>::default();
         let disk_total_bytes = Family::<DiskLabels, Gauge>::default();
+        let disk_data_bytes = Family::<DiskLabels, Gauge>::default();
         let db_table_bytes = Family::<DbTableLabels, Gauge>::default();
         let db_table_rows = Family::<DbTableLabels, Gauge>::default();
         let archives_created_total = Family::<KindLabels, Counter>::default();
@@ -511,6 +513,11 @@ impl Metrics {
             disk_total_bytes.clone(),
         );
         registry.register(
+            "disk_data_bytes",
+            "Bytes of active parts of every ClickHouse table on a disk, from system.parts",
+            disk_data_bytes.clone(),
+        );
+        registry.register(
             "db_table_bytes",
             "Disk bytes used by a ClickHouse source table, from system.tables, by table_kind and table",
             db_table_bytes.clone(),
@@ -612,6 +619,7 @@ impl Metrics {
             disk_free_bytes,
             disk_used_bytes,
             disk_total_bytes,
+            disk_data_bytes,
             db_table_bytes,
             db_table_rows,
             archives_created_total,
@@ -656,6 +664,9 @@ impl Metrics {
             self.disk_total_bytes
                 .get_or_create(&labels)
                 .set(clamp_i64(disk.total_bytes));
+            self.disk_data_bytes
+                .get_or_create(&labels)
+                .set(clamp_i64(disk.data_bytes));
         }
     }
 

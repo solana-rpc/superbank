@@ -1414,6 +1414,7 @@ fn dashboard_and_metrics_expose_clickhouse_disk_usage() {
                 path: "/var/lib/clickhouse/".to_string(),
                 free_bytes: 25 * 1024 * 1024 * 1024,
                 total_bytes: 100 * 1024 * 1024 * 1024,
+                data_bytes: 8 * 1024 * 1024 * 1024,
             }],
             ..Default::default()
         },
@@ -1421,7 +1422,11 @@ fn dashboard_and_metrics_expose_clickhouse_disk_usage() {
 
     let status = state.public_status();
     let html = render_dashboard(&config, &status);
-    assert!(html.contains("ClickHouse disk usage"));
+    assert!(html.contains("ClickHouse data on disk"));
+    assert!(
+        html.contains("8.0 GB (filesystem 75.0 GB / 100.0 GB used, 75%)"),
+        "{html}"
+    );
     assert!(html.contains("<code>default</code>"));
     assert!(html.contains("<code>/var/lib/clickhouse/</code>"));
     assert!(html.contains("75.0 GB"));
@@ -1438,6 +1443,9 @@ fn dashboard_and_metrics_expose_clickhouse_disk_usage() {
     ));
     assert!(text.contains(
         "solparq_disk_total_bytes{disk=\"default\",path=\"/var/lib/clickhouse/\"} 107374182400"
+    ));
+    assert!(text.contains(
+        "solparq_disk_data_bytes{disk=\"default\",path=\"/var/lib/clickhouse/\"} 8589934592"
     ));
 }
 

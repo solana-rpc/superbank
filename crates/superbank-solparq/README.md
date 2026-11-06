@@ -391,6 +391,7 @@ Currency (how up to date the data is):
 | `solparq_disk_free_bytes` | gauge | `disk`, `path` | Free space on a ClickHouse-managed disk, from `system.disks` |
 | `solparq_disk_used_bytes` | gauge | `disk`, `path` | Used space on a ClickHouse-managed disk, from `system.disks` |
 | `solparq_disk_total_bytes` | gauge | `disk`, `path` | Total space on a ClickHouse-managed disk, from `system.disks` |
+| `solparq_disk_data_bytes` | gauge | `disk`, `path` | Bytes of active parts of every ClickHouse table on a disk, system tables included, from `system.parts`. The `free`, `used` and `total` gauges are filesystem-wide and count other workloads that share the filesystem |
 | `solparq_db_table_bytes` | gauge | `table_kind`, `table` | Disk bytes used by a ClickHouse source table, from `system.tables` |
 | `solparq_db_table_rows` | gauge | `table_kind`, `table` | Row count of a ClickHouse source table, from `system.tables` |
 
