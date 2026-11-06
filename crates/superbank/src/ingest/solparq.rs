@@ -967,6 +967,38 @@ mod tests {
     }
 
     #[test]
+    fn restore_names_v1_config_columns_only_when_the_archive_has_them() {
+        let object = S3Object {
+            url: "http://minio:9000/bucket/transactions.parquet",
+            access_key: "ak",
+            secret_key: "sk",
+        };
+        let pre_v1 = parse_describe_columns("slot\tUInt64\ntx_version\tNullable(UInt8)\n");
+        let sql = build_s3_restore_sql("db.transactions", &pre_v1, &object, None, None, "");
+        assert!(
+            !sql.contains("tx_config_"),
+            "pre-v1 rows keep the NULL default"
+        );
+
+        let v1 = parse_describe_columns(
+            "slot\tUInt64\ntx_version\tNullable(UInt8)\ntx_config_priority_fee\tNullable(UInt64)\n\
+             tx_config_compute_unit_limit\tNullable(UInt32)\n\
+             tx_config_loaded_accounts_data_size_limit\tNullable(UInt32)\n\
+             tx_config_heap_size\tNullable(UInt32)\n",
+        );
+        let sql = build_s3_restore_sql("db.transactions", &v1, &object, None, None, "");
+        // Naming each column makes a destination without the v1 DDL fail instead of dropping data.
+        for column in [
+            "tx_config_priority_fee",
+            "tx_config_compute_unit_limit",
+            "tx_config_loaded_accounts_data_size_limit",
+            "tx_config_heap_size",
+        ] {
+            assert_eq!(sql.matches(&format!("`{column}`")).count(), 2, "{column}");
+        }
+    }
+
+    #[test]
     fn s3_restore_sql_escapes_quotes() {
         let columns = vec!["slot".to_string()];
         let object = S3Object {

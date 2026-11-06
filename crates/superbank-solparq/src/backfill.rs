@@ -138,6 +138,9 @@ mod tests {
             transaction_undercount_ranges: undercount_ranges,
             transaction_overcount_ranges: Vec::new(),
             rpc_check_error: None,
+            footer_missing_ranges: Vec::new(),
+            footer_coverage_required: false,
+            poh: None,
         }
     }
 

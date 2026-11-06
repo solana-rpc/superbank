@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, path::Path};
+use std::{collections::HashSet, fmt, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
@@ -6,7 +6,11 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt};
 
-use crate::{archive::ClickHouseBounds, config::Config};
+use crate::{
+    archive::ClickHouseBounds,
+    config::{Config, FooterCoveragePolicy},
+    poh::PohReport,
+};
 
 #[derive(Debug, Clone)]
 pub struct DbTables {
@@ -225,6 +229,7 @@ impl ClickHouseClient {
         &self,
         tables: &DbTables,
         solana_rpc_url: &str,
+        footer_check: FooterCheck,
         start_slot: u64,
         end_slot: u64,
     ) -> Result<ValidationReport> {
@@ -237,9 +242,10 @@ impl ClickHouseClient {
                 Err(err) => (Vec::new(), Some(err.to_string())),
             };
 
-        let transaction_mismatches = self
-            .fetch_transaction_mismatches(tables, start_slot, end_slot)
-            .await?;
+        let (transaction_mismatches, footer_gap_slots) = futures_util::try_join!(
+            self.fetch_transaction_mismatches(tables, start_slot, end_slot),
+            self.fetch_footer_gap_slots(&tables.blocks_table, footer_check, start_slot, end_slot),
+        )?;
 
         Ok(ValidationReport::from_observed_slots(
             start_slot,
@@ -248,7 +254,8 @@ impl ClickHouseClient {
             produced_slots,
             transaction_mismatches,
             rpc_check_error,
-        ))
+        )
+        .with_footer_gaps(&footer_gap_slots, footer_check.required))
     }
 
     pub async fn stream_local_parquet(
@@ -436,6 +443,59 @@ impl ClickHouseClient {
             .collect())
     }
 
+    /// Highest block slot at or before `slot`: the parent of a window that starts after `slot`.
+    pub async fn last_block_at_or_before(
+        &self,
+        blocks_table: &str,
+        slot: u64,
+    ) -> Result<Option<u64>> {
+        #[derive(Deserialize)]
+        struct SlotRow {
+            last_slot: Option<u64>,
+        }
+        let sql =
+            format!("SELECT maxOrNull(slot) AS last_slot FROM {blocks_table} WHERE slot <= {slot}");
+        let rows = self.query_json_rows::<SlotRow>(&sql).await?;
+        Ok(rows.into_iter().next().and_then(|row| row.last_slot))
+    }
+
+    /// `parent_slot` of the first block at or after `slot`.
+    pub async fn first_block_parent_from(
+        &self,
+        blocks_table: &str,
+        slot: u64,
+    ) -> Result<Option<u64>> {
+        #[derive(Deserialize)]
+        struct ParentRow {
+            parent_slot: u64,
+        }
+        let sql = format!(
+            "SELECT parent_slot FROM {blocks_table} WHERE slot >= {slot} ORDER BY slot LIMIT 1"
+        );
+        let rows = self.query_json_rows::<ParentRow>(&sql).await?;
+        Ok(rows.into_iter().next().map(|row| row.parent_slot))
+    }
+
+    /// Stored post-genesis blocks whose footer is incomplete. `FINAL` reads the row a replay left last.
+    async fn fetch_footer_gap_slots(
+        &self,
+        blocks_table: &str,
+        footer_check: FooterCheck,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<u64>> {
+        #[derive(Deserialize)]
+        struct SlotRow {
+            slot: u64,
+        }
+        let Some((first, last)) = footer_check.checked_range(start_slot, end_slot) else {
+            return Ok(Vec::new());
+        };
+        let sql = build_footer_gap_query(blocks_table, first, last);
+        let rows = self.query_json_rows::<SlotRow>(&sql).await?;
+        Ok(rows.into_iter().map(|row| row.slot).collect())
+    }
+
     async fn fetch_transaction_mismatches(
         &self,
         tables: &DbTables,
@@ -480,11 +540,16 @@ impl ClickHouseClient {
             path: String,
             free_space: u64,
             total_space: u64,
+            data_bytes: u64,
         }
 
         let rows = self
             .query_json_rows::<DiskRow>(
-                "SELECT name, path, free_space, total_space FROM system.disks ORDER BY name",
+                "SELECT d.name AS name, d.path AS path, d.free_space AS free_space, \
+                 d.total_space AS total_space, ifNull(p.bytes, 0) AS data_bytes \
+                 FROM system.disks AS d LEFT JOIN \
+                 (SELECT disk_name, sum(bytes_on_disk) AS bytes FROM system.parts \
+                 WHERE active GROUP BY disk_name) AS p ON p.disk_name = d.name ORDER BY name",
             )
             .await?;
         Ok(rows
@@ -494,6 +559,7 @@ impl ClickHouseClient {
                 path: row.path,
                 free_bytes: row.free_space,
                 total_bytes: row.total_space,
+                data_bytes: row.data_bytes,
             })
             .collect())
     }
@@ -574,8 +640,12 @@ impl ClickHouseClient {
 pub struct DiskUsage {
     pub name: String,
     pub path: String,
+    /// Filesystem free and total space; other workloads on the same filesystem count as used.
     pub free_bytes: u64,
     pub total_bytes: u64,
+    /// Active parts of every ClickHouse table on this disk, system tables included.
+    #[serde(default)]
+    pub data_bytes: u64,
 }
 
 impl DiskUsage {
@@ -621,6 +691,28 @@ impl fmt::Display for SlotRange {
     }
 }
 
+/// Alpenglow footer audit settings for one validation run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FooterCheck {
+    pub genesis_slot: Option<u64>,
+    pub required: bool,
+}
+
+impl FooterCheck {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            genesis_slot: config.alpenglow_genesis_slot,
+            required: config.footer_coverage_policy == FooterCoveragePolicy::Require,
+        }
+    }
+
+    /// The part of `[start_slot, end_slot]` after the genesis slot, if any.
+    pub fn checked_range(&self, start_slot: u64, end_slot: u64) -> Option<(u64, u64)> {
+        let first = self.genesis_slot?.checked_add(1)?.max(start_slot);
+        (first <= end_slot).then_some((first, end_slot))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ValidationReport {
     pub start_slot: u64,
@@ -637,6 +729,12 @@ pub struct ValidationReport {
     /// Slots with more archived rows than declared — fixable by ClickHouse dedup.
     pub transaction_overcount_ranges: Vec<SlotRange>,
     pub rpc_check_error: Option<String>,
+    /// Alpenglow blocks stored without a complete footer.
+    pub footer_missing_ranges: Vec<SlotRange>,
+    /// Footer gaps block the archive (`--footer-coverage-policy require`).
+    pub footer_coverage_required: bool,
+    /// superbank-verify result (`--poh-verify-mode`); `None` when it did not run.
+    pub poh: Option<PohReport>,
 }
 
 impl ValidationReport {
@@ -690,21 +788,46 @@ impl ValidationReport {
             missing_blocks,
             transaction_mismatches,
             rpc_check_error,
+            footer_missing_ranges: Vec::new(),
+            footer_coverage_required: false,
+            poh: None,
         }
     }
 
+    pub fn with_footer_gaps(mut self, footer_gap_slots: &[u64], required: bool) -> Self {
+        self.footer_missing_ranges = slot_ranges(footer_gap_slots);
+        self.footer_coverage_required = required;
+        self
+    }
+
+    pub fn footer_missing_slots(&self) -> u64 {
+        self.footer_missing_ranges
+            .iter()
+            .map(|range| range.slot_count)
+            .sum()
+    }
+
     pub fn has_warnings(&self) -> bool {
-        !self.missing_blocks.is_empty()
-            || !self.transaction_mismatches.is_empty()
-            || self.rpc_check_error.is_some()
+        self.has_data_warnings() || self.rpc_check_error.is_some()
     }
 
     /// Verified data problems that always block archiving: blocks Solana
-    /// produced but we are missing, or transaction-count mismatches. Excludes
+    /// produced but we are missing, transaction-count mismatches, footer
+    /// gaps when footers are required, and a blocking PoH result. Excludes
     /// the RPC cross-check *failure*, which is a "couldn't verify" condition
     /// rather than a detected gap.
     pub fn has_data_warnings(&self) -> bool {
-        !self.missing_blocks.is_empty() || !self.transaction_mismatches.is_empty()
+        self.missing_blocks.len() + self.transaction_mismatches.len() + self.blocking_footer_gaps()
+            > 0
+            || self.poh.as_ref().is_some_and(PohReport::blocks_archive)
+    }
+
+    fn blocking_footer_gaps(&self) -> usize {
+        if self.footer_coverage_required {
+            self.footer_missing_ranges.len()
+        } else {
+            0
+        }
     }
 
     /// Whether validation results should block archiving. When
@@ -781,7 +904,7 @@ impl TransactionMismatch {
     }
 }
 
-fn slot_ranges(slots: &[u64]) -> Vec<SlotRange> {
+pub(crate) fn slot_ranges(slots: &[u64]) -> Vec<SlotRange> {
     if slots.is_empty() {
         return Vec::new();
     }
@@ -835,6 +958,15 @@ pub fn build_local_parquet_query(
         "SELECT * FROM {transactions_table}{dedup} WHERE slot BETWEEN {start_slot} AND {end_slot} ORDER BY slot, slot_idx, signature{settings} FORMAT Parquet",
         dedup = final_suffix(dedup),
         settings = settings_suffix(settings, " ")
+    )
+}
+
+/// Slots in `[start_slot, end_slot]` whose stored footer is missing or partial.
+pub fn build_footer_gap_query(blocks_table: &str, start_slot: u64, end_slot: u64) -> String {
+    format!(
+        "SELECT slot FROM {blocks_table} FINAL WHERE slot BETWEEN {start_slot} AND {end_slot} \
+         AND (bank_hash IS NULL OR block_producer_time_nanos IS NULL OR block_user_agent IS NULL) \
+         ORDER BY slot"
     )
 }
 
@@ -972,6 +1104,92 @@ async fn fetch_solana_produced_slots(
     start_slot: u64,
     end_slot: u64,
 ) -> Result<Vec<u64>> {
+    fetch_solana_produced_slots_with_retry(rpc_url, start_slot, end_slot, RpcRetryPolicy::DEFAULT)
+        .await
+}
+
+/// Bounded backoff for the `getBlocks` cross-check, so a short rate-limit burst does not skip the run.
+#[derive(Debug, Clone, Copy)]
+struct RpcRetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl RpcRetryPolicy {
+    const DEFAULT: Self = Self {
+        max_attempts: 4,
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_secs(10),
+    };
+
+    /// Delay before retry `attempt` (1-based): `Retry-After` if given, else exponential; both capped.
+    fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        let backoff = self
+            .base_delay
+            .saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+        retry_after.unwrap_or(backoff).min(self.max_delay)
+    }
+}
+
+/// One failed `getBlocks` attempt: the error, whether a retry may help, and any `Retry-After`.
+struct RpcAttemptError {
+    error: anyhow::Error,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+async fn fetch_solana_produced_slots_with_retry(
+    rpc_url: &str,
+    start_slot: u64,
+    end_slot: u64,
+    policy: RpcRetryPolicy,
+) -> Result<Vec<u64>> {
+    let client = reqwest::Client::new();
+    let mut slots = Vec::new();
+    let mut cursor = start_slot;
+    while cursor <= end_slot {
+        let chunk_end = end_slot.min(cursor.saturating_add(499_999));
+        let mut attempt = 1;
+        let chunk = loop {
+            match get_blocks_once(&client, rpc_url, cursor, chunk_end).await {
+                Ok(chunk) => break chunk,
+                Err(failure) if failure.retryable && attempt < policy.max_attempts => {
+                    let delay = policy.delay(attempt, failure.retry_after);
+                    tracing::warn!(
+                        start_slot = cursor,
+                        end_slot = chunk_end,
+                        attempt,
+                        max_attempts = policy.max_attempts,
+                        delay_ms = delay.as_millis() as u64,
+                        error = format!("{:#}", failure.error),
+                        "Solana RPC getBlocks failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                // Callers keep only `to_string()`, so flatten the chain to keep the RPC error visible.
+                Err(failure) if attempt > 1 => {
+                    return Err(anyhow!("{:#} (after {attempt} attempts)", failure.error));
+                }
+                Err(failure) => return Err(failure.error),
+            }
+        };
+        slots.extend(chunk);
+        if chunk_end == u64::MAX {
+            break;
+        }
+        cursor = chunk_end + 1;
+    }
+    Ok(slots)
+}
+
+async fn get_blocks_once(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    start_slot: u64,
+    end_slot: u64,
+) -> std::result::Result<Vec<u64>, RpcAttemptError> {
     #[derive(Serialize)]
     struct RpcRequest<'a> {
         jsonrpc: &'a str,
@@ -984,37 +1202,82 @@ async fn fetch_solana_produced_slots(
         result: Option<Vec<u64>>,
         error: Option<serde_json::Value>,
     }
+    let fail =
+        |error: anyhow::Error, retryable: bool, retry_after: Option<Duration>| RpcAttemptError {
+            error,
+            retryable,
+            retry_after,
+        };
 
-    let client = reqwest::Client::new();
-    let mut slots = Vec::new();
-    let mut cursor = start_slot;
-    while cursor <= end_slot {
-        let chunk_end = end_slot.min(cursor.saturating_add(499_999));
-        let response = client
-            .post(rpc_url)
-            .json(&RpcRequest {
-                jsonrpc: "2.0",
-                id: 1,
-                method: "getBlocks",
-                params: [cursor, chunk_end],
-            })
-            .send()
-            .await
-            .with_context(|| format!("query Solana RPC getBlocks {cursor}-{chunk_end}"))?;
-        let parsed = response
-            .json::<RpcResponse>()
-            .await
-            .context("parse Solana RPC getBlocks response")?;
-        if let Some(error) = parsed.error {
-            return Err(anyhow!("Solana RPC getBlocks error: {error}"));
+    // The RPC URL carries a token in its path; strip it from reqwest errors before they reach logs.
+    let response = client
+        .post(rpc_url)
+        .json(&RpcRequest {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getBlocks",
+            params: [start_slot, end_slot],
+        })
+        .send()
+        .await
+        .map_err(|err| {
+            let retryable = err.is_timeout() || err.is_connect();
+            fail(
+                anyhow::Error::new(err.without_url()).context(format!(
+                    "query Solana RPC getBlocks {start_slot}-{end_slot}"
+                )),
+                retryable,
+                None,
+            )
+        })?;
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let status_retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+    let body = response.bytes().await.map_err(|err| {
+        fail(
+            anyhow::Error::new(err.without_url()).context("read Solana RPC getBlocks response"),
+            status_retryable,
+            retry_after,
+        )
+    })?;
+    let parsed = match serde_json::from_slice::<RpcResponse>(&body) {
+        Ok(parsed) => parsed,
+        Err(err) if status.is_success() => {
+            return Err(fail(
+                anyhow::Error::new(err).context("parse Solana RPC getBlocks response"),
+                false,
+                None,
+            ));
         }
-        slots.extend(parsed.result.unwrap_or_default());
-        if chunk_end == u64::MAX {
-            break;
+        Err(_) => {
+            return Err(fail(
+                anyhow!("Solana RPC getBlocks HTTP {status}"),
+                status_retryable,
+                retry_after,
+            ));
         }
-        cursor = chunk_end + 1;
+    };
+    if let Some(error) = parsed.error {
+        let rpc_rate_limited = error.get("code").and_then(serde_json::Value::as_i64) == Some(429);
+        return Err(fail(
+            anyhow!("Solana RPC getBlocks error: {error}"),
+            status_retryable || rpc_rate_limited,
+            retry_after,
+        ));
     }
-    Ok(slots)
+    if !status.is_success() {
+        return Err(fail(
+            anyhow!("Solana RPC getBlocks HTTP {status}"),
+            status_retryable,
+            retry_after,
+        ));
+    }
+    Ok(parsed.result.unwrap_or_default())
 }
 
 /// Query the current Solana network tip via `getSlot` at the given commitment.
@@ -1320,5 +1583,173 @@ mod redaction_tests {
         // treated as an s3() call.
         let sql = "SELECT hs3(col) FROM t";
         assert_eq!(redact_s3_credentials(sql), sql);
+    }
+}
+
+#[cfg(test)]
+mod rpc_retry_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::*;
+
+    const FAST: RpcRetryPolicy = RpcRetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+
+    /// Serves one canned `(status, extra_headers, body)` per connection, repeating the last one.
+    async fn serve(
+        responses: Vec<(u16, &'static str, &'static str)>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let (status, headers, body) = responses[index.min(responses.len() - 1)];
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let read = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                    if read == 0 {
+                        break;
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.ok();
+            }
+        });
+        (url, hits)
+    }
+
+    const RATE_LIMITED: &str = r#"{"jsonrpc":"2.0","error":{"code":429,"message":"Too many requests from your IP"},"id":null}"#;
+    const BLOCKS: &str = r#"{"jsonrpc":"2.0","result":[10,11,13],"id":1}"#;
+
+    #[tokio::test]
+    async fn retries_http_429_then_succeeds() {
+        let (url, hits) = serve(vec![
+            (429, "", RATE_LIMITED),
+            (429, "", RATE_LIMITED),
+            (200, "", BLOCKS),
+        ])
+        .await;
+        let slots = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap();
+        assert_eq!(slots, vec![10, 11, 13]);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retries_json_rpc_429_inside_http_200() {
+        let (url, hits) = serve(vec![(200, "", RATE_LIMITED), (200, "", BLOCKS)]).await;
+        let slots = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap();
+        assert_eq!(slots, vec![10, 11, 13]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_server_errors_without_json_body() {
+        let (url, hits) = serve(vec![(503, "", "upstream down"), (200, "", BLOCKS)]).await;
+        let slots = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap();
+        assert_eq!(slots, vec![10, 11, 13]);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_attempts_and_keeps_rpc_error() {
+        let (url, hits) = serve(vec![(429, "", RATE_LIMITED)]).await;
+        let err = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap_err();
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Solana RPC getBlocks error:"),
+            "{message}"
+        );
+        assert!(message.contains("Too many requests"), "{message}");
+        assert!(message.ends_with("(after 3 attempts)"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_other_rpc_errors() {
+        let (url, hits) = serve(vec![(
+            200,
+            "",
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#,
+        )])
+        .await;
+        let err = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap_err();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(err.to_string().contains("Method not found"));
+        assert!(!err.to_string().contains("attempts"));
+    }
+
+    #[tokio::test]
+    async fn connect_failure_does_not_leak_url_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/secret-token", listener.local_addr().unwrap());
+        drop(listener);
+        let err = fetch_solana_produced_slots_with_retry(&url, 10, 13, FAST)
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("(after 3 attempts)"), "{message}");
+        assert!(!message.contains("secret-token"), "{message}");
+    }
+
+    #[test]
+    fn delay_prefers_retry_after_and_caps_it() {
+        let policy = RpcRetryPolicy::DEFAULT;
+        assert_eq!(policy.delay(1, None), Duration::from_secs(1));
+        assert_eq!(policy.delay(2, None), Duration::from_secs(2));
+        assert_eq!(policy.delay(3, None), Duration::from_secs(4));
+        assert_eq!(policy.delay(10, None), Duration::from_secs(10));
+        assert_eq!(
+            policy.delay(1, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            policy.delay(1, Some(Duration::from_secs(60))),
+            Duration::from_secs(10)
+        );
     }
 }

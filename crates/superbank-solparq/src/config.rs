@@ -15,6 +15,61 @@ pub enum ArchiveLocation {
     S3,
 }
 
+/// What validation does with Alpenglow blocks that lack a complete stored footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum FooterCoveragePolicy {
+    Report,
+    Require,
+}
+
+/// Solana cluster being archived. It picks the defaults for `--alpenglow-genesis-slot` and
+/// `--solana-rpc-url`, and the PoH check's cluster parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum SolanaCluster {
+    #[default]
+    Mainnet,
+    Devnet,
+    Testnet,
+}
+
+impl SolanaCluster {
+    /// `block.slot` of the cluster's `getAgGenesisCert` response.
+    pub fn alpenglow_genesis_slot(self) -> u64 {
+        match self {
+            SolanaCluster::Mainnet => MAINNET_ALPENGLOW_GENESIS_SLOT,
+            SolanaCluster::Devnet => DEVNET_ALPENGLOW_GENESIS_SLOT,
+            SolanaCluster::Testnet => TESTNET_ALPENGLOW_GENESIS_SLOT,
+        }
+    }
+
+    pub fn default_rpc_url(self) -> &'static str {
+        match self {
+            SolanaCluster::Mainnet => "https://api.mainnet-beta.solana.com",
+            SolanaCluster::Devnet => "https://api.devnet.solana.com",
+            SolanaCluster::Testnet => "https://api.testnet.solana.com",
+        }
+    }
+
+    pub fn verify_cluster(self) -> superbank_verify::SlotRangeCluster {
+        match self {
+            SolanaCluster::Mainnet => superbank_verify::SlotRangeCluster::Mainnet,
+            SolanaCluster::Devnet => superbank_verify::SlotRangeCluster::Devnet,
+            SolanaCluster::Testnet => superbank_verify::SlotRangeCluster::Testnet,
+        }
+    }
+}
+
+/// Proof-of-History check run by superbank-verify before an archive is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum PohVerifyMode {
+    Off,
+    Structural,
+    Full,
+}
+
 #[derive(Debug, Clone)]
 pub struct S3Config {
     pub bucket_name: String,
@@ -78,6 +133,18 @@ pub struct Config {
     /// (missing blocks, transaction mismatches) still block; only the
     /// "couldn't verify" condition is treated as non-blocking. Off by default.
     pub allow_rpc_validation_failure: bool,
+    pub solana_cluster: SolanaCluster,
+    /// Trusted Alpenglow genesis certificate slot. Slots after it need a stored footer.
+    pub alpenglow_genesis_slot: Option<u64>,
+    pub footer_coverage_policy: FooterCoveragePolicy,
+    /// Run superbank-verify over the archive range after validation passes; a
+    /// failure blocks the archive like a missing block. `full` by default.
+    pub poh_verify_mode: PohVerifyMode,
+    /// Slots the PoH check could not verify (no entries rows, chain gaps) do
+    /// not block the archive; PoH failures still do.
+    pub poh_verify_allow_unverifiable: bool,
+    /// Hash recomputation threads for the PoH check (0 = all available cores).
+    pub poh_verify_threads: usize,
     /// Backfill blocks missing from the archive's slot range (detected by
     /// validation) from Solana RPC before archiving, by invoking the `superbank`
     /// RPC ingestor as a subprocess. Off by default.
@@ -134,7 +201,8 @@ impl Config {
     }
 
     fn from_cli(cli: Cli) -> Result<Self> {
-        hourly_slot_count(cli.hourly_slot_duration_ms)?;
+        validate_cadence_and_alpenglow_settings(&cli)?;
+        let alpenglow_genesis_slot = alpenglow_genesis_slot(&cli);
         let archive_kinds = parse_archive_kinds(&cli.archive_range_type, cli.custom_slot_range)?;
         if !cli.server_mode && archive_kinds.len() > 1 {
             return Err(anyhow!(
@@ -221,6 +289,12 @@ impl Config {
             s3_write_checksums: cli.archive_s3_write_checksums,
             force_archive: cli.force_archive,
             allow_rpc_validation_failure: cli.allow_rpc_validation_failure,
+            solana_cluster: cli.solana_cluster,
+            alpenglow_genesis_slot,
+            footer_coverage_policy: cli.footer_coverage_policy,
+            poh_verify_mode: cli.poh_verify_mode,
+            poh_verify_allow_unverifiable: cli.poh_verify_allow_unverifiable,
+            poh_verify_threads: cli.poh_verify_threads,
             backfill_gaps: cli.backfill_gaps,
             backfill_superbank_bin: cli.backfill_superbank_bin,
             backfill_include_undercounts: cli.backfill_include_undercounts,
@@ -230,7 +304,9 @@ impl Config {
             ops_port: cli.ops_port,
             metrics_port: cli.metrics_port,
             archives_to_keep: cli.archives_to_keep,
-            solana_rpc_url: cli.solana_rpc_url,
+            solana_rpc_url: cli
+                .solana_rpc_url
+                .unwrap_or_else(|| cli.solana_cluster.default_rpc_url().to_string()),
             archive_check_interval_secs: cli.archive_check_interval_secs,
             continue_from_last_archive: !cli.no_continue_from_last_archive,
             archive_slot_range: cli.archive_slot_range,
@@ -489,6 +565,64 @@ struct Cli {
     )]
     allow_rpc_validation_failure: bool,
 
+    /// Solana cluster being archived: sets the default Alpenglow genesis slot and
+    /// Solana RPC URL, and the PoH check's cluster parameters.
+    #[arg(
+        long = "solana-cluster",
+        env = "SOLPARQ_SOLANA_CLUSTER",
+        value_enum,
+        default_value = "mainnet"
+    )]
+    solana_cluster: SolanaCluster,
+
+    /// Trusted Alpenglow genesis certificate slot (`getAgGenesisCert` `block.slot`).
+    /// Defaults to the `--solana-cluster` slot; `none` disables the boundary.
+    #[arg(
+        long = "alpenglow-genesis-slot",
+        env = "SOLPARQ_ALPENGLOW_GENESIS_SLOT",
+        value_parser = parse_alpenglow_genesis_slot
+    )]
+    alpenglow_genesis_slot: Option<AlpenglowGenesisSlot>,
+
+    /// `report` lists Alpenglow blocks without a complete footer; `require` also blocks the archive.
+    #[arg(
+        long = "footer-coverage-policy",
+        env = "SOLPARQ_FOOTER_COVERAGE_POLICY",
+        value_enum,
+        default_value = "require"
+    )]
+    footer_coverage_policy: FooterCoveragePolicy,
+
+    /// Verify Proof-of-History over the archive range with superbank-verify
+    /// before writing it: `structural` checks ticks, entries and blockhash
+    /// linkage; `full` also recomputes every entry hash. A failure blocks the
+    /// archive. Runs only when the other validation checks pass. Needs
+    /// `--alpenglow-genesis-slot`.
+    #[arg(
+        long = "poh-verify-mode",
+        env = "SOLPARQ_POH_VERIFY_MODE",
+        value_enum,
+        default_value = "full"
+    )]
+    poh_verify_mode: PohVerifyMode,
+
+    /// Archive even when the PoH check leaves slots unverifiable (no entries
+    /// rows, e.g. RPC-backfilled blocks) or missing; failures still block.
+    #[arg(
+        long = "poh-verify-allow-unverifiable",
+        env = "SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE",
+        default_value_t = false
+    )]
+    poh_verify_allow_unverifiable: bool,
+
+    /// Hash recomputation threads for the PoH check (0 = all available cores).
+    #[arg(
+        long = "poh-verify-threads",
+        env = "SOLPARQ_POH_VERIFY_THREADS",
+        default_value_t = 0
+    )]
+    poh_verify_threads: usize,
+
     /// Backfill blocks missing from the archive's slot range from Solana RPC
     /// before archiving, by invoking the `superbank` RPC ingestor as a
     /// subprocess. Uses `--solana-rpc-url` and the configured ClickHouse
@@ -573,12 +707,9 @@ struct Cli {
     )]
     archives_to_keep: usize,
 
-    #[arg(
-        long = "solana-rpc-url",
-        env = "SOLPARQ_SOLANA_RPC_URL",
-        default_value = "https://api.mainnet-beta.solana.com"
-    )]
-    solana_rpc_url: String,
+    /// Defaults to the public Solana Foundation endpoint of `--solana-cluster`.
+    #[arg(long = "solana-rpc-url", env = "SOLPARQ_SOLANA_RPC_URL")]
+    solana_rpc_url: Option<String>,
 
     #[arg(
         long = "archive-check-interval-secs",
@@ -655,6 +786,56 @@ fn require_s3_value(value: Option<String>, name: &str) -> Result<String> {
         return Err(anyhow!("{name} is required when archive-location-type=s3"));
     }
     Ok(value)
+}
+
+fn validate_cadence_and_alpenglow_settings(cli: &Cli) -> Result<()> {
+    hourly_slot_count(cli.hourly_slot_duration_ms)?;
+    if cli.footer_coverage_policy == FooterCoveragePolicy::Require
+        && alpenglow_genesis_slot(cli).is_none()
+    {
+        return Err(anyhow!(
+            "--footer-coverage-policy require needs --alpenglow-genesis-slot; \
+             with `none`, also set --footer-coverage-policy report"
+        ));
+    }
+    // Without a boundary every slot is checked with historical PoH rules, so
+    // every post-Alpenglow window would fail and stall archiving.
+    if cli.poh_verify_mode != PohVerifyMode::Off && alpenglow_genesis_slot(cli).is_none() {
+        return Err(anyhow!(
+            "--poh-verify-mode needs --alpenglow-genesis-slot; \
+             with `none`, also set --poh-verify-mode off"
+        ));
+    }
+    Ok(())
+}
+
+/// `block.slot` of each cluster's `getAgGenesisCert` response, read from the public
+/// Solana Foundation RPC endpoints on 2026-11-03.
+pub const MAINNET_ALPENGLOW_GENESIS_SLOT: u64 = 459_652_999;
+pub const DEVNET_ALPENGLOW_GENESIS_SLOT: u64 = 504_148_999;
+pub const TESTNET_ALPENGLOW_GENESIS_SLOT: u64 = 444_625_255;
+
+/// The explicit `--alpenglow-genesis-slot`, else the `--solana-cluster` default.
+fn alpenglow_genesis_slot(cli: &Cli) -> Option<u64> {
+    match cli.alpenglow_genesis_slot {
+        Some(AlpenglowGenesisSlot(slot)) => slot,
+        None => Some(cli.solana_cluster.alpenglow_genesis_slot()),
+    }
+}
+
+/// `--alpenglow-genesis-slot`: a slot, or `None` when set to `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlpenglowGenesisSlot(Option<u64>);
+
+fn parse_alpenglow_genesis_slot(value: &str) -> Result<AlpenglowGenesisSlot, String> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Ok(AlpenglowGenesisSlot(None));
+    }
+    value
+        .trim()
+        .parse::<u64>()
+        .map(|slot| AlpenglowGenesisSlot(Some(slot)))
+        .map_err(|_| format!("expected a slot number or `none`, got `{value}`"))
 }
 
 fn validate_table_name(value: &str) -> Result<()> {
