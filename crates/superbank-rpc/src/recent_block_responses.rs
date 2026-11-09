@@ -281,7 +281,13 @@ impl RecentBlockResponses {
             let mut blocks = inner.lock();
             match blocks.entry(&key) {
                 Some(Entry::Ready(bytes)) => return Ok((bytes.clone(), RecentAccess::Hit)),
-                Some(Entry::Building { done, .. }) => (done.clone(), RecentAccess::Merged),
+                Some(Entry::Building { done, .. }) => {
+                    let done = done.clone();
+                    drop(blocks);
+                    // Free what the unused build holds, such as a prebuild permit, before waiting.
+                    drop(build);
+                    (done, RecentAccess::Merged)
+                }
                 None => {
                     let id = blocks.next_id;
                     blocks.next_id += 1;
@@ -762,6 +768,54 @@ mod tests {
         );
         assert!(!store.contains(&key(4, 1)));
         assert_eq!(store.resident(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn merged_request_releases_its_build_before_waiting() {
+        let store = RecentBlockResponses::new(1024);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let first = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .get_or_build(key(6, 1), async move {
+                        wait.await.ok();
+                        Ok(Bytes::from_static(b"block"))
+                    })
+                    .await
+            })
+        };
+        while !store.contains(&key(6, 1)) {
+            tokio::task::yield_now().await;
+        }
+        // Like a prebuild, the merged request's unused build owns a permit.
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let merged = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .get_or_build(key(6, 1), async move {
+                        let _permit = permit;
+                        Err(RecentBuildError::Unavailable)
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the merged request dropped its build while the first build ran");
+        release.send(()).unwrap();
+        let (bytes, access) = merged.await.unwrap().unwrap();
+        assert_eq!(
+            (bytes.as_ref(), access),
+            (&b"block"[..], RecentAccess::Merged)
+        );
+        assert_eq!(first.await.unwrap().unwrap().1, RecentAccess::Built);
     }
 
     #[tokio::test]
