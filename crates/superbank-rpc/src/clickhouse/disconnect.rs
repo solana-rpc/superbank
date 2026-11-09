@@ -141,13 +141,18 @@ fn record_verification(entry: &Pending, outcome: &'static str) {
     }
 }
 
+enum ReadLifecycle {
+    Prepared(OwnedSemaphorePermit),
+    Submitted(OwnedSemaphorePermit),
+    Released,
+}
+
 pub(crate) struct DisconnectGuard {
     owner: Arc<Inner>,
     query_id: String,
-    permit: Option<OwnedSemaphorePermit>,
+    lifecycle: ReadLifecycle,
     operation: &'static str,
     target: &'static str,
-    submitted: bool,
     retain_until_verified: bool,
     max_execution: Option<Duration>,
     additional: Vec<OwnedSemaphorePermit>,
@@ -199,10 +204,9 @@ impl DisconnectVerifier {
         Ok(DisconnectGuard {
             owner: self.0.clone(),
             query_id,
-            permit: Some(permit),
+            lifecycle: ReadLifecycle::Submitted(permit),
             operation: "signature_statuses",
             target: "primary",
-            submitted: true,
             retain_until_verified: true,
             max_execution: None,
             additional: Vec::new(),
@@ -244,10 +248,9 @@ impl DisconnectVerifier {
         Ok(DisconnectGuard {
             owner: self.0.clone(),
             query_id,
-            permit: Some(permit),
+            lifecycle: ReadLifecycle::Prepared(permit),
             operation,
             target,
-            submitted: false,
             retain_until_verified: true,
             max_execution,
             additional: Vec::new(),
@@ -315,7 +318,12 @@ impl DisconnectGuard {
         self.additional.push(permit);
     }
     pub(crate) fn submitted(&mut self) {
-        self.submitted = true;
+        self.lifecycle = match std::mem::replace(&mut self.lifecycle, ReadLifecycle::Released) {
+            ReadLifecycle::Prepared(permit) | ReadLifecycle::Submitted(permit) => {
+                ReadLifecycle::Submitted(permit)
+            }
+            ReadLifecycle::Released => ReadLifecycle::Released,
+        };
     }
     /// Release admission when the response is closed instead of holding it until
     /// termination is observed. Only for reads that ClickHouse bounds on its own.
@@ -329,7 +337,7 @@ impl DisconnectGuard {
 
     /// Only call after a fully consumed successful response, or before submission.
     pub(crate) fn disarm(&mut self) {
-        self.permit = None;
+        self.lifecycle = ReadLifecycle::Released;
         self.additional.clear();
         self.workflow.clear();
     }
@@ -342,23 +350,20 @@ impl Drop for DisconnectGuard {
 }
 
 fn enqueue_abandoned(guard: &mut DisconnectGuard) {
-    if !guard.submitted {
-        return;
-    }
-    if !guard.retain_until_verified {
-        // Permits drop with the guard, after the owning cursor closed the response.
-        if guard.permit.take().is_some() {
-            crate::metrics::read_disconnect_verification(
-                guard.operation,
-                guard.target,
-                "released_unverified",
-            );
-        }
-        return;
-    }
-    let Some(permit) = guard.permit.take() else {
+    let ReadLifecycle::Submitted(permit) =
+        std::mem::replace(&mut guard.lifecycle, ReadLifecycle::Released)
+    else {
         return;
     };
+    if !guard.retain_until_verified {
+        // The owning cursor closes the response before this releases admission.
+        crate::metrics::read_disconnect_verification(
+            guard.operation,
+            guard.target,
+            "released_unverified",
+        );
+        return;
+    }
     record_pending(guard.operation, guard.target, 1);
     let abandoned_at = Instant::now();
     let pending = Pending {
@@ -987,10 +992,9 @@ mod tests {
         DisconnectGuard {
             owner: verifier.0.clone(),
             query_id: id.into(),
-            permit: Some(semaphore.clone().try_acquire_owned().unwrap()),
+            lifecycle: ReadLifecycle::Submitted(semaphore.clone().try_acquire_owned().unwrap()),
             operation: "signature_statuses",
             target,
-            submitted: true,
             retain_until_verified: true,
             max_execution,
             additional: Vec::new(),
@@ -1228,10 +1232,9 @@ mod tests {
         let guard = DisconnectGuard {
             owner: verifier.0.clone(),
             query_id: "q".into(),
-            permit: Some(semaphore.clone().try_acquire_owned().unwrap()),
+            lifecycle: ReadLifecycle::Submitted(semaphore.clone().try_acquire_owned().unwrap()),
             operation: "signature_statuses",
             target: "primary",
-            submitted: true,
             retain_until_verified: true,
             max_execution: None,
             additional: Vec::new(),
@@ -1251,10 +1254,9 @@ mod tests {
         let mut guard = DisconnectGuard {
             owner: verifier.0.clone(),
             query_id: "q".into(),
-            permit: Some(semaphore.clone().try_acquire_owned().unwrap()),
+            lifecycle: ReadLifecycle::Submitted(semaphore.clone().try_acquire_owned().unwrap()),
             operation: "signature_statuses",
             target: "primary",
-            submitted: true,
             retain_until_verified: true,
             max_execution: None,
             additional: Vec::new(),
@@ -1264,6 +1266,73 @@ mod tests {
         drop(guard);
         assert_eq!(semaphore.available_permits(), 1);
         assert!(verifier.0.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guard_transitions_preserve_all_admission_until_release() {
+        for submitted in [false, true] {
+            for completed in [false, true] {
+                for release_on_abandon in [false, true] {
+                    let verifier = verifier();
+                    let admission = Arc::new(Semaphore::new(1));
+                    let additional = Arc::new(Semaphore::new(1));
+                    let workflow = Arc::new(Semaphore::new(1));
+                    let mut guard = verifier
+                        .arm_ready(
+                            "q".into(),
+                            admission.clone().try_acquire_owned().unwrap(),
+                            "signature_statuses",
+                            "primary",
+                            None,
+                        )
+                        .unwrap();
+                    guard.retain(additional.clone().try_acquire_owned().unwrap());
+                    guard.retain_workflow(vec![Arc::new(
+                        workflow.clone().try_acquire_owned().unwrap(),
+                    )]);
+                    if release_on_abandon {
+                        guard.release_on_abandon();
+                    }
+                    if submitted {
+                        guard.submitted();
+                        guard.submitted();
+                    }
+                    for semaphore in [&admission, &additional, &workflow] {
+                        assert_eq!(semaphore.available_permits(), 0);
+                    }
+                    if completed {
+                        guard.disarm();
+                        for semaphore in [&admission, &additional, &workflow] {
+                            assert_eq!(semaphore.available_permits(), 1);
+                        }
+                        guard.disarm();
+                        guard.submitted();
+                    }
+                    drop(guard);
+
+                    let retained = submitted && !completed && !release_on_abandon;
+                    for semaphore in [&admission, &additional, &workflow] {
+                        assert_eq!(semaphore.available_permits(), usize::from(!retained));
+                    }
+                    assert_eq!(
+                        verifier.0.pending.lock().unwrap().len(),
+                        usize::from(retained)
+                    );
+                    if retained {
+                        let ids = vec!["q".into()];
+                        apply_observation(&verifier.0, &ids, Some(&HashSet::new()));
+                        for semaphore in [&admission, &additional, &workflow] {
+                            assert_eq!(semaphore.available_permits(), 0);
+                        }
+                        apply_observation(&verifier.0, &ids, Some(&HashSet::new()));
+                        for semaphore in [&admission, &additional, &workflow] {
+                            assert_eq!(semaphore.available_permits(), 1);
+                        }
+                        assert!(verifier.0.pending.lock().unwrap().is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
