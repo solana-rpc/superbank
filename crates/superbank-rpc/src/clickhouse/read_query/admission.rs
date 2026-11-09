@@ -51,9 +51,8 @@ pub(crate) async fn scope<T>(future: impl Future<Output = T>) -> T {
     scope_with(current(), future).await
 }
 
-/// Seed a spawned workflow with its parent's leases. The task owns these leases
-/// until completion so parent cancellation cannot release capacity beneath it.
-/// The caller's backend request is captured here, before the future reaches its task.
+/// Seed a spawned workflow with its parent's leases and, captured at this call, its backend
+/// request. The task owns the leases until completion, so parent cancellation cannot free them.
 pub(crate) fn scope_with<T>(
     inherited: Vec<Arc<OwnedSemaphorePermit>>,
     future: impl Future<Output = T>,
