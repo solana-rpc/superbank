@@ -697,6 +697,21 @@ pub struct RpcConfig {
     pub(crate) head_cache_min_commitment: String,
 
     #[cfg(feature = "grpc-head-cache")]
+    /// Milliseconds a getTransaction waits for a signature the head holds below the requested
+    /// commitment to reach it. `0` disables the wait. Must be below `RPC_REQUEST_TIMEOUT_MS`.
+    #[arg(long, env = "HEAD_CACHE_COMMITMENT_WAIT_MS", default_value_t = 0)]
+    pub(crate) head_cache_commitment_wait_ms: u64,
+
+    #[cfg(feature = "grpc-head-cache")]
+    /// Concurrent getTransaction commitment waits; a request past the cap does not wait.
+    #[arg(
+        long,
+        env = "HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS",
+        default_value_t = crate::head_cache::COMMITMENT_WAIT_MAX_WAITERS
+    )]
+    pub(crate) head_cache_commitment_wait_max_waiters: usize,
+
+    #[cfg(feature = "grpc-head-cache")]
     /// Max gRPC decoding message size (bytes).
     #[arg(long, env = "GRPC_MAX_DECODING_BYTES", default_value_t = 67_108_864)]
     pub(crate) grpc_max_decoding_bytes: usize,
@@ -1631,6 +1646,16 @@ mod config_tests {
         );
         #[cfg(feature = "grpc-head-cache")]
         {
+            let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+            assert_eq!(cfg.head_cache_commitment_wait_ms, 0);
+            assert_eq!(cfg.head_cache_commitment_wait_max_waiters, 1024);
+            let cfg = RpcConfig::parse_from([
+                "superbank-rpc",
+                "--head-cache-commitment-wait-ms=400",
+                "--head-cache-commitment-wait-max-waiters=8",
+            ]);
+            assert_eq!(cfg.head_cache_commitment_wait_ms, 400);
+            assert_eq!(cfg.head_cache_commitment_wait_max_waiters, 8);
             assert!(RpcConfig::parse_from(["superbank-rpc"]).get_blocks_clamp_to_head_tip);
             let cfg =
                 RpcConfig::parse_from(["superbank-rpc", "--get-blocks-clamp-to-head-tip=false"]);

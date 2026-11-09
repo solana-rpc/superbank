@@ -11,7 +11,8 @@ use solana_transaction_status::TransactionDetails;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Notify, broadcast};
+use std::time::Duration;
+use tokio::sync::{Notify, Semaphore, broadcast};
 
 use crate::clickhouse::{
     BlockMetadataRecord, SlotBoundary, StoredAccountsTransactionRecord, StoredBlockPayload,
@@ -48,6 +49,21 @@ pub(crate) struct HeadTxMeta {
 
 /// Bank events buffered by a lagging receiver before it reports `Lagged`.
 const BANK_EVENT_CAPACITY: usize = 4096;
+
+/// Default `HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS`.
+pub(crate) const COMMITMENT_WAIT_MAX_WAITERS: usize = 1024;
+
+/// `outcome` labels of [`HeadCache::get_tx_waiting`].
+pub(crate) mod commitment_wait {
+    /// The signature reached the requested commitment during the wait.
+    pub(crate) const WON: &str = "won";
+    /// The deadline passed first.
+    pub(crate) const TIMEOUT: &str = "timeout";
+    /// The head dropped the signature (discard, eviction or reconnect) during the wait.
+    pub(crate) const GONE: &str = "gone";
+    /// The waiter cap was full, so the request did not wait.
+    pub(crate) const CAPPED: &str = "capped";
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeadBankEventKind {
@@ -144,6 +160,11 @@ pub(crate) struct HeadCache {
     // Events queued under the bank write lock and sent once it is released.
     pending_bank_events: std::sync::Mutex<Vec<HeadBankEvent>>,
     commit_notify: Notify,
+
+    /// `HEAD_CACHE_COMMITMENT_WAIT_MS`; zero disables the wait in [`Self::get_tx_waiting`].
+    commitment_wait: Duration,
+    /// `HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS` permits, one held per waiting request.
+    commitment_waiters: Semaphore,
 }
 
 impl HeadCache {
@@ -169,6 +190,8 @@ impl HeadCache {
             bank_events: broadcast::channel(BANK_EVENT_CAPACITY).0,
             pending_bank_events: std::sync::Mutex::default(),
             commit_notify: Notify::new(),
+            commitment_wait: Duration::ZERO,
+            commitment_waiters: Semaphore::new(COMMITMENT_WAIT_MAX_WAITERS),
         }
     }
 
@@ -179,7 +202,6 @@ impl HeadCache {
 
     /// `notify_waiters` runs after each freeze, commit, discard and session change releases
     /// the bank write lock. Enable a `Notified` before re-checking the head to avoid a race.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn commit_notify(&self) -> &Notify {
         &self.commit_notify
     }
@@ -219,6 +241,13 @@ impl HeadCache {
 
     pub(crate) fn clamps_explicit_end(&self) -> bool {
         self.clamp_explicit_end
+    }
+
+    /// Lets [`Self::get_tx_waiting`] wait up to `wait`, with at most `max_waiters` at once.
+    pub(crate) fn with_commitment_wait(mut self, wait: Duration, max_waiters: usize) -> Self {
+        self.commitment_wait = wait;
+        self.commitment_waiters = Semaphore::new(max_waiters.min(Semaphore::MAX_PERMITS));
+        self
     }
 
     pub(crate) fn latest_slot(&self) -> u64 {
@@ -468,6 +497,63 @@ impl HeadCache {
             return None;
         }
         self.tx_by_signature.get(signature).map(|v| v.clone())
+    }
+
+    /// [`Self::get_tx`] that waits up to `HEAD_CACHE_COMMITMENT_WAIT_MS` when the head holds
+    /// `signature` (in `slot`, if pinned) only below `min_commitment`. It never returns less.
+    pub(crate) async fn get_tx_waiting(
+        &self,
+        signature: &Signature,
+        min_commitment: CommitmentLevel,
+        slot: Option<u64>,
+    ) -> Option<Arc<StoredTransactionRecord>> {
+        let record = self.get_tx(signature, min_commitment);
+        if record.is_some()
+            || self.commitment_wait.is_zero()
+            || !self.holds_signature(signature, slot)
+        {
+            return record;
+        }
+        let Ok(_permit) = self.commitment_waiters.try_acquire() else {
+            crate::metrics::head_cache_commitment_wait(commitment_wait::CAPPED, None);
+            return None;
+        };
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.commitment_wait;
+        let notified = self.commit_notify().notified();
+        tokio::pin!(notified);
+        let (outcome, record) = loop {
+            notified.as_mut().enable();
+            if let Some(record) = self.get_tx(signature, min_commitment) {
+                break (commitment_wait::WON, Some(record));
+            }
+            if !self.holds_signature(signature, slot) {
+                break (commitment_wait::GONE, None);
+            }
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                let record = self.get_tx(signature, min_commitment);
+                let outcome = if record.is_some() {
+                    commitment_wait::WON
+                } else {
+                    commitment_wait::TIMEOUT
+                };
+                break (outcome, record);
+            }
+            notified.set(self.commit_notify().notified());
+        };
+        crate::metrics::head_cache_commitment_wait(outcome, Some(started.elapsed().as_secs_f64()));
+        record
+    }
+
+    /// Whether the head holds `signature` at any commitment, in `slot` when one is given.
+    fn holds_signature(&self, signature: &Signature, slot: Option<u64>) -> bool {
+        let _view = self.banks.read().expect("head bank lock");
+        self.meta_by_signature
+            .get(signature)
+            .is_some_and(|meta| slot.is_none_or(|slot| slot == meta.pos.slot))
     }
 
     pub(crate) fn get_meta(

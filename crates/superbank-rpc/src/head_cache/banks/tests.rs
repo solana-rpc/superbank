@@ -836,6 +836,127 @@ fn commit_notify_wakes_waiters_after_commit_and_discard() {
     }
 }
 
+/// A cache whose bank 1 holds `[1; 64]` at `processed` in slot 42.
+fn waiting_cache(wait_ms: u64, max_waiters: usize) -> (Arc<HeadCache>, u64) {
+    let cache = HeadCache::new(32, 64)
+        .with_commitment_wait(std::time::Duration::from_millis(wait_ms), max_waiters);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    (Arc::new(cache), session)
+}
+
+fn spawn_waiter(
+    cache: &Arc<HeadCache>,
+    commitment: CommitmentLevel,
+) -> tokio::task::JoinHandle<Option<Arc<crate::clickhouse::StoredTransactionRecord>>> {
+    let cache = cache.clone();
+    tokio::spawn(async move {
+        cache
+            .get_tx_waiting(&Signature::from([1; 64]), commitment, Some(42))
+            .await
+    })
+}
+
+const SHORT: std::time::Duration = std::time::Duration::from_millis(20);
+
+#[tokio::test]
+async fn commitment_wait_returns_a_transaction_committed_during_the_wait() {
+    let (cache, session) = waiting_cache(10_000, 4);
+    let started = Instant::now();
+    let waiter = spawn_waiter(&cache, CommitmentLevel::Confirmed);
+    tokio::time::sleep(SHORT).await;
+    // Another bank wakes the waiter without raising its signature.
+    freeze(&cache, session, 43, 2, 2);
+    tokio::time::sleep(SHORT).await;
+    assert!(!waiter.is_finished());
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    let record = waiter.await.unwrap().expect("confirmed during the wait");
+    assert_eq!(record.slot, 42);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn commitment_wait_skips_when_off_or_the_head_lacks_the_signature() {
+    use crate::head_cache::commitment_wait::CAPPED;
+    use futures_util::FutureExt;
+    let held = Signature::from([1; 64]);
+    let off = HeadCache::new(32, 64);
+    let session = off.start_bank_session(CommitmentLevel::Processed);
+    freeze(&off, session, 42, 1, 1);
+    let lookup = |cache: &HeadCache, signature: &Signature, commitment, slot| {
+        cache
+            .get_tx_waiting(signature, commitment, slot)
+            .now_or_never()
+            .expect("resolves without waiting")
+    };
+    assert!(lookup(&off, &held, CommitmentLevel::Confirmed, None).is_none());
+
+    let (cache, _) = waiting_cache(10_000, 4);
+    let unknown = Signature::from([9; 64]);
+    assert!(lookup(&cache, &unknown, CommitmentLevel::Confirmed, None).is_none());
+    assert!(lookup(&cache, &held, CommitmentLevel::Confirmed, Some(41)).is_none());
+    assert!(lookup(&cache, &held, CommitmentLevel::Processed, None).is_some());
+
+    let (none_allowed, _) = waiting_cache(10_000, 0);
+    let capped = crate::metrics::head_cache_commitment_waits_count(CAPPED);
+    assert!(lookup(&none_allowed, &held, CommitmentLevel::Confirmed, None).is_none());
+    assert!(crate::metrics::head_cache_commitment_waits_count(CAPPED) > capped);
+}
+
+#[tokio::test]
+async fn commitment_wait_times_out_without_returning_a_lower_commitment() {
+    use crate::head_cache::commitment_wait::TIMEOUT;
+    let (cache, session) = waiting_cache(150, 4);
+    let timeouts = crate::metrics::head_cache_commitment_waits_count(TIMEOUT);
+    let started = Instant::now();
+    let waiter = spawn_waiter(&cache, CommitmentLevel::Finalized);
+    tokio::time::sleep(SHORT).await;
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    assert!(waiter.await.unwrap().is_none());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "{elapsed:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert!(crate::metrics::head_cache_commitment_waits_count(TIMEOUT) > timeouts);
+}
+
+#[tokio::test]
+async fn commitment_wait_stops_when_the_head_drops_the_signature() {
+    use crate::head_cache::commitment_wait::GONE;
+    let (cache, session) = waiting_cache(10_000, 4);
+    let gone = crate::metrics::head_cache_commitment_waits_count(GONE);
+    let started = Instant::now();
+    let waiter = spawn_waiter(&cache, CommitmentLevel::Confirmed);
+    tokio::time::sleep(SHORT).await;
+    cache.discard_bank(session, 42, 1);
+    assert!(waiter.await.unwrap().is_none());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(crate::metrics::head_cache_commitment_waits_count(GONE) > gone);
+}
+
+#[tokio::test]
+async fn commitment_wait_caps_concurrent_waiters() {
+    use futures_util::FutureExt;
+    let (cache, session) = waiting_cache(10_000, 1);
+    let held = Signature::from([1; 64]);
+    let first = cache.get_tx_waiting(&held, CommitmentLevel::Confirmed, None);
+    tokio::pin!(first);
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    let second = cache.get_tx_waiting(&held, CommitmentLevel::Confirmed, None);
+    assert!(matches!(second.now_or_never(), Some(None)), "past the cap");
+
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    assert!(first.await.is_some());
+    // A finished or dropped waiter returns its permit.
+    for _ in 0..2 {
+        let next = cache.get_tx_waiting(&held, CommitmentLevel::Finalized, None);
+        tokio::pin!(next);
+        assert!(futures_util::poll!(next.as_mut()).is_pending());
+    }
+}
+
 #[test]
 fn block_identity_matches_get_block() {
     use solana_transaction_status::TransactionDetails;

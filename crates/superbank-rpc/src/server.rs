@@ -270,6 +270,14 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
                 .to_string(),
         ));
     }
+    #[cfg(feature = "grpc-head-cache")]
+    if args.head_cache_commitment_wait_ms > 0
+        && args.head_cache_commitment_wait_ms >= args.rpc_request_timeout_ms
+    {
+        return Err(RpcError::Config(
+            "HEAD_CACHE_COMMITMENT_WAIT_MS must be below RPC_REQUEST_TIMEOUT_MS".to_string(),
+        ));
+    }
 
     let epoch_schedule = epoch_schedule_from_config(&args)?;
     let ag_genesis_cert = crate::ag_genesis_cert::AgGenesisCertSource::from_config(&args)
@@ -420,7 +428,11 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 
             let cache = Arc::new(
                 HeadCache::new(retain_slots, max_per_address)
-                    .with_explicit_end_clamp(args.get_blocks_clamp_to_head_tip),
+                    .with_explicit_end_clamp(args.get_blocks_clamp_to_head_tip)
+                    .with_commitment_wait(
+                        Duration::from_millis(args.head_cache_commitment_wait_ms),
+                        args.head_cache_commitment_wait_max_waiters,
+                    ),
             );
 
             let cfg = DragonsmouthHeadCacheConfig {

@@ -600,6 +600,21 @@ export default {
           default: 'processed',
           text: 'Lowest commitment the cache serves. An invalid value falls back to `processed` with a warning.',
         }),
+        opt('HEAD_CACHE_COMMITMENT_WAIT_MS', {
+          type: 'u64 (ms)',
+          default: '0',
+          text: 'How long a `getTransaction` waits for a signature the head holds below the requested commitment to reach it. A commit in time returns the head response; otherwise the request continues to the disk cache and the primary. `0` disables the wait. Startup fails unless it is below `RPC_REQUEST_TIMEOUT_MS`.',
+          relations: [
+            { type: 'capped-by', to: 'RPC_REQUEST_TIMEOUT_MS' },
+            { type: 'see', to: 'HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS' },
+          ],
+        }),
+        opt('HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS', {
+          type: 'usize',
+          default: '1024',
+          text: 'Requests that may wait for a commitment at once. A request past the cap does not wait. `0` turns the wait off.',
+          relations: [{ type: 'see', to: 'HEAD_CACHE_COMMITMENT_WAIT_MS' }],
+        }),
         opt('GRPC_MAX_DECODING_BYTES', { type: 'usize (bytes)', default: '67108864', text: 'Largest gRPC message decoded from the stream.' }),
         opt('GET_BLOCKS_CLAMP_TO_HEAD_TIP', {
           type: 'bool',

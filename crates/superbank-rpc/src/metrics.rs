@@ -672,6 +672,12 @@ struct RecentStoreEvictionLabels {
     reason: &'static str,
 }
 
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheCommitmentWaitLabels {
+    outcome: &'static str,
+}
+
 #[cfg(feature = "grpc-streaming")]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct SuperbankGrpcMethodLabels {
@@ -791,6 +797,10 @@ pub struct Metrics {
     get_block_recent_store_resident_bytes: Gauge,
     #[cfg(feature = "grpc-head-cache")]
     get_block_recent_store_max_bytes: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_commitment_waits: Family<HeadCacheCommitmentWaitLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_commitment_wait_seconds: Family<HeadCacheCommitmentWaitLabels, Histogram>,
 
     #[cfg(feature = "grpc-streaming")]
     superbank_grpc_stream_requests_total: Family<SuperbankGrpcMethodLabels, Counter>,
@@ -875,6 +885,7 @@ pub struct Metrics {
     get_transaction_disk_cache_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
     get_transaction_primary_slot_age: Histogram,
     get_transaction_primary_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
+    get_transaction_not_found: Family<GetTransactionNotFoundLabels, Counter>,
 }
 
 impl Metrics {
@@ -984,6 +995,11 @@ impl Metrics {
         let get_block_recent_store_resident_bytes = Gauge::default();
         #[cfg(feature = "grpc-head-cache")]
         let get_block_recent_store_max_bytes = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_commitment_waits = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_commitment_wait_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
 
         #[cfg(feature = "grpc-streaming")]
         let superbank_grpc_stream_requests_total = Family::default();
@@ -1418,6 +1434,16 @@ impl Metrics {
                 "Byte budget of the recent getBlock store",
                 get_block_recent_store_max_bytes.clone(),
             );
+            registry.register(
+                "head_cache_commitment_waits",
+                "getTransaction waits for a head signature to reach the requested commitment, by outcome",
+                head_cache_commitment_waits.clone(),
+            );
+            registry.register(
+                "head_cache_commitment_wait_seconds",
+                "Time getTransaction waited for a head signature to reach the requested commitment",
+                head_cache_commitment_wait_seconds.clone(),
+            );
         }
 
         #[cfg(feature = "disk-cache")]
@@ -1657,6 +1683,12 @@ impl Metrics {
             "Primary getTransaction results not recorded in the slot-age histogram, by reason",
             get_transaction_primary_slot_age_skipped_total.clone(),
         );
+        let get_transaction_not_found = Family::<GetTransactionNotFoundLabels, Counter>::default();
+        registry.register(
+            "get_transaction_not_found",
+            "getTransaction null results, by why no tier returned the transaction",
+            get_transaction_not_found.clone(),
+        );
 
         // Register process metrics to expose basic runtime health info (CPU, memory).
         if let Err(err) =
@@ -1757,6 +1789,10 @@ impl Metrics {
             get_block_recent_store_resident_bytes,
             #[cfg(feature = "grpc-head-cache")]
             get_block_recent_store_max_bytes,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_commitment_waits,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_commitment_wait_seconds,
             #[cfg(feature = "grpc-streaming")]
             superbank_grpc_stream_requests_total,
             #[cfg(feature = "grpc-streaming")]
@@ -1839,6 +1875,7 @@ impl Metrics {
             get_transaction_disk_cache_slot_age_skipped_total,
             get_transaction_primary_slot_age,
             get_transaction_primary_slot_age_skipped_total,
+            get_transaction_not_found,
         }
     }
 
@@ -2693,6 +2730,31 @@ pub(crate) fn head_cache_bank_events_lagged_count() -> u64 {
     metrics().head_cache_bank_events_lagged.get()
 }
 
+/// Counts a getTransaction commitment wait; `waited_seconds` is `None` when it never started.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_commitment_wait(outcome: &'static str, waited_seconds: Option<f64>) {
+    let metrics = metrics();
+    let labels = HeadCacheCommitmentWaitLabels { outcome };
+    metrics
+        .head_cache_commitment_waits
+        .get_or_create(&labels)
+        .inc();
+    if let Some(seconds) = waited_seconds {
+        metrics
+            .head_cache_commitment_wait_seconds
+            .get_or_create(&labels)
+            .observe(seconds);
+    }
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_commitment_waits_count(outcome: &'static str) -> u64 {
+    metrics()
+        .head_cache_commitment_waits
+        .get_or_create(&HeadCacheCommitmentWaitLabels { outcome })
+        .get()
+}
+
 #[cfg(feature = "grpc-head-cache")]
 pub(crate) fn get_block_recent_store_request(outcome: &'static str) {
     metrics()
@@ -3188,6 +3250,27 @@ pub(crate) fn get_transaction_primary_slot_age(slots: u64) {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct SlotAgeSkipLabels {
     reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct GetTransactionNotFoundLabels {
+    reason: &'static str,
+}
+
+/// Counts a getTransaction null result by why no tier returned the transaction.
+pub(crate) fn get_transaction_not_found(reason: &'static str) {
+    metrics()
+        .get_transaction_not_found
+        .get_or_create(&GetTransactionNotFoundLabels { reason })
+        .inc();
+}
+
+#[cfg(test)]
+pub(crate) fn get_transaction_not_found_count(reason: &'static str) -> u64 {
+    metrics()
+        .get_transaction_not_found
+        .get_or_create(&GetTransactionNotFoundLabels { reason })
+        .get()
 }
 
 /// Counts a primary getTransaction result left out of the slot-age histogram because no usable
