@@ -41,6 +41,8 @@ mod clickhouse;
 mod get_transaction_primary_cache;
 mod metrics;
 mod processing;
+#[cfg(feature = "grpc-head-cache")]
+mod recent_block_responses;
 mod request_filter;
 mod status_history_cache;
 

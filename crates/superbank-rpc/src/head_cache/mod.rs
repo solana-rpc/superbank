@@ -74,7 +74,6 @@ impl HeadBankEventKind {
 
 /// Head block lifecycle change, sent after the bank write lock is released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct HeadBankEvent {
     pub(crate) slot: u64,
     pub(crate) blockhash: [u8; 32],
@@ -82,7 +81,6 @@ pub(crate) struct HeadBankEvent {
 }
 
 /// `recv` that counts the events a lagging receiver skipped.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn recv_bank_event(
     receiver: &mut broadcast::Receiver<HeadBankEvent>,
 ) -> Result<HeadBankEvent, broadcast::error::RecvError> {
@@ -175,7 +173,6 @@ impl HeadCache {
     }
 
     /// Receives every [`HeadBankEvent`] sent after this call; read it with [`recv_bank_event`].
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn subscribe_bank_events(&self) -> broadcast::Receiver<HeadBankEvent> {
         self.bank_events.subscribe()
     }

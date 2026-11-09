@@ -139,6 +139,30 @@ export default {
           text: 'Blocking threads one full or accounts `getBlock` build may use. Extra threads come from the hydration pool only when free; 1 disables chunking.',
           relations: [{ type: 'see', to: 'HYDRATION_CPU_CONCURRENCY' }],
         }),
+        opt('GET_BLOCK_RECENT_STORE_MAX_BYTES', {
+          type: 'u64 (bytes)',
+          default: '0',
+          text: 'Memory budget for serialized `getBlock` results of head-cache blocks, keyed by slot, blockhash and response shape. Concurrent requests share one build, and a forked or evicted block is dropped. Zero disables the store; it also stays off without a running head cache.',
+          requires: ['feature:grpc-head-cache'],
+          relations: [{ type: 'see', to: 'HEAD_CACHE_ENABLED' }],
+        }),
+        opt('GET_BLOCK_PREBUILD_SHAPES', {
+          type: 'list',
+          default: '',
+          text: 'Comma-separated `getBlock` shapes to build into the recent store when a head block is confirmed. A shape is `name=value` pairs of `encoding`, `transactionDetails`, `rewards` and `maxSupportedTransactionVersion` joined by `:`; omitted fields take the `getBlock` defaults. Empty disables prebuilds. No shapes ship by default: take them from the `superbank_get_block_request_shape_total` metric.',
+          requires: ['feature:grpc-head-cache'],
+          relations: [{ type: 'requires', to: 'GET_BLOCK_RECENT_STORE_MAX_BYTES' }],
+        }),
+        opt('GET_BLOCK_PREBUILD_CONCURRENCY', {
+          type: 'usize',
+          default: '1',
+          text: 'Blocking threads for prebuilds, separate from the request hydration pool.',
+          requires: ['feature:grpc-head-cache'],
+          relations: [
+            { type: 'requires', to: 'GET_BLOCK_PREBUILD_SHAPES' },
+            { type: 'see', to: 'HYDRATION_CPU_CONCURRENCY' },
+          ],
+        }),
       ],
     },
     {

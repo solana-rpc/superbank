@@ -6,7 +6,7 @@
 pub(crate) mod ag_genesis_cert;
 mod block_ranges;
 pub(crate) mod blocks;
-mod encoding;
+pub(crate) mod encoding;
 pub(crate) mod signatures;
 pub(crate) mod transactions;
 pub(crate) mod types;

@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, warn};
 
 use super::block_ranges::{RangeObservation, get_block_slots_response_for_range, resolve_range};
@@ -37,12 +38,18 @@ use crate::handlers::{
         reject_unknown_fields,
     },
 };
+#[cfg(feature = "grpc-head-cache")]
+use crate::head_cache::HeadCache;
 use crate::hydration::{
     BlockBuildError, BlockHydrationError, SplitBlockPayload, assemble_block_chunks,
     block_hydration_chunk_count, hydrate_block_payload, hydrate_serialize_block_chunk,
     split_block_payload,
 };
 use crate::metrics;
+#[cfg(feature = "grpc-head-cache")]
+use crate::recent_block_responses::{
+    PrebuildShape, RecentAccess, RecentBlockKey, RecentBuildError,
+};
 use crate::rpc::{
     json_rpc_error_response, json_rpc_internal_error_response, json_rpc_node_unhealthy_response,
     json_rpc_null_response, json_rpc_success_response, json_rpc_success_response_from_result_bytes,
@@ -89,28 +96,15 @@ impl GetBlockFetchPlan {
     }
 
     fn cache_key(self, slot: u64, commitment: CommitmentLevel) -> BlockResponseCacheKey {
-        let encoding = match self.encoding {
-            UiTransactionEncoding::Binary => 0,
-            UiTransactionEncoding::Base58 => 1,
-            UiTransactionEncoding::Base64 => 2,
-            UiTransactionEncoding::Json => 3,
-            UiTransactionEncoding::JsonParsed => 4,
-        };
-        let transaction_details = match self.transaction_details {
-            TransactionDetails::Full => 0,
-            TransactionDetails::Signatures => 1,
-            TransactionDetails::None => 2,
-            TransactionDetails::Accounts => 3,
-        };
-        BlockResponseCacheKey {
+        BlockResponseCacheKey::new(
             slot,
             commitment,
-            encoding,
-            transaction_details,
-            show_rewards: self.show_rewards,
-            max_supported_transaction_version: self.max_supported_transaction_version,
-            footer: self.footer,
-        }
+            self.encoding,
+            self.transaction_details,
+            self.show_rewards,
+            self.max_supported_transaction_version,
+            self.footer,
+        )
     }
 }
 
@@ -1311,23 +1305,49 @@ fn join_error(err: tokio::task::JoinError) -> BlockResultBuildError {
     BlockResultBuildError::Failed(err.to_string())
 }
 
+/// Blocking-pool permits for one getBlock build.
+struct BlockHydrationPermits {
+    semaphore: Arc<Semaphore>,
+    parallelism: usize,
+    /// A permit the caller already holds; without one the first permit is awaited.
+    lead: Option<OwnedSemaphorePermit>,
+}
+
+impl BlockHydrationPermits {
+    fn shared(state: &AppState) -> Self {
+        Self {
+            semaphore: state.hydration_sem.clone(),
+            parallelism: state.get_block_hydration_parallelism,
+            lead: None,
+        }
+    }
+}
+
 /// Hydrates and serializes on the blocking pool. Large full/accounts blocks
 /// are split into contiguous chunks, one hydration permit each; extra permits
 /// are taken only when immediately free, so the total never exceeds
 /// `HYDRATION_CPU_CONCURRENCY` and a busy pool degrades to one thread.
 async fn build_block_result_blocking(
-    state: &AppState,
+    pool: BlockHydrationPermits,
     payload: StoredBlockPayload,
     fetch_plan: GetBlockFetchPlan,
 ) -> Result<Bytes, BlockResultBuildError> {
     let closed = |_| BlockResultBuildError::Failed("hydration semaphore closed".to_string());
-    let semaphore = state.hydration_sem.clone();
-    let mut permits = vec![semaphore.clone().acquire_owned().await.map_err(closed)?];
+    let BlockHydrationPermits {
+        semaphore,
+        parallelism,
+        lead,
+    } = pool;
+    let lead = match lead {
+        Some(lead) => lead,
+        None => semaphore.clone().acquire_owned().await.map_err(closed)?,
+    };
+    let mut permits = vec![lead];
 
     let wanted = match fetch_plan.transaction_details {
         TransactionDetails::Full | TransactionDetails::Accounts => block_hydration_chunk_count(
             payload.observed_transaction_count().unwrap_or(0),
-            state.get_block_hydration_parallelism,
+            parallelism,
         ),
         TransactionDetails::Signatures | TransactionDetails::None => 1,
     };
@@ -1424,6 +1444,27 @@ async fn build_block_result_chunked(
     })
 }
 
+/// Hydrates and serializes a block result, then adds the footer when requested.
+async fn build_block_result(
+    pool: BlockHydrationPermits,
+    payload: StoredBlockPayload,
+    fetch_plan: GetBlockFetchPlan,
+) -> Result<Bytes, BlockResultBuildError> {
+    let footer = fetch_plan.footer.then(|| payload.metadata().footer.clone());
+    let started = Instant::now();
+    let result = if fetch_plan.needs_blocking_hydration() {
+        build_block_result_blocking(pool, payload, fetch_plan).await
+    } else {
+        encode_block_result(payload, fetch_plan)
+    };
+    let result = match (result, footer) {
+        (Ok(bytes), Some(footer)) => insert_footer_field(&bytes, footer.as_ref()),
+        (result, _) => result,
+    };
+    metrics::get_block_phase("hydrate_serialize", started.elapsed().as_secs_f64());
+    result
+}
+
 /// Hydrate a block payload and build the JSON-RPC response; shared by the
 /// head-cache, disk-cache, and ClickHouse branches of getBlock.
 async fn respond_with_hydrated_block(
@@ -1459,21 +1500,8 @@ async fn respond_with_hydrated_block(
         }
     };
 
-    let footer = fetch_plan.footer.then(|| payload.metadata().footer.clone());
-    let build_result = async move {
-        let started = Instant::now();
-        let result = if fetch_plan.needs_blocking_hydration() {
-            build_block_result_blocking(state, payload, fetch_plan).await
-        } else {
-            encode_block_result(payload, fetch_plan)
-        };
-        let result = match (result, footer) {
-            (Ok(bytes), Some(footer)) => insert_footer_field(&bytes, footer.as_ref()),
-            (result, _) => result,
-        };
-        metrics::get_block_phase("hydrate_serialize", started.elapsed().as_secs_f64());
-        result
-    };
+    let build_result =
+        build_block_result(BlockHydrationPermits::shared(state), payload, fetch_plan);
 
     let cache_key_for_errors = cache_key.clone();
     let built = match cache_key {
@@ -1535,6 +1563,165 @@ async fn respond_with_hydrated_block(
             Ok(resp)
         }
     }
+}
+
+#[cfg(feature = "grpc-head-cache")]
+impl From<BlockResultBuildError> for RecentBuildError {
+    fn from(err: BlockResultBuildError) -> Self {
+        match err {
+            BlockResultBuildError::UnsupportedTransactionVersion(version) => {
+                Self::UnsupportedTransactionVersion(version)
+            }
+            BlockResultBuildError::Failed(message) => Self::Failed(message),
+        }
+    }
+}
+
+#[cfg(feature = "grpc-head-cache")]
+impl From<PrebuildShape> for GetBlockFetchPlan {
+    fn from(shape: PrebuildShape) -> Self {
+        Self::new(&RpcBlockConfig {
+            encoding: Some(shape.encoding),
+            transaction_details: Some(shape.transaction_details),
+            rewards: Some(shape.rewards),
+            commitment: None,
+            max_supported_transaction_version: shape.max_supported_transaction_version,
+        })
+    }
+}
+
+/// The head block for a recent-store key, or `Unavailable` when the head no longer holds it.
+#[cfg(feature = "grpc-head-cache")]
+fn recent_head_payload(
+    head: &HeadCache,
+    key: &RecentBlockKey,
+    commitment: CommitmentLevel,
+    fetch_plan: GetBlockFetchPlan,
+) -> Result<StoredBlockPayload, RecentBuildError> {
+    let payload = head
+        .get_block(key.slot(), commitment, fetch_plan.transaction_details)
+        .ok_or(RecentBuildError::Unavailable)?;
+    if payload.metadata().blockhash != key.blockhash()
+        || !block_payload_has_consistent_transaction_count(&payload)
+    {
+        return Err(RecentBuildError::Unavailable);
+    }
+    Ok(payload)
+}
+
+/// Serves a head-cache block from the recent store, building it once per blockhash and
+/// shape. `None` falls through to the uncached head read.
+#[cfg(feature = "grpc-head-cache")]
+async fn respond_from_recent_store(
+    state: &Arc<AppState>,
+    head: &Arc<HeadCache>,
+    id: &Value,
+    route: &mut RouteMetric,
+    slot: u64,
+    commitment: CommitmentLevel,
+    fetch_plan: GetBlockFetchPlan,
+) -> Option<Result<Response, StatusCode>> {
+    // The footer can change under the same blockhash, so it is read here, not stored.
+    let (blockhash, footer) = if fetch_plan.footer {
+        let payload = head.get_block(slot, commitment, TransactionDetails::None)?;
+        let metadata = payload.metadata();
+        (metadata.blockhash, Some(metadata.footer.clone()))
+    } else {
+        (head.block_identity(slot, commitment)?.0, None)
+    };
+    let body_plan = fetch_plan.with_footer(false);
+    let key = RecentBlockKey::new(body_plan.cache_key(slot, commitment), blockhash);
+    let build = {
+        let state = state.clone();
+        let head = head.clone();
+        let key = key.clone();
+        async move {
+            let payload = recent_head_payload(&head, &key, commitment, body_plan)?;
+            build_block_result(BlockHydrationPermits::shared(&state), payload, body_plan)
+                .await
+                .map_err(RecentBuildError::from)
+        }
+    };
+    let built = state.recent_block_responses.get_or_build(key, build).await;
+    let built = match built {
+        Ok((body, access)) => {
+            metrics::get_block_recent_store_request(access.label());
+            if access == RecentAccess::Built {
+                route.source_head_cache();
+            } else {
+                route.source_response_cache();
+            }
+            match footer {
+                Some(footer) => insert_footer_field(&body, footer.as_ref()),
+                None => Ok(body),
+            }
+        }
+        Err(err) => {
+            let err = match err.as_ref() {
+                RecentBuildError::Unavailable => return None,
+                RecentBuildError::UnsupportedTransactionVersion(version) => {
+                    BlockResultBuildError::UnsupportedTransactionVersion(*version)
+                }
+                RecentBuildError::Failed(message) => BlockResultBuildError::Failed(message.clone()),
+            };
+            route.source_head_cache();
+            Err(err)
+        }
+    };
+    let id = id.clone();
+    Some(Ok(match built {
+        Ok(result_bytes) => {
+            route.success();
+            json_rpc_success_response_from_result_bytes(id, result_bytes)
+        }
+        Err(BlockResultBuildError::UnsupportedTransactionVersion(version)) => {
+            route.rpc_error();
+            json_rpc_error_response(
+                id,
+                JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32,
+                unsupported_transaction_version_message(version),
+                None,
+            )
+        }
+        Err(BlockResultBuildError::Failed(message)) => {
+            error!("Failed to build block {} response: {}", slot, message);
+            json_rpc_internal_error_response(id)
+        }
+    }))
+}
+
+/// Builds one prebuild shape of a confirmed head block into the recent store, holding
+/// `lead` from the prebuild pool.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) async fn prebuild_recent_block(
+    state: &Arc<AppState>,
+    head: &Arc<HeadCache>,
+    key: RecentBlockKey,
+    shape: PrebuildShape,
+    semaphore: Arc<Semaphore>,
+    lead: OwnedSemaphorePermit,
+) -> Result<RecentAccess, Arc<RecentBuildError>> {
+    let fetch_plan = GetBlockFetchPlan::from(shape);
+    let pool = BlockHydrationPermits {
+        semaphore,
+        parallelism: state.get_block_hydration_parallelism,
+        lead: Some(lead),
+    };
+    let build = {
+        let head = head.clone();
+        let key = key.clone();
+        async move {
+            let payload = recent_head_payload(&head, &key, CommitmentLevel::Confirmed, fetch_plan)?;
+            build_block_result(pool, payload, fetch_plan)
+                .await
+                .map_err(RecentBuildError::from)
+        }
+    };
+    state
+        .recent_block_responses
+        .get_or_build(key, build)
+        .await
+        .map(|(_, access)| access)
 }
 
 /// Returns the block config and whether footer fields were requested (default false).
@@ -1649,6 +1836,24 @@ pub(crate) async fn handle_get_block(
     #[cfg(feature = "grpc-head-cache")]
     if let Some(cache) = state.head_cache.as_ref() {
         route.head_cache_read();
+        // Requests the finalized response cache would store keep using it.
+        let finalized_cache_stores =
+            requested_finalized && !fetch_plan.footer && state.block_response_cache.enabled();
+        if !finalized_cache_stores
+            && state.recent_block_responses.enabled()
+            && let Some(response) = respond_from_recent_store(
+                &state,
+                cache,
+                &id,
+                &mut route,
+                slot,
+                commitment.commitment,
+                fetch_plan,
+            )
+            .await
+        {
+            return response;
+        }
         if let Some(payload) =
             cache.get_block(slot, commitment.commitment, fetch_plan.transaction_details)
         {

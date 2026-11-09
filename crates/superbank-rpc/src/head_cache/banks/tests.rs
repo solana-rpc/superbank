@@ -1038,3 +1038,49 @@ async fn lagging_bank_event_receivers_are_counted() {
         event(2)
     );
 }
+
+#[tokio::test]
+async fn recent_store_prebuilds_confirmed_blocks_and_drops_discarded_ones() {
+    use crate::recent_block_responses::{
+        Prebuild, RecentBlockResponses, parse_prebuild_shapes, run,
+    };
+    let cache = std::sync::Arc::new(HeadCache::new(32, 64));
+    let mut state = crate::tests::test_state();
+    {
+        let state = std::sync::Arc::get_mut(&mut state).unwrap();
+        state.head_cache = Some(cache.clone());
+        state.recent_block_responses = RecentBlockResponses::new(1 << 20);
+    }
+    let shapes = parse_prebuild_shapes("maxSupportedTransactionVersion=0")
+        .unwrap()
+        .0;
+    let key = shapes[0].key(42, [2; 32]);
+    let task = tokio::spawn(run(
+        state.clone(),
+        cache.clone(),
+        cache.subscribe_bank_events(),
+        Prebuild::new(shapes, 1),
+    ));
+    let entries = || state.recent_block_responses.resident().0;
+    async fn wait(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+    let built = crate::metrics::get_block_recent_store_prebuild_count("built");
+
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    freeze(&cache, session, 42, 2, 2);
+    cache.commit_bank(session, 42, 2, CommitmentLevel::Confirmed, Some(41));
+    wait(|| entries() == 1).await;
+    assert!(state.recent_block_responses.contains(&key));
+    assert!(crate::metrics::get_block_recent_store_prebuild_count("built") > built);
+
+    cache.discard_bank(session, 42, 2);
+    wait(|| entries() == 0).await;
+    assert!(!state.recent_block_responses.contains(&key));
+    task.abort();
+}

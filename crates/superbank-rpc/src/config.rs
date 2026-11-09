@@ -701,6 +701,26 @@ pub struct RpcConfig {
     #[arg(long, env = "GRPC_MAX_DECODING_BYTES", default_value_t = 67_108_864)]
     pub(crate) grpc_max_decoding_bytes: usize,
 
+    #[cfg(feature = "grpc-head-cache")]
+    /// Serialized head-cache getBlock result bytes kept per blockhash and shape; zero disables.
+    #[arg(long, env = "GET_BLOCK_RECENT_STORE_MAX_BYTES", default_value_t = 0)]
+    pub(crate) get_block_recent_store_max_bytes: u64,
+
+    #[cfg(feature = "grpc-head-cache")]
+    /// getBlock shapes built into the recent store when a head block is confirmed.
+    #[arg(
+        long,
+        env = "GET_BLOCK_PREBUILD_SHAPES",
+        default_value = "",
+        value_parser = crate::recent_block_responses::parse_prebuild_shapes
+    )]
+    pub(crate) get_block_prebuild_shapes: crate::recent_block_responses::PrebuildShapes,
+
+    #[cfg(feature = "grpc-head-cache")]
+    /// Blocking threads for prebuilds, separate from HYDRATION_CPU_CONCURRENCY.
+    #[arg(long, env = "GET_BLOCK_PREBUILD_CONCURRENCY", default_value_t = 1)]
+    pub(crate) get_block_prebuild_concurrency: usize,
+
     // --- Optional local ClickHouse cache of recent finalized slots ---
     #[cfg(feature = "disk-cache")]
     /// Enable the localhost ClickHouse forward cache of recent finalized slots.
@@ -1633,6 +1653,65 @@ mod config_tests {
             assert!(!cfg.disk_cache_status_span_query);
             assert!(!cfg.gsfa_race_primary);
             assert!(cfg.disk_cache_compact_transactions_parts);
+        }
+    }
+
+    #[cfg(feature = "grpc-head-cache")]
+    #[test]
+    fn recent_block_store_flags_parse() {
+        use crate::recent_block_responses::{PrebuildShape, PrebuildShapes};
+        use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
+
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.get_block_recent_store_max_bytes, 0);
+        assert_eq!(cfg.get_block_prebuild_shapes, PrebuildShapes::default());
+        assert_eq!(cfg.get_block_prebuild_concurrency, 1);
+
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-block-recent-store-max-bytes",
+            "1073741824",
+            "--get-block-prebuild-shapes",
+            "encoding=json:transactionDetails=full:rewards=false:maxSupportedTransactionVersion=0, \
+             transactionDetails=signatures,encoding=json:transactionDetails=full:rewards=false:maxSupportedTransactionVersion=0",
+            "--get-block-prebuild-concurrency",
+            "2",
+        ]);
+        assert_eq!(cfg.get_block_recent_store_max_bytes, 1 << 30);
+        assert_eq!(cfg.get_block_prebuild_concurrency, 2);
+        assert_eq!(
+            cfg.get_block_prebuild_shapes.0,
+            vec![
+                PrebuildShape {
+                    encoding: UiTransactionEncoding::Json,
+                    transaction_details: TransactionDetails::Full,
+                    rewards: false,
+                    max_supported_transaction_version: Some(0),
+                },
+                PrebuildShape {
+                    encoding: UiTransactionEncoding::Json,
+                    transaction_details: TransactionDetails::Signatures,
+                    rewards: true,
+                    max_supported_transaction_version: None,
+                },
+            ]
+        );
+
+        for bad in [
+            "encoding=xml",
+            "transactionDetails=most",
+            "rewards=yes",
+            "maxSupportedTransactionVersion=256",
+            "commitment=confirmed",
+            "encoding=json:encoding=base64",
+            "full",
+            "encoding=base58:maxSupportedTransactionVersion=1",
+        ] {
+            assert!(
+                RpcConfig::try_parse_from(["superbank-rpc", "--get-block-prebuild-shapes", bad])
+                    .is_err(),
+                "{bad}"
+            );
         }
     }
 

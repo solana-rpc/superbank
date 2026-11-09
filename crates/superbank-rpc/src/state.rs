@@ -25,6 +25,8 @@ use crate::util::{current_time_millis, ttl_millis};
 use crate::disk_cache::DiskCache;
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::HeadCache;
+#[cfg(feature = "grpc-head-cache")]
+use crate::recent_block_responses::RecentBlockResponses;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MetricsHeaderCaptureConfig {
@@ -62,6 +64,9 @@ pub(crate) struct AppState {
     pub(crate) epoch_schedule: EpochSchedule,
     #[cfg(feature = "grpc-head-cache")]
     pub(crate) head_cache: Option<Arc<HeadCache>>,
+    /// Serialized head-cache getBlock results keyed by blockhash (disabled unless sized).
+    #[cfg(feature = "grpc-head-cache")]
+    pub(crate) recent_block_responses: RecentBlockResponses,
     /// Finalized recent-slot cache in local ClickHouse; consulted between the
     /// head cache and source ClickHouse. It is not part of latest-slot resolution:
     /// its tip never leads the head cache, so it adds nothing there.

@@ -660,6 +660,18 @@ struct HeadCacheBankEventLabels {
     outcome: &'static str,
 }
 
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RecentStoreOutcomeLabels {
+    outcome: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RecentStoreEvictionLabels {
+    reason: &'static str,
+}
+
 #[cfg(feature = "grpc-streaming")]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct SuperbankGrpcMethodLabels {
@@ -767,6 +779,18 @@ pub struct Metrics {
     head_cache_bank_events: Family<HeadCacheBankEventLabels, Counter>,
     #[cfg(feature = "grpc-head-cache")]
     head_cache_bank_events_lagged: Counter,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_requests: Family<RecentStoreOutcomeLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_prebuilds: Family<RecentStoreOutcomeLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_evictions: Family<RecentStoreEvictionLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_entries: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_resident_bytes: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_max_bytes: Gauge,
 
     #[cfg(feature = "grpc-streaming")]
     superbank_grpc_stream_requests_total: Family<SuperbankGrpcMethodLabels, Counter>,
@@ -948,6 +972,18 @@ impl Metrics {
         let head_cache_bank_events = Family::default();
         #[cfg(feature = "grpc-head-cache")]
         let head_cache_bank_events_lagged = Counter::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_requests = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_prebuilds = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_evictions = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_entries = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_resident_bytes = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_max_bytes = Gauge::default();
 
         #[cfg(feature = "grpc-streaming")]
         let superbank_grpc_stream_requests_total = Family::default();
@@ -1352,6 +1388,36 @@ impl Metrics {
                 "gRPC head cache bank events skipped by a lagging receiver",
                 head_cache_bank_events_lagged.clone(),
             );
+            registry.register(
+                "get_block_recent_store_requests",
+                "Recent getBlock store lookups by outcome",
+                get_block_recent_store_requests.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_prebuilds",
+                "Recent getBlock prebuild attempts by outcome",
+                get_block_recent_store_prebuilds.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_evictions",
+                "Recent getBlock store entries removed, by reason",
+                get_block_recent_store_evictions.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_entries",
+                "Serialized results held by the recent getBlock store",
+                get_block_recent_store_entries.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_resident_bytes",
+                "Serialized result bytes held by the recent getBlock store",
+                get_block_recent_store_resident_bytes.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_max_bytes",
+                "Byte budget of the recent getBlock store",
+                get_block_recent_store_max_bytes.clone(),
+            );
         }
 
         #[cfg(feature = "disk-cache")]
@@ -1679,6 +1745,18 @@ impl Metrics {
             head_cache_bank_events,
             #[cfg(feature = "grpc-head-cache")]
             head_cache_bank_events_lagged,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_requests,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_prebuilds,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_evictions,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_entries,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_resident_bytes,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_max_bytes,
             #[cfg(feature = "grpc-streaming")]
             superbank_grpc_stream_requests_total,
             #[cfg(feature = "grpc-streaming")]
@@ -2613,6 +2691,52 @@ pub(crate) fn head_cache_bank_events_lagged(skipped: u64) {
 #[cfg(all(feature = "grpc-head-cache", test))]
 pub(crate) fn head_cache_bank_events_lagged_count() -> u64 {
     metrics().head_cache_bank_events_lagged.get()
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_request(outcome: &'static str) {
+    metrics()
+        .get_block_recent_store_requests
+        .get_or_create(&RecentStoreOutcomeLabels { outcome })
+        .inc();
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_prebuild(outcome: &'static str) {
+    metrics()
+        .get_block_recent_store_prebuilds
+        .get_or_create(&RecentStoreOutcomeLabels { outcome })
+        .inc();
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn get_block_recent_store_prebuild_count(outcome: &'static str) -> u64 {
+    metrics()
+        .get_block_recent_store_prebuilds
+        .get_or_create(&RecentStoreOutcomeLabels { outcome })
+        .get()
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_evictions(reason: &'static str, count: u64) {
+    metrics()
+        .get_block_recent_store_evictions
+        .get_or_create(&RecentStoreEvictionLabels { reason })
+        .inc_by(count);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_state(entries: u64, bytes: u64, max_bytes: u64) {
+    let metrics = metrics();
+    metrics
+        .get_block_recent_store_entries
+        .set(clamp_i64(entries));
+    metrics
+        .get_block_recent_store_resident_bytes
+        .set(clamp_i64(bytes));
+    metrics
+        .get_block_recent_store_max_bytes
+        .set(clamp_i64(max_bytes));
 }
 
 #[cfg(feature = "grpc-head-cache")]

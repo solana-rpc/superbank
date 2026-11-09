@@ -52,6 +52,8 @@ use crate::head_cache::dragonsmouth::DragonsmouthHeadCacheConfig;
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::{HeadCache, dragonsmouth};
 #[cfg(feature = "grpc-head-cache")]
+use crate::recent_block_responses::{self, RecentBlockResponses};
+#[cfg(feature = "grpc-head-cache")]
 use solana_commitment_config::CommitmentLevel;
 
 pub type RpcResult<T> = Result<T, RpcError>;
@@ -443,6 +445,9 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     #[cfg(not(feature = "grpc-head-cache"))]
     let head_cache_task: Option<JoinHandle<()>> = None;
 
+    #[cfg(feature = "grpc-head-cache")]
+    let recent_block_responses = recent_block_store(&args, head_cache.is_some());
+
     #[cfg(all(feature = "disk-cache", feature = "grpc-head-cache"))]
     let status_history_tiers = Some((
         head_cache.is_some(),
@@ -501,9 +506,32 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         ),
         #[cfg(feature = "grpc-head-cache")]
         head_cache,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses,
         #[cfg(feature = "disk-cache")]
         disk_cache: disk_runtime.as_ref().map(|runtime| runtime.cache.clone()),
     });
+
+    #[cfg(feature = "grpc-head-cache")]
+    let recent_store_task = state
+        .head_cache
+        .clone()
+        .filter(|_| state.recent_block_responses.enabled())
+        .map(|head| {
+            let events = head.subscribe_bank_events();
+            let prebuild = recent_block_responses::Prebuild::new(
+                args.get_block_prebuild_shapes.0.clone(),
+                args.get_block_prebuild_concurrency,
+            );
+            tokio::spawn(recent_block_responses::run(
+                state.clone(),
+                head,
+                events,
+                prebuild,
+            ))
+        });
+    #[cfg(not(feature = "grpc-head-cache"))]
+    let recent_store_task: Option<JoinHandle<()>> = None;
 
     // Build the router
     let rpc_layers = tower::ServiceBuilder::new()
@@ -567,6 +595,9 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         if let Some(task) = head_cache_task {
+            task.abort();
+        }
+        if let Some(task) = recent_store_task {
             task.abort();
         }
         #[cfg(feature = "pyroscope")]
@@ -634,6 +665,33 @@ struct DiskCacheRuntime {
 /// Head retention below this cannot bridge a disk cache trailing the finalized tip, so
 /// the status history cache would only ever bypass.
 const STATUS_HISTORY_MIN_HEAD_RETAIN_SLOTS: u64 = 256;
+
+/// The recent getBlock store needs the head cache; prebuild needs the store.
+#[cfg(feature = "grpc-head-cache")]
+fn recent_block_store(args: &RpcConfig, head_cache_running: bool) -> RecentBlockResponses {
+    let max_bytes = args.get_block_recent_store_max_bytes;
+    let shapes = args.get_block_prebuild_shapes.0.len();
+    if max_bytes > 0 && !head_cache_running {
+        warn!(
+            "GET_BLOCK_RECENT_STORE_MAX_BYTES > 0 but the head cache is not running; store disabled"
+        );
+        return RecentBlockResponses::new(0);
+    }
+    if shapes > 0 && max_bytes == 0 {
+        warn!(
+            "GET_BLOCK_PREBUILD_SHAPES is set but GET_BLOCK_RECENT_STORE_MAX_BYTES is 0; prebuild disabled"
+        );
+    }
+    if max_bytes > 0 {
+        info!(
+            max_bytes,
+            prebuild_shapes = shapes,
+            prebuild_concurrency = args.get_block_prebuild_concurrency.max(1),
+            "recent getBlock store enabled"
+        );
+    }
+    RecentBlockResponses::new(max_bytes)
+}
 
 /// Why an enabled status history cache can never skip the primary, if it cannot.
 /// `tiers` is (head cache running, disk cache enabled, head retained slots), or `None`
@@ -1058,6 +1116,22 @@ mod tests {
     use solana_epoch_schedule::EpochSchedule;
     use std::convert::Infallible;
     use tower::{ServiceBuilder, ServiceExt, service_fn};
+
+    #[cfg(feature = "grpc-head-cache")]
+    #[test]
+    fn recent_block_store_needs_a_budget_and_the_head_cache() {
+        use super::recent_block_store;
+        use clap::Parser;
+        let defaults = RpcConfig::parse_from(["superbank-rpc"]);
+        assert!(!recent_block_store(&defaults, true).enabled());
+        let sized = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-block-recent-store-max-bytes",
+            "1048576",
+        ]);
+        assert!(recent_block_store(&sized, true).enabled());
+        assert!(!recent_block_store(&sized, false).enabled());
+    }
 
     #[test]
     fn inert_status_history_cache_is_reported() {

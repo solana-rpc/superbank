@@ -191,6 +191,8 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -302,6 +304,8 @@ pub(crate) fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppSta
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -367,6 +371,8 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -423,6 +429,7 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -482,6 +489,7 @@ fn test_state_with_head_cache_and_clickhouse_url(
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -548,6 +556,7 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -8115,6 +8124,8 @@ mod agave43_cached_encoding;
 mod get_block_footer;
 #[cfg(feature = "grpc-head-cache")]
 mod get_block_head_proof;
+#[cfg(feature = "grpc-head-cache")]
+mod get_block_recent_store;
 #[cfg(feature = "disk-cache")]
 mod gsfa_race {
     //! getSignaturesForAddress races the local page against the primary's full page.
