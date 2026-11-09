@@ -91,6 +91,34 @@ impl GetBlockFetchPlan {
         Self { footer, ..self }
     }
 
+    /// Shape metric labels; `commitment` is confirmed or finalized once processed is rejected.
+    fn shape(self, commitment: CommitmentLevel) -> metrics::GetBlockRequestShape {
+        metrics::GetBlockRequestShape {
+            encoding: match self.encoding {
+                UiTransactionEncoding::Json => "json",
+                UiTransactionEncoding::JsonParsed => "jsonParsed",
+                UiTransactionEncoding::Base58 => "base58",
+                UiTransactionEncoding::Base64 => "base64",
+                UiTransactionEncoding::Binary => "other",
+            },
+            details: match self.transaction_details {
+                TransactionDetails::Full => "full",
+                TransactionDetails::Signatures => "signatures",
+                TransactionDetails::None => "none",
+                TransactionDetails::Accounts => "accounts",
+            },
+            rewards: if self.show_rewards { "true" } else { "false" },
+            msv: match self.max_supported_transaction_version {
+                Some(_) => "set",
+                None => "none",
+            },
+            commitment: match commitment {
+                CommitmentLevel::Finalized => "finalized",
+                CommitmentLevel::Confirmed | CommitmentLevel::Processed => "confirmed",
+            },
+        }
+    }
+
     fn needs_blocking_hydration(self) -> bool {
         !matches!(self.transaction_details, TransactionDetails::None)
     }
@@ -1340,7 +1368,11 @@ async fn build_block_result_blocking(
     } = pool;
     let lead = match lead {
         Some(lead) => lead,
-        None => semaphore.clone().acquire_owned().await.map_err(closed)?,
+        // Only the shared request pool comes without a lead; record its wait as AppState does.
+        None => {
+            let _wait = metrics::HydrationPermitWait::start("getBlock");
+            semaphore.clone().acquire_owned().await.map_err(closed)?
+        }
     };
     let mut permits = vec![lead];
 
@@ -1799,6 +1831,7 @@ pub(crate) async fn handle_get_block(
             Some(json!({ "requestedCommitment": commitment.commitment })),
         ));
     }
+    route.get_block_shape(fetch_plan.shape(commitment.commitment));
 
     // Entries are only ever built from finalized data (see the per-tier keys
     // below), so an entry proves the slot is finalized. A confirmed request for
@@ -3058,6 +3091,66 @@ mod tests {
     }
 
     #[test]
+    fn get_block_shape_labels_cover_representative_requests() {
+        fn shape(config: Value, commitment: CommitmentLevel) -> [&'static str; 5] {
+            let (config, _) = parse_block_config(config).expect("valid config");
+            let shape = GetBlockFetchPlan::new(&config).shape(commitment);
+            [
+                shape.encoding,
+                shape.details,
+                shape.rewards,
+                shape.msv,
+                shape.commitment,
+            ]
+        }
+        let confirmed = CommitmentLevel::Confirmed;
+        let finalized = CommitmentLevel::Finalized;
+        assert_eq!(
+            shape(
+                json!({
+                    "encoding": "json",
+                    "transactionDetails": "full",
+                    "rewards": false,
+                    "commitment": "confirmed",
+                    "maxSupportedTransactionVersion": 0
+                }),
+                confirmed
+            ),
+            ["json", "full", "false", "set", "confirmed"]
+        );
+        // Agave defaults: json, full, rewards true, no version cap.
+        assert_eq!(
+            shape(json!(null), finalized),
+            ["json", "full", "true", "none", "finalized"]
+        );
+        assert_eq!(
+            shape(json!("base64"), finalized),
+            ["base64", "full", "true", "none", "finalized"]
+        );
+        assert_eq!(
+            shape(
+                json!({"encoding": "jsonParsed", "transactionDetails": "accounts"}),
+                confirmed
+            ),
+            ["jsonParsed", "accounts", "true", "none", "confirmed"]
+        );
+        assert_eq!(
+            shape(
+                json!({"encoding": "base58", "transactionDetails": "signatures", "rewards": true}),
+                finalized
+            ),
+            ["base58", "signatures", "true", "none", "finalized"]
+        );
+        assert_eq!(
+            shape(
+                json!({"encoding": "binary", "transactionDetails": "none", "maxSupportedTransactionVersion": 0}),
+                finalized
+            ),
+            ["other", "none", "true", "set", "finalized"]
+        );
+    }
+
+    #[test]
     fn footer_flag_is_part_of_the_response_cache_key() {
         let plan = GetBlockFetchPlan::new(&RpcBlockConfig::default());
         let with = plan
@@ -3134,8 +3227,8 @@ mod tests {
         }
     }
 
-    /// Local benchmark for the `hydrate_serialize` phase on a large synthetic
-    /// block: `cargo test ... get_block_hydration_benchmark -- --ignored --nocapture`.
+    /// Release bench of `hydrate_serialize` and the recent getBlock full response path: `cargo test --release
+    /// -p superbank-rpc --all-features --locked get_block_hydration_benchmark -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn get_block_hydration_benchmark() {
@@ -3257,6 +3350,100 @@ mod tests {
                     samples[samples.len() - 1],
                 );
             }
+        }
+        #[cfg(feature = "grpc-head-cache")]
+        recent_get_block_full_path_benchmark(transactions, iterations, realistic).await;
+    }
+
+    /// Recent confirmed getBlock (json, full, rewards false, version 0) served by the head cache
+    /// through dispatch, the JSON-RPC envelope and HTTP status promotion.
+    #[cfg(feature = "grpc-head-cache")]
+    async fn recent_get_block_full_path_benchmark(
+        transactions: usize,
+        iterations: usize,
+        realistic: bool,
+    ) {
+        use crate::head_cache::HeadCache;
+        use crate::solana_sdk::signature::Signature;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+
+        let mut block = if realistic {
+            crate::tests::realistic_synthetic_block_record(transactions)
+        } else {
+            crate::tests::large_synthetic_block_record(transactions, true)
+        };
+        // Version 0 is the highest version this request accepts.
+        for record in &mut block.transactions {
+            if record.tx_version == Some(1) {
+                record.tx_version = Some(0);
+                record.tx_config_priority_fee = None;
+                record.tx_config_compute_unit_limit = None;
+                record.tx_config_loaded_accounts_data_size_limit = None;
+                record.tx_config_heap_size = None;
+            }
+        }
+        let slot = block.metadata.slot;
+        let cache = Arc::new(HeadCache::new(64, 1_000));
+        cache.note_block_metadata(block.metadata.clone());
+        cache.note_slot_commitment(slot, CommitmentLevel::Confirmed);
+        for record in block.transactions {
+            let idx = record.slot_idx;
+            let signature = Signature::from(record.signature);
+            cache.insert_for_tests(signature, record, idx, &[], CommitmentLevel::Confirmed);
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBlock",
+            "params": [slot, {
+                "encoding": "json",
+                "transactionDetails": "full",
+                "rewards": false,
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0
+            }]
+        });
+        let body = Bytes::from(serde_json::to_vec(&request).unwrap());
+
+        for emit_http_errors in [false, true] {
+            let mut state = crate::tests::test_state();
+            {
+                let state = Arc::get_mut(&mut state).unwrap();
+                state.head_cache = Some(cache.clone());
+                state.emit_http_errors = emit_http_errors;
+            }
+            let mut samples = Vec::with_capacity(iterations);
+            let mut last = Bytes::new();
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let response = crate::handlers::handle_json_rpc_with_headers(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    body.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                last = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            let parsed: Value = serde_json::from_slice(&last).unwrap();
+            assert!(parsed.get("error").is_none(), "{}", parsed["error"]);
+            assert_eq!(
+                parsed["result"]["transactions"].as_array().unwrap().len(),
+                transactions
+            );
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "bench recent realistic={realistic} shape=json/full/rewards=false/msv=0/confirmed source=head txs={transactions} emit_http_errors={emit_http_errors} bytes={} p50_ms={:.2} min_ms={:.2} max_ms={:.2}",
+                last.len(),
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1],
+            );
         }
     }
 

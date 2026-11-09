@@ -25,7 +25,7 @@ use crate::clickhouse::{
     SignatureSlot, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
     TransactionStatusFilter, TransactionsForAddressQuery,
 };
-use crate::get_transaction_primary_cache::PrimaryTransactionCacheKey;
+use crate::get_transaction_primary_cache::{PrimaryTransactionCacheKey, record_heap_bytes};
 use crate::handlers::{
     RouteMetric,
     types::{
@@ -358,6 +358,13 @@ fn unsupported_transaction_version_message(version: u8) -> String {
     )
 }
 
+/// A record within `GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES`, sized as the primary record
+/// cache weighs it, hydrates on the async worker without a permit.
+fn hydrates_inline(state: &AppState, record: &StoredTransactionRecord) -> bool {
+    let max_bytes = state.get_transaction_inline_hydration_max_bytes;
+    max_bytes > 0 && record_heap_bytes(record) <= max_bytes
+}
+
 /// Hydrate a stored record and build the JSON-RPC response; shared by the
 /// head-cache, disk-cache, and ClickHouse branches of getTransaction.
 #[allow(clippy::too_many_arguments)]
@@ -377,23 +384,31 @@ pub(crate) async fn respond_with_hydrated_transaction(
         }
     };
 
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            error!(signature = signature_str, "Hydration semaphore closed");
-            let mut resp = json_rpc_internal_error_response(id);
-            attach_timings(&mut resp);
-            return Ok(resp);
-        }
+    let record_slot = record.slot;
+    let hydrated = if hydrates_inline(state, &record) {
+        Ok(hydrate_transaction_record(
+            record.as_ref(),
+            encoding,
+            max_version,
+        ))
+    } else {
+        let permit = match state.acquire_hydration_permit(route.method()).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!(signature = signature_str, "Hydration semaphore closed");
+                let mut resp = json_rpc_internal_error_response(id);
+                attach_timings(&mut resp);
+                return Ok(resp);
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            hydrate_transaction_record(record.as_ref(), encoding, max_version)
+        })
+        .await
     };
 
-    let record_slot = record.slot;
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        hydrate_transaction_record(record.as_ref(), encoding, max_version)
-    })
-    .await
-    {
+    match hydrated {
         Ok(Ok(encoded_tx)) => {
             route.success();
             let mut resp = json_rpc_success_response(id, encoded_tx);
@@ -1422,7 +1437,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                     error: TransactionHydrationError,
                 }
 
-                let permit = match state.hydration_sem.clone().acquire_owned().await {
+                let permit = match state.acquire_hydration_permit(route.method()).await {
                     Ok(permit) => permit,
                     Err(_) => {
                         error!(address, "Hydration semaphore closed");
@@ -2080,7 +2095,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         error: TransactionHydrationError,
     }
 
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
+    let permit = match state.acquire_hydration_permit(route.method()).await {
         Ok(permit) => permit,
         Err(_) => {
             error!(address, "Hydration semaphore closed");

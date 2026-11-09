@@ -571,6 +571,15 @@ pub struct RpcConfig {
     #[arg(long, env = "GET_BLOCK_HYDRATION_PARALLELISM", default_value_t = 4)]
     pub(crate) get_block_hydration_parallelism: usize,
 
+    /// getTransaction records of at most this many bytes hydrate on the async worker
+    /// without a hydration permit. 0 disables.
+    #[arg(
+        long,
+        env = "GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES",
+        default_value_t = 0
+    )]
+    pub(crate) get_transaction_inline_hydration_max_bytes: usize,
+
     /// ClickHouse transport used for all shard-direct queries.
     #[arg(long, env = "CLICKHOUSE_TRANSPORT", value_enum, default_value = "http")]
     pub(crate) clickhouse_transport: ClickHouseTransport,
@@ -1425,6 +1434,7 @@ mod config_tests {
         assert!(cfg.get_block_response_cache_share_confirmed);
         assert!(cfg.get_block_response_cache_unsupported_version);
         assert_eq!(cfg.get_block_hydration_parallelism, 4);
+        assert_eq!(cfg.get_transaction_inline_hydration_max_bytes, 0);
         assert!(!cfg.rpc_response_gzip_enabled);
         assert!(!cfg.metrics_capture_x_endpoint());
         assert!(!cfg.metrics_capture_x_rpc_node());

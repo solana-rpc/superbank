@@ -920,6 +920,8 @@ pub struct Metrics {
     get_transaction_primary_slot_age: Histogram,
     get_transaction_primary_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
     get_transaction_not_found: Family<GetTransactionNotFoundLabels, Counter>,
+    get_block_request_shape_total: Family<GetBlockRequestShapeLabels, Counter>,
+    hydration_permit_wait_seconds: Family<HydrationPermitLabels, Histogram>,
 }
 
 impl Metrics {
@@ -1762,6 +1764,21 @@ impl Metrics {
             get_transaction_not_found.clone(),
         );
 
+        let get_block_request_shape_total =
+            Family::<GetBlockRequestShapeLabels, Counter>::default();
+        registry.register(
+            "get_block_request_shape",
+            "Parsed getBlock requests by response-shaping options and the tier that served them",
+            get_block_request_shape_total.clone(),
+        );
+        let hydration_permit_wait_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
+        registry.register(
+            "hydration_permit_wait_seconds",
+            "Wait for a HYDRATION_CPU_CONCURRENCY permit by method, including cancelled waits",
+            hydration_permit_wait_seconds.clone(),
+        );
+
         // Register process metrics to expose basic runtime health info (CPU, memory).
         if let Err(err) =
             kubert_prometheus_process::register(registry.sub_registry_with_prefix("process"))
@@ -1954,6 +1971,8 @@ impl Metrics {
             get_transaction_primary_slot_age,
             get_transaction_primary_slot_age_skipped_total,
             get_transaction_not_found,
+            get_block_request_shape_total,
+            hydration_permit_wait_seconds,
         }
     }
 
@@ -3428,6 +3447,100 @@ pub(crate) fn get_transaction_disk_cache_slot_age_skipped(reason: &'static str) 
         .inc();
 }
 
+/// Response-shaping options of one parsed getBlock request; every field is a fixed enumeration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GetBlockRequestShape {
+    pub(crate) encoding: &'static str,
+    pub(crate) details: &'static str,
+    pub(crate) rewards: &'static str,
+    pub(crate) msv: &'static str,
+    pub(crate) commitment: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct GetBlockRequestShapeLabels {
+    encoding: &'static str,
+    details: &'static str,
+    rewards: &'static str,
+    msv: &'static str,
+    commitment: &'static str,
+    tier: &'static str,
+}
+
+impl GetBlockRequestShapeLabels {
+    fn new(shape: GetBlockRequestShape, tier: &'static str) -> Self {
+        Self {
+            encoding: shape.encoding,
+            details: shape.details,
+            rewards: shape.rewards,
+            msv: shape.msv,
+            commitment: shape.commitment,
+            tier,
+        }
+    }
+}
+
+/// Counts one getBlock request; `tier` is `head`, `response_cache`, `disk`, `clickhouse` or `other`.
+pub(crate) fn get_block_request_shape(shape: GetBlockRequestShape, tier: &'static str) {
+    metrics()
+        .get_block_request_shape_total
+        .get_or_create(&GetBlockRequestShapeLabels::new(shape, tier))
+        .inc();
+}
+
+#[cfg(all(test, feature = "grpc-head-cache"))]
+pub(crate) fn get_block_request_shape_count_for_tests(
+    shape: GetBlockRequestShape,
+    tier: &'static str,
+) -> u64 {
+    metrics()
+        .get_block_request_shape_total
+        .get_or_create(&GetBlockRequestShapeLabels::new(shape, tier))
+        .get()
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HydrationPermitLabels {
+    method: &'static str,
+}
+
+/// Records one hydration permit wait for `method` when dropped, so cancelled waits count too.
+pub(crate) struct HydrationPermitWait {
+    method: &'static str,
+    started: Instant,
+}
+
+impl HydrationPermitWait {
+    pub(crate) fn start(method: &'static str) -> Self {
+        Self {
+            method,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for HydrationPermitWait {
+    fn drop(&mut self) {
+        metrics()
+            .hydration_permit_wait_seconds
+            .get_or_create(&HydrationPermitLabels {
+                method: self.method,
+            })
+            .observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hydration_permit_wait_count_for_tests(method: &'static str) -> u64 {
+    let exported =
+        String::from_utf8(metrics().export().expect("metrics export")).expect("metrics are UTF-8");
+    let prefix = format!("superbank_hydration_permit_wait_seconds_count{{method=\"{method}\"}} ");
+    exported
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map_or(0, |count| count.parse().expect("numeric count"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3475,6 +3588,10 @@ mod tests {
             .observe(0.01);
         metrics.rpc_admission_wait(std::time::Duration::from_millis(1));
         metrics.backend_admission("fetch", "admitted", std::time::Duration::ZERO);
+        metrics
+            .hydration_permit_wait_seconds
+            .get_or_create(&HydrationPermitLabels { method: "getBlock" })
+            .observe(0.0001);
         #[cfg(feature = "disk-cache")]
         metrics
             .disk_cache_key_seconds
@@ -3492,6 +3609,7 @@ mod tests {
             "superbank_rpc_envelope_seconds",
             "superbank_rpc_admission_wait_seconds",
             "superbank_rpc_backend_admission_wait_seconds",
+            "superbank_hydration_permit_wait_seconds",
         ];
         if cfg!(feature = "disk-cache") {
             serving.push("superbank_disk_cache_key_seconds");
@@ -3599,6 +3717,33 @@ mod tests {
         assert!(exported.contains(
             "superbank_rpc_response_time_seconds_count{method=\"getSlot\",status=\"abandoned\"} 1"
         ));
+    }
+
+    #[test]
+    fn get_block_request_shape_exports_enumerated_labels_only() {
+        let metrics = Metrics::new();
+        let shape = GetBlockRequestShape {
+            encoding: "json",
+            details: "full",
+            rewards: "false",
+            msv: "set",
+            commitment: "confirmed",
+        };
+        for tier in ["head", "head", "other"] {
+            metrics
+                .get_block_request_shape_total
+                .get_or_create(&GetBlockRequestShapeLabels::new(shape, tier))
+                .inc();
+        }
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        let line = |tier: &str, count: u64| {
+            format!(
+                "superbank_get_block_request_shape_total{{encoding=\"json\",details=\"full\",rewards=\"false\",msv=\"set\",commitment=\"confirmed\",tier=\"{tier}\"}} {count}"
+            )
+        };
+        assert!(exported.contains(&line("head", 2)), "{exported}");
+        assert!(exported.contains(&line("other", 1)), "{exported}");
     }
 
     #[test]

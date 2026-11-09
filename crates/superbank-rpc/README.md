@@ -1037,6 +1037,7 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | `--get-block-recent-store-max-bytes` | `GET_BLOCK_RECENT_STORE_MAX_BYTES` | `0` | Serialized head-cache `getBlock` result byte budget, keyed by blockhash and response shape. `0` disables the store. Requires `grpc-head-cache` and a running head cache. See "Recent `getBlock` store". |
 | `--get-block-prebuild-shapes` | `GET_BLOCK_PREBUILD_SHAPES` | empty | Comma-separated `getBlock` shapes to build into the recent store when a head block is confirmed. Each shape is `name=value` config fields joined by `:`. Empty disables prebuilds. Needs `GET_BLOCK_RECENT_STORE_MAX_BYTES`. |
 | `--get-block-prebuild-concurrency` | `GET_BLOCK_PREBUILD_CONCURRENCY` | `1` | Blocking-pool permits for prebuilds, separate from `HYDRATION_CPU_CONCURRENCY`. |
+| `--get-transaction-inline-hydration-max-bytes` | `GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES` | `0` | A `getTransaction` record of at most this many bytes hydrates on the async worker. It takes no `HYDRATION_CPU_CONCURRENCY` permit and does not move to the blocking pool. The size is the estimate that the primary record cache weighs: the decoded record struct (about 1.3 KB) plus its heap buffers. A mainnet-like record with 24 accounts, 12 log lines and token balances is about 6.5 KB. Response bytes are the same on both paths. `0` disables inline hydration. |
 | `--signature-status-history-cache-entries` | `SIGNATURE_STATUS_HISTORY_CACHE_ENTRIES` | `0` | Signatures whose empty primary `searchTransactionHistory` answer is remembered (see "Primary signature-status overload protection"). `0` disables the cache. Requires `grpc-head-cache` and `disk-cache`. |
 | `--signature-status-history-cache-max-bytes` | `SIGNATURE_STATUS_HISTORY_CACHE_MAX_BYTES` | `67108864` | Memory bound for that cache, budgeted at 384 bytes per entry. |
 | `--signature-status-history-cache-ttl-secs` | `SIGNATURE_STATUS_HISTORY_CACHE_TTL_SECS` | `300` | How long a remembered absence may skip the primary (1-300 seconds). |
@@ -1419,7 +1420,7 @@ Request-scoped metric families:
 - `superbank_rpc_response_bytes{method}` (histogram): uncompressed response body size in bytes, from `Content-Length` or the exact body size. Buckets are 1 KiB to 64 MiB in powers of 4 (`le` 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864).
 - Both envelope families carry only `method`, with no request-header labels: a supported method name, `unknown` for any other method string, `batch` for an array envelope, and `invalid` for a parse error or a request without a string `method`.
 - `rpc_admission_wait_seconds`, `rpc_inflight`, `rpc_backend_admission_total` and `rpc_backend_admission_wait_seconds` carry no request-header labels; see "Request admission".
-- `rpc_response_time_seconds`, `rpc_clickhouse_duration_seconds`, `rpc_envelope_seconds`, `disk_cache_key_seconds`, `head_cache_write_lock_hold_seconds`, `head_cache_commitment_wait_seconds`, `rpc_admission_wait_seconds` and `rpc_backend_admission_wait_seconds` use `le` 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 2.5, 5, 10 s. Only these eight families use that set. `clickhouse_read_disconnect_probe_seconds`, `rpc_response_overhead_seconds`, `rpc_blocks_range_seconds`, `get_block_phase_seconds`, `rpc_signature_status_admission_seconds`, `disk_cache_write_latency_seconds` and `block_index_lookup_seconds` keep the 13 `le` values without 0.15, 0.2, 0.3, 0.4 and 0.75. Histograms of counts and sizes have their own buckets.
+- `rpc_response_time_seconds`, `rpc_clickhouse_duration_seconds`, `rpc_envelope_seconds`, `disk_cache_key_seconds`, `head_cache_write_lock_hold_seconds`, `head_cache_commitment_wait_seconds`, `rpc_admission_wait_seconds`, `rpc_backend_admission_wait_seconds` and `hydration_permit_wait_seconds` use `le` 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 2.5, 5, 10 s. Only these nine families use that set. `clickhouse_read_disconnect_probe_seconds`, `rpc_response_overhead_seconds`, `rpc_blocks_range_seconds`, `get_block_phase_seconds`, `rpc_signature_status_admission_seconds`, `disk_cache_write_latency_seconds` and `block_index_lookup_seconds` keep the 13 `le` values without 0.15, 0.2, 0.3, 0.4 and 0.75. Histograms of counts and sizes have their own buckets.
 
 `getBlock` response-cache metrics:
 
@@ -1430,6 +1431,17 @@ Request-scoped metric families:
 `getBlock` not-found metric:
 
 - `superbank_get_block_not_found_total{reason}`, with no request-header labels: not-found answers by the tier and proof that decided them. `proven_skipped` (`-32009`) and `above_head_tip` (`-32004`) come from the head cache's finalized parent-link chain (`grpc-head-cache` only). `disk_skipped` (`-32009`) is a disk-cache skip marker (`disk-cache` only). `clickhouse_not_found` (`-32009`) and `above_clickhouse_latest` (`-32004`) classify a source ClickHouse miss against its latest finalized slot.
+
+`getBlock` request shape and hydration permit metrics (no request-header labels):
+
+- `superbank_get_block_request_shape_total{encoding,details,rewards,msv,commitment,tier}` counts each parsed `getBlock` request once, when its handler finishes. Each batch item counts as one request. Requests rejected during parsing, including `processed` commitment, are not counted.
+  - `encoding`: `json|jsonParsed|base58|base64|other`. `other` is the legacy `binary` encoding.
+  - `details`: `full|signatures|none|accounts`.
+  - `rewards`: `true|false`. This is the effective value, so an omitted `rewards` counts as `true`.
+  - `msv`: `none|set`. `set` means the request sets `maxSupportedTransactionVersion`.
+  - `commitment`: `confirmed|finalized`.
+  - `tier`: `head|response_cache|disk|clickhouse` names the tier that served a successful response. Every other outcome (not found, RPC errors, backend errors, timeouts and abandoned requests) is `other`.
+- `superbank_hydration_permit_wait_seconds{method}` (histogram): the wait for a `HYDRATION_CPU_CONCURRENCY` permit. A wait that a timeout or a disconnect cancels is recorded too. `method` is `getBlock`, `getTransaction` or `getTransactionsForAddress`, or `StreamBlocks` and `StreamTransactions` for gRPC streaming. Extra `getBlock` chunk permits are taken only when free, so they are not recorded. A `getTransaction` record that hydrates inline (`GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES`) takes no permit and is not recorded.
 
 `getInflationReward` response-cache metrics (`GET_INFLATION_REWARD_RESPONSE_CACHE_MAX_BYTES`, default `0` = off):
 

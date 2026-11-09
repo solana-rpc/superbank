@@ -531,6 +531,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             args.hydration_cpu_concurrency.max(1),
         )),
         get_block_hydration_parallelism: args.get_block_hydration_parallelism.max(1),
+        get_transaction_inline_hydration_max_bytes: args.get_transaction_inline_hydration_max_bytes,
         block_response_cache: BlockResponseCache::new(args.get_block_response_cache_max_bytes)
             .with_unsupported_version_cache(args.get_block_response_cache_unsupported_version),
         get_transaction_primary_cache: PrimaryTransactionCache::new(

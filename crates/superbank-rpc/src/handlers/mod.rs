@@ -363,6 +363,7 @@ pub(crate) struct RouteMetric {
     timeout: std::time::Duration,
     /// Created by a handler the JSON-RPC dispatcher is polling.
     dispatched: bool,
+    get_block_shape: Option<metrics::GetBlockRequestShape>,
     x_endpoint: Option<String>,
     x_rpc_node: Option<String>,
     x_subscription_id: Option<String>,
@@ -384,6 +385,7 @@ impl RouteMetric {
             started: Instant::now(),
             timeout: state.rpc_request_timeout,
             dispatched: in_handler_poll(),
+            get_block_shape: None,
             x_endpoint: request_headers.x_endpoint,
             x_rpc_node: request_headers.x_rpc_node,
             x_subscription_id: request_headers.x_subscription_id,
@@ -471,6 +473,27 @@ impl RouteMetric {
     pub(crate) fn method(&self) -> &'static str {
         self.method
     }
+
+    /// Counts this request in the getBlock shape metric when the route is recorded.
+    pub(crate) fn get_block_shape(&mut self, shape: metrics::GetBlockRequestShape) {
+        self.get_block_shape = Some(shape);
+    }
+}
+
+/// The tier that served a successful getBlock request; any other outcome is `other`.
+fn get_block_shape_tier(source: &'static str, outcome: &'static str) -> &'static str {
+    if outcome != ROUTE_OUTCOME_SUCCESS {
+        return "other";
+    }
+    match source {
+        ROUTE_SOURCE_CLICKHOUSE => "clickhouse",
+        ROUTE_SOURCE_RESPONSE_CACHE => "response_cache",
+        #[cfg(feature = "grpc-head-cache")]
+        ROUTE_SOURCE_HEAD_CACHE => "head",
+        #[cfg(feature = "disk-cache")]
+        ROUTE_SOURCE_DISK_CACHE => "disk",
+        _ => "other",
+    }
 }
 
 /// `backend_error` is the unset default, so it also covers handlers that never finished:
@@ -495,6 +518,9 @@ impl Drop for RouteMetric {
             self.started.elapsed() >= self.timeout,
             self.dispatched && !in_handler_poll(),
         );
+        if let Some(shape) = self.get_block_shape {
+            metrics::get_block_request_shape(shape, get_block_shape_tier(self.source, outcome));
+        }
         metrics::route(metrics::RouteMetricLabels {
             method: self.method,
             transport: self.transport,
@@ -2101,6 +2127,46 @@ mod route_tests {
         );
         for explicit in [ROUTE_OUTCOME_SUCCESS, ROUTE_OUTCOME_RPC_ERROR] {
             assert_eq!(route_drop_outcome(explicit, true, true), explicit);
+        }
+    }
+
+    #[test]
+    fn get_block_shape_tier_names_the_serving_tier_only_on_success() {
+        let success = ROUTE_OUTCOME_SUCCESS;
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_CLICKHOUSE, success),
+            "clickhouse"
+        );
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_RESPONSE_CACHE, success),
+            "response_cache"
+        );
+        #[cfg(feature = "grpc-head-cache")]
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_HEAD_CACHE, success),
+            "head"
+        );
+        #[cfg(feature = "disk-cache")]
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_DISK_CACHE, success),
+            "disk"
+        );
+        assert_eq!(get_block_shape_tier(ROUTE_SOURCE_NONE, success), "other");
+        for failed in [
+            ROUTE_OUTCOME_NOT_FOUND,
+            ROUTE_OUTCOME_RPC_ERROR,
+            ROUTE_OUTCOME_BACKEND_ERROR,
+            ROUTE_OUTCOME_TIMEOUT,
+            ROUTE_OUTCOME_ABANDONED,
+        ] {
+            assert_eq!(
+                get_block_shape_tier(ROUTE_SOURCE_CLICKHOUSE, failed),
+                "other"
+            );
+            assert_eq!(
+                get_block_shape_tier(ROUTE_SOURCE_RESPONSE_CACHE, failed),
+                "other"
+            );
         }
     }
 

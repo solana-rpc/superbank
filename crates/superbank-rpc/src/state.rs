@@ -10,7 +10,7 @@ use std::time::Duration;
 use solana_commitment_config::CommitmentLevel;
 use solana_epoch_schedule::EpochSchedule;
 use tokio::sync::futures::OwnedNotified;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{AcquireError, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::ClickHouseClient;
@@ -52,6 +52,8 @@ pub(crate) struct AppState {
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
     pub(crate) get_block_hydration_parallelism: usize,
+    /// getTransaction records up to this many bytes hydrate on the async worker; 0 disables.
+    pub(crate) get_transaction_inline_hydration_max_bytes: usize,
     pub(crate) block_response_cache: BlockResponseCache,
     pub(crate) get_transaction_primary_cache: PrimaryTransactionCache,
     pub(crate) get_block_response_cache_share_confirmed: bool,
@@ -85,6 +87,15 @@ impl AppState {
     #[cfg(feature = "disk-cache")]
     pub(crate) fn disk_cache(&self) -> Option<&Arc<DiskCache>> {
         self.disk_cache.as_ref()?.get()
+    }
+
+    /// Waits for a `hydration_sem` permit and records the wait under `method`.
+    pub(crate) async fn acquire_hydration_permit(
+        &self,
+        method: &'static str,
+    ) -> Result<OwnedSemaphorePermit, AcquireError> {
+        let _wait = metrics::HydrationPermitWait::start(method);
+        self.hydration_sem.clone().acquire_owned().await
     }
 
     pub(crate) async fn resolve_latest_slot_with_source(

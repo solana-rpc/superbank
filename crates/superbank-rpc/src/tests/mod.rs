@@ -7,6 +7,9 @@ mod agave44_transaction;
 mod backend_admission;
 mod block_ranges;
 mod cache_refresh;
+#[cfg(feature = "grpc-head-cache")]
+mod get_block_request_shape;
+mod get_transaction_inline_hydration;
 mod latest_slot;
 
 use crate::solana_sdk;
@@ -186,6 +189,7 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
@@ -299,6 +303,7 @@ pub(crate) fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppSta
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
@@ -366,6 +371,7 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
@@ -425,6 +431,7 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
@@ -485,6 +492,7 @@ fn test_state_with_head_cache_and_clickhouse_url(
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
@@ -552,6 +560,7 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),

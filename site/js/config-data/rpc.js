@@ -200,6 +200,12 @@ export default {
           default: '0',
           text: 'ClickHouse `max_threads` and `max_threads_for_indexes` for primary `getTransaction` reads, including the signature position lookup that `getSignaturesForAddress` cursors also use. Zero keeps the server setting. Local-cache and shard-direct shard-local reads are unchanged.',
         }),
+        opt('GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES', {
+          type: 'usize (bytes)',
+          default: '0',
+          text: 'Records of at most this size, as the primary record cache weighs them, hydrate on the async worker without a hydration permit. Response bytes are unchanged. Zero disables it.',
+          relations: [{ type: 'see', to: 'HYDRATION_CPU_CONCURRENCY' }],
+        }),
         envOnly('SIGNATURE_SLOT_CACHE_SIZE', CACHE, {
           type: 'usize',
           default: '50000',
