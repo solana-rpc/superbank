@@ -872,6 +872,59 @@ fn block_identity_matches_get_block() {
     assert_eq!(identity_and_block(CommitmentLevel::Processed), None);
 }
 
+/// Stages bank 1 of `slot` on `parent`; `transactions` other than 1 cannot seal.
+fn finalize_on(cache: &HeadCache, session: u64, slot: u64, parent: u64, transactions: u64) {
+    let mut meta = metadata(slot, slot as u8);
+    meta.parent_slot = parent;
+    meta.parent_blockhash = [parent as u8; 32];
+    meta.executed_transaction_count = transactions;
+    cache.stage_bank_metadata(session, 1, meta);
+    stage_entry(cache, session, slot, 1, 1);
+    let tx = transaction(slot as u8);
+    cache.freeze_bank(session, slot, 1, [slot as u8; 32], vec![tx]);
+    cache.commit_bank(session, slot, 1, CommitmentLevel::Finalized, Some(parent));
+}
+
+#[test]
+fn slot_status_proves_skips_on_sealed_banks_and_stops_at_an_unsealed_one() {
+    use crate::head_cache::coverage::SlotStatus::{
+        AboveFinalizedTip, Present, ProvenSkipped, Unknown,
+    };
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    finalize_on(&cache, session, 40, 39, 1);
+    finalize_on(&cache, session, 42, 40, 1);
+    let status = |slots: std::ops::RangeInclusive<u64>| {
+        slots
+            .map(|slot| cache.slot_status(slot))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        status(39..=43),
+        vec![Unknown, Present, ProvenSkipped, Present, AboveFinalizedTip]
+    );
+    // Slot 43 is a finalized block whose bank never sealed: no link, so no trusted chain.
+    finalize_on(&cache, session, 43, 42, 2);
+    assert_eq!(status(40..=44), vec![Unknown; 5]);
+    finalize_on(&cache, session, 44, 43, 1);
+    finalize_on(&cache, session, 46, 44, 1);
+    assert_eq!(
+        status(40..=47),
+        vec![
+            Unknown,
+            Unknown,
+            Unknown,
+            Unknown,
+            Present,
+            ProvenSkipped,
+            Present,
+            AboveFinalizedTip
+        ]
+    );
+    cache.end_bank_session(session);
+    assert_eq!(status(44..=47), vec![Unknown; 4]);
+}
+
 type Corruption = dyn Fn(
     &mut BlockMetadataRecord,
     &mut Vec<SubscribeUpdateTransactionInfo>,

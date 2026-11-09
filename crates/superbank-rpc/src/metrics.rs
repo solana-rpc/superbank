@@ -68,6 +68,11 @@ struct DisconnectOutcomeLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct GetBlockNotFoundLabels {
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ReadDisconnectLabels {
     operation: &'static str,
     target: &'static str,
@@ -709,6 +714,7 @@ pub struct Metrics {
     get_transaction_primary_cache_weighted_bytes: Gauge,
     get_transaction_primary_cache_max_bytes: Gauge,
     get_block_phase_seconds: Family<OperationLabels, Histogram>,
+    get_block_not_found: Family<GetBlockNotFoundLabels, Counter>,
 
     backend_errors: Family<OperationLabels, Counter>,
     inflation_reward_rejections: Family<BatchRejectLabels, Counter>,
@@ -887,6 +893,7 @@ impl Metrics {
         let get_transaction_primary_cache_max_bytes = Gauge::default();
         let get_block_phase_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+        let get_block_not_found = Family::default();
 
         let backend_errors = Family::default();
         let inflation_reward_rejections = Family::default();
@@ -1171,6 +1178,11 @@ impl Metrics {
             "get_block_phase_seconds",
             "getBlock phase latency in seconds",
             get_block_phase_seconds.clone(),
+        );
+        registry.register(
+            "get_block_not_found",
+            "getBlock not-found answers by the tier and proof that decided them",
+            get_block_not_found.clone(),
         );
         registry.register(
             "rpc_backend_errors",
@@ -1618,6 +1630,7 @@ impl Metrics {
             get_transaction_primary_cache_weighted_bytes,
             get_transaction_primary_cache_max_bytes,
             get_block_phase_seconds,
+            get_block_not_found,
             backend_errors,
             inflation_reward_rejections,
             inflation_reward_lookups,
@@ -2484,6 +2497,22 @@ pub(crate) fn get_transaction_primary_cache_state(entries: u64, bytes: u64, max_
 pub(crate) fn get_block_phase(phase: &str, elapsed_seconds: f64) {
     let metrics = metrics();
     metrics.get_block_phase(phase, elapsed_seconds);
+}
+
+/// Only a `reason` label, so captured request headers never multiply the series.
+pub(crate) fn get_block_not_found(reason: &'static str) {
+    metrics()
+        .get_block_not_found
+        .get_or_create(&GetBlockNotFoundLabels { reason })
+        .inc();
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn get_block_not_found_count(reason: &'static str) -> u64 {
+    metrics()
+        .get_block_not_found
+        .get_or_create(&GetBlockNotFoundLabels { reason })
+        .get()
 }
 
 pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {

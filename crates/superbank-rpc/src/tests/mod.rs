@@ -8113,6 +8113,8 @@ mod agave_43;
 mod agave43_cached_encoding;
 #[cfg(feature = "grpc-head-cache")]
 mod get_block_footer;
+#[cfg(feature = "grpc-head-cache")]
+mod get_block_head_proof;
 #[cfg(feature = "disk-cache")]
 mod gsfa_race {
     //! getSignaturesForAddress races the local page against the primary's full page.

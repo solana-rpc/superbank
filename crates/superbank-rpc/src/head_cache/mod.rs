@@ -583,9 +583,16 @@ impl HeadCache {
         }
     }
 
+    /// What this session's trusted finalized parent-link chain proves about `slot`.
+    pub(crate) fn slot_status(&self, slot: u64) -> coverage::SlotStatus {
+        self.coverage
+            .read()
+            .expect("head coverage lock")
+            .slot_status(slot, std::time::Instant::now())
+    }
+
     /// Blockhash and commitment of the block `get_block` would read at `min_commitment`.
     /// It does not check that every transaction of the block is present.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn block_identity(
         &self,
         slot: u64,

@@ -16,6 +16,19 @@ pub(crate) struct Link {
     pub(crate) parent_hash: [u8; 32],
 }
 
+/// What the trusted finalized parent-link chain proves about one slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotStatus {
+    /// A verified link of the finalized chain.
+    Present,
+    /// Strictly between two consecutive verified links of the finalized chain.
+    ProvenSkipped,
+    /// Above the trusted finalized tip.
+    AboveFinalizedTip,
+    /// Not provable: below the chain, no session, a stale tip or no verified parent edge.
+    Unknown,
+}
+
 #[derive(Default)]
 struct Node {
     link: Option<Link>,
@@ -213,6 +226,36 @@ impl HeadCoverage {
             return Err("untrusted_tip");
         }
         Ok((tip.slot, chain))
+    }
+
+    /// Classifies `slot` against the trusted finalized chain only. A real block that never
+    /// sealed has no link, so it ends the chain and everything below it stays `Unknown`.
+    pub(crate) fn slot_status(&self, slot: u64, now: Instant) -> SlotStatus {
+        // Every chain link is a retained node, so an older slot is never provable.
+        if self
+            .nodes
+            .first_key_value()
+            .is_none_or(|(&oldest, _)| slot < oldest)
+        {
+            return SlotStatus::Unknown;
+        }
+        let Ok((tip, chain)) = self.trusted_chain(CommitmentLevel::Finalized, now) else {
+            return SlotStatus::Unknown;
+        };
+        if slot > tip {
+            return SlotStatus::AboveFinalizedTip;
+        }
+        if chain.iter().any(|link| link.slot == slot) {
+            return SlotStatus::Present;
+        }
+        // Newest first: each pair is a child and the parent its verified link names.
+        if chain
+            .windows(2)
+            .any(|pair| pair[1].slot < slot && slot < pair[0].slot)
+        {
+            return SlotStatus::ProvenSkipped;
+        }
+        SlotStatus::Unknown
     }
 
     pub(crate) fn snapshot(
@@ -526,6 +569,88 @@ mod tests {
         let (end, proof, clamped) = state.snapshot_clamped(10, 20, finalized, now);
         assert_eq!((end, clamped), (20, false));
         assert!(proof.intervals.is_empty());
+    }
+
+    #[test]
+    fn slot_status_proves_skips_only_between_finalized_links() {
+        let now = Instant::now();
+        let mut state = HeadCoverage::default();
+        state.connect();
+        add(&mut state, 10, 9, now);
+        add(&mut state, 13, 10, now);
+        add(&mut state, 14, 13, now);
+        // Confirmed links above the finalized tip prove nothing about their gaps yet.
+        for (slot, parent) in [(16, 14), (18, 16)] {
+            state.metadata(link(slot, parent));
+            state.observe(slot, CommitmentLevel::Confirmed, now);
+            state.publish(slot, CommitmentLevel::Confirmed);
+        }
+        let status = |slot| state.slot_status(slot, now);
+        assert_eq!(status(8), SlotStatus::Unknown);
+        assert_eq!(status(9), SlotStatus::Unknown, "parent of the oldest link");
+        for slot in [10, 13, 14] {
+            assert_eq!(status(slot), SlotStatus::Present, "{slot}");
+        }
+        for slot in [11, 12] {
+            assert_eq!(status(slot), SlotStatus::ProvenSkipped, "{slot}");
+        }
+        for slot in [15, 16, 17, 18, 19, u64::MAX] {
+            assert_eq!(status(slot), SlotStatus::AboveFinalizedTip, "{slot}");
+        }
+    }
+
+    #[test]
+    fn slot_status_treats_an_unsealed_block_as_a_gap() {
+        let now = Instant::now();
+        let mut state = HeadCoverage::default();
+        state.connect();
+        add(&mut state, 10, 9, now);
+        add(&mut state, 12, 10, now);
+        // Slot 13 was a real block whose bank never sealed: finalized, but no link.
+        state.observe(13, CommitmentLevel::Finalized, now);
+        assert_eq!(state.slot_status(11, now), SlotStatus::Unknown);
+        assert_eq!(state.slot_status(14, now), SlotStatus::Unknown);
+        add(&mut state, 14, 13, now);
+        add(&mut state, 16, 14, now);
+        let status = |slot| state.slot_status(slot, now);
+        for slot in [9, 10, 11, 12, 13] {
+            assert_eq!(status(slot), SlotStatus::Unknown, "{slot}");
+        }
+        assert_eq!(status(14), SlotStatus::Present);
+        assert_eq!(status(15), SlotStatus::ProvenSkipped);
+        assert_eq!(status(16), SlotStatus::Present);
+        assert_eq!(status(17), SlotStatus::AboveFinalizedTip);
+    }
+
+    #[test]
+    fn slot_status_is_unknown_without_a_trusted_tip() {
+        let now = Instant::now();
+        let mut state = HeadCoverage::default();
+        state.connect();
+        add(&mut state, 10, 9, now);
+        // A single unverified link is not a trusted chain.
+        assert_eq!(state.slot_status(11, now), SlotStatus::Unknown);
+        add(&mut state, 12, 10, now);
+        assert_eq!(state.slot_status(11, now), SlotStatus::ProvenSkipped);
+        let stale = now + TIP_MAX_AGE + Duration::from_nanos(1);
+        for slot in [10, 11, 13] {
+            assert_eq!(
+                state.slot_status(slot, stale),
+                SlotStatus::Unknown,
+                "{slot}"
+            );
+        }
+        // A replaced bank breaks the verified parent edge.
+        state.metadata(Link {
+            hash: [99; 32],
+            ..link(10, 9)
+        });
+        assert_eq!(state.slot_status(11, now), SlotStatus::Unknown);
+        assert_eq!(state.slot_status(13, now), SlotStatus::Unknown);
+        state.disconnect();
+        for slot in [10, 11, 13] {
+            assert_eq!(state.slot_status(slot, now), SlotStatus::Unknown, "{slot}");
+        }
     }
 
     #[test]

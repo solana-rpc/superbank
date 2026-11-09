@@ -269,19 +269,67 @@ pub(super) fn merge_sorted_block_slots(
     merged
 }
 
+fn block_not_available_error(slot: u64) -> (i32, String) {
+    (
+        JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32,
+        format!("Block not available for slot {slot}"),
+    )
+}
+
+fn slot_skipped_error(slot: u64) -> (i32, String) {
+    (
+        JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
+        format!("Slot {slot} was skipped, or missing in long-term storage"),
+    )
+}
+
 // `getBlock` is served from ClickHouse, so classify misses against ClickHouse ingest state.
-fn classify_get_block_miss(slot: u64, clickhouse_latest: u64) -> (i32, String) {
+// Returns the error and its `get_block_not_found` reason.
+fn classify_get_block_miss(slot: u64, clickhouse_latest: u64) -> (i32, String, &'static str) {
     if slot > clickhouse_latest {
-        (
-            JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32,
-            format!("Block not available for slot {slot}"),
-        )
+        let (code, message) = block_not_available_error(slot);
+        (code, message, "above_clickhouse_latest")
     } else {
-        (
-            JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
-            format!("Slot {slot} was skipped, or missing in long-term storage"),
-        )
+        let (code, message) = slot_skipped_error(slot);
+        (code, message, "clickhouse_not_found")
     }
+}
+
+/// Answers a head-cache getBlock miss that the head's finalized parent-link chain decides,
+/// without the disk tier or ClickHouse. `None` leaves the request to the next tier.
+#[cfg(feature = "grpc-head-cache")]
+fn head_proof_miss_response(
+    state: &AppState,
+    route: &mut RouteMetric,
+    id: &Value,
+    slot: u64,
+    commitment: CommitmentLevel,
+) -> Option<Response> {
+    use crate::head_cache::coverage::SlotStatus;
+    let head = state.head_cache.as_ref()?;
+    let (code, message, reason) = match head.slot_status(slot) {
+        SlotStatus::ProvenSkipped => {
+            let (code, message) = slot_skipped_error(slot);
+            (code, message, "proven_skipped")
+        }
+        // A primary already seen at `slot` may hold a block the head has not finalized.
+        SlotStatus::AboveFinalizedTip
+            if head.block_identity(slot, commitment).is_none()
+                && state
+                    .latest_slot_cache
+                    .value
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    < slot =>
+        {
+            let (code, message) = block_not_available_error(slot);
+            (code, message, "above_head_tip")
+        }
+        _ => return None,
+    };
+    route.source_head_cache();
+    route.not_found();
+    metrics::get_block_not_found(reason);
+    Some(json_rpc_error_response(id.clone(), code, message, None))
 }
 
 pub(crate) async fn handle_get_block_height(
@@ -1634,6 +1682,13 @@ pub(crate) async fn handle_get_block(
         }
     }
 
+    #[cfg(feature = "grpc-head-cache")]
+    if let Some(resp) =
+        head_proof_miss_response(&state, &mut route, &id, slot, commitment.commitment)
+    {
+        return Ok(resp);
+    }
+
     // Disk tier: serves any individually covered slot (all stored data is
     // finalized, satisfying the confirmed/finalized commitments accepted
     // above). A Skipped marker is proof the slot has no block on the finalized
@@ -1669,12 +1724,9 @@ pub(crate) async fn handle_get_block(
             crate::disk_cache::DiskBlockResult::Skipped => {
                 route.source_disk_cache();
                 route.not_found();
-                return Ok(json_rpc_error_response(
-                    id,
-                    JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
-                    format!("Slot {slot} was skipped, or missing in long-term storage"),
-                    None,
-                ));
+                metrics::get_block_not_found("disk_skipped");
+                let (code, message) = slot_skipped_error(slot);
+                return Ok(json_rpc_error_response(id, code, message, None));
             }
             crate::disk_cache::DiskBlockResult::NotCovered => {}
         }
@@ -1789,7 +1841,8 @@ pub(crate) async fn handle_get_block(
         };
 
         route.not_found();
-        let (code, message) = classify_get_block_miss(slot, clickhouse_latest);
+        let (code, message, reason) = classify_get_block_miss(slot, clickhouse_latest);
+        metrics::get_block_not_found(reason);
         let mut resp = json_rpc_error_response(id, code, message, None);
         add_downstream_header(&mut resp, &timings);
         return Ok(resp);
@@ -3369,14 +3422,16 @@ mod tests {
 
     #[test]
     fn classify_get_block_miss_returns_block_not_available_above_clickhouse_latest() {
-        let (code, message) = classify_get_block_miss(11, 10);
+        let (code, message, reason) = classify_get_block_miss(11, 10);
         assert_eq!(code, JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32);
         assert_eq!(message, "Block not available for slot 11");
+        assert_eq!(reason, "above_clickhouse_latest");
+        assert_eq!((code, message), block_not_available_error(11));
     }
 
     #[test]
     fn classify_get_block_miss_returns_long_term_storage_error_at_clickhouse_latest() {
-        let (code, message) = classify_get_block_miss(10, 10);
+        let (code, message, reason) = classify_get_block_miss(10, 10);
         assert_eq!(
             code,
             JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32
@@ -3385,11 +3440,13 @@ mod tests {
             message,
             "Slot 10 was skipped, or missing in long-term storage"
         );
+        assert_eq!(reason, "clickhouse_not_found");
+        assert_eq!((code, message), slot_skipped_error(10));
     }
 
     #[test]
     fn classify_get_block_miss_returns_long_term_storage_error_below_clickhouse_latest() {
-        let (code, message) = classify_get_block_miss(9, 10);
+        let (code, message, _) = classify_get_block_miss(9, 10);
         assert_eq!(
             code,
             JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32
@@ -3402,7 +3459,7 @@ mod tests {
 
     #[test]
     fn classify_get_block_miss_treats_slots_above_zero_latest_as_not_available() {
-        let (code, message) = classify_get_block_miss(1, 0);
+        let (code, message, _) = classify_get_block_miss(1, 0);
         assert_eq!(code, JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32);
         assert_eq!(message, "Block not available for slot 1");
     }
