@@ -60,6 +60,21 @@ export default {
           relations: [{ type: 'see', to: 'CLICKHOUSE_QUERY_TIMEOUT_MS' }],
         }),
         opt('RPC_CONCURRENCY_LIMIT', { type: 'usize', default: '512', text: 'Maximum in-flight JSON-RPC requests.' }),
+        opt('RPC_BACKEND_CONCURRENCY_LIMIT', {
+          type: 'usize',
+          default: '0',
+          text: 'Maximum JSON-RPC calls that read source ClickHouse at once. `0` turns the limit off. Calls answered from a cache never wait for it, so keep it below `RPC_CONCURRENCY_LIMIT` to leave global permits for them.',
+          relations: [{ type: 'see', to: 'RPC_CONCURRENCY_LIMIT' }],
+        }),
+        opt('RPC_BACKEND_QUEUE_TIMEOUT_MS', {
+          type: 'u64 (ms)',
+          default: '250',
+          text: 'Longest wait for a backend permit. A call still waiting is shed and gets the error its method returns when ClickHouse fails. Keep it below `CLICKHOUSE_QUERY_TIMEOUT_MS`.',
+          relations: [
+            { type: 'requires', to: 'RPC_BACKEND_CONCURRENCY_LIMIT' },
+            { type: 'see', to: 'CLICKHOUSE_QUERY_TIMEOUT_MS' },
+          ],
+        }),
         opt('RPC_MAX_BATCH_SIZE', { type: 'usize', default: '64', text: 'Maximum calls accepted in one batch request.' }),
         opt('RPC_BATCH_CONCURRENCY_LIMIT', { type: 'usize', default: '8', text: 'Maximum calls of one batch executed concurrently.' }),
         opt('RPC_RESPONSE_GZIP_ENABLED', { type: 'bool', default: 'false', text: 'Gzip responses when the client advertises gzip support.' }),

@@ -70,6 +70,14 @@ pub struct RpcConfig {
     #[arg(long, env = "RPC_CONCURRENCY_LIMIT", default_value_t = 512)]
     pub(crate) rpc_concurrency_limit: usize,
 
+    /// Maximum JSON-RPC calls reading source ClickHouse at once; zero disables the limit.
+    #[arg(long, env = "RPC_BACKEND_CONCURRENCY_LIMIT", default_value_t = 0)]
+    pub(crate) rpc_backend_concurrency_limit: usize,
+
+    /// Longest wait for a backend permit before the read is shed (milliseconds).
+    #[arg(long, env = "RPC_BACKEND_QUEUE_TIMEOUT_MS", default_value_t = 250)]
+    pub(crate) rpc_backend_queue_timeout_ms: u64,
+
     /// Maximum serialized getBlock result bytes retained in memory; zero disables the cache.
     #[arg(long, env = "GET_BLOCK_RESPONSE_CACHE_MAX_BYTES", default_value_t = 0)]
     pub(crate) get_block_response_cache_max_bytes: u64,
@@ -1361,6 +1369,20 @@ mod config_tests {
                 "{ttl}"
             );
         }
+    }
+
+    #[test]
+    fn backend_admission_defaults_leave_it_off() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.rpc_concurrency_limit, 512);
+        assert_eq!(cfg.rpc_backend_concurrency_limit, 0);
+        assert_eq!(cfg.rpc_backend_queue_timeout_ms, 250);
+
+        let _limit = EnvVarGuard::set("RPC_BACKEND_CONCURRENCY_LIMIT", "64");
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--rpc-backend-queue-timeout-ms", "50"]);
+        assert_eq!(cfg.rpc_backend_concurrency_limit, 64);
+        assert_eq!(cfg.rpc_backend_queue_timeout_ms, 50);
     }
 
     #[test]

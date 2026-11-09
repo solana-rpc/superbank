@@ -95,6 +95,12 @@ struct GetBlockNotFoundLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BackendAdmissionLabels {
+    operation: &'static str,
+    outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ReadDisconnectLabels {
     operation: &'static str,
     target: &'static str,
@@ -728,6 +734,10 @@ pub struct Metrics {
     rpc_latency_seconds: Family<MethodStatusLabels, Histogram>,
 
     rpc_inflight: Family<MethodLabels, Gauge>,
+    rpc_admission_wait_seconds: Histogram,
+    rpc_admission_inflight: Gauge,
+    rpc_backend_admission: Family<BackendAdmissionLabels, Counter>,
+    rpc_backend_admission_wait_seconds: Histogram,
     rpc_timeouts: Family<MethodLabels, Counter>,
     rpc_batch_requests: Family<BatchLabels, Counter>,
     rpc_batch_items: Family<BatchLabels, Counter>,
@@ -919,6 +929,10 @@ impl Metrics {
             Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
 
         let rpc_inflight = Family::default();
+        let rpc_admission_wait_seconds = serving_latency_histogram();
+        let rpc_admission_inflight = Gauge::default();
+        let rpc_backend_admission = Family::default();
+        let rpc_backend_admission_wait_seconds = serving_latency_histogram();
         let rpc_timeouts = Family::default();
         let rpc_batch_requests = Family::default();
         let rpc_batch_items = Family::default();
@@ -1128,6 +1142,26 @@ impl Metrics {
             "rpc_inflight_requests",
             "In-flight JSON-RPC requests",
             rpc_inflight.clone(),
+        );
+        registry.register(
+            "rpc_admission_wait_seconds",
+            "Time an HTTP request waited for an RPC_CONCURRENCY_LIMIT permit",
+            rpc_admission_wait_seconds.clone(),
+        );
+        registry.register(
+            "rpc_inflight",
+            "HTTP requests holding an RPC_CONCURRENCY_LIMIT permit",
+            rpc_admission_inflight.clone(),
+        );
+        registry.register(
+            "rpc_backend_admission",
+            "JSON-RPC calls admitted to or shed from source ClickHouse by RPC_BACKEND_CONCURRENCY_LIMIT, by the operation that asked first",
+            rpc_backend_admission.clone(),
+        );
+        registry.register(
+            "rpc_backend_admission_wait_seconds",
+            "Time a JSON-RPC call waited for an RPC_BACKEND_CONCURRENCY_LIMIT permit, including shed waits",
+            rpc_backend_admission_wait_seconds.clone(),
         );
         registry.register(
             "rpc_timeouts",
@@ -1740,6 +1774,10 @@ impl Metrics {
             rpc_requests,
             rpc_latency_seconds,
             rpc_inflight,
+            rpc_admission_wait_seconds,
+            rpc_admission_inflight,
+            rpc_backend_admission,
+            rpc_backend_admission_wait_seconds,
             rpc_timeouts,
             rpc_batch_requests,
             rpc_batch_items,
@@ -2216,6 +2254,24 @@ impl Metrics {
         self.backend_errors.get_or_create(&labels).inc();
     }
 
+    fn rpc_admission_wait(&self, waited: std::time::Duration) {
+        self.rpc_admission_wait_seconds
+            .observe(waited.as_secs_f64());
+    }
+
+    fn backend_admission(
+        &self,
+        operation: &'static str,
+        outcome: &'static str,
+        waited: std::time::Duration,
+    ) {
+        self.rpc_backend_admission
+            .get_or_create(&BackendAdmissionLabels { operation, outcome })
+            .inc();
+        self.rpc_backend_admission_wait_seconds
+            .observe(waited.as_secs_f64());
+    }
+
     pub fn inflation_reward_rejection(&self, reason: &str) {
         let labels = Self::current_batch_reject_labels(reason);
         self.inflation_reward_rejections
@@ -2468,6 +2524,23 @@ pub(crate) fn track_request(method: &str) -> RequestTracker<'static> {
 pub(crate) fn backend_error(operation: &str) {
     let metrics = metrics();
     metrics.backend_error(operation);
+}
+
+pub(crate) fn rpc_admission_wait(waited: std::time::Duration) {
+    metrics().rpc_admission_wait(waited);
+}
+
+pub(crate) fn rpc_inflight(delta: i64) {
+    metrics().rpc_admission_inflight.inc_by(delta);
+}
+
+/// `outcome` is `admitted` or `shed`.
+pub(crate) fn backend_admission(
+    operation: &'static str,
+    outcome: &'static str,
+    waited: std::time::Duration,
+) {
+    metrics().backend_admission(operation, outcome, waited);
 }
 
 pub(crate) fn inflation_reward_rejection(reason: &str) {
@@ -3400,6 +3473,8 @@ mod tests {
             .rpc_envelope_seconds
             .get_or_create(&EnvelopeMethodLabels { method: "getSlot" })
             .observe(0.01);
+        metrics.rpc_admission_wait(std::time::Duration::from_millis(1));
+        metrics.backend_admission("fetch", "admitted", std::time::Duration::ZERO);
         #[cfg(feature = "disk-cache")]
         metrics
             .disk_cache_key_seconds
@@ -3415,6 +3490,8 @@ mod tests {
             "superbank_rpc_response_time_seconds",
             "superbank_rpc_clickhouse_duration_seconds",
             "superbank_rpc_envelope_seconds",
+            "superbank_rpc_admission_wait_seconds",
+            "superbank_rpc_backend_admission_wait_seconds",
         ];
         if cfg!(feature = "disk-cache") {
             serving.push("superbank_disk_cache_key_seconds");
@@ -3457,6 +3534,28 @@ mod tests {
             exported.contains(&format!("{name}_count{{method=\"getBlock\"}} 1")),
             "{exported}"
         );
+    }
+
+    #[test]
+    fn admission_metrics_export_bounded_labels() {
+        let metrics = Metrics::new();
+        metrics.rpc_admission_wait(std::time::Duration::from_millis(2));
+        metrics.rpc_admission_inflight.inc_by(1);
+        metrics.backend_admission(
+            "get_transaction_by_signature",
+            "shed",
+            std::time::Duration::from_millis(5),
+        );
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        for line in [
+            "superbank_rpc_admission_wait_seconds_count 1",
+            "superbank_rpc_inflight 1",
+            "superbank_rpc_backend_admission_total{operation=\"get_transaction_by_signature\",outcome=\"shed\"} 1",
+            "superbank_rpc_backend_admission_wait_seconds_count 1",
+        ] {
+            assert!(exported.lines().any(|l| l == line), "{line}\n{exported}");
+        }
     }
 
     #[test]

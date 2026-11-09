@@ -4,6 +4,7 @@
  */
 
 mod agave44_transaction;
+mod backend_admission;
 mod block_ranges;
 mod cache_refresh;
 mod latest_slot;

@@ -318,6 +318,24 @@ See the [miss replay and cancellation gate](../../tests/k6/README.md#signature-s
 for the matched-rate 256-signature workload. Preserve fast-negative behavior during warm
 and cold cache validation; cache warming delays are not backend protection.
 
+### Request admission
+
+Two limits decide when a JSON-RPC request runs. Neither limit looks at the caller. No token, IP address, header or user agent changes how a request is admitted. The backend limit keys only on the request class: whether the call reads source ClickHouse.
+
+- **Global limit** (`RPC_CONCURRENCY_LIMIT`, default `512`). Each HTTP request on the RPC listener takes one permit before its body is read, and returns it when the handler returns the response. A batch envelope takes one permit. `/health` has its own permits, so health checks never queue behind JSON-RPC traffic. The wait for a permit has no timeout, and `RPC_REQUEST_TIMEOUT_MS` starts only after the request is admitted.
+- **Backend limit** (`RPC_BACKEND_CONCURRENCY_LIMIT`, default `0`, off). A JSON-RPC call takes one backend permit at its first source ClickHouse read: a primary read, or a shard-direct read over HTTP or TCP. The call keeps the permit until it returns. Its later reads and fanout tasks share the same permit. Each batch item is its own call. A call answered from the head cache, an in-process response cache or the local disk cache never asks for a backend permit.
+
+A call that waits longer than `RPC_BACKEND_QUEUE_TIMEOUT_MS` (default `250`) is shed. Its read fails before it reaches ClickHouse, and the method returns the same response it gives when ClickHouse fails. For example, `getBlock` and `getTransaction` return internal error (`-32603`), and `getSignaturesForAddress` returns long-term storage unreachable (`-32019`). Both codes are eligible for HTTP `503` with `--emit-http-errors`. A shed call stays shed: its later reads fail at once and do not queue again. The backend wait runs inside the ClickHouse operation timeout (`CLICKHOUSE_QUERY_TIMEOUT_MS`), so keep the queue timeout below it. An abandoned primary or shard read keeps the backend permit like its HTTP permit, until the read is confirmed gone or a liveness bound above releases it. Background work, such as disk-cache backfill, and gRPC streams do not take backend permits.
+
+How the two limits combine: with only the global limit, slow ClickHouse reads can fill it, and requests that a cache answers in about a millisecond wait behind them until they time out. To keep cache-served requests fast, raise `RPC_CONCURRENCY_LIMIT` and set `RPC_BACKEND_CONCURRENCY_LIMIT` below it. Backend-bound calls then hold at most `RPC_BACKEND_CONCURRENCY_LIMIT` global permits while they run, plus the calls still queued for a backend permit, each for at most `RPC_BACKEND_QUEUE_TIMEOUT_MS`. The remaining global permits stay free for cache-served requests. Startup warns when the backend limit is not below the global limit, or when the queue timeout is not below `CLICKHOUSE_QUERY_TIMEOUT_MS`.
+
+| Metric | Meaning |
+| --- | --- |
+| `superbank_rpc_admission_wait_seconds` | Histogram of the time an HTTP request on the RPC listener waited for a global permit. |
+| `superbank_rpc_inflight` | Gauge of HTTP requests that hold a global permit, summed over the listener's routes. `superbank_rpc_inflight_requests{method}` counts JSON-RPC calls inside them. |
+| `superbank_rpc_backend_admission_total{operation,outcome}` | JSON-RPC calls that got a backend permit (`admitted`) or were shed (`shed`). `operation` is the ClickHouse operation that asked first. |
+| `superbank_rpc_backend_admission_wait_seconds` | Histogram of the time a call waited for a backend permit, including waits that ended in a shed. |
+
 ## ClickHouse schemas
 
 Choose one schema set under `ddl/`:
@@ -462,6 +480,7 @@ Client, malformed-request, and data-condition errors remain HTTP `200 OK`. For b
 eligible item promotes the whole HTTP response to `503`.
 A single response carries its classification from the response builder, so promotion does not
 read or buffer its body, and a streamed body keeps streaming. Batch responses are scanned.
+A call shed by `RPC_BACKEND_CONCURRENCY_LIMIT` returns its method's ClickHouse-failure error and is promoted the same way (see "Request admission").
 For `getInflationReward`, both boundary-unavailable (`-32004`) and rewards-period-active (`-32017`)
 are data-condition errors and remain HTTP `200`; ClickHouse query, metadata, and integrity failures
 continue to use internal error (`-32603`) and are eligible for HTTP `503`.
@@ -1004,7 +1023,9 @@ CLI flags and environment variables (see `crates/superbank-rpc/src/config.rs`):
 | --- | --- | --- | --- |
 | `--rpc-max-body-bytes` | `RPC_MAX_BODY_BYTES` | `1048576` | Maximum accepted JSON-RPC request body size (bytes). |
 | `--rpc-request-timeout-ms` | `RPC_REQUEST_TIMEOUT_MS` | `10000` | End-to-end timeout for a request envelope (single or batch). |
-| `--rpc-concurrency-limit` | `RPC_CONCURRENCY_LIMIT` | `512` | Maximum number of in-flight HTTP JSON-RPC envelopes. |
+| `--rpc-concurrency-limit` | `RPC_CONCURRENCY_LIMIT` | `512` | Maximum number of in-flight HTTP JSON-RPC envelopes. See "Request admission". |
+| `--rpc-backend-concurrency-limit` | `RPC_BACKEND_CONCURRENCY_LIMIT` | `0` | Maximum JSON-RPC calls that read source ClickHouse at once. `0` turns the limit off. Calls answered from a cache never wait for it. See "Request admission". |
+| `--rpc-backend-queue-timeout-ms` | `RPC_BACKEND_QUEUE_TIMEOUT_MS` | `250` | Longest wait for a backend permit. A call still waiting is shed with the error its method returns when ClickHouse fails. Used only when `RPC_BACKEND_CONCURRENCY_LIMIT` is set; keep it below `CLICKHOUSE_QUERY_TIMEOUT_MS`. |
 | `--get-block-response-cache-max-bytes` | `GET_BLOCK_RESPONSE_CACHE_MAX_BYTES` | `0` | Serialized finalized `getBlock` result byte budget. `0` disables the in-process cache. Actual RSS also includes cache metadata and in-flight values. |
 | `--get-transaction-primary-cache-max-bytes` | `GET_TRANSACTION_PRIMARY_CACHE_MAX_BYTES` | `0` | Approximate byte budget for `getTransaction` records served by primary ClickHouse. `0` disables the in-process cache. |
 | `--get-transaction-primary-cache-ttl-secs` | `GET_TRANSACTION_PRIMARY_CACHE_TTL_SECS` | `600` | Seconds a primary-served `getTransaction` record stays cached after insertion (1..=86400). |
@@ -1397,7 +1418,8 @@ Request-scoped metric families:
 - `superbank_rpc_envelope_seconds{method}` (histogram): time for the whole HTTP envelope, from handler entry (after the request body is read) through parsing, dispatch, HTTP status promotion and response headers. It ends when the response is handed to the server, before the body is written, so it does not include the time to send a large body. `rpc_response_time_seconds` stops at dispatch, so the difference is envelope overhead.
 - `superbank_rpc_response_bytes{method}` (histogram): uncompressed response body size in bytes, from `Content-Length` or the exact body size. Buckets are 1 KiB to 64 MiB in powers of 4 (`le` 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864).
 - Both envelope families carry only `method`, with no request-header labels: a supported method name, `unknown` for any other method string, `batch` for an array envelope, and `invalid` for a parse error or a request without a string `method`.
-- `rpc_response_time_seconds`, `rpc_clickhouse_duration_seconds`, `rpc_envelope_seconds`, `disk_cache_key_seconds`, `head_cache_write_lock_hold_seconds` and `head_cache_commitment_wait_seconds` use `le` 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 2.5, 5, 10 s. Only these six families use that set. `clickhouse_read_disconnect_probe_seconds`, `rpc_response_overhead_seconds`, `rpc_blocks_range_seconds`, `get_block_phase_seconds`, `rpc_signature_status_admission_seconds`, `disk_cache_write_latency_seconds` and `block_index_lookup_seconds` keep the 13 `le` values without 0.15, 0.2, 0.3, 0.4 and 0.75. Histograms of counts and sizes have their own buckets.
+- `rpc_admission_wait_seconds`, `rpc_inflight`, `rpc_backend_admission_total` and `rpc_backend_admission_wait_seconds` carry no request-header labels; see "Request admission".
+- `rpc_response_time_seconds`, `rpc_clickhouse_duration_seconds`, `rpc_envelope_seconds`, `disk_cache_key_seconds`, `head_cache_write_lock_hold_seconds`, `head_cache_commitment_wait_seconds`, `rpc_admission_wait_seconds` and `rpc_backend_admission_wait_seconds` use `le` 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1, 2.5, 5, 10 s. Only these eight families use that set. `clickhouse_read_disconnect_probe_seconds`, `rpc_response_overhead_seconds`, `rpc_blocks_range_seconds`, `get_block_phase_seconds`, `rpc_signature_status_admission_seconds`, `disk_cache_write_latency_seconds` and `block_index_lookup_seconds` keep the 13 `le` values without 0.15, 0.2, 0.3, 0.4 and 0.75. Histograms of counts and sizes have their own buckets.
 
 `getBlock` response-cache metrics:
 

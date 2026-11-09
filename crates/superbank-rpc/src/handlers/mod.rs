@@ -964,6 +964,7 @@ async fn dispatch_json_rpc_request(
     let id_for_dispatch = id.clone();
     let params = req.params;
     let method_str = method.as_str();
+    let backend_admission = state.clickhouse.backend_admission.clone();
     let dispatch = Box::pin(async {
         match method_str {
             "getSignaturesForAddress" => {
@@ -1022,7 +1023,8 @@ async fn dispatch_json_rpc_request(
             )),
         }
     });
-    let dispatch = mark_handler_polls(dispatch);
+    let dispatch =
+        crate::admission::backend_request_scope(backend_admission, mark_handler_polls(dispatch));
     let result = if let Some(timeout) = timeout {
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(result) => result,

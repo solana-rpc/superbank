@@ -24,6 +24,7 @@ use tower_http::{
 };
 use tracing::{info, warn};
 
+use crate::admission::{BackendAdmission, GlobalAdmissionLayer};
 use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::{
     ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, QueryCacheConfig,
@@ -221,6 +222,31 @@ fn validate_query_resource_limits(args: &RpcConfig) -> RpcResult<()> {
     Ok(())
 }
 
+fn backend_admission(args: &RpcConfig) -> Option<Arc<BackendAdmission>> {
+    let queue_timeout = Duration::from_millis(args.rpc_backend_queue_timeout_ms);
+    let admission = BackendAdmission::new(args.rpc_backend_concurrency_limit, queue_timeout)?;
+    info!(
+        limit = args.rpc_backend_concurrency_limit,
+        queue_timeout_ms = args.rpc_backend_queue_timeout_ms,
+        "JSON-RPC backend admission enabled"
+    );
+    if args.rpc_backend_concurrency_limit >= args.rpc_concurrency_limit {
+        warn!(
+            rpc_backend_concurrency_limit = args.rpc_backend_concurrency_limit,
+            rpc_concurrency_limit = args.rpc_concurrency_limit,
+            "RPC_BACKEND_CONCURRENCY_LIMIT should stay below RPC_CONCURRENCY_LIMIT so cache-served requests keep global permits"
+        );
+    }
+    if args.rpc_backend_queue_timeout_ms >= args.clickhouse_query_timeout_ms {
+        warn!(
+            rpc_backend_queue_timeout_ms = args.rpc_backend_queue_timeout_ms,
+            clickhouse_query_timeout_ms = args.clickhouse_query_timeout_ms,
+            "RPC_BACKEND_QUEUE_TIMEOUT_MS should remain below CLICKHOUSE_QUERY_TIMEOUT_MS; the backend wait runs inside the ClickHouse operation timeout"
+        );
+    }
+    Some(admission)
+}
+
 pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     info!("Starting Solana RPC server on {}:{}", args.host, args.port);
     let rpc_parameter_filters =
@@ -378,6 +404,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         args.clickhouse_transactions_for_address_union_pushdown,
     );
     clickhouse.set_gsfa_inline_cursor(args.clickhouse_gsfa_inline_cursor);
+    clickhouse.set_backend_admission(backend_admission(&args));
     clickhouse.set_signatures_owner_shard_routing(
         args.clickhouse_signatures_owner_shard_routing,
         &args.clickhouse_cluster,
@@ -550,9 +577,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         .layer(axum::extract::DefaultBodyLimit::max(
             args.rpc_max_body_bytes,
         ))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(
-            args.rpc_concurrency_limit.max(1),
-        ))
+        .layer(GlobalAdmissionLayer::new(args.rpc_concurrency_limit))
         .layer(CorsLayer::permissive());
 
     let app = Router::new()

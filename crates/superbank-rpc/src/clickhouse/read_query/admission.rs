@@ -53,14 +53,32 @@ pub(crate) async fn scope<T>(future: impl Future<Output = T>) -> T {
 
 /// Seed a spawned workflow with its parent's leases. The task owns these leases
 /// until completion so parent cancellation cannot release capacity beneath it.
-pub(crate) async fn scope_with<T>(
+/// The caller's backend request is captured here, before the future reaches its task.
+pub(crate) fn scope_with<T>(
     inherited: Vec<Arc<OwnedSemaphorePermit>>,
     future: impl Future<Output = T>,
-) -> T {
-    let context = inherited.iter().map(Arc::downgrade).collect();
-    let result = LEASES.scope(Mutex::new(context), future).await;
-    drop(inherited);
-    result
+) -> impl Future<Output = T> {
+    let request = crate::admission::current_backend_request();
+    crate::admission::within_backend_request(request, async move {
+        let context = inherited.iter().map(Arc::downgrade).collect();
+        let result = LEASES.scope(Mutex::new(context), future).await;
+        drop(inherited);
+        result
+    })
+}
+
+/// Make admission acquired elsewhere visible to reads submitted in this scope.
+pub(crate) fn register(lease: &Arc<OwnedSemaphorePermit>) {
+    let _ = LEASES.try_with(|leases| {
+        let mut leases = leases.lock().expect("read admission context poisoned");
+        leases.retain(|held| held.strong_count() != 0);
+        if !leases
+            .iter()
+            .any(|held| held.as_ptr() == Arc::as_ptr(lease))
+        {
+            leases.push(Arc::downgrade(lease));
+        }
+    });
 }
 
 /// Snapshot active workflow leases for ownership by a submitted read guard.
@@ -165,6 +183,25 @@ mod tests {
             assert!(current().is_empty());
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn registered_lease_is_retained_once_by_reads_in_scope() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let lease = Arc::new(semaphore.clone().acquire_owned().await.unwrap());
+        let reads = scope(async {
+            register(&lease);
+            register(&lease);
+            current()
+        })
+        .await;
+        assert_eq!(reads.len(), 1);
+        drop(lease);
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(reads);
+        assert_eq!(semaphore.available_permits(), 1);
+        register(&Arc::new(semaphore.clone().acquire_owned().await.unwrap()));
+        assert!(current().is_empty());
     }
 
     #[tokio::test]
