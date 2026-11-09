@@ -11,10 +11,11 @@ use solana_transaction_status::TransactionDetails;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Notify, broadcast};
 
 use crate::clickhouse::{
     BlockMetadataRecord, SlotBoundary, StoredAccountsTransactionRecord, StoredBlockPayload,
-    StoredBlockRecord, StoredTransactionRecord, extract_memo,
+    StoredTransactionRecord, extract_memo,
 };
 
 mod banks;
@@ -43,6 +44,53 @@ pub(crate) struct HeadTxMeta {
     pub(crate) err: Option<serde_json::Value>,
     pub(crate) memo: Option<String>,
     pub(crate) block_time: Option<i64>,
+}
+
+/// Bank events buffered by a lagging receiver before it reports `Lagged`.
+const BANK_EVENT_CAPACITY: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadBankEventKind {
+    /// The published bank first reached `confirmed` (also sent when it jumps to `finalized`).
+    Confirmed,
+    /// The published bank first reached `finalized`.
+    Finalized,
+    /// The bank's block left the head because a fork choice, discard or dead slot dropped it.
+    Discarded,
+    /// The slot left the head through retention or a subscription reset.
+    Evicted,
+}
+
+impl HeadBankEventKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Finalized => "finalized",
+            Self::Discarded => "discarded",
+            Self::Evicted => "evicted",
+        }
+    }
+}
+
+/// Head block lifecycle change, sent after the bank write lock is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct HeadBankEvent {
+    pub(crate) slot: u64,
+    pub(crate) blockhash: [u8; 32],
+    pub(crate) kind: HeadBankEventKind,
+}
+
+/// `recv` that counts the events a lagging receiver skipped.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn recv_bank_event(
+    receiver: &mut broadcast::Receiver<HeadBankEvent>,
+) -> Result<HeadBankEvent, broadcast::error::RecvError> {
+    let result = receiver.recv().await;
+    if let Err(broadcast::error::RecvError::Lagged(skipped)) = &result {
+        crate::metrics::head_cache_bank_events_lagged(*skipped);
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +141,11 @@ pub(crate) struct HeadCache {
     /// Clamp explicit getBlocks/getBlocksWithLimit ends to the trusted tip
     /// (`GET_BLOCKS_CLAMP_TO_HEAD_TIP`).
     clamp_explicit_end: bool,
+
+    bank_events: broadcast::Sender<HeadBankEvent>,
+    // Events queued under the bank write lock and sent once it is released.
+    pending_bank_events: std::sync::Mutex<Vec<HeadBankEvent>>,
+    commit_notify: Notify,
 }
 
 impl HeadCache {
@@ -115,6 +168,49 @@ impl HeadCache {
             addrs_by_slot: DashMap::new(),
             slot_commitment: DashMap::new(),
             clamp_explicit_end: true,
+            bank_events: broadcast::channel(BANK_EVENT_CAPACITY).0,
+            pending_bank_events: std::sync::Mutex::default(),
+            commit_notify: Notify::new(),
+        }
+    }
+
+    /// Receives every [`HeadBankEvent`] sent after this call; read it with [`recv_bank_event`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn subscribe_bank_events(&self) -> broadcast::Receiver<HeadBankEvent> {
+        self.bank_events.subscribe()
+    }
+
+    /// `notify_waiters` runs after each freeze, commit, discard and session change releases
+    /// the bank write lock. Enable a `Notified` before re-checking the head to avoid a race.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn commit_notify(&self) -> &Notify {
+        &self.commit_notify
+    }
+
+    fn queue_bank_event(&self, slot: u64, blockhash: [u8; 32], kind: HeadBankEventKind) {
+        self.pending_bank_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(HeadBankEvent {
+                slot,
+                blockhash,
+                kind,
+            });
+    }
+
+    // Holding the queue lock while sending keeps events in order across callers.
+    fn send_bank_events(&self) {
+        let mut pending = self
+            .pending_bank_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for event in pending.drain(..) {
+            let outcome = if self.bank_events.send(event).is_ok() {
+                "sent"
+            } else {
+                "no_receivers"
+            };
+            crate::metrics::head_cache_bank_event(event.kind.label(), outcome);
         }
     }
 
@@ -401,48 +497,65 @@ impl HeadCache {
         commitment_to_str(self.meta_commitment(meta))
     }
 
+    /// Builds the payload from shared records: the read lock covers only the commitment,
+    /// count and slot checks and the `Arc` collection.
     pub(crate) fn get_block(
         &self,
         slot: u64,
         min_commitment: CommitmentLevel,
         transaction_details: TransactionDetails,
     ) -> Option<StoredBlockPayload> {
-        let _view = self.banks.read().expect("head bank lock");
-        if !commitment_meets(self.slot_commitment(slot), min_commitment) {
-            return None;
-        }
-
-        let metadata = self.slot_block_metadata.get(&slot)?.clone();
-        if transaction_details == TransactionDetails::None {
-            return Some(StoredBlockPayload::Metadata(metadata));
-        }
-
-        let expected_txs = metadata.executed_transaction_count as usize;
-        let slot_signatures = if expected_txs == 0 {
-            Vec::new()
-        } else {
-            self.sigs_by_slot.get(&slot).map(|entry| entry.clone())?
-        };
-
-        if slot_signatures.len() != expected_txs {
-            return None;
-        }
-
-        let mut ordered = Vec::with_capacity(slot_signatures.len());
-        for signature in slot_signatures {
-            let meta = self.meta_by_signature.get(&signature)?;
-            if meta.pos.slot != slot {
+        let with_records = matches!(
+            transaction_details,
+            TransactionDetails::Full | TransactionDetails::Accounts
+        );
+        let (metadata, mut ordered) = {
+            let _view = self.banks.read().expect("head bank lock");
+            if !commitment_meets(self.slot_commitment(slot), min_commitment) {
                 return None;
             }
-            ordered.push((meta.pos.idx, signature, meta.signature_str.clone()));
-        }
+
+            let metadata = self.slot_block_metadata.get(&slot)?.clone();
+            if transaction_details == TransactionDetails::None {
+                return Some(StoredBlockPayload::Metadata(metadata));
+            }
+
+            let expected_txs = metadata.executed_transaction_count as usize;
+            let slot_signatures = if expected_txs == 0 {
+                Vec::new()
+            } else {
+                self.sigs_by_slot.get(&slot).map(|entry| entry.clone())?
+            };
+
+            if slot_signatures.len() != expected_txs {
+                return None;
+            }
+
+            let mut ordered = Vec::with_capacity(slot_signatures.len());
+            for signature in slot_signatures {
+                let (idx, signature_str) = {
+                    let meta = self.meta_by_signature.get(&signature)?;
+                    if meta.pos.slot != slot {
+                        return None;
+                    }
+                    (meta.pos.idx, meta.signature_str.clone())
+                };
+                let record = if with_records {
+                    Some(self.tx_by_signature.get(&signature)?.clone())
+                } else {
+                    None
+                };
+                ordered.push((idx, signature, signature_str, record));
+            }
+            (metadata, ordered)
+        };
 
         ordered.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then_with(|| lhs.1.cmp(&rhs.1)));
 
-        if transaction_details == TransactionDetails::Signatures {
+        if !with_records {
             let signatures = ordered
                 .into_iter()
-                .map(|(_, _, signature)| signature.to_string())
+                .map(|(_, _, signature, _)| signature.to_string())
                 .collect();
             return Some(StoredBlockPayload::Signatures {
                 metadata,
@@ -450,26 +563,41 @@ impl HeadCache {
             });
         }
 
-        let mut transactions = Vec::with_capacity(ordered.len());
-        for (_, signature, _) in ordered {
-            let record = self.tx_by_signature.get(&signature)?.clone();
-            transactions.push(record.as_ref().clone());
-        }
-
+        let transactions = ordered
+            .into_iter()
+            .filter_map(|(_, _, _, record)| record)
+            .collect::<Vec<_>>();
         match transaction_details {
             TransactionDetails::Accounts => Some(StoredBlockPayload::Accounts {
                 metadata,
                 transactions: transactions
-                    .into_iter()
-                    .map(StoredAccountsTransactionRecord::from)
+                    .iter()
+                    .map(|record| StoredAccountsTransactionRecord::from(record.as_ref().clone()))
                     .collect(),
             }),
-            TransactionDetails::Full => Some(StoredBlockPayload::Full(StoredBlockRecord {
+            TransactionDetails::Full => Some(StoredBlockPayload::SharedFull {
                 metadata,
                 transactions,
-            })),
+            }),
             TransactionDetails::None | TransactionDetails::Signatures => None,
         }
+    }
+
+    /// Blockhash and commitment of the block `get_block` would read at `min_commitment`.
+    /// It does not check that every transaction of the block is present.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn block_identity(
+        &self,
+        slot: u64,
+        min_commitment: CommitmentLevel,
+    ) -> Option<([u8; 32], CommitmentLevel)> {
+        let _view = self.banks.read().expect("head bank lock");
+        let commitment = self.slot_commitment(slot);
+        if !commitment_meets(commitment, min_commitment) {
+            return None;
+        }
+        let blockhash = self.slot_block_metadata.get(&slot)?.blockhash;
+        Some((blockhash, commitment))
     }
 
     pub(crate) fn signatures_for_address(
@@ -535,17 +663,20 @@ impl HeadCache {
             .write()
             .expect("head coverage lock")
             .invalidate_branch(slot);
-        self.remove_slot_inner(slot);
+        self.remove_slot_inner(slot, HeadBankEventKind::Discarded);
     }
 
-    fn remove_slot_inner(&self, slot: u64) {
+    /// `kind` is the event queued when the slot held a published block.
+    fn remove_slot_inner(&self, slot: u64, kind: HeadBankEventKind) {
         let mut proof = self.coverage.write().expect("head coverage lock");
         proof.invalidate(slot);
         proof.retain(self.latest_slot(), self.retain_slots);
         drop(proof);
         self.slot_commitment.remove(&slot);
         self.slot_block_height.remove(&slot);
-        self.slot_blockhash.remove(&slot);
+        if let Some((_, blockhash)) = self.slot_blockhash.remove(&slot) {
+            self.queue_bank_event(slot, blockhash, kind);
+        }
         self.slot_block_time.remove(&slot);
         self.slot_block_metadata.remove(&slot);
 
@@ -883,7 +1014,7 @@ impl HeadCache {
             return;
         }
         for slot in old {
-            self.remove_slot_inner(slot);
+            self.remove_slot_inner(slot, HeadBankEventKind::Evicted);
         }
         // A truncation record matters while its slot is retained; below that the
         // retention floor dominates it. Fork and dead-slot removal must not clear it:
@@ -1199,11 +1330,16 @@ mod tests {
             .expect("complete block available");
 
         match payload {
-            StoredBlockPayload::Full(block) => {
-                assert_eq!(block.metadata.slot, slot);
-                assert_eq!(block.transactions.len(), 2);
-                assert_eq!(block.transactions[0].signature, *sig_b.as_array());
-                assert_eq!(block.transactions[1].signature, *sig_a.as_array());
+            StoredBlockPayload::SharedFull {
+                metadata,
+                transactions,
+            } => {
+                assert_eq!(metadata.slot, slot);
+                assert_eq!(transactions.len(), 2);
+                assert_eq!(transactions[0].signature, *sig_b.as_array());
+                assert_eq!(transactions[1].signature, *sig_a.as_array());
+                let held = cache.tx_by_signature.get(&sig_b).unwrap().clone();
+                assert!(Arc::ptr_eq(&transactions[0], &held), "records are shared");
             }
             other => panic!("unexpected payload: {other:?}"),
         }

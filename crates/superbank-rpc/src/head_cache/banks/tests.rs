@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
 use crate::head_cache::dragonsmouth::parse_block_meta;
+use crate::head_cache::{HeadBankEvent, HeadBankEventKind};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
 use yellowstone_grpc_proto::prelude::{
     Message, MessageHeader, SubscribeUpdateBlockMeta, Transaction, TransactionStatusMeta,
@@ -723,5 +724,264 @@ async fn status_rpc_does_not_promote_replaced_or_reconnected_bank_results() {
     assert_eq!(
         processed["result"]["value"][2]["confirmationStatus"],
         "processed"
+    );
+}
+
+fn drain(
+    events: &mut tokio::sync::broadcast::Receiver<HeadBankEvent>,
+) -> Vec<(u64, u8, HeadBankEventKind)> {
+    std::iter::from_fn(|| events.try_recv().ok())
+        .map(|event| (event.slot, event.blockhash[0], event.kind))
+        .collect()
+}
+
+#[test]
+fn bank_events_announce_each_commitment_once_per_published_bank() {
+    use HeadBankEventKind::{Confirmed, Discarded, Finalized};
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    let mut events = cache.subscribe_bank_events();
+
+    freeze(&cache, session, 42, 1, 1);
+    assert_eq!(drain(&mut events), vec![]);
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    assert_eq!(drain(&mut events), vec![(42, 1, Confirmed)]);
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Finalized, Some(41));
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Finalized, Some(41));
+    assert_eq!(drain(&mut events), vec![(42, 1, Finalized)]);
+
+    // Status before sealing: announced when the block becomes readable.
+    cache.commit_bank(session, 43, 3, CommitmentLevel::Confirmed, Some(42));
+    assert_eq!(drain(&mut events), vec![]);
+    freeze(&cache, session, 43, 3, 3);
+    assert_eq!(drain(&mut events), vec![(43, 3, Confirmed)]);
+
+    // A jump to finalized still announces confirmed first.
+    freeze(&cache, session, 44, 4, 4);
+    cache.commit_bank(session, 44, 4, CommitmentLevel::Finalized, Some(43));
+    assert_eq!(
+        drain(&mut events),
+        vec![(44, 4, Confirmed), (44, 4, Finalized)]
+    );
+
+    // A canonical status for another bank discards the published processed bank.
+    freeze(&cache, session, 45, 5, 5);
+    freeze(&cache, session, 45, 6, 6);
+    cache.commit_bank(session, 45, 6, CommitmentLevel::Confirmed, Some(44));
+    assert_eq!(
+        drain(&mut events),
+        vec![(45, 5, Discarded), (45, 6, Confirmed)]
+    );
+
+    // Discarding a published bank; an unpublished sibling sends nothing.
+    freeze(&cache, session, 46, 7, 7);
+    freeze(&cache, session, 46, 8, 8);
+    cache.discard_bank(session, 46, 8);
+    assert_eq!(drain(&mut events), vec![]);
+    cache.discard_bank(session, 46, 7);
+    assert_eq!(drain(&mut events), vec![(46, 7, Discarded)]);
+}
+
+#[test]
+fn bank_events_report_slots_leaving_the_head() {
+    use HeadBankEventKind::{Confirmed, Evicted};
+    let cache = HeadCache::new(2, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Confirmed);
+    let mut events = cache.subscribe_bank_events();
+    freeze(&cache, session, 10, 1, 1);
+    cache.commit_bank(session, 10, 1, CommitmentLevel::Confirmed, Some(9));
+    freeze(&cache, session, 11, 2, 2);
+    cache.commit_bank(session, 11, 2, CommitmentLevel::Confirmed, Some(10));
+    assert_eq!(
+        drain(&mut events),
+        vec![(10, 1, Confirmed), (11, 2, Confirmed)]
+    );
+    freeze(&cache, session, 12, 3, 3);
+    cache.commit_bank(session, 12, 3, CommitmentLevel::Confirmed, Some(11));
+    assert_eq!(
+        drain(&mut events),
+        vec![(10, 1, Evicted), (12, 3, Confirmed)]
+    );
+    // A late status for an evicted slot does not announce it again.
+    cache.commit_bank(session, 10, 1, CommitmentLevel::Finalized, Some(9));
+    assert_eq!(drain(&mut events), vec![]);
+    cache.end_bank_session(session);
+    let mut left = drain(&mut events);
+    left.sort_unstable_by_key(|event| event.0);
+    assert_eq!(left, vec![(11, 2, Evicted), (12, 3, Evicted)]);
+}
+
+#[test]
+fn commit_notify_wakes_waiters_after_commit_and_discard() {
+    use futures_util::FutureExt;
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    for step in 0..2 {
+        let notified = cache.commit_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        cache.stage_bank_metadata(session, 2, metadata(43, 2));
+        assert!(
+            notified.as_mut().now_or_never().is_none(),
+            "staging is silent"
+        );
+        if step == 0 {
+            cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+        } else {
+            cache.discard_bank(session, 43, 2);
+        }
+        assert!(notified.now_or_never().is_some(), "step {step}");
+    }
+}
+
+#[test]
+fn block_identity_matches_get_block() {
+    use solana_transaction_status::TransactionDetails;
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    let identity_and_block = |commitment| {
+        let identity = cache.block_identity(42, commitment);
+        let block = cache
+            .get_block(42, commitment, TransactionDetails::Full)
+            .map(|block| block.metadata().blockhash);
+        assert_eq!(identity.map(|(hash, _)| hash), block, "{commitment:?}");
+        identity
+    };
+    assert_eq!(identity_and_block(CommitmentLevel::Processed), None);
+    freeze(&cache, session, 42, 1, 1);
+    assert_eq!(
+        identity_and_block(CommitmentLevel::Processed),
+        Some(([1; 32], CommitmentLevel::Processed))
+    );
+    assert_eq!(identity_and_block(CommitmentLevel::Confirmed), None);
+    freeze(&cache, session, 42, 2, 2);
+    cache.commit_bank(session, 42, 2, CommitmentLevel::Confirmed, Some(41));
+    assert_eq!(
+        identity_and_block(CommitmentLevel::Confirmed),
+        Some(([2; 32], CommitmentLevel::Confirmed))
+    );
+    assert_eq!(identity_and_block(CommitmentLevel::Finalized), None);
+    cache.commit_bank(session, 42, 2, CommitmentLevel::Finalized, Some(41));
+    assert_eq!(
+        identity_and_block(CommitmentLevel::Confirmed),
+        Some(([2; 32], CommitmentLevel::Finalized))
+    );
+    cache.discard_bank(session, 42, 2);
+    assert_eq!(identity_and_block(CommitmentLevel::Processed), None);
+}
+
+type Corruption = dyn Fn(
+    &mut BlockMetadataRecord,
+    &mut Vec<SubscribeUpdateTransactionInfo>,
+    &mut Vec<yellowstone_grpc_proto::prelude::SubscribeUpdateEntry>,
+    &mut [u8; 32],
+);
+
+#[test]
+fn rejected_banks_are_counted_by_the_failed_check() {
+    let attempt = |reason: &'static str, corrupt: &Corruption| {
+        let cache = HeadCache::new(32, 64);
+        let session = cache.start_bank_session(CommitmentLevel::Processed);
+        let mut meta = metadata(42, 2);
+        let mut txs = vec![transaction(2)];
+        let mut entries = vec![yellowstone_grpc_proto::prelude::SubscribeUpdateEntry {
+            slot: 42,
+            bank_id: 2,
+            hash: vec![9; 32],
+            executed_transaction_count: 1,
+            ..Default::default()
+        }];
+        let mut hash = [2; 32];
+        corrupt(&mut meta, &mut txs, &mut entries, &mut hash);
+        let before = crate::metrics::head_cache_rejected_banks_count(reason);
+        if reason != "metadata_missing" {
+            cache.stage_bank_metadata(session, 2, meta);
+        }
+        for entry in &entries {
+            cache.stage_bank_entry(session, entry);
+        }
+        cache.freeze_bank(session, 42, 2, hash, txs);
+        assert!(
+            crate::metrics::head_cache_rejected_banks_count(reason) > before,
+            "{reason}"
+        );
+        assert!(
+            cache
+                .get_meta(&Signature::from([2; 64]), CommitmentLevel::Processed)
+                .is_none(),
+            "{reason}"
+        );
+    };
+    attempt("metadata_missing", &|_, _, _, _| {});
+    attempt("blockhash_mismatch", &|_, _, _, hash| *hash = [3; 32]);
+    attempt("transaction_count", &|meta, _, _, _| {
+        meta.executed_transaction_count = 2
+    });
+    attempt("entry_count", &|meta, _, _, _| meta.entry_count = 2);
+    attempt("transaction_index", &|_, txs, _, _| txs[0].index = 1);
+    attempt("duplicate_signature", &|meta, txs, entries, _| {
+        meta.executed_transaction_count = 2;
+        entries[0].executed_transaction_count = 2;
+        let mut second = transaction(2);
+        second.index = 1;
+        txs.push(second);
+    });
+    attempt("malformed_transaction", &|_, txs, _, _| txs[0].meta = None);
+    attempt("entry_sequence", &|_, _, entries, _| entries[0].index = 1);
+    attempt("entry_hash", &|_, _, entries, _| {
+        entries[0].hash.pop();
+    });
+    attempt("entry_range", &|_, _, entries, _| {
+        entries[0].executed_transaction_count = 2
+    });
+    attempt("entry_range", &|_, _, entries, _| {
+        entries[0].executed_transaction_count = 0
+    });
+}
+
+#[test]
+fn bank_write_lock_hold_is_observed_per_operation() {
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    cache.discard_bank(session, 42, 1);
+    let exported = String::from_utf8(crate::metrics::export_metrics().unwrap()).unwrap();
+    for op in [
+        "session_start",
+        "stage_metadata",
+        "stage_entry",
+        "freeze",
+        "commit",
+        "discard",
+    ] {
+        let series = format!("superbank_head_cache_write_lock_hold_seconds_count{{op=\"{op}\"}}");
+        assert!(exported.contains(&series), "{series}");
+    }
+}
+
+#[tokio::test]
+async fn lagging_bank_event_receivers_are_counted() {
+    let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+    let event = |slot| HeadBankEvent {
+        slot,
+        blockhash: [0; 32],
+        kind: HeadBankEventKind::Evicted,
+    };
+    sender.send(event(1)).unwrap();
+    sender.send(event(2)).unwrap();
+    let before = crate::metrics::head_cache_bank_events_lagged_count();
+    assert!(matches!(
+        crate::head_cache::recv_bank_event(&mut receiver).await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+    ));
+    assert!(crate::metrics::head_cache_bank_events_lagged_count() > before);
+    assert_eq!(
+        crate::head_cache::recv_bank_event(&mut receiver)
+            .await
+            .unwrap(),
+        event(2)
     );
 }

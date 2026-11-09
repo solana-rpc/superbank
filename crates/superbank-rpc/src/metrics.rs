@@ -636,6 +636,25 @@ struct HeadCacheActiveLabels {
     x_rpc_node: String,
 }
 
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheLockOpLabels {
+    op: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheRejectedBankLabels {
+    reason: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheBankEventLabels {
+    kind: &'static str,
+    outcome: &'static str,
+}
+
 #[cfg(feature = "grpc-streaming")]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct SuperbankGrpcMethodLabels {
@@ -734,6 +753,14 @@ pub struct Metrics {
     head_cache_address_entries: Gauge,
     #[cfg(feature = "grpc-head-cache")]
     head_cache_slot_entries: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_write_lock_hold_seconds: Family<HeadCacheLockOpLabels, Histogram>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_rejected_banks: Family<HeadCacheRejectedBankLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_bank_events: Family<HeadCacheBankEventLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_bank_events_lagged: Counter,
 
     #[cfg(feature = "grpc-streaming")]
     superbank_grpc_stream_requests_total: Family<SuperbankGrpcMethodLabels, Counter>,
@@ -905,6 +932,15 @@ impl Metrics {
         let head_cache_address_entries = Gauge::default();
         #[cfg(feature = "grpc-head-cache")]
         let head_cache_slot_entries = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_write_lock_hold_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_rejected_banks = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_bank_events = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_bank_events_lagged = Counter::default();
 
         #[cfg(feature = "grpc-streaming")]
         let superbank_grpc_stream_requests_total = Family::default();
@@ -1284,6 +1320,26 @@ impl Metrics {
                 "Current number of slot entries tracked by the gRPC head cache",
                 head_cache_slot_entries.clone(),
             );
+            registry.register(
+                "head_cache_write_lock_hold_seconds",
+                "Time the gRPC head cache bank write lock is held, by operation",
+                head_cache_write_lock_hold_seconds.clone(),
+            );
+            registry.register(
+                "head_cache_rejected_banks",
+                "Frozen banks the gRPC head cache could not seal, by the first failed check",
+                head_cache_rejected_banks.clone(),
+            );
+            registry.register(
+                "head_cache_bank_events",
+                "gRPC head cache bank lifecycle events by kind and send outcome",
+                head_cache_bank_events.clone(),
+            );
+            registry.register(
+                "head_cache_bank_events_lagged",
+                "gRPC head cache bank events skipped by a lagging receiver",
+                head_cache_bank_events_lagged.clone(),
+            );
         }
 
         #[cfg(feature = "disk-cache")]
@@ -1602,6 +1658,14 @@ impl Metrics {
             head_cache_address_entries,
             #[cfg(feature = "grpc-head-cache")]
             head_cache_slot_entries,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_write_lock_hold_seconds,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_rejected_banks,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_bank_events,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_bank_events_lagged,
             #[cfg(feature = "grpc-streaming")]
             superbank_grpc_stream_requests_total,
             #[cfg(feature = "grpc-streaming")]
@@ -2474,6 +2538,52 @@ pub(crate) fn head_cache_observe_block(
     metrics
         .head_cache_slot_entries
         .set(clamp_i64_usize(slot_entries));
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_write_lock_hold(op: &'static str, elapsed_seconds: f64) {
+    let metrics = metrics();
+    metrics
+        .head_cache_write_lock_hold_seconds
+        .get_or_create(&HeadCacheLockOpLabels { op })
+        .observe(elapsed_seconds);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_rejected_bank(reason: &'static str) {
+    let metrics = metrics();
+    metrics
+        .head_cache_rejected_banks
+        .get_or_create(&HeadCacheRejectedBankLabels { reason })
+        .inc();
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_rejected_banks_count(reason: &'static str) -> u64 {
+    metrics()
+        .head_cache_rejected_banks
+        .get_or_create(&HeadCacheRejectedBankLabels { reason })
+        .get()
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_bank_event(kind: &'static str, outcome: &'static str) {
+    let metrics = metrics();
+    metrics
+        .head_cache_bank_events
+        .get_or_create(&HeadCacheBankEventLabels { kind, outcome })
+        .inc();
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_bank_events_lagged(skipped: u64) {
+    let metrics = metrics();
+    metrics.head_cache_bank_events_lagged.inc_by(skipped);
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_bank_events_lagged_count() -> u64 {
+    metrics().head_cache_bank_events_lagged.get()
 }
 
 #[cfg(feature = "grpc-head-cache")]

@@ -954,7 +954,38 @@ fn assert_chunked_block_hydration_matches(block: StoredBlockRecord) {
                     "{details:?}/{encoding:?}/rewards={show_rewards}/chunks={chunk_count} differ"
                 );
             }
+            if let StoredBlockPayload::Full(block) = payload {
+                assert_shared_block_bytes_match(block, encoding, details, show_rewards, &expected);
+            }
         }
+    }
+}
+
+/// The head cache's shared payload must build the bytes of the owned payload.
+fn assert_shared_block_bytes_match(
+    block: &StoredBlockRecord,
+    encoding: UiTransactionEncoding,
+    details: TransactionDetails,
+    show_rewards: bool,
+    expected: &[u8],
+) {
+    let shared = shared_block_payload(block);
+    let sequential =
+        sequential_block_bytes(shared.clone(), encoding, details, show_rewards, Some(1))
+            .expect("shared sequential build succeeds");
+    assert!(sequential == expected, "{details:?}/{encoding:?} shared");
+    let chunked = chunked_block_bytes(shared, encoding, details, show_rewards, Some(1), 3)
+        .expect("shared chunked build succeeds");
+    assert!(
+        chunked == expected,
+        "{details:?}/{encoding:?} shared chunks"
+    );
+}
+
+fn shared_block_payload(block: &StoredBlockRecord) -> StoredBlockPayload {
+    StoredBlockPayload::SharedFull {
+        metadata: block.metadata.clone(),
+        transactions: block.transactions.iter().cloned().map(Arc::new).collect(),
     }
 }
 
@@ -1035,6 +1066,31 @@ fn chunked_block_hydration_reports_the_sequential_error() {
                 )
                 .expect_err("chunked build fails");
                 assert_eq!(actual, expected, "{name}/{details:?}/chunks={chunk_count}");
+            }
+            let shared = shared_block_payload(&block);
+            let shared_sequential = sequential_block_bytes(
+                shared.clone(),
+                UiTransactionEncoding::Json,
+                details,
+                true,
+                None,
+            )
+            .expect_err("shared sequential build fails");
+            assert_eq!(shared_sequential, expected, "{name}/{details:?} shared");
+            for chunk_count in [2, 3, 4] {
+                let actual = chunked_block_bytes(
+                    shared.clone(),
+                    UiTransactionEncoding::Json,
+                    details,
+                    true,
+                    None,
+                    chunk_count,
+                )
+                .expect_err("shared chunked build fails");
+                assert_eq!(
+                    actual, expected,
+                    "{name}/{details:?}/chunks={chunk_count} shared"
+                );
             }
         }
     }
