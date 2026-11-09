@@ -31,8 +31,11 @@ superbank-verify --full
 # Full PoH recomputation for a slot range
 superbank-verify --range 250000000:250001000 --mode full
 
-# Epochs 700-701 (mainnet warmup schedule is applied for epochs < 14)
+# Epochs 700-701 (mainnet has no warmup epochs)
 superbank-verify --range 700-701 --mode full
+
+# Devnet data: genesis hash, warmup, hashes_per_tick and Alpenglow boundary for devnet
+superbank-verify --solana-cluster devnet --range 1100:1101
 
 # Multi-day genesis-to-tip run with resume + JSONL findings report
 superbank-verify --full --mode full \
@@ -43,6 +46,18 @@ superbank-verify --full --mode full \
 Range grammar (same as the ingestor's `--bigtable-range`): `a:b` = slots
 (inclusive), `a-b` = epochs, `a` = a single epoch.
 
+### Clusters
+
+`--solana-cluster` (`mainnet`, the default, `devnet` or `testnet`) sets the defaults below. An explicit flag, env var or YAML key overrides each one.
+
+| Cluster | Epoch warmup | Genesis hash | Alpenglow genesis slot |
+|---|---|---|---|
+| mainnet | false | `5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d` | 459652999 |
+| devnet | false | `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG` | 504148999 |
+| testnet | true | `4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY` | 444625255 |
+
+Each cluster also has its own `hashes_per_tick` history (`src/eras.rs`). The Alpenglow slot and block ID come from each cluster's `getAgGenesisCert` (`src/cluster.rs`).
+
 ### Modes
 
 - **structural** (default): no hash recomputation. Checks entry counts and
@@ -51,9 +66,7 @@ Range grammar (same as the ingestor's `--bigtable-range`): `a:b` = slots
   replica of Agave's `verify_tick_hash_count` (per-tick `num_hashes` windows
   against the era's `hashes_per_tick`), transaction-index tiling, the
   last-entry-hash == blockhash equality, and blockhash chain linkage.
-- After the Alpenglow genesis certificate slot, structural mode requires one ending Alpentick and `num_hashes = 1` for every entry. Skipped slots do not add ticks. Provide `--alpenglow-rpc-url` for a trusted Agave 4.3+ RPC `getAgGenesisCert` response or `--alpenglow-genesis-block
-  <slot>:<base58-block-id>` for an offline run. If both are supplied, they
-  must agree. The certified genesis slot itself still uses PoH rules. The certificate's consensus block ID is not treated as an RPC blockhash anchor.
+- After the Alpenglow genesis certificate slot, structural mode requires one ending Alpentick and `num_hashes = 1` for every entry. Skipped slots do not add ticks. The boundary defaults to the `--solana-cluster` value. `--alpenglow-genesis-block <slot>:<base58-block-id>` overrides it, and `none` turns it off. With `--alpenglow-rpc-url`, the trusted `getAgGenesisCert` response must match the resolved boundary. The certified genesis slot itself still uses PoH rules. The certificate's consensus block ID is not treated as an RPC blockhash anchor.
 - **full**: everything above **plus** recomputing every SHA-256 hash of every
   entry, including the transaction-signature merkle mixin, and comparing
   against the recorded entry hashes and blockhash. Roughly 800k hashes per
@@ -61,25 +74,13 @@ Range grammar (same as the ingestor's `--bigtable-range`): `a:b` = slots
   budget multiple days for a genesis-to-tip run on a large machine.
   In Alpenglow slots this checks the low power entry hash chain; it does not prove elapsed time or verify Alpenglow consensus certificates.
 
-### Optional duplicate-conflict audit
+### Duplicate-conflict audit
 
-`--audit-duplicate-conflicts` (or
-`SUPERBANK_VERIFY_AUDIT_DUPLICATE_CONFLICTS=true`, or YAML
-`audit-duplicate-conflicts: true`) scans the raw ClickHouse tables for logical
-duplicates with differing values and emits `duplicate_conflict` findings. It
-is off by default: the baseline verifier uses the deduplicated rows selected
-by `LIMIT 1 BY`. Enabling the audit adds aggregation scans of the blocks and
-entries tables for every window, plus transactions in full mode, so use it as
-a targeted forensic integrity audit rather than a normal PoH sweep.
+The verifier reads one arbitrary row per logical key (`LIMIT 1 BY`). The audit scans the raw ClickHouse tables for logical duplicates with differing values and fails the slot with `duplicate_conflict`. It is on by default. It adds aggregation scans of the blocks and entries tables for every window, plus transactions in full mode. Turn it off with `--audit-duplicate-conflicts=false` (`SUPERBANK_VERIFY_AUDIT_DUPLICATE_CONFLICTS=false`, YAML `audit-duplicate-conflicts: false`).
 
 ### hashes_per_tick eras
 
-`--hashes-per-tick-schedule` defaults to the built-in mainnet history
-(12,500 at genesis, then the `update_hashes_per_tick2..6` feature activations
-at slots 253584001 / 255312004 / 255744008 / 257040000 / 257904000 up to
-62,500; see `src/eras.rs` for provenance). Override for other clusters with
-`"<from_slot>:<value>,..."`; a value of `0` disables the tick-hash-count check
-for that era.
+`--hashes-per-tick-schedule` defaults to the `--solana-cluster` history. On mainnet that is 12,500 at genesis, then the `update_hashes_per_tick2..6` feature activations at slots 253584001 / 255312004 / 255744008 / 257040000 / 257904000 up to 62,500. See `src/eras.rs` for provenance and the devnet and testnet tables. Override with `"<from_slot>:<value>,..."`. A value of `0` disables the tick-hash-count check for that era.
 
 ### Trust model
 
@@ -88,9 +89,8 @@ its recorded `parent_blockhash`; chain linkage extends that to the whole
 range. A fabricated-but-self-consistent segment after a coverage gap is only
 detectable against an external reference: pass one or more
 `--anchor <slot>:<base58-blockhash>` (e.g. from a trusted RPC's `getBlock`)
-to pin recorded blockhashes, and `--expected-genesis-hash` (defaults to
-mainnet's `5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d`; pass `""` to
-disable) to pin slot 0. PoH commits only to transaction *signatures* — message
+to pin recorded blockhashes, and `--expected-genesis-hash` (defaults to the
+`--solana-cluster` genesis hash; pass `""` to disable) to pin slot 0. PoH commits only to transaction *signatures* — message
 contents are outside its proof and are not checked by this tool.
 
 ### Findings and statuses
@@ -159,8 +159,11 @@ CLI flags > environment variables > YAML config (`--config` /
 the repo root and `superbank-verify --help` for the full reference. ClickHouse
 connection uses the same `CLICKHOUSE_URL` / `CLICKHOUSE_DATABASE` /
 `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` variables as the other binaries;
-table names default to `default.blocks_metadata`, `default.entries`,
-`default.transactions`.
+table names default to `blocks_metadata`, `entries` and `transactions` in the selected database. Explicit database-qualified table names still override the database.
+
+Logs default to `info`, which shows progress and the final summary. Set `RUST_LOG` to override the log filter.
+
+Checkpoints include the table names. To resume a checkpoint created with the database-qualified defaults, pass `--blocks-table default.blocks_metadata --entries-table default.entries --transactions-table default.transactions`.
 
 ## Test fixtures
 
@@ -171,17 +174,13 @@ golden vectors.
 
 ## Notes
 
-- ReplacingMergeTree duplicates are deduplicated with `LIMIT 1 BY`. Enable
-  `--audit-duplicate-conflicts` to report differing duplicates as
-  `duplicate_conflict`; otherwise the baseline verifier does not scan for
-  them.
-- Configure the Alpenglow genesis boundary before verifying postmigration ranges. Without it the verifier applies the legacy PoH rules to every slot.
-- `getEpochSchedule` in superbank-rpc ignores mainnet's warmup epochs; this
-  crate carries its own epoch math (`src/epoch.rs`) instead of sharing that
-  code.
+- ReplacingMergeTree duplicates are deduplicated with `LIMIT 1 BY`. The default duplicate-conflict audit fails slots whose duplicates differ.
+- Set `--solana-cluster` to match the stored data. A wrong cluster applies the wrong Alpenglow boundary, genesis hash and `hashes_per_tick` history.
+- This crate carries its own epoch math (`src/epoch.rs`). Only testnet has warmup epochs.
+- Checkpoints from runs before `--solana-cluster` recorded no Alpenglow boundary and the duplicate audit off. Such a run resumes only before the boundary, and with `--audit-duplicate-conflicts=false`. Otherwise start a fresh job.
 
 ### Trusted migration evidence
 
-Configure `--alpenglow-rpc-url` / `SUPERBANK_VERIFY_ALPENGLOW_RPC_URL` / `alpenglow-rpc-url` with a trusted endpoint for the same cluster as the stored data, or `--alpenglow-genesis-block` / `SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK` / `alpenglow-genesis-block` with its certificate's `<slot>:<base58-block-id>` pair. CLI overrides env, which overrides YAML. The certificate slot is the last historical PoH slot; new entry rules apply strictly after it. A missing boundary retains PoH rules. An authoritative successful null means no certificate; unsupported, unavailable and malformed responses are operational errors, never null. Discovery is bounded to ten seconds and 64 KiB, rejects redirects, and does not include upstream URLs/messages in errors. Wire validation establishes shape only; no BLS or stake verification is claimed.
+The boundary defaults to the built-in `--solana-cluster` pair. `--alpenglow-genesis-block` / `SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK` / `alpenglow-genesis-block` overrides it with a certificate's `<slot>:<base58-block-id>` pair, or `none` to apply PoH rules to every slot. `--alpenglow-rpc-url` / `SUPERBANK_VERIFY_ALPENGLOW_RPC_URL` / `alpenglow-rpc-url` asks a trusted endpoint for the same cluster, and its answer must match the resolved boundary. CLI overrides env, which overrides YAML. The certificate slot is the last historical PoH slot; new entry rules apply strictly after it. An authoritative successful null means no certificate; unsupported, unavailable and malformed responses are operational errors, never null. Discovery is bounded to ten seconds and 64 KiB, rejects redirects, and does not include upstream URLs/messages in errors. Wire validation establishes shape only; no BLS or stake verification is claimed.
 
 The resolved slot and consensus block ID are part of checkpoint identity. Legacy checkpoints without this field resume with historical rules. A `None` to trusted `Some(G, ID)` handoff is allowed only with `next_start <= G + 1`; later progress requires starting a fresh verification job. Removing or changing either component rejects resume even after the boundary is behind the cursor. The comparison handles `G = UInt64::MAX` without wrapping. The consensus block ID is distinct from the entry blockhash; use `--anchor` separately.

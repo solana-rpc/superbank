@@ -16,6 +16,7 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 
+use crate::cluster::SolanaCluster;
 use crate::eras::HashesPerTickSchedule;
 use crate::range::{RangeSpec, parse_range_spec};
 use crate::verify::VerifyMode;
@@ -87,6 +88,16 @@ struct CliArgs {
     )]
     mode: ModeArg,
 
+    /// Solana cluster of the stored data: sets the defaults for the genesis hash,
+    /// epoch warmup, hashes_per_tick history and Alpenglow genesis block
+    #[arg(
+        long,
+        env = "SUPERBANK_VERIFY_SOLANA_CLUSTER",
+        value_enum,
+        default_value = "mainnet"
+    )]
+    solana_cluster: SolanaCluster,
+
     /// Slots per normal epoch (used to resolve epoch ranges)
     #[arg(
         long,
@@ -95,33 +106,28 @@ struct CliArgs {
     )]
     slots_per_epoch: u64,
 
-    /// Whether the cluster uses warmup epochs (mainnet-beta: true)
+    /// Whether the cluster uses warmup epochs (default: true only for testnet)
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_EPOCH_WARMUP",
-        default_value_t = true,
         default_missing_value = "true",
         num_args = 0..=1,
         require_equals = true,
         action = clap::ArgAction::Set
     )]
-    epoch_warmup: bool,
+    epoch_warmup: Option<bool>,
 
     /// Ticks per slot (64 for all of mainnet history)
     #[arg(long, env = "SUPERBANK_VERIFY_TICKS_PER_SLOT", default_value_t = 64)]
     ticks_per_slot: u64,
 
     /// Expected genesis blockhash, checked against slot 0's parent_blockhash
-    /// (base58; empty string disables the check)
-    #[arg(
-        long,
-        env = "SUPERBANK_VERIFY_EXPECTED_GENESIS_HASH",
-        default_value = MAINNET_GENESIS_HASH
-    )]
-    expected_genesis_hash: String,
+    /// (base58; empty string disables the check; default: the cluster's)
+    #[arg(long, env = "SUPERBANK_VERIFY_EXPECTED_GENESIS_HASH")]
+    expected_genesis_hash: Option<String>,
 
     /// hashes_per_tick eras as "<from_slot>:<value>,..."; 0 disables the
-    /// tick-hash-count check for that era (default: built-in mainnet history)
+    /// tick-hash-count check for that era (default: the cluster's built-in history)
     #[arg(long, env = "SUPERBANK_VERIFY_HASHES_PER_TICK_SCHEDULE")]
     hashes_per_tick_schedule: Option<String>,
 
@@ -129,7 +135,8 @@ struct CliArgs {
     #[arg(long, env = "SUPERBANK_VERIFY_ALPENGLOW_RPC_URL")]
     alpenglow_rpc_url: Option<String>,
 
-    /// Offline Alpenglow genesis override: <slot>:<base58-block-id>
+    /// Alpenglow genesis block: <slot>:<base58-block-id>, or "none" to apply
+    /// historical PoH rules to every slot (default: the cluster's)
     #[arg(long, env = "SUPERBANK_VERIFY_ALPENGLOW_GENESIS_BLOCK")]
     alpenglow_genesis_block: Option<String>,
 
@@ -149,12 +156,12 @@ struct CliArgs {
     )]
     fetch_ahead: usize,
 
-    /// Forensic audit: scan raw ClickHouse rows for conflicting duplicates
-    /// (off by default; adds extra scans for every window)
+    /// Scan raw ClickHouse rows for conflicting duplicates; a conflict fails
+    /// the slot (adds extra scans for every window)
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_AUDIT_DUPLICATE_CONFLICTS",
-        default_value_t = false,
+        default_value_t = true,
         default_missing_value = "true",
         num_args = 0..=1,
         require_equals = true,
@@ -231,7 +238,7 @@ struct CliArgs {
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_BLOCKS_TABLE",
-        default_value = "default.blocks_metadata"
+        default_value = "blocks_metadata"
     )]
     blocks_table: String,
 
@@ -239,7 +246,7 @@ struct CliArgs {
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_ENTRIES_TABLE",
-        default_value = "default.entries"
+        default_value = "entries"
     )]
     entries_table: String,
 
@@ -247,7 +254,7 @@ struct CliArgs {
     #[arg(
         long,
         env = "SUPERBANK_VERIFY_TRANSACTIONS_TABLE",
-        default_value = "default.transactions"
+        default_value = "transactions"
     )]
     transactions_table: String,
 
@@ -301,6 +308,8 @@ struct FileConfig {
     full: Option<bool>,
     #[serde(alias = "mode")]
     mode: Option<ModeArg>,
+    #[serde(rename = "solana-cluster", alias = "solana_cluster")]
+    solana_cluster: Option<SolanaCluster>,
     #[serde(rename = "slots-per-epoch", alias = "slots_per_epoch")]
     slots_per_epoch: Option<u64>,
     #[serde(rename = "epoch-warmup", alias = "epoch_warmup")]
@@ -466,12 +475,20 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
         .transpose()
         .context("parse --range")?;
 
-    let expected_genesis_hash = merge_value(
+    let cluster = merge_value(
+        matches,
+        "solana_cluster",
+        cli.solana_cluster,
+        config.solana_cluster,
+    );
+
+    let expected_genesis_hash = merge_option(
         matches,
         "expected_genesis_hash",
         cli.expected_genesis_hash,
         config.expected_genesis_hash,
-    );
+    )
+    .unwrap_or_else(|| cluster.genesis_hash().to_string());
     let expected_genesis_hash = match expected_genesis_hash.trim() {
         "" => None,
         value => Some(parse_hash32(value).context("parse --expected-genesis-hash")?),
@@ -486,15 +503,19 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
         Some(spec) => {
             HashesPerTickSchedule::parse(&spec).context("parse --hashes-per-tick-schedule")?
         }
-        None => HashesPerTickSchedule::mainnet(),
+        None => cluster.hashes_per_tick_schedule(),
     };
 
-    let alpenglow_genesis_block = parse_optional_alpenglow_genesis(non_blank(merge_option(
+    let alpenglow_genesis_block = match non_blank(merge_option(
         matches,
         "alpenglow_genesis_block",
         cli.alpenglow_genesis_block,
         config.alpenglow_genesis_block,
-    )))?;
+    )) {
+        None => Some(cluster.alpenglow_genesis_block()?),
+        Some(spec) if spec.eq_ignore_ascii_case("none") => None,
+        Some(spec) => Some(parse_anchor(&spec).context("parse --alpenglow-genesis-block")?),
+    };
 
     let anchor_specs = if matches
         .value_source("anchor")
@@ -521,12 +542,13 @@ fn resolve_from(matches: &ArgMatches, cli: CliArgs) -> Result<Args> {
             cli.slots_per_epoch,
             config.slots_per_epoch,
         ),
-        epoch_warmup: merge_value(
+        epoch_warmup: merge_option(
             matches,
             "epoch_warmup",
             cli.epoch_warmup,
             config.epoch_warmup,
-        ),
+        )
+        .unwrap_or_else(|| cluster.epoch_warmup()),
         ticks_per_slot: merge_value(
             matches,
             "ticks_per_slot",
@@ -666,13 +688,6 @@ fn non_blank(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn parse_optional_alpenglow_genesis(spec: Option<String>) -> Result<Option<(u64, [u8; 32])>> {
-    spec.as_deref()
-        .map(parse_anchor)
-        .transpose()
-        .context("parse --alpenglow-genesis-block")
 }
 
 fn resolve_export_fixture(
@@ -823,7 +838,7 @@ mod tests {
         let args = resolve(&["superbank-verify", "--full"]).unwrap();
         assert_eq!(args.mode, ModeArg::Structural);
         assert_eq!(args.slots_per_epoch, 432_000);
-        assert!(args.epoch_warmup);
+        assert!(!args.epoch_warmup);
         assert_eq!(args.ticks_per_slot, 64);
         assert_eq!(
             args.expected_genesis_hash,
@@ -834,7 +849,127 @@ mod tests {
             HashesPerTickSchedule::mainnet()
         );
         assert_eq!(args.metrics_port, 9902);
-        assert!(!args.audit_duplicate_conflicts);
+        assert!(args.audit_duplicate_conflicts);
+        assert_eq!(
+            args.alpenglow_genesis_block,
+            Some(SolanaCluster::Mainnet.alpenglow_genesis_block().unwrap())
+        );
+    }
+
+    #[test]
+    fn table_defaults_follow_the_selected_database() {
+        let args = resolve(&[
+            "superbank-verify",
+            "--full",
+            "--clickhouse-database",
+            "archive",
+        ])
+        .unwrap();
+        assert_eq!(args.clickhouse_database, "archive");
+        assert_eq!(args.blocks_table, "blocks_metadata");
+        assert_eq!(args.entries_table, "entries");
+        assert_eq!(args.transactions_table, "transactions");
+
+        let args = resolve(&[
+            "superbank-verify",
+            "--full",
+            "--clickhouse-database",
+            "archive",
+            "--blocks-table",
+            "other.blocks",
+            "--entries-table",
+            "other.entries",
+            "--transactions-table",
+            "other.transactions",
+        ])
+        .unwrap();
+        assert_eq!(args.blocks_table, "other.blocks");
+        assert_eq!(args.entries_table, "other.entries");
+        assert_eq!(args.transactions_table, "other.transactions");
+    }
+
+    #[test]
+    fn solana_cluster_sets_every_cluster_default() {
+        for (name, cluster, warmup) in [
+            ("devnet", SolanaCluster::Devnet, false),
+            ("testnet", SolanaCluster::Testnet, true),
+        ] {
+            let args = resolve(&["superbank-verify", "--full", "--solana-cluster", name]).unwrap();
+            assert_eq!(args.epoch_warmup, warmup, "{name}");
+            assert_eq!(
+                args.expected_genesis_hash,
+                Some(parse_hash32(cluster.genesis_hash()).unwrap())
+            );
+            assert_eq!(
+                args.hashes_per_tick_schedule,
+                cluster.hashes_per_tick_schedule()
+            );
+            assert_eq!(
+                args.alpenglow_genesis_block,
+                Some(cluster.alpenglow_genesis_block().unwrap())
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "full: true\nsolana-cluster: testnet\n").unwrap();
+        let path = path.to_str().unwrap();
+        assert!(
+            resolve(&["superbank-verify", "--config", path])
+                .unwrap()
+                .epoch_warmup
+        );
+        let args = resolve(&[
+            "superbank-verify",
+            "--config",
+            path,
+            "--solana-cluster=devnet",
+        ])
+        .unwrap();
+        assert!(!args.epoch_warmup);
+    }
+
+    #[test]
+    fn explicit_flags_override_cluster_defaults() {
+        let block = format!("7:{MAINNET_GENESIS_HASH}");
+        let args = resolve(&[
+            "superbank-verify",
+            "--full",
+            "--solana-cluster",
+            "testnet",
+            "--epoch-warmup=false",
+            "--hashes-per-tick-schedule",
+            "0:5",
+            "--alpenglow-genesis-block",
+            &block,
+        ])
+        .unwrap();
+        assert!(!args.epoch_warmup);
+        assert_eq!(args.hashes_per_tick_schedule.value_at(1), 5);
+        assert_eq!(args.alpenglow_genesis_block.map(|(slot, _)| slot), Some(7));
+    }
+
+    #[test]
+    fn alpenglow_genesis_block_none_disables_the_boundary() {
+        for value in ["none", "NONE"] {
+            let args = resolve(&[
+                "superbank-verify",
+                "--full",
+                "--alpenglow-genesis-block",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.alpenglow_genesis_block, None);
+        }
+        assert!(
+            resolve(&[
+                "superbank-verify",
+                "--full",
+                "--alpenglow-genesis-block",
+                "7"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -896,28 +1031,32 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_conflict_audit_is_opt_in_across_cli_and_yaml() {
+    fn duplicate_conflict_audit_can_be_disabled_across_cli_and_yaml() {
         assert!(
-            resolve(&["superbank-verify", "--full", "--audit-duplicate-conflicts",])
-                .unwrap()
-                .audit_duplicate_conflicts
+            !resolve(&[
+                "superbank-verify",
+                "--full",
+                "--audit-duplicate-conflicts=false"
+            ])
+            .unwrap()
+            .audit_duplicate_conflicts
         );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
-        std::fs::write(&path, "full: true\naudit_duplicate_conflicts: true\n").unwrap();
+        std::fs::write(&path, "full: true\naudit_duplicate_conflicts: false\n").unwrap();
         let path = path.to_str().unwrap();
         assert!(
-            resolve(&["superbank-verify", "--config", path])
+            !resolve(&["superbank-verify", "--config", path])
                 .unwrap()
                 .audit_duplicate_conflicts
         );
         assert!(
-            !resolve(&[
+            resolve(&[
                 "superbank-verify",
                 "--config",
                 path,
-                "--audit-duplicate-conflicts=false",
+                "--audit-duplicate-conflicts=true",
             ])
             .unwrap()
             .audit_duplicate_conflicts
