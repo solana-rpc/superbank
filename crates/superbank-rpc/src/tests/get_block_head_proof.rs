@@ -2,9 +2,7 @@
 //! getBlock misses that the head's finalized parent-link chain answers without ClickHouse.
 use super::*;
 use crate::head_cache::coverage::{Link, TIP_MAX_AGE};
-use solana_rpc_client_api::custom_error::{
-    JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE, JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
-};
+use solana_rpc_client_api::custom_error::JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED;
 use std::time::Instant;
 
 /// An unreachable primary: any request that reaches ClickHouse answers `-32603`.
@@ -104,26 +102,6 @@ async fn proven_skip_returns_the_disk_tier_skipped_error_without_clickhouse() {
 }
 
 #[tokio::test]
-async fn above_the_finalized_tip_returns_block_not_available_without_clickhouse() {
-    let (_, state) = head_state(Instant::now());
-    for commitment in ["confirmed", "finalized"] {
-        for slot in [105, 1_000_000] {
-            let before = metrics::get_block_not_found_count("above_head_tip");
-            assert_eq!(
-                get_block(&state, slot, commitment).await,
-                expected(
-                    JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
-                    format!("Block not available for slot {slot}"),
-                )
-                .await,
-                "{commitment} {slot}"
-            );
-            assert!(metrics::get_block_not_found_count("above_head_tip") > before);
-        }
-    }
-}
-
-#[tokio::test]
 async fn unproven_slots_fall_through_to_clickhouse() {
     let (_, state) = head_state(Instant::now());
     // Below the chain, and a finalized link whose block the head does not serve.
@@ -137,40 +115,28 @@ async fn unproven_slots_fall_through_to_clickhouse() {
 }
 
 #[tokio::test]
-async fn above_tip_falls_through_while_the_head_holds_the_slot_at_that_commitment() {
-    let (cache, state) = head_state(Instant::now());
-    // A confirmed block with a missing transaction: get_block misses, block_identity does not.
-    let mut metadata = base_block_record(105).metadata;
-    metadata.executed_transaction_count = 2;
-    cache.note_block_metadata(metadata);
-    cache.note_slot_commitment(105, CommitmentLevel::Confirmed);
-    assert_eq!(error_code(&state, 105, "confirmed").await, -32603);
-    assert_eq!(
-        error_code(&state, 105, "finalized").await,
-        JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE
-    );
+async fn above_the_finalized_tip_falls_through_to_clickhouse() {
+    let (_, state) = head_state(Instant::now());
+    for commitment in ["confirmed", "finalized"] {
+        for slot in [105, 1_000_000] {
+            assert_eq!(
+                error_code(&state, slot, commitment).await,
+                -32603,
+                "{commitment} {slot}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
-async fn primary_seen_at_the_slot_disables_the_above_tip_answer() {
+async fn skip_proof_does_not_depend_on_the_primary_tip() {
     let (_, state) = head_state(Instant::now());
     state.latest_slot_cache.value.store(106, Ordering::Relaxed);
-    for slot in [105, 106] {
-        assert_eq!(
-            error_code(&state, slot, "finalized").await,
-            -32603,
-            "{slot}"
-        );
-    }
-    assert_eq!(
-        error_code(&state, 107, "finalized").await,
-        JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE
-    );
-    // The skip proof does not depend on the primary's tip.
     assert_eq!(
         error_code(&state, 101, "finalized").await,
         JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED
     );
+    assert_eq!(error_code(&state, 107, "finalized").await, -32603);
 }
 
 #[tokio::test]

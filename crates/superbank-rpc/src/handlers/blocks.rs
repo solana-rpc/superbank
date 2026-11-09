@@ -317,7 +317,7 @@ fn classify_get_block_miss(slot: u64, clickhouse_latest: u64) -> (i32, String, &
     }
 }
 
-/// Answers a head-cache getBlock miss that the head's finalized parent-link chain decides,
+/// Answers a getBlock miss that the head's finalized parent-link chain proves skipped,
 /// without the disk tier or ClickHouse. `None` leaves the request to the next tier.
 #[cfg(feature = "grpc-head-cache")]
 fn head_proof_miss_response(
@@ -325,32 +325,16 @@ fn head_proof_miss_response(
     route: &mut RouteMetric,
     id: &Value,
     slot: u64,
-    commitment: CommitmentLevel,
 ) -> Option<Response> {
     use crate::head_cache::coverage::SlotStatus;
     let head = state.head_cache.as_ref()?;
-    let (code, message, reason) = match head.slot_status(slot) {
-        SlotStatus::ProvenSkipped => {
-            let (code, message) = slot_skipped_error(slot);
-            (code, message, "proven_skipped")
-        }
-        // A primary already seen at `slot` may hold a block the head has not finalized.
-        SlotStatus::AboveFinalizedTip
-            if head.block_identity(slot, commitment).is_none()
-                && state
-                    .latest_slot_cache
-                    .value
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    < slot =>
-        {
-            let (code, message) = block_not_available_error(slot);
-            (code, message, "above_head_tip")
-        }
-        _ => return None,
-    };
+    if head.slot_status(slot) != SlotStatus::ProvenSkipped {
+        return None;
+    }
+    let (code, message) = slot_skipped_error(slot);
     route.source_head_cache();
     route.not_found();
-    metrics::get_block_not_found(reason);
+    metrics::get_block_not_found("proven_skipped");
     Some(json_rpc_error_response(id.clone(), code, message, None))
 }
 
@@ -1921,9 +1905,7 @@ pub(crate) async fn handle_get_block(
     }
 
     #[cfg(feature = "grpc-head-cache")]
-    if let Some(resp) =
-        head_proof_miss_response(&state, &mut route, &id, slot, commitment.commitment)
-    {
+    if let Some(resp) = head_proof_miss_response(&state, &mut route, &id, slot) {
         return Ok(resp);
     }
 
