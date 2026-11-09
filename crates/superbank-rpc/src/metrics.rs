@@ -42,9 +42,26 @@ const SERVING_LATENCY_BUCKETS: [f64; 18] = [
     5.0, 10.0,
 ];
 
-/// Request, primary ClickHouse and local-cache key latency, which judge p90/p99.
+/// Request, envelope, primary ClickHouse and local-cache key latency, which judge p90/p99.
 fn serving_latency_histogram() -> Histogram {
     Histogram::new(SERVING_LATENCY_BUCKETS)
+}
+
+/// 1 KiB to 64 MiB in powers of 4.
+const RESPONSE_BYTES_BUCKETS: [f64; 9] = [
+    1024.0,
+    4096.0,
+    16384.0,
+    65536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+];
+
+fn response_bytes_histogram() -> Histogram {
+    Histogram::new(RESPONSE_BYTES_BUCKETS)
 }
 
 const BATCH_SIZE_BUCKETS: [f64; 8] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
@@ -60,6 +77,11 @@ fn signature_status_batch_histogram() -> Histogram {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct SignatureStatusStageLabels {
     stage: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct EnvelopeMethodLabels {
+    method: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -719,6 +741,8 @@ pub struct Metrics {
     signature_status_disconnect_verification: Family<DisconnectOutcomeLabels, Counter>,
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
+    rpc_envelope_seconds: Family<EnvelopeMethodLabels, Histogram>,
+    rpc_response_bytes: Family<EnvelopeMethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
     rpc_blocks_range_seconds: Family<BlockRangeLabels, Histogram>,
     get_block_response_cache_access: Family<OperationOutcomeLabels, Counter>,
@@ -912,6 +936,10 @@ impl Metrics {
         let rpc_batch_rejected = Family::default();
         let rpc_response_overhead_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+        let rpc_envelope_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
+        let rpc_response_bytes =
+            Family::new_with_constructor(response_bytes_histogram as fn() -> Histogram);
         let rpc_blocks_slots_returned =
             Family::new_with_constructor(block_slot_count_histogram as fn() -> Histogram);
         let rpc_blocks_range_seconds =
@@ -1165,6 +1193,16 @@ impl Metrics {
             "rpc_response_overhead_seconds",
             "Estimated non-ClickHouse response overhead in seconds by method",
             rpc_response_overhead_seconds.clone(),
+        );
+        registry.register(
+            "rpc_envelope_seconds",
+            "JSON-RPC HTTP envelope time by method, batch or invalid, from handler entry until the response is handed to the server, before the body is written",
+            rpc_envelope_seconds.clone(),
+        );
+        registry.register(
+            "rpc_response_bytes",
+            "Uncompressed JSON-RPC HTTP response body size in bytes by method, batch or invalid",
+            rpc_response_bytes.clone(),
         );
         registry.register(
             "rpc_blocks_range_seconds",
@@ -1715,6 +1753,8 @@ impl Metrics {
             signature_status_disconnect_verification,
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
+            rpc_envelope_seconds,
+            rpc_response_bytes,
             rpc_blocks_slots_returned,
             rpc_blocks_range_seconds,
             get_block_response_cache_access,
@@ -2560,6 +2600,20 @@ pub(crate) fn response_overhead(method: &str, elapsed_ms: u64) {
     metrics.response_overhead(method, elapsed_ms);
 }
 
+pub(crate) fn rpc_envelope(method: &'static str, elapsed_seconds: f64) {
+    metrics()
+        .rpc_envelope_seconds
+        .get_or_create(&EnvelopeMethodLabels { method })
+        .observe(elapsed_seconds);
+}
+
+pub(crate) fn rpc_response_bytes(method: &'static str, bytes: u64) {
+    metrics()
+        .rpc_response_bytes
+        .get_or_create(&EnvelopeMethodLabels { method })
+        .observe(bytes as f64);
+}
+
 pub(crate) fn blocks_slots_returned(method: &str, slots: usize) {
     let metrics = metrics();
     metrics.blocks_slots_returned(method, slots);
@@ -3342,6 +3396,10 @@ mod tests {
         metrics.track_request("getSlot").observe(StatusCode::OK);
         metrics.observe_clickhouse("getSlot", 5, 0, 0);
         metrics.get_block_phase("fetch", 0.01);
+        metrics
+            .rpc_envelope_seconds
+            .get_or_create(&EnvelopeMethodLabels { method: "getSlot" })
+            .observe(0.01);
         #[cfg(feature = "disk-cache")]
         metrics
             .disk_cache_key_seconds
@@ -3356,6 +3414,7 @@ mod tests {
         let mut serving = vec![
             "superbank_rpc_response_time_seconds",
             "superbank_rpc_clickhouse_duration_seconds",
+            "superbank_rpc_envelope_seconds",
         ];
         if cfg!(feature = "disk-cache") {
             serving.push("superbank_disk_cache_key_seconds");
@@ -3374,6 +3433,29 @@ mod tests {
         assert_eq!(
             exported_buckets(&exported, "superbank_get_block_phase_seconds"),
             LATENCY_BUCKETS
+        );
+    }
+
+    #[test]
+    fn response_bytes_use_power_of_four_buckets_with_static_method_label() {
+        let metrics = Metrics::new();
+        metrics
+            .rpc_response_bytes
+            .get_or_create(&EnvelopeMethodLabels { method: "getBlock" })
+            .observe(4_600_000.0);
+
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        let name = "superbank_rpc_response_bytes";
+        assert_eq!(exported_buckets(&exported, name), RESPONSE_BYTES_BUCKETS);
+        let bucket = |le: &str, count: u64| {
+            format!("{name}_bucket{{le=\"{le}\",method=\"getBlock\"}} {count}")
+        };
+        assert!(exported.contains(&bucket("4194304.0", 0)), "{exported}");
+        assert!(exported.contains(&bucket("16777216.0", 1)), "{exported}");
+        assert!(
+            exported.contains(&format!("{name}_count{{method=\"getBlock\"}} 1")),
+            "{exported}"
         );
     }
 

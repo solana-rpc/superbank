@@ -79,3 +79,77 @@ fn http_response_logs_match_final_status() {
         }
     }
 }
+
+fn exported_count(exported: &str, family: &str, method: &str) -> u64 {
+    let prefix = format!("{family}_count{{method=\"{method}\"}} ");
+    exported
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.parse().ok())
+        .unwrap_or(0)
+}
+
+fn envelope_counts(method: &str) -> (u64, u64) {
+    let exported = String::from_utf8(metrics::export_metrics().expect("metrics export"))
+        .expect("metrics are UTF-8");
+    (
+        exported_count(&exported, "superbank_rpc_envelope_seconds", method),
+        exported_count(&exported, "superbank_rpc_response_bytes", method),
+    )
+}
+
+#[tokio::test]
+async fn envelope_metrics_and_status_promotion_cover_single_and_batch() {
+    let success = json!({"jsonrpc": "2.0", "id": 1, "method": "getEpochSchedule"});
+    let server_error = json!({"jsonrpc": "2.0", "id": 3, "method": "getInflationReward",
+        "params": [["11111111111111111111111111111111"], {"epoch": 43}]});
+    let cases = [
+        (
+            false,
+            server_error.clone(),
+            StatusCode::OK,
+            "getInflationReward",
+        ),
+        (
+            true,
+            server_error.clone(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "getInflationReward",
+        ),
+        (true, success.clone(), StatusCode::OK, "getEpochSchedule"),
+        (
+            true,
+            json!([success, server_error.clone()]),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "batch",
+        ),
+        (true, json!("not a request"), StatusCode::OK, "invalid"),
+    ];
+    let mut server_error_bodies = Vec::new();
+    for (enabled, request, expected, method) in cases {
+        let mut state = test_state();
+        Arc::get_mut(&mut state).unwrap().emit_http_errors = enabled;
+        // Force a server-side rejection without relying on a database or a timeout race.
+        let _permit = state
+            .get_inflation_reward_sem
+            .as_ref()
+            .unwrap()
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let (envelopes_before, sizes_before) = envelope_counts(method);
+        let response = handle_json_rpc_value(state, &request).await;
+        assert_eq!(response.status(), expected, "{request}");
+        let (envelopes_after, sizes_after) = envelope_counts(method);
+        assert!(envelopes_after > envelopes_before, "{method}");
+        assert!(sizes_after > sizes_before, "{method}");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        if request == server_error {
+            server_error_bodies.push(body);
+        }
+    }
+    assert_eq!(server_error_bodies.len(), 2);
+    assert_eq!(server_error_bodies[0], server_error_bodies[1]);
+}
