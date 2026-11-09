@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, warn};
 
 use super::block_ranges::{RangeObservation, get_block_slots_response_for_range, resolve_range};
@@ -37,12 +38,18 @@ use crate::handlers::{
         reject_unknown_fields,
     },
 };
+#[cfg(feature = "grpc-head-cache")]
+use crate::head_cache::HeadCache;
 use crate::hydration::{
     BlockBuildError, BlockHydrationError, SplitBlockPayload, assemble_block_chunks,
     block_hydration_chunk_count, hydrate_block_payload, hydrate_serialize_block_chunk,
     split_block_payload,
 };
 use crate::metrics;
+#[cfg(feature = "grpc-head-cache")]
+use crate::recent_block_responses::{
+    PrebuildShape, RecentAccess, RecentBlockKey, RecentBuildError,
+};
 use crate::rpc::{
     json_rpc_error_response, json_rpc_internal_error_response, json_rpc_node_unhealthy_response,
     json_rpc_null_response, json_rpc_success_response, json_rpc_success_response_from_result_bytes,
@@ -84,33 +91,48 @@ impl GetBlockFetchPlan {
         Self { footer, ..self }
     }
 
+    /// Shape metric labels; `commitment` is confirmed or finalized once processed is rejected.
+    fn shape(self, commitment: CommitmentLevel) -> metrics::GetBlockRequestShape {
+        metrics::GetBlockRequestShape {
+            encoding: match self.encoding {
+                UiTransactionEncoding::Json => "json",
+                UiTransactionEncoding::JsonParsed => "jsonParsed",
+                UiTransactionEncoding::Base58 => "base58",
+                UiTransactionEncoding::Base64 => "base64",
+                UiTransactionEncoding::Binary => "other",
+            },
+            details: match self.transaction_details {
+                TransactionDetails::Full => "full",
+                TransactionDetails::Signatures => "signatures",
+                TransactionDetails::None => "none",
+                TransactionDetails::Accounts => "accounts",
+            },
+            rewards: if self.show_rewards { "true" } else { "false" },
+            msv: match self.max_supported_transaction_version {
+                Some(_) => "set",
+                None => "none",
+            },
+            commitment: match commitment {
+                CommitmentLevel::Finalized => "finalized",
+                CommitmentLevel::Confirmed | CommitmentLevel::Processed => "confirmed",
+            },
+        }
+    }
+
     fn needs_blocking_hydration(self) -> bool {
         !matches!(self.transaction_details, TransactionDetails::None)
     }
 
     fn cache_key(self, slot: u64, commitment: CommitmentLevel) -> BlockResponseCacheKey {
-        let encoding = match self.encoding {
-            UiTransactionEncoding::Binary => 0,
-            UiTransactionEncoding::Base58 => 1,
-            UiTransactionEncoding::Base64 => 2,
-            UiTransactionEncoding::Json => 3,
-            UiTransactionEncoding::JsonParsed => 4,
-        };
-        let transaction_details = match self.transaction_details {
-            TransactionDetails::Full => 0,
-            TransactionDetails::Signatures => 1,
-            TransactionDetails::None => 2,
-            TransactionDetails::Accounts => 3,
-        };
-        BlockResponseCacheKey {
+        BlockResponseCacheKey::new(
             slot,
             commitment,
-            encoding,
-            transaction_details,
-            show_rewards: self.show_rewards,
-            max_supported_transaction_version: self.max_supported_transaction_version,
-            footer: self.footer,
-        }
+            self.encoding,
+            self.transaction_details,
+            self.show_rewards,
+            self.max_supported_transaction_version,
+            self.footer,
+        )
     }
 }
 
@@ -269,19 +291,51 @@ pub(super) fn merge_sorted_block_slots(
     merged
 }
 
+fn block_not_available_error(slot: u64) -> (i32, String) {
+    (
+        JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32,
+        format!("Block not available for slot {slot}"),
+    )
+}
+
+fn slot_skipped_error(slot: u64) -> (i32, String) {
+    (
+        JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
+        format!("Slot {slot} was skipped, or missing in long-term storage"),
+    )
+}
+
 // `getBlock` is served from ClickHouse, so classify misses against ClickHouse ingest state.
-fn classify_get_block_miss(slot: u64, clickhouse_latest: u64) -> (i32, String) {
+// Returns the error and its `get_block_not_found` reason.
+fn classify_get_block_miss(slot: u64, clickhouse_latest: u64) -> (i32, String, &'static str) {
     if slot > clickhouse_latest {
-        (
-            JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32,
-            format!("Block not available for slot {slot}"),
-        )
+        let (code, message) = block_not_available_error(slot);
+        (code, message, "above_clickhouse_latest")
     } else {
-        (
-            JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
-            format!("Slot {slot} was skipped, or missing in long-term storage"),
-        )
+        let (code, message) = slot_skipped_error(slot);
+        (code, message, "clickhouse_not_found")
     }
+}
+
+/// Answers a getBlock miss that the head's finalized parent-link chain proves skipped,
+/// without the disk tier or ClickHouse. `None` leaves the request to the next tier.
+#[cfg(feature = "grpc-head-cache")]
+fn head_proof_miss_response(
+    state: &AppState,
+    route: &mut RouteMetric,
+    id: &Value,
+    slot: u64,
+) -> Option<Response> {
+    use crate::head_cache::coverage::SlotStatus;
+    let head = state.head_cache.as_ref()?;
+    if head.slot_status(slot) != SlotStatus::ProvenSkipped {
+        return None;
+    }
+    let (code, message) = slot_skipped_error(slot);
+    route.source_head_cache();
+    route.not_found();
+    metrics::get_block_not_found("proven_skipped");
+    Some(json_rpc_error_response(id.clone(), code, message, None))
 }
 
 pub(crate) async fn handle_get_block_height(
@@ -1263,23 +1317,53 @@ fn join_error(err: tokio::task::JoinError) -> BlockResultBuildError {
     BlockResultBuildError::Failed(err.to_string())
 }
 
+/// Blocking-pool permits for one getBlock build.
+struct BlockHydrationPermits {
+    semaphore: Arc<Semaphore>,
+    parallelism: usize,
+    /// A permit the caller already holds; without one the first permit is awaited.
+    lead: Option<OwnedSemaphorePermit>,
+}
+
+impl BlockHydrationPermits {
+    fn shared(state: &AppState) -> Self {
+        Self {
+            semaphore: state.hydration_sem.clone(),
+            parallelism: state.get_block_hydration_parallelism,
+            lead: None,
+        }
+    }
+}
+
 /// Hydrates and serializes on the blocking pool. Large full/accounts blocks
 /// are split into contiguous chunks, one hydration permit each; extra permits
 /// are taken only when immediately free, so the total never exceeds
 /// `HYDRATION_CPU_CONCURRENCY` and a busy pool degrades to one thread.
 async fn build_block_result_blocking(
-    state: &AppState,
+    pool: BlockHydrationPermits,
     payload: StoredBlockPayload,
     fetch_plan: GetBlockFetchPlan,
 ) -> Result<Bytes, BlockResultBuildError> {
     let closed = |_| BlockResultBuildError::Failed("hydration semaphore closed".to_string());
-    let semaphore = state.hydration_sem.clone();
-    let mut permits = vec![semaphore.clone().acquire_owned().await.map_err(closed)?];
+    let BlockHydrationPermits {
+        semaphore,
+        parallelism,
+        lead,
+    } = pool;
+    let lead = match lead {
+        Some(lead) => lead,
+        // Only the shared request pool comes without a lead; record its wait as AppState does.
+        None => {
+            let _wait = metrics::HydrationPermitWait::start("getBlock");
+            semaphore.clone().acquire_owned().await.map_err(closed)?
+        }
+    };
+    let mut permits = vec![lead];
 
     let wanted = match fetch_plan.transaction_details {
         TransactionDetails::Full | TransactionDetails::Accounts => block_hydration_chunk_count(
             payload.observed_transaction_count().unwrap_or(0),
-            state.get_block_hydration_parallelism,
+            parallelism,
         ),
         TransactionDetails::Signatures | TransactionDetails::None => 1,
     };
@@ -1376,6 +1460,27 @@ async fn build_block_result_chunked(
     })
 }
 
+/// Hydrates and serializes a block result, then adds the footer when requested.
+async fn build_block_result(
+    pool: BlockHydrationPermits,
+    payload: StoredBlockPayload,
+    fetch_plan: GetBlockFetchPlan,
+) -> Result<Bytes, BlockResultBuildError> {
+    let footer = fetch_plan.footer.then(|| payload.metadata().footer.clone());
+    let started = Instant::now();
+    let result = if fetch_plan.needs_blocking_hydration() {
+        build_block_result_blocking(pool, payload, fetch_plan).await
+    } else {
+        encode_block_result(payload, fetch_plan)
+    };
+    let result = match (result, footer) {
+        (Ok(bytes), Some(footer)) => insert_footer_field(&bytes, footer.as_ref()),
+        (result, _) => result,
+    };
+    metrics::get_block_phase("hydrate_serialize", started.elapsed().as_secs_f64());
+    result
+}
+
 /// Hydrate a block payload and build the JSON-RPC response; shared by the
 /// head-cache, disk-cache, and ClickHouse branches of getBlock.
 async fn respond_with_hydrated_block(
@@ -1411,21 +1516,8 @@ async fn respond_with_hydrated_block(
         }
     };
 
-    let footer = fetch_plan.footer.then(|| payload.metadata().footer.clone());
-    let build_result = async move {
-        let started = Instant::now();
-        let result = if fetch_plan.needs_blocking_hydration() {
-            build_block_result_blocking(state, payload, fetch_plan).await
-        } else {
-            encode_block_result(payload, fetch_plan)
-        };
-        let result = match (result, footer) {
-            (Ok(bytes), Some(footer)) => insert_footer_field(&bytes, footer.as_ref()),
-            (result, _) => result,
-        };
-        metrics::get_block_phase("hydrate_serialize", started.elapsed().as_secs_f64());
-        result
-    };
+    let build_result =
+        build_block_result(BlockHydrationPermits::shared(state), payload, fetch_plan);
 
     let cache_key_for_errors = cache_key.clone();
     let built = match cache_key {
@@ -1487,6 +1579,165 @@ async fn respond_with_hydrated_block(
             Ok(resp)
         }
     }
+}
+
+#[cfg(feature = "grpc-head-cache")]
+impl From<BlockResultBuildError> for RecentBuildError {
+    fn from(err: BlockResultBuildError) -> Self {
+        match err {
+            BlockResultBuildError::UnsupportedTransactionVersion(version) => {
+                Self::UnsupportedTransactionVersion(version)
+            }
+            BlockResultBuildError::Failed(message) => Self::Failed(message),
+        }
+    }
+}
+
+#[cfg(feature = "grpc-head-cache")]
+impl From<PrebuildShape> for GetBlockFetchPlan {
+    fn from(shape: PrebuildShape) -> Self {
+        Self::new(&RpcBlockConfig {
+            encoding: Some(shape.encoding),
+            transaction_details: Some(shape.transaction_details),
+            rewards: Some(shape.rewards),
+            commitment: None,
+            max_supported_transaction_version: shape.max_supported_transaction_version,
+        })
+    }
+}
+
+/// The head block for a recent-store key, or `Unavailable` when the head no longer holds it.
+#[cfg(feature = "grpc-head-cache")]
+fn recent_head_payload(
+    head: &HeadCache,
+    key: &RecentBlockKey,
+    commitment: CommitmentLevel,
+    fetch_plan: GetBlockFetchPlan,
+) -> Result<StoredBlockPayload, RecentBuildError> {
+    let payload = head
+        .get_block(key.slot(), commitment, fetch_plan.transaction_details)
+        .ok_or(RecentBuildError::Unavailable)?;
+    if payload.metadata().blockhash != key.blockhash()
+        || !block_payload_has_consistent_transaction_count(&payload)
+    {
+        return Err(RecentBuildError::Unavailable);
+    }
+    Ok(payload)
+}
+
+/// Serves a head-cache block from the recent store, building it once per blockhash and
+/// shape. `None` falls through to the uncached head read.
+#[cfg(feature = "grpc-head-cache")]
+async fn respond_from_recent_store(
+    state: &Arc<AppState>,
+    head: &Arc<HeadCache>,
+    id: &Value,
+    route: &mut RouteMetric,
+    slot: u64,
+    commitment: CommitmentLevel,
+    fetch_plan: GetBlockFetchPlan,
+) -> Option<Result<Response, StatusCode>> {
+    // The footer can change under the same blockhash, so it is read here, not stored.
+    let (blockhash, footer) = if fetch_plan.footer {
+        let payload = head.get_block(slot, commitment, TransactionDetails::None)?;
+        let metadata = payload.metadata();
+        (metadata.blockhash, Some(metadata.footer.clone()))
+    } else {
+        (head.block_identity(slot, commitment)?.0, None)
+    };
+    let body_plan = fetch_plan.with_footer(false);
+    let key = RecentBlockKey::new(body_plan.cache_key(slot, commitment), blockhash);
+    let build = {
+        let state = state.clone();
+        let head = head.clone();
+        let key = key.clone();
+        async move {
+            let payload = recent_head_payload(&head, &key, commitment, body_plan)?;
+            build_block_result(BlockHydrationPermits::shared(&state), payload, body_plan)
+                .await
+                .map_err(RecentBuildError::from)
+        }
+    };
+    let built = state.recent_block_responses.get_or_build(key, build).await;
+    let built = match built {
+        Ok((body, access)) => {
+            metrics::get_block_recent_store_request(access.label());
+            if access == RecentAccess::Built {
+                route.source_head_cache();
+            } else {
+                route.source_response_cache();
+            }
+            match footer {
+                Some(footer) => insert_footer_field(&body, footer.as_ref()),
+                None => Ok(body),
+            }
+        }
+        Err(err) => {
+            let err = match err.as_ref() {
+                RecentBuildError::Unavailable => return None,
+                RecentBuildError::UnsupportedTransactionVersion(version) => {
+                    BlockResultBuildError::UnsupportedTransactionVersion(*version)
+                }
+                RecentBuildError::Failed(message) => BlockResultBuildError::Failed(message.clone()),
+            };
+            route.source_head_cache();
+            Err(err)
+        }
+    };
+    let id = id.clone();
+    Some(Ok(match built {
+        Ok(result_bytes) => {
+            route.success();
+            json_rpc_success_response_from_result_bytes(id, result_bytes)
+        }
+        Err(BlockResultBuildError::UnsupportedTransactionVersion(version)) => {
+            route.rpc_error();
+            json_rpc_error_response(
+                id,
+                JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32,
+                unsupported_transaction_version_message(version),
+                None,
+            )
+        }
+        Err(BlockResultBuildError::Failed(message)) => {
+            error!("Failed to build block {} response: {}", slot, message);
+            json_rpc_internal_error_response(id)
+        }
+    }))
+}
+
+/// Builds one prebuild shape of a confirmed head block into the recent store, holding
+/// `lead` from the prebuild pool.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) async fn prebuild_recent_block(
+    state: &Arc<AppState>,
+    head: &Arc<HeadCache>,
+    key: RecentBlockKey,
+    shape: PrebuildShape,
+    semaphore: Arc<Semaphore>,
+    lead: OwnedSemaphorePermit,
+) -> Result<RecentAccess, Arc<RecentBuildError>> {
+    let fetch_plan = GetBlockFetchPlan::from(shape);
+    let pool = BlockHydrationPermits {
+        semaphore,
+        parallelism: state.get_block_hydration_parallelism,
+        lead: Some(lead),
+    };
+    let build = {
+        let head = head.clone();
+        let key = key.clone();
+        async move {
+            let payload = recent_head_payload(&head, &key, CommitmentLevel::Confirmed, fetch_plan)?;
+            build_block_result(pool, payload, fetch_plan)
+                .await
+                .map_err(RecentBuildError::from)
+        }
+    };
+    state
+        .recent_block_responses
+        .get_or_build(key, build)
+        .await
+        .map(|(_, access)| access)
 }
 
 /// Returns the block config and whether footer fields were requested (default false).
@@ -1564,6 +1815,7 @@ pub(crate) async fn handle_get_block(
             Some(json!({ "requestedCommitment": commitment.commitment })),
         ));
     }
+    route.get_block_shape(fetch_plan.shape(commitment.commitment));
 
     // Entries are only ever built from finalized data (see the per-tier keys
     // below), so an entry proves the slot is finalized. A confirmed request for
@@ -1601,6 +1853,24 @@ pub(crate) async fn handle_get_block(
     #[cfg(feature = "grpc-head-cache")]
     if let Some(cache) = state.head_cache.as_ref() {
         route.head_cache_read();
+        // Requests the finalized response cache would store keep using it.
+        let finalized_cache_stores =
+            requested_finalized && !fetch_plan.footer && state.block_response_cache.enabled();
+        if !finalized_cache_stores
+            && state.recent_block_responses.enabled()
+            && let Some(response) = respond_from_recent_store(
+                &state,
+                cache,
+                &id,
+                &mut route,
+                slot,
+                commitment.commitment,
+                fetch_plan,
+            )
+            .await
+        {
+            return response;
+        }
         if let Some(payload) =
             cache.get_block(slot, commitment.commitment, fetch_plan.transaction_details)
         {
@@ -1632,6 +1902,11 @@ pub(crate) async fn handle_get_block(
                 .await;
             }
         }
+    }
+
+    #[cfg(feature = "grpc-head-cache")]
+    if let Some(resp) = head_proof_miss_response(&state, &mut route, &id, slot) {
+        return Ok(resp);
     }
 
     // Disk tier: serves any individually covered slot (all stored data is
@@ -1669,12 +1944,9 @@ pub(crate) async fn handle_get_block(
             crate::disk_cache::DiskBlockResult::Skipped => {
                 route.source_disk_cache();
                 route.not_found();
-                return Ok(json_rpc_error_response(
-                    id,
-                    JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
-                    format!("Slot {slot} was skipped, or missing in long-term storage"),
-                    None,
-                ));
+                metrics::get_block_not_found("disk_skipped");
+                let (code, message) = slot_skipped_error(slot);
+                return Ok(json_rpc_error_response(id, code, message, None));
             }
             crate::disk_cache::DiskBlockResult::NotCovered => {}
         }
@@ -1789,7 +2061,8 @@ pub(crate) async fn handle_get_block(
         };
 
         route.not_found();
-        let (code, message) = classify_get_block_miss(slot, clickhouse_latest);
+        let (code, message, reason) = classify_get_block_miss(slot, clickhouse_latest);
+        metrics::get_block_not_found(reason);
         let mut resp = json_rpc_error_response(id, code, message, None);
         add_downstream_header(&mut resp, &timings);
         return Ok(resp);
@@ -2800,6 +3073,66 @@ mod tests {
     }
 
     #[test]
+    fn get_block_shape_labels_cover_representative_requests() {
+        fn shape(config: Value, commitment: CommitmentLevel) -> [&'static str; 5] {
+            let (config, _) = parse_block_config(config).expect("valid config");
+            let shape = GetBlockFetchPlan::new(&config).shape(commitment);
+            [
+                shape.encoding,
+                shape.details,
+                shape.rewards,
+                shape.msv,
+                shape.commitment,
+            ]
+        }
+        let confirmed = CommitmentLevel::Confirmed;
+        let finalized = CommitmentLevel::Finalized;
+        assert_eq!(
+            shape(
+                json!({
+                    "encoding": "json",
+                    "transactionDetails": "full",
+                    "rewards": false,
+                    "commitment": "confirmed",
+                    "maxSupportedTransactionVersion": 0
+                }),
+                confirmed
+            ),
+            ["json", "full", "false", "set", "confirmed"]
+        );
+        // Agave defaults: json, full, rewards true, no version cap.
+        assert_eq!(
+            shape(json!(null), finalized),
+            ["json", "full", "true", "none", "finalized"]
+        );
+        assert_eq!(
+            shape(json!("base64"), finalized),
+            ["base64", "full", "true", "none", "finalized"]
+        );
+        assert_eq!(
+            shape(
+                json!({"encoding": "jsonParsed", "transactionDetails": "accounts"}),
+                confirmed
+            ),
+            ["jsonParsed", "accounts", "true", "none", "confirmed"]
+        );
+        assert_eq!(
+            shape(
+                json!({"encoding": "base58", "transactionDetails": "signatures", "rewards": true}),
+                finalized
+            ),
+            ["base58", "signatures", "true", "none", "finalized"]
+        );
+        assert_eq!(
+            shape(
+                json!({"encoding": "binary", "transactionDetails": "none", "maxSupportedTransactionVersion": 0}),
+                finalized
+            ),
+            ["other", "none", "true", "set", "finalized"]
+        );
+    }
+
+    #[test]
     fn footer_flag_is_part_of_the_response_cache_key() {
         let plan = GetBlockFetchPlan::new(&RpcBlockConfig::default());
         let with = plan
@@ -2876,8 +3209,8 @@ mod tests {
         }
     }
 
-    /// Local benchmark for the `hydrate_serialize` phase on a large synthetic
-    /// block: `cargo test ... get_block_hydration_benchmark -- --ignored --nocapture`.
+    /// Release bench of `hydrate_serialize` and the recent getBlock full response path: `cargo test --release
+    /// -p superbank-rpc --all-features --locked get_block_hydration_benchmark -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn get_block_hydration_benchmark() {
@@ -2999,6 +3332,100 @@ mod tests {
                     samples[samples.len() - 1],
                 );
             }
+        }
+        #[cfg(feature = "grpc-head-cache")]
+        recent_get_block_full_path_benchmark(transactions, iterations, realistic).await;
+    }
+
+    /// Recent confirmed getBlock (json, full, rewards false, version 0) served by the head cache
+    /// through dispatch, the JSON-RPC envelope and HTTP status promotion.
+    #[cfg(feature = "grpc-head-cache")]
+    async fn recent_get_block_full_path_benchmark(
+        transactions: usize,
+        iterations: usize,
+        realistic: bool,
+    ) {
+        use crate::head_cache::HeadCache;
+        use crate::solana_sdk::signature::Signature;
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+
+        let mut block = if realistic {
+            crate::tests::realistic_synthetic_block_record(transactions)
+        } else {
+            crate::tests::large_synthetic_block_record(transactions, true)
+        };
+        // Version 0 is the highest version this request accepts.
+        for record in &mut block.transactions {
+            if record.tx_version == Some(1) {
+                record.tx_version = Some(0);
+                record.tx_config_priority_fee = None;
+                record.tx_config_compute_unit_limit = None;
+                record.tx_config_loaded_accounts_data_size_limit = None;
+                record.tx_config_heap_size = None;
+            }
+        }
+        let slot = block.metadata.slot;
+        let cache = Arc::new(HeadCache::new(64, 1_000));
+        cache.note_block_metadata(block.metadata.clone());
+        cache.note_slot_commitment(slot, CommitmentLevel::Confirmed);
+        for record in block.transactions {
+            let idx = record.slot_idx;
+            let signature = Signature::from(record.signature);
+            cache.insert_for_tests(signature, record, idx, &[], CommitmentLevel::Confirmed);
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBlock",
+            "params": [slot, {
+                "encoding": "json",
+                "transactionDetails": "full",
+                "rewards": false,
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0
+            }]
+        });
+        let body = Bytes::from(serde_json::to_vec(&request).unwrap());
+
+        for emit_http_errors in [false, true] {
+            let mut state = crate::tests::test_state();
+            {
+                let state = Arc::get_mut(&mut state).unwrap();
+                state.head_cache = Some(cache.clone());
+                state.emit_http_errors = emit_http_errors;
+            }
+            let mut samples = Vec::with_capacity(iterations);
+            let mut last = Bytes::new();
+            for _ in 0..iterations {
+                let started = Instant::now();
+                let response = crate::handlers::handle_json_rpc_with_headers(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    body.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                last = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            let parsed: Value = serde_json::from_slice(&last).unwrap();
+            assert!(parsed.get("error").is_none(), "{}", parsed["error"]);
+            assert_eq!(
+                parsed["result"]["transactions"].as_array().unwrap().len(),
+                transactions
+            );
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "bench recent realistic={realistic} shape=json/full/rewards=false/msv=0/confirmed source=head txs={transactions} emit_http_errors={emit_http_errors} bytes={} p50_ms={:.2} min_ms={:.2} max_ms={:.2}",
+                last.len(),
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1],
+            );
         }
     }
 
@@ -3369,14 +3796,16 @@ mod tests {
 
     #[test]
     fn classify_get_block_miss_returns_block_not_available_above_clickhouse_latest() {
-        let (code, message) = classify_get_block_miss(11, 10);
+        let (code, message, reason) = classify_get_block_miss(11, 10);
         assert_eq!(code, JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32);
         assert_eq!(message, "Block not available for slot 11");
+        assert_eq!(reason, "above_clickhouse_latest");
+        assert_eq!((code, message), block_not_available_error(11));
     }
 
     #[test]
     fn classify_get_block_miss_returns_long_term_storage_error_at_clickhouse_latest() {
-        let (code, message) = classify_get_block_miss(10, 10);
+        let (code, message, reason) = classify_get_block_miss(10, 10);
         assert_eq!(
             code,
             JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32
@@ -3385,11 +3814,13 @@ mod tests {
             message,
             "Slot 10 was skipped, or missing in long-term storage"
         );
+        assert_eq!(reason, "clickhouse_not_found");
+        assert_eq!((code, message), slot_skipped_error(10));
     }
 
     #[test]
     fn classify_get_block_miss_returns_long_term_storage_error_below_clickhouse_latest() {
-        let (code, message) = classify_get_block_miss(9, 10);
+        let (code, message, _) = classify_get_block_miss(9, 10);
         assert_eq!(
             code,
             JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32
@@ -3402,7 +3833,7 @@ mod tests {
 
     #[test]
     fn classify_get_block_miss_treats_slots_above_zero_latest_as_not_available() {
-        let (code, message) = classify_get_block_miss(1, 0);
+        let (code, message, _) = classify_get_block_miss(1, 0);
         assert_eq!(code, JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32);
         assert_eq!(message, "Block not available for slot 1");
     }

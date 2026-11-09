@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
 use crate::head_cache::dragonsmouth::parse_block_meta;
+use crate::head_cache::{HeadBankEvent, HeadBankEventKind};
 use crate::solana_sdk::{pubkey::Pubkey, signature::Signature};
 use yellowstone_grpc_proto::prelude::{
     Message, MessageHeader, SubscribeUpdateBlockMeta, Transaction, TransactionStatusMeta,
@@ -724,4 +725,483 @@ async fn status_rpc_does_not_promote_replaced_or_reconnected_bank_results() {
         processed["result"]["value"][2]["confirmationStatus"],
         "processed"
     );
+}
+
+fn drain(
+    events: &mut tokio::sync::broadcast::Receiver<HeadBankEvent>,
+) -> Vec<(u64, u8, HeadBankEventKind)> {
+    std::iter::from_fn(|| events.try_recv().ok())
+        .map(|event| (event.slot, event.blockhash[0], event.kind))
+        .collect()
+}
+
+#[test]
+fn bank_events_announce_each_commitment_once_per_published_bank() {
+    use HeadBankEventKind::{Confirmed, Discarded, Finalized};
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    let mut events = cache.subscribe_bank_events();
+
+    freeze(&cache, session, 42, 1, 1);
+    assert_eq!(drain(&mut events), vec![]);
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    assert_eq!(drain(&mut events), vec![(42, 1, Confirmed)]);
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Finalized, Some(41));
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Finalized, Some(41));
+    assert_eq!(drain(&mut events), vec![(42, 1, Finalized)]);
+
+    // Status before sealing: announced when the block becomes readable.
+    cache.commit_bank(session, 43, 3, CommitmentLevel::Confirmed, Some(42));
+    assert_eq!(drain(&mut events), vec![]);
+    freeze(&cache, session, 43, 3, 3);
+    assert_eq!(drain(&mut events), vec![(43, 3, Confirmed)]);
+
+    // A jump to finalized still announces confirmed first.
+    freeze(&cache, session, 44, 4, 4);
+    cache.commit_bank(session, 44, 4, CommitmentLevel::Finalized, Some(43));
+    assert_eq!(
+        drain(&mut events),
+        vec![(44, 4, Confirmed), (44, 4, Finalized)]
+    );
+
+    // A canonical status for another bank discards the published processed bank.
+    freeze(&cache, session, 45, 5, 5);
+    freeze(&cache, session, 45, 6, 6);
+    cache.commit_bank(session, 45, 6, CommitmentLevel::Confirmed, Some(44));
+    assert_eq!(
+        drain(&mut events),
+        vec![(45, 5, Discarded), (45, 6, Confirmed)]
+    );
+
+    // Discarding a published bank; an unpublished sibling sends nothing.
+    freeze(&cache, session, 46, 7, 7);
+    freeze(&cache, session, 46, 8, 8);
+    cache.discard_bank(session, 46, 8);
+    assert_eq!(drain(&mut events), vec![]);
+    cache.discard_bank(session, 46, 7);
+    assert_eq!(drain(&mut events), vec![(46, 7, Discarded)]);
+}
+
+#[test]
+fn bank_events_report_slots_leaving_the_head() {
+    use HeadBankEventKind::{Confirmed, Evicted};
+    let cache = HeadCache::new(2, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Confirmed);
+    let mut events = cache.subscribe_bank_events();
+    freeze(&cache, session, 10, 1, 1);
+    cache.commit_bank(session, 10, 1, CommitmentLevel::Confirmed, Some(9));
+    freeze(&cache, session, 11, 2, 2);
+    cache.commit_bank(session, 11, 2, CommitmentLevel::Confirmed, Some(10));
+    assert_eq!(
+        drain(&mut events),
+        vec![(10, 1, Confirmed), (11, 2, Confirmed)]
+    );
+    freeze(&cache, session, 12, 3, 3);
+    cache.commit_bank(session, 12, 3, CommitmentLevel::Confirmed, Some(11));
+    assert_eq!(
+        drain(&mut events),
+        vec![(10, 1, Evicted), (12, 3, Confirmed)]
+    );
+    // A late status for an evicted slot does not announce it again.
+    cache.commit_bank(session, 10, 1, CommitmentLevel::Finalized, Some(9));
+    assert_eq!(drain(&mut events), vec![]);
+    cache.end_bank_session(session);
+    let mut left = drain(&mut events);
+    left.sort_unstable_by_key(|event| event.0);
+    assert_eq!(left, vec![(11, 2, Evicted), (12, 3, Evicted)]);
+}
+
+#[test]
+fn commit_notify_wakes_waiters_after_commit_and_discard() {
+    use futures_util::FutureExt;
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    for step in 0..2 {
+        let notified = cache.commit_notify().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        cache.stage_bank_metadata(session, 2, metadata(43, 2));
+        assert!(
+            notified.as_mut().now_or_never().is_none(),
+            "staging is silent"
+        );
+        if step == 0 {
+            cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+        } else {
+            cache.discard_bank(session, 43, 2);
+        }
+        assert!(notified.now_or_never().is_some(), "step {step}");
+    }
+}
+
+/// A cache whose bank 1 holds `[1; 64]` at `processed` in slot 42.
+fn waiting_cache(wait_ms: u64, max_waiters: usize) -> (Arc<HeadCache>, u64) {
+    let cache = HeadCache::new(32, 64)
+        .with_commitment_wait(std::time::Duration::from_millis(wait_ms), max_waiters);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    (Arc::new(cache), session)
+}
+
+fn spawn_waiter(
+    cache: &Arc<HeadCache>,
+    commitment: CommitmentLevel,
+) -> tokio::task::JoinHandle<Option<Arc<crate::clickhouse::StoredTransactionRecord>>> {
+    let cache = cache.clone();
+    tokio::spawn(async move {
+        cache
+            .get_tx_waiting(&Signature::from([1; 64]), commitment, Some(42))
+            .await
+    })
+}
+
+const SHORT: std::time::Duration = std::time::Duration::from_millis(20);
+
+#[tokio::test]
+async fn commitment_wait_returns_a_transaction_committed_during_the_wait() {
+    let (cache, session) = waiting_cache(10_000, 4);
+    let started = Instant::now();
+    let waiter = spawn_waiter(&cache, CommitmentLevel::Confirmed);
+    tokio::time::sleep(SHORT).await;
+    // Another bank wakes the waiter without raising its signature.
+    freeze(&cache, session, 43, 2, 2);
+    tokio::time::sleep(SHORT).await;
+    assert!(!waiter.is_finished());
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    let record = waiter.await.unwrap().expect("confirmed during the wait");
+    assert_eq!(record.slot, 42);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn commitment_wait_skips_when_off_or_the_head_lacks_the_signature() {
+    use crate::head_cache::commitment_wait::CAPPED;
+    use futures_util::FutureExt;
+    let held = Signature::from([1; 64]);
+    let off = HeadCache::new(32, 64);
+    let session = off.start_bank_session(CommitmentLevel::Processed);
+    freeze(&off, session, 42, 1, 1);
+    let lookup = |cache: &HeadCache, signature: &Signature, commitment, slot| {
+        cache
+            .get_tx_waiting(signature, commitment, slot)
+            .now_or_never()
+            .expect("resolves without waiting")
+    };
+    assert!(lookup(&off, &held, CommitmentLevel::Confirmed, None).is_none());
+
+    let (cache, _) = waiting_cache(10_000, 4);
+    let unknown = Signature::from([9; 64]);
+    assert!(lookup(&cache, &unknown, CommitmentLevel::Confirmed, None).is_none());
+    assert!(lookup(&cache, &held, CommitmentLevel::Confirmed, Some(41)).is_none());
+    assert!(lookup(&cache, &held, CommitmentLevel::Processed, None).is_some());
+
+    let (none_allowed, _) = waiting_cache(10_000, 0);
+    let capped = crate::metrics::head_cache_commitment_waits_count(CAPPED);
+    assert!(lookup(&none_allowed, &held, CommitmentLevel::Confirmed, None).is_none());
+    assert!(crate::metrics::head_cache_commitment_waits_count(CAPPED) > capped);
+}
+
+#[tokio::test]
+async fn commitment_wait_times_out_without_returning_a_lower_commitment() {
+    use crate::head_cache::commitment_wait::TIMEOUT;
+    let (cache, session) = waiting_cache(150, 4);
+    let timeouts = crate::metrics::head_cache_commitment_waits_count(TIMEOUT);
+    let started = Instant::now();
+    let waiter = spawn_waiter(&cache, CommitmentLevel::Finalized);
+    tokio::time::sleep(SHORT).await;
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    assert!(waiter.await.unwrap().is_none());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(150),
+        "{elapsed:?}"
+    );
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert!(crate::metrics::head_cache_commitment_waits_count(TIMEOUT) > timeouts);
+}
+
+#[tokio::test]
+async fn commitment_wait_stops_when_the_head_drops_the_signature() {
+    use crate::head_cache::commitment_wait::GONE;
+    let (cache, session) = waiting_cache(10_000, 4);
+    let gone = crate::metrics::head_cache_commitment_waits_count(GONE);
+    let started = Instant::now();
+    let waiter = spawn_waiter(&cache, CommitmentLevel::Confirmed);
+    tokio::time::sleep(SHORT).await;
+    cache.discard_bank(session, 42, 1);
+    assert!(waiter.await.unwrap().is_none());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(crate::metrics::head_cache_commitment_waits_count(GONE) > gone);
+}
+
+#[tokio::test]
+async fn commitment_wait_caps_concurrent_waiters() {
+    use futures_util::FutureExt;
+    let (cache, session) = waiting_cache(10_000, 1);
+    let held = Signature::from([1; 64]);
+    let first = cache.get_tx_waiting(&held, CommitmentLevel::Confirmed, None);
+    tokio::pin!(first);
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    let second = cache.get_tx_waiting(&held, CommitmentLevel::Confirmed, None);
+    assert!(matches!(second.now_or_never(), Some(None)), "past the cap");
+
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    assert!(first.await.is_some());
+    // A finished or dropped waiter returns its permit.
+    for _ in 0..2 {
+        let next = cache.get_tx_waiting(&held, CommitmentLevel::Finalized, None);
+        tokio::pin!(next);
+        assert!(futures_util::poll!(next.as_mut()).is_pending());
+    }
+}
+
+#[test]
+fn block_identity_matches_get_block() {
+    use solana_transaction_status::TransactionDetails;
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    let identity_and_block = |commitment| {
+        let identity = cache.block_identity(42, commitment);
+        let block = cache
+            .get_block(42, commitment, TransactionDetails::Full)
+            .map(|block| block.metadata().blockhash);
+        assert_eq!(identity.map(|(hash, _)| hash), block, "{commitment:?}");
+        identity
+    };
+    assert_eq!(identity_and_block(CommitmentLevel::Processed), None);
+    freeze(&cache, session, 42, 1, 1);
+    assert_eq!(
+        identity_and_block(CommitmentLevel::Processed),
+        Some(([1; 32], CommitmentLevel::Processed))
+    );
+    assert_eq!(identity_and_block(CommitmentLevel::Confirmed), None);
+    freeze(&cache, session, 42, 2, 2);
+    cache.commit_bank(session, 42, 2, CommitmentLevel::Confirmed, Some(41));
+    assert_eq!(
+        identity_and_block(CommitmentLevel::Confirmed),
+        Some(([2; 32], CommitmentLevel::Confirmed))
+    );
+    assert_eq!(identity_and_block(CommitmentLevel::Finalized), None);
+    cache.commit_bank(session, 42, 2, CommitmentLevel::Finalized, Some(41));
+    assert_eq!(
+        identity_and_block(CommitmentLevel::Confirmed),
+        Some(([2; 32], CommitmentLevel::Finalized))
+    );
+    cache.discard_bank(session, 42, 2);
+    assert_eq!(identity_and_block(CommitmentLevel::Processed), None);
+}
+
+/// Stages bank 1 of `slot` on `parent`; `transactions` other than 1 cannot seal.
+fn finalize_on(cache: &HeadCache, session: u64, slot: u64, parent: u64, transactions: u64) {
+    let mut meta = metadata(slot, slot as u8);
+    meta.parent_slot = parent;
+    meta.parent_blockhash = [parent as u8; 32];
+    meta.executed_transaction_count = transactions;
+    cache.stage_bank_metadata(session, 1, meta);
+    stage_entry(cache, session, slot, 1, 1);
+    let tx = transaction(slot as u8);
+    cache.freeze_bank(session, slot, 1, [slot as u8; 32], vec![tx]);
+    cache.commit_bank(session, slot, 1, CommitmentLevel::Finalized, Some(parent));
+}
+
+#[test]
+fn slot_status_proves_skips_on_sealed_banks_and_stops_at_an_unsealed_one() {
+    use crate::head_cache::coverage::SlotStatus::{
+        AboveFinalizedTip, Present, ProvenSkipped, Unknown,
+    };
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    finalize_on(&cache, session, 40, 39, 1);
+    finalize_on(&cache, session, 42, 40, 1);
+    let status = |slots: std::ops::RangeInclusive<u64>| {
+        slots
+            .map(|slot| cache.slot_status(slot))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        status(39..=43),
+        vec![Unknown, Present, ProvenSkipped, Present, AboveFinalizedTip]
+    );
+    // Slot 43 is a finalized block whose bank never sealed: no link, so no trusted chain.
+    finalize_on(&cache, session, 43, 42, 2);
+    assert_eq!(status(40..=44), vec![Unknown; 5]);
+    finalize_on(&cache, session, 44, 43, 1);
+    finalize_on(&cache, session, 46, 44, 1);
+    assert_eq!(
+        status(40..=47),
+        vec![
+            Unknown,
+            Unknown,
+            Unknown,
+            Unknown,
+            Present,
+            ProvenSkipped,
+            Present,
+            AboveFinalizedTip
+        ]
+    );
+    cache.end_bank_session(session);
+    assert_eq!(status(44..=47), vec![Unknown; 4]);
+}
+
+type Corruption = dyn Fn(
+    &mut BlockMetadataRecord,
+    &mut Vec<SubscribeUpdateTransactionInfo>,
+    &mut Vec<yellowstone_grpc_proto::prelude::SubscribeUpdateEntry>,
+    &mut [u8; 32],
+);
+
+#[test]
+fn rejected_banks_are_counted_by_the_failed_check() {
+    let attempt = |reason: &'static str, corrupt: &Corruption| {
+        let cache = HeadCache::new(32, 64);
+        let session = cache.start_bank_session(CommitmentLevel::Processed);
+        let mut meta = metadata(42, 2);
+        let mut txs = vec![transaction(2)];
+        let mut entries = vec![yellowstone_grpc_proto::prelude::SubscribeUpdateEntry {
+            slot: 42,
+            bank_id: 2,
+            hash: vec![9; 32],
+            executed_transaction_count: 1,
+            ..Default::default()
+        }];
+        let mut hash = [2; 32];
+        corrupt(&mut meta, &mut txs, &mut entries, &mut hash);
+        let before = crate::metrics::head_cache_rejected_banks_count(reason);
+        if reason != "metadata_missing" {
+            cache.stage_bank_metadata(session, 2, meta);
+        }
+        for entry in &entries {
+            cache.stage_bank_entry(session, entry);
+        }
+        cache.freeze_bank(session, 42, 2, hash, txs);
+        assert!(
+            crate::metrics::head_cache_rejected_banks_count(reason) > before,
+            "{reason}"
+        );
+        assert!(
+            cache
+                .get_meta(&Signature::from([2; 64]), CommitmentLevel::Processed)
+                .is_none(),
+            "{reason}"
+        );
+    };
+    attempt("metadata_missing", &|_, _, _, _| {});
+    attempt("blockhash_mismatch", &|_, _, _, hash| *hash = [3; 32]);
+    attempt("transaction_count", &|meta, _, _, _| {
+        meta.executed_transaction_count = 2
+    });
+    attempt("entry_count", &|meta, _, _, _| meta.entry_count = 2);
+    attempt("transaction_index", &|_, txs, _, _| txs[0].index = 1);
+    attempt("duplicate_signature", &|meta, txs, entries, _| {
+        meta.executed_transaction_count = 2;
+        entries[0].executed_transaction_count = 2;
+        let mut second = transaction(2);
+        second.index = 1;
+        txs.push(second);
+    });
+    attempt("malformed_transaction", &|_, txs, _, _| txs[0].meta = None);
+    attempt("entry_sequence", &|_, _, entries, _| entries[0].index = 1);
+    attempt("entry_hash", &|_, _, entries, _| {
+        entries[0].hash.pop();
+    });
+    attempt("entry_range", &|_, _, entries, _| {
+        entries[0].executed_transaction_count = 2
+    });
+    attempt("entry_range", &|_, _, entries, _| {
+        entries[0].executed_transaction_count = 0
+    });
+}
+
+#[test]
+fn bank_write_lock_hold_is_observed_per_operation() {
+    let cache = HeadCache::new(32, 64);
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    cache.commit_bank(session, 42, 1, CommitmentLevel::Confirmed, Some(41));
+    cache.discard_bank(session, 42, 1);
+    let exported = String::from_utf8(crate::metrics::export_metrics().unwrap()).unwrap();
+    for op in [
+        "session_start",
+        "stage_metadata",
+        "stage_entry",
+        "freeze",
+        "commit",
+        "discard",
+    ] {
+        let series = format!("superbank_head_cache_write_lock_hold_seconds_count{{op=\"{op}\"}}");
+        assert!(exported.contains(&series), "{series}");
+    }
+}
+
+#[tokio::test]
+async fn lagging_bank_event_receivers_are_counted() {
+    let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+    let event = |slot| HeadBankEvent {
+        slot,
+        blockhash: [0; 32],
+        kind: HeadBankEventKind::Evicted,
+    };
+    sender.send(event(1)).unwrap();
+    sender.send(event(2)).unwrap();
+    let before = crate::metrics::head_cache_bank_events_lagged_count();
+    assert!(matches!(
+        crate::head_cache::recv_bank_event(&mut receiver).await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+    ));
+    assert!(crate::metrics::head_cache_bank_events_lagged_count() > before);
+    assert_eq!(
+        crate::head_cache::recv_bank_event(&mut receiver)
+            .await
+            .unwrap(),
+        event(2)
+    );
+}
+
+#[tokio::test]
+async fn recent_store_prebuilds_confirmed_blocks_and_drops_discarded_ones() {
+    use crate::recent_block_responses::{
+        Prebuild, RecentBlockResponses, parse_prebuild_shapes, run,
+    };
+    let cache = std::sync::Arc::new(HeadCache::new(32, 64));
+    let mut state = crate::tests::test_state();
+    {
+        let state = std::sync::Arc::get_mut(&mut state).unwrap();
+        state.head_cache = Some(cache.clone());
+        state.recent_block_responses = RecentBlockResponses::new(1 << 20);
+    }
+    let shapes = parse_prebuild_shapes("maxSupportedTransactionVersion=0")
+        .unwrap()
+        .0;
+    let key = shapes[0].key(42, [2; 32]);
+    let task = tokio::spawn(run(
+        state.clone(),
+        cache.clone(),
+        cache.subscribe_bank_events(),
+        Prebuild::new(shapes, 1),
+    ));
+    let entries = || state.recent_block_responses.resident().0;
+    async fn wait(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+    let built = crate::metrics::get_block_recent_store_prebuild_count("built");
+
+    let session = cache.start_bank_session(CommitmentLevel::Processed);
+    freeze(&cache, session, 42, 1, 1);
+    freeze(&cache, session, 42, 2, 2);
+    cache.commit_bank(session, 42, 2, CommitmentLevel::Confirmed, Some(41));
+    wait(|| entries() == 1).await;
+    assert!(state.recent_block_responses.contains(&key));
+    assert!(crate::metrics::get_block_recent_store_prebuild_count("built") > built);
+
+    cache.discard_bank(session, 42, 2);
+    wait(|| entries() == 0).await;
+    assert!(!state.recent_block_responses.contains(&key));
+    task.abort();
 }

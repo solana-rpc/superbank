@@ -312,9 +312,7 @@ async fn encode_block_response_blocking(
     transactions: Vec<StoredTransactionRecord>,
 ) -> Result<BlockResponse, Status> {
     let permit = state
-        .hydration_sem
-        .clone()
-        .acquire_owned()
+        .acquire_hydration_permit(STREAM_BLOCKS_METHOD)
         .await
         .map_err(|_| Status::new(Code::Internal, "hydration semaphore closed"))?;
 
@@ -336,9 +334,7 @@ async fn encode_transaction_response_blocking(
     record: StoredTransactionRecord,
 ) -> Result<TransactionResponse, Status> {
     let permit = state
-        .hydration_sem
-        .clone()
-        .acquire_owned()
+        .acquire_hydration_permit(STREAM_TRANSACTIONS_METHOD)
         .await
         .map_err(|_| Status::new(Code::Internal, "hydration semaphore closed"))?;
 

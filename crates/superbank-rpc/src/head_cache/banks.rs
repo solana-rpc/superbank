@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Speculative banks are scoped to one subscription; only a selected bank is published.
-use super::{HeadCache, coverage::Link};
+use super::{HeadBankEventKind, HeadCache, coverage::Link};
 use crate::clickhouse::{BlockFooterRecord, BlockMetadataRecord};
 use solana_commitment_config::CommitmentLevel;
 use std::{
     collections::{HashMap, HashSet},
+    ops::{Deref, DerefMut},
     sync::{
-        Arc,
+        Arc, RwLockWriteGuard,
         atomic::{AtomicU8, Ordering},
     },
+    time::Instant,
 };
 use yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo;
 
@@ -37,6 +39,77 @@ struct Bank {
     entries: Vec<yellowstone_grpc_proto::prelude::SubscribeUpdateEntry>,
     commitment: Arc<AtomicU8>,
     observed_at: Option<std::time::Instant>,
+    // Highest commitment rank already sent as a bank event.
+    announced: u8,
+}
+
+#[derive(Clone, Copy)]
+enum BankOp {
+    SessionStart,
+    SessionEnd,
+    StageMetadata,
+    StageFooter,
+    StageEntry,
+    Freeze,
+    Commit,
+    Discard,
+}
+
+impl BankOp {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::SessionEnd => "session_end",
+            Self::StageMetadata => "stage_metadata",
+            Self::StageFooter => "stage_footer",
+            Self::StageEntry => "stage_entry",
+            Self::Freeze => "freeze",
+            Self::Commit => "commit",
+            Self::Discard => "discard",
+        }
+    }
+
+    fn notifies(self) -> bool {
+        !matches!(
+            self,
+            Self::StageMetadata | Self::StageFooter | Self::StageEntry
+        )
+    }
+}
+
+/// Bank write lock that records its hold time, then sends queued events and notifies
+/// commit waiters once released.
+struct BankWrite<'a> {
+    cache: &'a HeadCache,
+    state: Option<RwLockWriteGuard<'a, BankState>>,
+    op: BankOp,
+    acquired: Instant,
+}
+
+impl Deref for BankWrite<'_> {
+    type Target = BankState;
+
+    fn deref(&self) -> &BankState {
+        self.state.as_deref().expect("held bank lock")
+    }
+}
+
+impl DerefMut for BankWrite<'_> {
+    fn deref_mut(&mut self) -> &mut BankState {
+        self.state.as_deref_mut().expect("held bank lock")
+    }
+}
+
+impl Drop for BankWrite<'_> {
+    fn drop(&mut self) {
+        let held = self.acquired.elapsed();
+        drop(self.state.take());
+        crate::metrics::head_cache_write_lock_hold(self.op.label(), held.as_secs_f64());
+        self.cache.send_bank_events();
+        if self.op.notifies() {
+            self.cache.commit_notify.notify_waiters();
+        }
+    }
 }
 
 pub(super) fn decode_commitment(rank: u8) -> CommitmentLevel {
@@ -56,8 +129,18 @@ fn rank(commitment: CommitmentLevel) -> u8 {
 }
 
 impl HeadCache {
+    fn write_banks(&self, op: BankOp) -> BankWrite<'_> {
+        let state = self.banks.write().expect("head bank lock");
+        BankWrite {
+            cache: self,
+            state: Some(state),
+            op,
+            acquired: Instant::now(),
+        }
+    }
+
     pub(super) fn start_bank_session(&self, minimum: CommitmentLevel) -> u64 {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::SessionStart);
         let session = state.session.checked_add(1).expect("head session overflow");
         // Even an identical node-local ID can name a different bank after reconnecting.
         let slots: Vec<_> = self
@@ -66,7 +149,7 @@ impl HeadCache {
             .map(|entry| *entry.key())
             .collect();
         for slot in slots {
-            self.remove_slot_inner(slot);
+            self.remove_slot_inner(slot, HeadBankEventKind::Evicted);
         }
         self.latest_slot.store(0, Ordering::Relaxed);
         self.address_truncated_slot.clear();
@@ -80,7 +163,7 @@ impl HeadCache {
     }
 
     pub(super) fn end_bank_session(&self, session: u64) {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::SessionEnd);
         if state.session != session {
             return;
         }
@@ -90,7 +173,7 @@ impl HeadCache {
             .map(|entry| *entry.key())
             .collect();
         for slot in slots {
-            self.remove_slot_inner(slot);
+            self.remove_slot_inner(slot, HeadBankEventKind::Evicted);
         }
         state.session = state.session.checked_add(1).expect("head session overflow");
         state.banks.clear();
@@ -110,7 +193,7 @@ impl HeadCache {
         bank_id: u64,
         metadata: BlockMetadataRecord,
     ) {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::StageMetadata);
         let key = (metadata.slot, bank_id);
         if !self.accept_bank(&state, session, key) {
             return;
@@ -137,7 +220,7 @@ impl HeadCache {
         bank_id: u64,
         footer: BlockFooterRecord,
     ) {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::StageFooter);
         let key = (slot, bank_id);
         if !self.accept_bank(&state, session, key) {
             return;
@@ -163,7 +246,7 @@ impl HeadCache {
         session: u64,
         entry: &yellowstone_grpc_proto::prelude::SubscribeUpdateEntry,
     ) {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::StageEntry);
         let key = (entry.slot, entry.bank_id);
         if self.accept_bank(&state, session, key) {
             let bank = state.banks.entry(key).or_default();
@@ -181,7 +264,7 @@ impl HeadCache {
         hash: [u8; 32],
         transactions: Vec<SubscribeUpdateTransactionInfo>,
     ) {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::Freeze);
         let key = (slot, bank_id);
         if !self.accept_bank(&state, session, key) {
             return;
@@ -190,24 +273,22 @@ impl HeadCache {
         if bank.sealed_hash.is_some() {
             return;
         }
-        if bank
-            .metadata
-            .as_ref()
-            .is_none_or(|meta| meta.blockhash != hash)
-        {
-            return;
-        }
-        if !complete_bank(bank, slot, &transactions) {
-            tracing::warn!(
-                slot,
-                bank_id,
-                expected_transactions = bank
-                    .metadata
-                    .as_ref()
-                    .map(|meta| meta.executed_transaction_count),
-                received_transactions = transactions.len(),
-                "head cache: incomplete or malformed bank"
-            );
+        let checked = match bank.metadata.as_ref() {
+            None => Err("metadata_missing"),
+            Some(meta) if meta.blockhash != hash => Err("blockhash_mismatch"),
+            Some(meta) => complete_bank(bank, slot, &transactions).inspect_err(|reason| {
+                tracing::warn!(
+                    slot,
+                    bank_id,
+                    reason,
+                    expected_transactions = meta.executed_transaction_count,
+                    received_transactions = transactions.len(),
+                    "head cache: incomplete or malformed bank"
+                );
+            }),
+        };
+        if let Err(reason) = checked {
+            crate::metrics::head_cache_rejected_bank(reason);
             return;
         }
         bank.sealed_hash = Some(hash);
@@ -224,7 +305,7 @@ impl HeadCache {
         commitment: CommitmentLevel,
         parent: Option<u64>,
     ) {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::Commit);
         let key = (slot, bank_id);
         if !self.accept_bank(&state, session, key) {
             return;
@@ -237,7 +318,7 @@ impl HeadCache {
                 .is_some_and(|selected| *selected != bank_id)
             {
                 state.selected.remove(&slot);
-                self.remove_slot_inner(slot);
+                self.remove_slot_inner(slot, HeadBankEventKind::Discarded);
             }
             let losers: Vec<_> = state
                 .banks
@@ -277,7 +358,7 @@ impl HeadCache {
     }
 
     pub(super) fn discard_bank(&self, session: u64, slot: u64, bank_id: u64) {
-        let mut state = self.banks.write().expect("head bank lock");
+        let mut state = self.write_banks(BankOp::Discard);
         if state.session != session {
             return;
         }
@@ -333,10 +414,11 @@ impl HeadCache {
                 self.ingest_bank_transaction(key.0, tx, Some(bank.commitment.clone()));
             }
             self.note_slot_commitment(key.0, commitment);
+            self.announce_bank(state, key, commitment);
             return;
         }
         if current.is_some() {
-            self.remove_slot_inner(key.0);
+            self.remove_slot_inner(key.0, HeadBankEventKind::Discarded);
         }
         self.note_block_metadata(metadata.clone());
         for tx in transactions {
@@ -355,6 +437,35 @@ impl HeadCache {
         if let Some(observed_at) = bank.observed_at {
             proof.observe(key.0, commitment, observed_at);
         }
+        drop(proof);
+        self.announce_bank(state, key, commitment);
+    }
+
+    /// Queues a Confirmed and a Finalized event once per bank, while the head holds its block.
+    fn announce_bank(&self, state: &mut BankState, key: BankKey, commitment: CommitmentLevel) {
+        let Some(bank) = state.banks.get_mut(&key) else {
+            return;
+        };
+        let Some(blockhash) = bank.metadata.as_ref().map(|meta| meta.blockhash) else {
+            return;
+        };
+        if !self
+            .slot_block_metadata
+            .get(&key.0)
+            .is_some_and(|published| published.blockhash == blockhash)
+        {
+            return;
+        }
+        let reached = rank(commitment);
+        for (level, kind) in [
+            (CommitmentLevel::Confirmed, HeadBankEventKind::Confirmed),
+            (CommitmentLevel::Finalized, HeadBankEventKind::Finalized),
+        ] {
+            if bank.announced < rank(level) && rank(level) <= reached {
+                self.queue_bank_event(key.0, blockhash, kind);
+            }
+        }
+        bank.announced = bank.announced.max(reached);
     }
 
     fn bank_floor(&self, state: &BankState) -> u64 {
@@ -378,44 +489,57 @@ impl HeadCache {
     }
 }
 
-fn complete_bank(bank: &Bank, slot: u64, transactions: &[SubscribeUpdateTransactionInfo]) -> bool {
+/// `Err` names the first check that rejects the bank; it is a metric label.
+fn complete_bank(
+    bank: &Bank,
+    slot: u64,
+    transactions: &[SubscribeUpdateTransactionInfo],
+) -> Result<(), &'static str> {
     let Some(metadata) = &bank.metadata else {
-        return false;
+        return Err("metadata_missing");
     };
-    if metadata.executed_transaction_count != transactions.len() as u64
-        || metadata.entry_count != bank.entries.len() as u64
-    {
-        return false;
+    if metadata.executed_transaction_count != transactions.len() as u64 {
+        return Err("transaction_count");
+    }
+    if metadata.entry_count != bank.entries.len() as u64 {
+        return Err("entry_count");
     }
     let mut indices = HashSet::new();
     let mut signatures = HashSet::new();
-    if transactions.iter().any(|tx| {
-        tx.index >= transactions.len() as u64
-            || !indices.insert(tx.index)
-            || !signatures.insert(&tx.signature)
-            || super::convert::stored_record_from_transaction_info(slot, tx).is_err()
-    }) {
-        return false;
+    for tx in transactions {
+        if tx.index >= transactions.len() as u64 || !indices.insert(tx.index) {
+            return Err("transaction_index");
+        }
+        if !signatures.insert(&tx.signature) {
+            return Err("duplicate_signature");
+        }
+        if super::convert::stored_record_from_transaction_info(slot, tx).is_err() {
+            return Err("malformed_transaction");
+        }
     }
     let mut entries = bank.entries.iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|entry| entry.index);
     let mut next = 0u64;
     for (index, entry) in entries.into_iter().enumerate() {
-        if entry.index != index as u64
-            || entry.starting_transaction_index != next
-            || entry.hash.len() != 32
-        {
-            return false;
+        if entry.index != index as u64 || entry.starting_transaction_index != next {
+            return Err("entry_sequence");
+        }
+        if entry.hash.len() != 32 {
+            return Err("entry_hash");
         }
         let Some(end) = next.checked_add(entry.executed_transaction_count) else {
-            return false;
+            return Err("entry_range");
         };
         if end > metadata.executed_transaction_count {
-            return false;
+            return Err("entry_range");
         }
         next = end;
     }
-    next == metadata.executed_transaction_count
+    if next == metadata.executed_transaction_count {
+        Ok(())
+    } else {
+        Err("entry_range")
+    }
 }
 
 #[cfg(test)]

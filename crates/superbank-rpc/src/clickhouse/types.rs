@@ -3,6 +3,8 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+use std::sync::Arc;
+
 #[derive(Debug, Clone)]
 pub struct QueryTimings {
     pub elapsed_ms: u64,
@@ -397,6 +399,12 @@ pub enum StoredBlockPayload {
         transactions: Vec<StoredAccountsTransactionRecord>,
     },
     Full(StoredBlockRecord),
+    /// Full block whose records stay shared with the head cache; hydration borrows them.
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    SharedFull {
+        metadata: BlockMetadataRecord,
+        transactions: Vec<Arc<StoredTransactionRecord>>,
+    },
 }
 
 impl StoredBlockPayload {
@@ -406,6 +414,7 @@ impl StoredBlockPayload {
             Self::Signatures { metadata, .. } => metadata,
             Self::Accounts { metadata, .. } => metadata,
             Self::Full(record) => &record.metadata,
+            Self::SharedFull { metadata, .. } => metadata,
         }
     }
 
@@ -415,6 +424,7 @@ impl StoredBlockPayload {
             Self::Signatures { signatures, .. } => Some(signatures.len()),
             Self::Accounts { transactions, .. } => Some(transactions.len()),
             Self::Full(record) => Some(record.transactions.len()),
+            Self::SharedFull { transactions, .. } => Some(transactions.len()),
         }
     }
 }

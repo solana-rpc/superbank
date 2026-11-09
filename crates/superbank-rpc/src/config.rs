@@ -70,6 +70,14 @@ pub struct RpcConfig {
     #[arg(long, env = "RPC_CONCURRENCY_LIMIT", default_value_t = 512)]
     pub(crate) rpc_concurrency_limit: usize,
 
+    /// Maximum JSON-RPC calls reading source ClickHouse at once; zero disables the limit.
+    #[arg(long, env = "RPC_BACKEND_CONCURRENCY_LIMIT", default_value_t = 0)]
+    pub(crate) rpc_backend_concurrency_limit: usize,
+
+    /// Longest wait for a backend permit before the read is shed (milliseconds).
+    #[arg(long, env = "RPC_BACKEND_QUEUE_TIMEOUT_MS", default_value_t = 250)]
+    pub(crate) rpc_backend_queue_timeout_ms: u64,
+
     /// Maximum serialized getBlock result bytes retained in memory; zero disables the cache.
     #[arg(long, env = "GET_BLOCK_RESPONSE_CACHE_MAX_BYTES", default_value_t = 0)]
     pub(crate) get_block_response_cache_max_bytes: u64,
@@ -563,6 +571,15 @@ pub struct RpcConfig {
     #[arg(long, env = "GET_BLOCK_HYDRATION_PARALLELISM", default_value_t = 4)]
     pub(crate) get_block_hydration_parallelism: usize,
 
+    /// getTransaction records of at most this many bytes hydrate on the async worker
+    /// without a hydration permit. 0 disables.
+    #[arg(
+        long,
+        env = "GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES",
+        default_value_t = 0
+    )]
+    pub(crate) get_transaction_inline_hydration_max_bytes: usize,
+
     /// ClickHouse transport used for all shard-direct queries.
     #[arg(long, env = "CLICKHOUSE_TRANSPORT", value_enum, default_value = "http")]
     pub(crate) clickhouse_transport: ClickHouseTransport,
@@ -697,9 +714,44 @@ pub struct RpcConfig {
     pub(crate) head_cache_min_commitment: String,
 
     #[cfg(feature = "grpc-head-cache")]
+    /// Milliseconds a getTransaction waits for a signature the head holds below the requested
+    /// commitment to reach it. `0` disables the wait. Must be below `RPC_REQUEST_TIMEOUT_MS`.
+    #[arg(long, env = "HEAD_CACHE_COMMITMENT_WAIT_MS", default_value_t = 0)]
+    pub(crate) head_cache_commitment_wait_ms: u64,
+
+    #[cfg(feature = "grpc-head-cache")]
+    /// Concurrent getTransaction commitment waits; a request past the cap does not wait.
+    #[arg(
+        long,
+        env = "HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS",
+        default_value_t = crate::head_cache::COMMITMENT_WAIT_MAX_WAITERS
+    )]
+    pub(crate) head_cache_commitment_wait_max_waiters: usize,
+
+    #[cfg(feature = "grpc-head-cache")]
     /// Max gRPC decoding message size (bytes).
     #[arg(long, env = "GRPC_MAX_DECODING_BYTES", default_value_t = 67_108_864)]
     pub(crate) grpc_max_decoding_bytes: usize,
+
+    #[cfg(feature = "grpc-head-cache")]
+    /// Serialized head-cache getBlock result bytes kept per blockhash and shape; zero disables.
+    #[arg(long, env = "GET_BLOCK_RECENT_STORE_MAX_BYTES", default_value_t = 0)]
+    pub(crate) get_block_recent_store_max_bytes: u64,
+
+    #[cfg(feature = "grpc-head-cache")]
+    /// getBlock shapes built into the recent store when a head block is confirmed.
+    #[arg(
+        long,
+        env = "GET_BLOCK_PREBUILD_SHAPES",
+        default_value = "",
+        value_parser = crate::recent_block_responses::parse_prebuild_shapes
+    )]
+    pub(crate) get_block_prebuild_shapes: crate::recent_block_responses::PrebuildShapes,
+
+    #[cfg(feature = "grpc-head-cache")]
+    /// Blocking threads for prebuilds, separate from HYDRATION_CPU_CONCURRENCY.
+    #[arg(long, env = "GET_BLOCK_PREBUILD_CONCURRENCY", default_value_t = 1)]
+    pub(crate) get_block_prebuild_concurrency: usize,
 
     // --- Optional local ClickHouse cache of recent finalized slots ---
     #[cfg(feature = "disk-cache")]
@@ -1329,6 +1381,20 @@ mod config_tests {
     }
 
     #[test]
+    fn backend_admission_defaults_leave_it_off() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.rpc_concurrency_limit, 512);
+        assert_eq!(cfg.rpc_backend_concurrency_limit, 0);
+        assert_eq!(cfg.rpc_backend_queue_timeout_ms, 250);
+
+        let _limit = EnvVarGuard::set("RPC_BACKEND_CONCURRENCY_LIMIT", "64");
+        let cfg = RpcConfig::parse_from(["superbank-rpc", "--rpc-backend-queue-timeout-ms", "50"]);
+        assert_eq!(cfg.rpc_backend_concurrency_limit, 64);
+        assert_eq!(cfg.rpc_backend_queue_timeout_ms, 50);
+    }
+
+    #[test]
     fn signature_status_limits_cli_overrides() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let cfg = RpcConfig::parse_from([
@@ -1368,6 +1434,7 @@ mod config_tests {
         assert!(cfg.get_block_response_cache_share_confirmed);
         assert!(cfg.get_block_response_cache_unsupported_version);
         assert_eq!(cfg.get_block_hydration_parallelism, 4);
+        assert_eq!(cfg.get_transaction_inline_hydration_max_bytes, 0);
         assert!(!cfg.rpc_response_gzip_enabled);
         assert!(!cfg.metrics_capture_x_endpoint());
         assert!(!cfg.metrics_capture_x_rpc_node());
@@ -1611,6 +1678,16 @@ mod config_tests {
         );
         #[cfg(feature = "grpc-head-cache")]
         {
+            let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+            assert_eq!(cfg.head_cache_commitment_wait_ms, 0);
+            assert_eq!(cfg.head_cache_commitment_wait_max_waiters, 1024);
+            let cfg = RpcConfig::parse_from([
+                "superbank-rpc",
+                "--head-cache-commitment-wait-ms=400",
+                "--head-cache-commitment-wait-max-waiters=8",
+            ]);
+            assert_eq!(cfg.head_cache_commitment_wait_ms, 400);
+            assert_eq!(cfg.head_cache_commitment_wait_max_waiters, 8);
             assert!(RpcConfig::parse_from(["superbank-rpc"]).get_blocks_clamp_to_head_tip);
             let cfg =
                 RpcConfig::parse_from(["superbank-rpc", "--get-blocks-clamp-to-head-tip=false"]);
@@ -1633,6 +1710,65 @@ mod config_tests {
             assert!(!cfg.disk_cache_status_span_query);
             assert!(!cfg.gsfa_race_primary);
             assert!(cfg.disk_cache_compact_transactions_parts);
+        }
+    }
+
+    #[cfg(feature = "grpc-head-cache")]
+    #[test]
+    fn recent_block_store_flags_parse() {
+        use crate::recent_block_responses::{PrebuildShape, PrebuildShapes};
+        use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
+
+        let cfg = RpcConfig::parse_from(["superbank-rpc"]);
+        assert_eq!(cfg.get_block_recent_store_max_bytes, 0);
+        assert_eq!(cfg.get_block_prebuild_shapes, PrebuildShapes::default());
+        assert_eq!(cfg.get_block_prebuild_concurrency, 1);
+
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-block-recent-store-max-bytes",
+            "1073741824",
+            "--get-block-prebuild-shapes",
+            "encoding=json:transactionDetails=full:rewards=false:maxSupportedTransactionVersion=0, \
+             transactionDetails=signatures,encoding=json:transactionDetails=full:rewards=false:maxSupportedTransactionVersion=0",
+            "--get-block-prebuild-concurrency",
+            "2",
+        ]);
+        assert_eq!(cfg.get_block_recent_store_max_bytes, 1 << 30);
+        assert_eq!(cfg.get_block_prebuild_concurrency, 2);
+        assert_eq!(
+            cfg.get_block_prebuild_shapes.0,
+            vec![
+                PrebuildShape {
+                    encoding: UiTransactionEncoding::Json,
+                    transaction_details: TransactionDetails::Full,
+                    rewards: false,
+                    max_supported_transaction_version: Some(0),
+                },
+                PrebuildShape {
+                    encoding: UiTransactionEncoding::Json,
+                    transaction_details: TransactionDetails::Signatures,
+                    rewards: true,
+                    max_supported_transaction_version: None,
+                },
+            ]
+        );
+
+        for bad in [
+            "encoding=xml",
+            "transactionDetails=most",
+            "rewards=yes",
+            "maxSupportedTransactionVersion=256",
+            "commitment=confirmed",
+            "encoding=json:encoding=base64",
+            "full",
+            "encoding=base58:maxSupportedTransactionVersion=1",
+        ] {
+            assert!(
+                RpcConfig::try_parse_from(["superbank-rpc", "--get-block-prebuild-shapes", bad])
+                    .is_err(),
+                "{bad}"
+            );
         }
     }
 

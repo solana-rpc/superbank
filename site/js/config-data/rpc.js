@@ -60,6 +60,21 @@ export default {
           relations: [{ type: 'see', to: 'CLICKHOUSE_QUERY_TIMEOUT_MS' }],
         }),
         opt('RPC_CONCURRENCY_LIMIT', { type: 'usize', default: '512', text: 'Maximum in-flight JSON-RPC requests.' }),
+        opt('RPC_BACKEND_CONCURRENCY_LIMIT', {
+          type: 'usize',
+          default: '0',
+          text: 'Maximum JSON-RPC calls that read source ClickHouse at once. `0` turns the limit off. Calls answered from a cache never wait for it, so keep it below `RPC_CONCURRENCY_LIMIT` to leave global permits for them.',
+          relations: [{ type: 'see', to: 'RPC_CONCURRENCY_LIMIT' }],
+        }),
+        opt('RPC_BACKEND_QUEUE_TIMEOUT_MS', {
+          type: 'u64 (ms)',
+          default: '250',
+          text: 'Longest wait for a backend permit. A call still waiting is shed and gets the error its method returns when ClickHouse fails. Keep it below `CLICKHOUSE_QUERY_TIMEOUT_MS`.',
+          relations: [
+            { type: 'requires', to: 'RPC_BACKEND_CONCURRENCY_LIMIT' },
+            { type: 'see', to: 'CLICKHOUSE_QUERY_TIMEOUT_MS' },
+          ],
+        }),
         opt('RPC_MAX_BATCH_SIZE', { type: 'usize', default: '64', text: 'Maximum calls accepted in one batch request.' }),
         opt('RPC_BATCH_CONCURRENCY_LIMIT', { type: 'usize', default: '8', text: 'Maximum calls of one batch executed concurrently.' }),
         opt('RPC_RESPONSE_GZIP_ENABLED', { type: 'bool', default: 'false', text: 'Gzip responses when the client advertises gzip support.' }),
@@ -139,6 +154,30 @@ export default {
           text: 'Blocking threads one full or accounts `getBlock` build may use. Extra threads come from the hydration pool only when free; 1 disables chunking.',
           relations: [{ type: 'see', to: 'HYDRATION_CPU_CONCURRENCY' }],
         }),
+        opt('GET_BLOCK_RECENT_STORE_MAX_BYTES', {
+          type: 'u64 (bytes)',
+          default: '0',
+          text: 'Memory budget for serialized `getBlock` results of head-cache blocks, keyed by slot, blockhash and response shape. Concurrent requests share one build, and a forked or evicted block is dropped. Zero disables the store; it also stays off without a running head cache.',
+          requires: ['feature:grpc-head-cache'],
+          relations: [{ type: 'see', to: 'HEAD_CACHE_ENABLED' }],
+        }),
+        opt('GET_BLOCK_PREBUILD_SHAPES', {
+          type: 'list',
+          default: '',
+          text: 'Comma-separated `getBlock` shapes to build into the recent store when a head block is confirmed. A shape is `name=value` pairs of `encoding`, `transactionDetails`, `rewards` and `maxSupportedTransactionVersion` joined by `:`; omitted fields take the `getBlock` defaults. Empty disables prebuilds. No shapes ship by default: take them from the `superbank_get_block_request_shape_total` metric.',
+          requires: ['feature:grpc-head-cache'],
+          relations: [{ type: 'requires', to: 'GET_BLOCK_RECENT_STORE_MAX_BYTES' }],
+        }),
+        opt('GET_BLOCK_PREBUILD_CONCURRENCY', {
+          type: 'usize',
+          default: '1',
+          text: 'Blocking threads for prebuilds, separate from the request hydration pool.',
+          requires: ['feature:grpc-head-cache'],
+          relations: [
+            { type: 'requires', to: 'GET_BLOCK_PREBUILD_SHAPES' },
+            { type: 'see', to: 'HYDRATION_CPU_CONCURRENCY' },
+          ],
+        }),
       ],
     },
     {
@@ -160,6 +199,12 @@ export default {
           type: 'usize',
           default: '0',
           text: 'ClickHouse `max_threads` and `max_threads_for_indexes` for primary `getTransaction` reads, including the signature position lookup that `getSignaturesForAddress` cursors also use. Zero keeps the server setting. Local-cache and shard-direct shard-local reads are unchanged.',
+        }),
+        opt('GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES', {
+          type: 'usize (bytes)',
+          default: '0',
+          text: 'Records of at most this size, as the primary record cache weighs them, hydrate on the async worker without a hydration permit. Response bytes are unchanged. Zero disables it.',
+          relations: [{ type: 'see', to: 'HYDRATION_CPU_CONCURRENCY' }],
         }),
         envOnly('SIGNATURE_SLOT_CACHE_SIZE', CACHE, {
           type: 'usize',
@@ -575,6 +620,21 @@ export default {
           type: 'processed | confirmed | finalized',
           default: 'processed',
           text: 'Lowest commitment the cache serves. An invalid value falls back to `processed` with a warning.',
+        }),
+        opt('HEAD_CACHE_COMMITMENT_WAIT_MS', {
+          type: 'u64 (ms)',
+          default: '0',
+          text: 'How long a `getTransaction` waits for a signature the head holds below the requested commitment to reach it. A commit in time returns the head response; otherwise the request continues to the disk cache and the primary. `0` disables the wait. Startup fails unless it is below `RPC_REQUEST_TIMEOUT_MS`.',
+          relations: [
+            { type: 'capped-by', to: 'RPC_REQUEST_TIMEOUT_MS' },
+            { type: 'see', to: 'HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS' },
+          ],
+        }),
+        opt('HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS', {
+          type: 'usize',
+          default: '1024',
+          text: 'Requests that may wait for a commitment at once. A request past the cap does not wait. `0` turns the wait off.',
+          relations: [{ type: 'see', to: 'HEAD_CACHE_COMMITMENT_WAIT_MS' }],
         }),
         opt('GRPC_MAX_DECODING_BYTES', { type: 'usize (bytes)', default: '67108864', text: 'Largest gRPC message decoded from the stream.' }),
         opt('GET_BLOCKS_CLAMP_TO_HEAD_TIP', {

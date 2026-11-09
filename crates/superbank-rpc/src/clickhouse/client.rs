@@ -224,6 +224,7 @@ pub(crate) async fn execute_shard_tcp_query_block(
     query_label: &'static str,
     sql: String,
 ) -> ProcessingResult<(TcpBlock<TcpComplex>, QueryTimings)> {
+    let _backend = crate::admission::admit_backend(operation).await?;
     let start = std::time::Instant::now();
     let mut client = match tokio::time::timeout(query_timeout, shard.tcp_pool.get_handle()).await {
         Ok(Ok(handle)) => handle,
@@ -391,6 +392,8 @@ pub struct ClickHouseClient {
     // connection demand does not track raw request/batch concurrency. Acquired only by explicitly
     // HTTP-permitted query stages.
     pub(crate) http_query_sem: Arc<Semaphore>,
+    /// `RPC_BACKEND_CONCURRENCY_LIMIT`; JSON-RPC dispatch admits each call against it.
+    pub(crate) backend_admission: Option<Arc<crate::admission::BackendAdmission>>,
     pub(crate) tcp_pool_min: usize,
     pub(crate) tcp_pool_max: usize,
     pub(crate) in_clause_chunk: usize,
@@ -868,6 +871,7 @@ impl ClickHouseClient {
             verification_timeouts,
             fanout_sem: Arc::new(Semaphore::new(fanout_concurrency.max(1))),
             http_query_sem: Arc::new(Semaphore::new(http_concurrency.max(1))),
+            backend_admission: None,
             tcp_pool_max: tcp_pool_max.max(1),
             tcp_pool_min: tcp_pool_min.min(tcp_pool_max.max(1)),
             in_clause_chunk: in_clause_chunk.max(1),
@@ -1296,7 +1300,10 @@ impl ClickHouseClient {
         // is sized to its largest method arm). Keeping `fut` inline lets those sizes compound up
         // the call tree and overflow the (2 MiB) worker/test thread stack; boxing keeps each
         // timeout future pointer-sized in its caller.
-        let fut = Box::pin(fut);
+        let fut = Box::pin(async {
+            let _backend = self.admit_backend(operation).await?;
+            fut.await
+        });
         match tokio::time::timeout(timeout, super::read_query::admission::scope(fut)).await {
             Ok(result) => result,
             Err(_) => {
@@ -1306,6 +1313,29 @@ impl ClickHouseClient {
                 )))
             }
         }
+    }
+
+    /// Primary operations admit the calling JSON-RPC call before any other ClickHouse permit,
+    /// and register the lease so abandoned reads and fanout tasks keep it.
+    async fn admit_backend(
+        &self,
+        operation: &'static str,
+    ) -> ProcessingResult<Option<Arc<OwnedSemaphorePermit>>> {
+        if self.read_endpoint.target() != "primary" {
+            return Ok(None);
+        }
+        let lease = crate::admission::admit_backend(operation).await?;
+        if let Some(lease) = lease.as_ref() {
+            super::read_query::admission::register(lease);
+        }
+        Ok(lease)
+    }
+
+    pub(crate) fn set_backend_admission(
+        &mut self,
+        admission: Option<Arc<crate::admission::BackendAdmission>>,
+    ) {
+        self.backend_admission = admission;
     }
 
     /// Acquires one global HTTP-query permit. Callers must acquire it inside an operation timeout

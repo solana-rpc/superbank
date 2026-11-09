@@ -9,9 +9,11 @@ use solana_transaction_status::{
     BlockEncodingOptions, ConfirmedBlock, Reward, TransactionDetails, TransactionWithStatusMeta,
     UiConfirmedBlock, UiTransactionEncoding, VersionedTransactionWithStatusMeta,
 };
+use std::borrow::Borrow;
+use std::sync::Arc;
 
 use crate::clickhouse::{
-    BlockMetadataRecord, StoredAccountsTransactionRecord, StoredBlockPayload, StoredBlockRecord,
+    BlockMetadataRecord, StoredAccountsTransactionRecord, StoredBlockPayload,
     StoredTransactionRecord,
 };
 use crate::hydration::errors::{BlockHydrationError, TransactionHydrationError};
@@ -47,21 +49,38 @@ pub(crate) fn hydrate_block_payload(
                 max_supported_transaction_version,
             )
         }
-        TransactionDetails::Full => {
-            let record = payload.into_full()?;
-            hydrate_full_block_record(
-                record,
+        TransactionDetails::Full => match payload {
+            StoredBlockPayload::Full(record) => hydrate_full_block_record(
+                record.metadata,
+                &record.transactions,
                 encoding,
                 show_rewards,
                 max_supported_transaction_version,
-            )
-        }
+            ),
+            StoredBlockPayload::SharedFull {
+                metadata,
+                transactions,
+            } => hydrate_full_block_record(
+                metadata,
+                &transactions,
+                encoding,
+                show_rewards,
+                max_supported_transaction_version,
+            ),
+            StoredBlockPayload::Metadata(_)
+            | StoredBlockPayload::Signatures { .. }
+            | StoredBlockPayload::Accounts { .. } => Err(BlockHydrationError::Transaction(
+                TransactionHydrationError::InvalidStoredTransaction(
+                    "full block payload required for transactionDetails=full".to_string(),
+                ),
+            )),
+        },
     }
 }
 
 #[cfg(test)]
 pub(crate) fn hydrate_block_record(
-    record: StoredBlockRecord,
+    record: crate::clickhouse::StoredBlockRecord,
     encoding: UiTransactionEncoding,
     transaction_details: TransactionDetails,
     show_rewards: bool,
@@ -76,23 +95,20 @@ pub(crate) fn hydrate_block_record(
     )
 }
 
-fn hydrate_full_block_record(
-    record: StoredBlockRecord,
+fn hydrate_full_block_record<T: Borrow<StoredTransactionRecord>>(
+    metadata: BlockMetadataRecord,
+    records: &[T],
     encoding: UiTransactionEncoding,
     show_rewards: bool,
     max_supported_transaction_version: Option<u8>,
 ) -> Result<UiConfirmedBlock, BlockHydrationError> {
-    let metadata = record.metadata;
     let rewards = if show_rewards {
         build_block_rewards(&metadata)?
     } else {
         Vec::new()
     };
 
-    let mut transactions = Vec::with_capacity(record.transactions.len());
-    for tx_record in record.transactions {
-        transactions.push(hydrate_full_transaction(&tx_record)?);
-    }
+    let transactions = hydrate_full_transactions(records)?;
 
     confirmed_block(metadata, transactions, rewards)
         .encode_with_options(
@@ -104,6 +120,16 @@ fn hydrate_full_block_record(
             },
         )
         .map_err(BlockHydrationError::from)
+}
+
+fn hydrate_full_transactions<T: Borrow<StoredTransactionRecord>>(
+    records: &[T],
+) -> Result<Vec<TransactionWithStatusMeta>, BlockHydrationError> {
+    let mut transactions = Vec::with_capacity(records.len());
+    for tx_record in records {
+        transactions.push(hydrate_full_transaction(tx_record.borrow())?);
+    }
+    Ok(transactions)
 }
 
 fn hydrate_full_transaction(
@@ -156,6 +182,7 @@ pub(crate) fn block_hydration_chunk_count(transaction_count: usize, parallelism:
 /// Contiguous slice of a block's transactions, in block order.
 pub(crate) enum BlockTransactionChunk {
     Full(Vec<StoredTransactionRecord>),
+    SharedFull(Vec<Arc<StoredTransactionRecord>>),
     Accounts(Vec<StoredAccountsTransactionRecord>),
 }
 
@@ -218,6 +245,39 @@ pub(crate) fn split_block_payload(
                 .collect(),
         }),
         (
+            TransactionDetails::Full,
+            StoredBlockPayload::SharedFull {
+                metadata,
+                transactions,
+            },
+        ) => Ok(SplitBlockPayload {
+            metadata,
+            chunks: split_contiguous(transactions, chunk_count)
+                .into_iter()
+                .map(BlockTransactionChunk::SharedFull)
+                .collect(),
+        }),
+        (
+            TransactionDetails::Accounts,
+            StoredBlockPayload::SharedFull {
+                metadata,
+                transactions,
+            },
+        ) => Ok(SplitBlockPayload {
+            metadata,
+            chunks: split_contiguous(transactions, chunk_count)
+                .into_iter()
+                .map(|chunk| {
+                    BlockTransactionChunk::Accounts(
+                        chunk
+                            .into_iter()
+                            .map(|record| Arc::unwrap_or_clone(record).into())
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }),
+        (
             TransactionDetails::Accounts,
             StoredBlockPayload::Accounts {
                 metadata,
@@ -260,13 +320,16 @@ pub(crate) fn hydrate_serialize_block_chunk(
         error: BlockBuildError::Hydration(error),
     };
     let (transactions, encoding, transaction_details) = match chunk {
-        BlockTransactionChunk::Full(records) => {
-            let mut transactions = Vec::with_capacity(records.len());
-            for tx_record in &records {
-                transactions.push(hydrate_full_transaction(tx_record).map_err(hydrate_failure)?);
-            }
-            (transactions, encoding, TransactionDetails::Full)
-        }
+        BlockTransactionChunk::Full(records) => (
+            hydrate_full_transactions(&records).map_err(hydrate_failure)?,
+            encoding,
+            TransactionDetails::Full,
+        ),
+        BlockTransactionChunk::SharedFull(records) => (
+            hydrate_full_transactions(&records).map_err(hydrate_failure)?,
+            encoding,
+            TransactionDetails::Full,
+        ),
         BlockTransactionChunk::Accounts(records) => {
             let mut transactions = Vec::with_capacity(records.len());
             for tx_record in &records {
@@ -560,7 +623,6 @@ trait StoredBlockPayloadExt {
     fn into_accounts(
         self,
     ) -> Result<(BlockMetadataRecord, Vec<StoredAccountsTransactionRecord>), BlockHydrationError>;
-    fn into_full(self) -> Result<StoredBlockRecord, BlockHydrationError>;
 }
 
 impl StoredBlockPayloadExt for StoredBlockPayload {
@@ -570,6 +632,7 @@ impl StoredBlockPayloadExt for StoredBlockPayload {
             StoredBlockPayload::Signatures { metadata, .. } => metadata,
             StoredBlockPayload::Accounts { metadata, .. } => metadata,
             StoredBlockPayload::Full(record) => record.metadata,
+            StoredBlockPayload::SharedFull { metadata, .. } => metadata,
         }
     }
 
@@ -580,18 +643,21 @@ impl StoredBlockPayloadExt for StoredBlockPayload {
                 signatures,
             } => Ok((metadata, signatures)),
             StoredBlockPayload::Full(record) => {
-                let mut signatures = Vec::with_capacity(record.transactions.len());
-                for tx in &record.transactions {
-                    signatures.push(primary_signature_string(&tx.tx_signatures)?);
-                }
+                let signatures = primary_signature_strings(&record.transactions)?;
                 Ok((record.metadata, signatures))
             }
-            _ => Err(BlockHydrationError::Transaction(
-                TransactionHydrationError::InvalidStoredTransaction(
-                    "signatures block payload required for transactionDetails=signatures"
-                        .to_string(),
-                ),
-            )),
+            StoredBlockPayload::SharedFull {
+                metadata,
+                transactions,
+            } => Ok((metadata, primary_signature_strings(&transactions)?)),
+            StoredBlockPayload::Metadata(_) | StoredBlockPayload::Accounts { .. } => {
+                Err(BlockHydrationError::Transaction(
+                    TransactionHydrationError::InvalidStoredTransaction(
+                        "signatures block payload required for transactionDetails=signatures"
+                            .to_string(),
+                    ),
+                ))
+            }
         }
     }
 
@@ -608,24 +674,36 @@ impl StoredBlockPayloadExt for StoredBlockPayload {
                 record.metadata,
                 record.transactions.into_iter().map(Into::into).collect(),
             )),
-            _ => Err(BlockHydrationError::Transaction(
-                TransactionHydrationError::InvalidStoredTransaction(
-                    "accounts block payload required for transactionDetails=accounts".to_string(),
-                ),
+            StoredBlockPayload::SharedFull {
+                metadata,
+                transactions,
+            } => Ok((
+                metadata,
+                transactions
+                    .into_iter()
+                    .map(|record| Arc::unwrap_or_clone(record).into())
+                    .collect(),
             )),
+            StoredBlockPayload::Metadata(_) | StoredBlockPayload::Signatures { .. } => {
+                Err(BlockHydrationError::Transaction(
+                    TransactionHydrationError::InvalidStoredTransaction(
+                        "accounts block payload required for transactionDetails=accounts"
+                            .to_string(),
+                    ),
+                ))
+            }
         }
     }
+}
 
-    fn into_full(self) -> Result<StoredBlockRecord, BlockHydrationError> {
-        match self {
-            StoredBlockPayload::Full(record) => Ok(record),
-            _ => Err(BlockHydrationError::Transaction(
-                TransactionHydrationError::InvalidStoredTransaction(
-                    "full block payload required for transactionDetails=full".to_string(),
-                ),
-            )),
-        }
+fn primary_signature_strings<T: Borrow<StoredTransactionRecord>>(
+    records: &[T],
+) -> Result<Vec<String>, BlockHydrationError> {
+    let mut signatures = Vec::with_capacity(records.len());
+    for record in records {
+        signatures.push(primary_signature_string(&record.borrow().tx_signatures)?);
     }
+    Ok(signatures)
 }
 
 fn primary_signature_string(signatures: &[[u8; 64]]) -> Result<String, BlockHydrationError> {

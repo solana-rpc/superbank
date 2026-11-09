@@ -25,7 +25,7 @@ use crate::clickhouse::{
     SignatureSlot, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
     TransactionStatusFilter, TransactionsForAddressQuery,
 };
-use crate::get_transaction_primary_cache::PrimaryTransactionCacheKey;
+use crate::get_transaction_primary_cache::{PrimaryTransactionCacheKey, record_heap_bytes};
 use crate::handlers::{
     RouteMetric,
     types::{
@@ -59,6 +59,82 @@ const GET_TRANSACTION_INVALID_SIGNATURE_MESSAGE: &str =
     "Invalid params: signature is not a valid transaction signature";
 const GET_TRANSACTION_DENYLISTED_SIGNATURES: [&str; 1] =
     ["1111111111111111111111111111111111111111111111111111111111111111"];
+
+/// `reason` labels of `superbank_get_transaction_not_found_total`.
+pub(crate) mod not_found {
+    /// The head holds the signature in another slot than the pinned one.
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    pub(crate) const HEAD_SLOT_MISMATCH: &str = "head_slot_mismatch";
+    /// The head holds the signature only below the requested commitment.
+    pub(crate) const HEAD_PROCESSED_ONLY: &str = "head_processed_only";
+    /// The pinned slot is not below the head window, but the head does not know the signature.
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    pub(crate) const HEAD_ABSENT: &str = "head_absent";
+    /// The pinned slot is older than the head window.
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    pub(crate) const BELOW_HEAD: &str = "below_head";
+    /// The disk cache holds the signature in another slot than the pinned one.
+    #[cfg_attr(not(feature = "disk-cache"), allow(dead_code))]
+    pub(crate) const DISK_SLOT_MISMATCH: &str = "disk_slot_mismatch";
+    /// The disk cache proved that the pinned slot does not hold the signature.
+    #[cfg_attr(not(feature = "disk-cache"), allow(dead_code))]
+    pub(crate) const DISK_MISS: &str = "disk_miss";
+    /// The primary returned no row and no other reason applies.
+    pub(crate) const CLICKHOUSE_NULL: &str = "clickhouse_null";
+
+    /// `head_processed_only` outranks the tier that answered; the window reasons refine only
+    /// the primary's null.
+    pub(crate) fn reason(head_miss: Option<&'static str>, tier: &'static str) -> &'static str {
+        match head_miss {
+            Some(HEAD_PROCESSED_ONLY) => HEAD_PROCESSED_ONLY,
+            Some(head) if tier == CLICKHOUSE_NULL => head,
+            _ => tier,
+        }
+    }
+}
+
+/// Counts a null answered by `tier`, refined by the head's view of the signature at that time.
+#[cfg_attr(not(feature = "grpc-head-cache"), allow(unused_variables))]
+fn record_not_found(
+    state: &AppState,
+    signature: &Signature,
+    requested_slot: Option<u64>,
+    tier: &'static str,
+) {
+    #[cfg(feature = "grpc-head-cache")]
+    let head_miss = state
+        .head_cache
+        .as_deref()
+        .and_then(|cache| head_miss_reason(cache, signature, requested_slot));
+    #[cfg(not(feature = "grpc-head-cache"))]
+    let head_miss = None;
+    metrics::get_transaction_not_found(not_found::reason(head_miss, tier));
+}
+
+/// Why the head could not serve `signature`, when it can tell: it holds it below the requested
+/// commitment, or a pinned slot falls inside or below its window.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_miss_reason(
+    cache: &crate::head_cache::HeadCache,
+    signature: &Signature,
+    requested_slot: Option<u64>,
+) -> Option<&'static str> {
+    if cache
+        .get_meta(signature, CommitmentLevel::Processed)
+        .is_some()
+    {
+        return Some(not_found::HEAD_PROCESSED_ONLY);
+    }
+    let slot = requested_slot?;
+    if cache.latest_slot() == 0 {
+        return None;
+    }
+    Some(if slot >= cache.min_retained_slot() {
+        not_found::HEAD_ABSENT
+    } else {
+        not_found::BELOW_HEAD
+    })
+}
 
 #[derive(Debug)]
 struct ParsedGetTransactionConfig {
@@ -282,6 +358,13 @@ fn unsupported_transaction_version_message(version: u8) -> String {
     )
 }
 
+/// A record within `GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES`, sized as the primary record
+/// cache weighs it, hydrates on the async worker without a permit.
+fn hydrates_inline(state: &AppState, record: &StoredTransactionRecord) -> bool {
+    let max_bytes = state.get_transaction_inline_hydration_max_bytes;
+    max_bytes > 0 && record_heap_bytes(record) <= max_bytes
+}
+
 /// Hydrate a stored record and build the JSON-RPC response; shared by the
 /// head-cache, disk-cache, and ClickHouse branches of getTransaction.
 #[allow(clippy::too_many_arguments)]
@@ -301,23 +384,31 @@ pub(crate) async fn respond_with_hydrated_transaction(
         }
     };
 
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            error!(signature = signature_str, "Hydration semaphore closed");
-            let mut resp = json_rpc_internal_error_response(id);
-            attach_timings(&mut resp);
-            return Ok(resp);
-        }
+    let record_slot = record.slot;
+    let hydrated = if hydrates_inline(state, &record) {
+        Ok(hydrate_transaction_record(
+            record.as_ref(),
+            encoding,
+            max_version,
+        ))
+    } else {
+        let permit = match state.acquire_hydration_permit(route.method()).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!(signature = signature_str, "Hydration semaphore closed");
+                let mut resp = json_rpc_internal_error_response(id);
+                attach_timings(&mut resp);
+                return Ok(resp);
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            hydrate_transaction_record(record.as_ref(), encoding, max_version)
+        })
+        .await
     };
 
-    let record_slot = record.slot;
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        hydrate_transaction_record(record.as_ref(), encoding, max_version)
-    })
-    .await
-    {
+    match hydrated {
         Ok(Ok(encoded_tx)) => {
             route.success();
             let mut resp = json_rpc_success_response(id, encoded_tx);
@@ -515,30 +606,31 @@ pub(crate) async fn handle_get_transaction(
     }
 
     #[cfg(feature = "grpc-head-cache")]
-    if let Some(cache) = state.head_cache.as_ref()
-        && let Some(record) = cache.get_tx(&signature, commitment.commitment)
-    {
-        if requested_slot.is_some_and(|slot| record.slot != slot) {
-            route.source_head_cache();
-            route.not_found();
-            return Ok(json_rpc_null_response(id));
-        }
+    if let Some(cache) = state.head_cache.as_ref() {
+        if let Some(record) = cache
+            .get_tx_waiting(&signature, commitment.commitment, requested_slot)
+            .await
+        {
+            if requested_slot.is_some_and(|slot| record.slot != slot) {
+                route.source_head_cache();
+                route.not_found();
+                metrics::get_transaction_not_found(not_found::HEAD_SLOT_MISMATCH);
+                return Ok(json_rpc_null_response(id));
+            }
 
-        route.source_head_cache();
-        return respond_with_hydrated_transaction(
-            state.as_ref(),
-            id,
-            &mut route,
-            signature_str,
-            record,
-            encoding,
-            config.max_supported_transaction_version,
-            None,
-        )
-        .await;
-    }
-    #[cfg(feature = "grpc-head-cache")]
-    if state.head_cache.is_some() {
+            route.source_head_cache();
+            return respond_with_hydrated_transaction(
+                state.as_ref(),
+                id,
+                &mut route,
+                signature_str,
+                record,
+                encoding,
+                config.max_supported_transaction_version,
+                None,
+            )
+            .await;
+        }
         route.head_cache_read();
     }
 
@@ -552,6 +644,7 @@ pub(crate) async fn handle_get_transaction(
             if requested_slot.is_some_and(|slot| record.slot != slot) {
                 route.source_disk_cache();
                 route.not_found();
+                metrics::get_transaction_not_found(not_found::DISK_SLOT_MISMATCH);
                 return Ok(json_rpc_null_response(id));
             }
             observe_disk_cache_slot_age(state.as_ref(), record.slot);
@@ -574,6 +667,12 @@ pub(crate) async fn handle_get_transaction(
         ) {
             route.source_disk_cache();
             route.not_found();
+            record_not_found(
+                state.as_ref(),
+                &signature,
+                requested_slot,
+                not_found::DISK_MISS,
+            );
             return Ok(json_rpc_null_response(id));
         }
     }
@@ -635,6 +734,12 @@ pub(crate) async fn handle_get_transaction(
 
     let Some(record) = transaction_row else {
         route.not_found();
+        record_not_found(
+            state.as_ref(),
+            &signature,
+            requested_slot,
+            not_found::CLICKHOUSE_NULL,
+        );
         let mut resp = json_rpc_null_response(id);
         add_downstream_header(&mut resp, &timings);
         return Ok(resp);
@@ -1332,7 +1437,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                     error: TransactionHydrationError,
                 }
 
-                let permit = match state.hydration_sem.clone().acquire_owned().await {
+                let permit = match state.acquire_hydration_permit(route.method()).await {
                     Ok(permit) => permit,
                     Err(_) => {
                         error!(address, "Hydration semaphore closed");
@@ -1990,7 +2095,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         error: TransactionHydrationError,
     }
 
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
+    let permit = match state.acquire_hydration_permit(route.method()).await {
         Ok(permit) => permit,
         Err(_) => {
             error!(address, "Hydration semaphore closed");

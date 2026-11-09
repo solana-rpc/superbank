@@ -114,6 +114,11 @@ impl ReadEndpoint {
         matches!(self.target, "primary" | "shard")
     }
 
+    /// Primary and shard endpoints read source ClickHouse; cache and background lanes do not.
+    fn reads_source(&self) -> bool {
+        matches!(self.target, "primary" | "shard")
+    }
+
     pub(crate) fn with_timeout(&self, timeout: Duration) -> Self {
         Self {
             timeout,
@@ -206,6 +211,11 @@ impl ReadEndpoint {
         // No discovery, probes, or IO on the ready query path.
         self.verifier.require_ready()?;
         let deadline = Instant::now() + self.timeout;
+        let backend = if self.reads_source() {
+            crate::admission::admit_backend(operation).await?
+        } else {
+            None
+        };
         let permit = tokio::time::timeout_at(deadline, self.admission.clone().acquire_owned())
             .await
             .map_err(|e| ProcessingError::timeout("ClickHouse read admission", e))?
@@ -215,7 +225,13 @@ impl ReadEndpoint {
         let mut guard =
             self.verifier
                 .arm_ready(id.clone(), permit, operation, self.target, max_execution)?;
-        guard.retain_workflow(admission::current());
+        let mut workflow = admission::current();
+        if let Some(backend) = backend
+            && !workflow.iter().any(|lease| Arc::ptr_eq(lease, &backend))
+        {
+            workflow.push(backend);
+        }
+        guard.retain_workflow(workflow);
         if !self.retain_until_verified {
             guard.release_on_abandon();
         }
