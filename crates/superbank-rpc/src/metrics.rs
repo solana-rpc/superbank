@@ -816,6 +816,10 @@ pub struct Metrics {
     #[cfg(feature = "grpc-head-cache")]
     head_cache_write_lock_hold_seconds: Family<HeadCacheLockOpLabels, Histogram>,
     #[cfg(feature = "grpc-head-cache")]
+    head_cache_freeze_prepare_seconds: Histogram,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_worker_wait_seconds: Histogram,
+    #[cfg(feature = "grpc-head-cache")]
     head_cache_rejected_banks: Family<HeadCacheRejectedBankLabels, Counter>,
     #[cfg(feature = "grpc-head-cache")]
     head_cache_bank_events: Family<HeadCacheBankEventLabels, Counter>,
@@ -1025,6 +1029,10 @@ impl Metrics {
         #[cfg(feature = "grpc-head-cache")]
         let head_cache_write_lock_hold_seconds =
             Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_freeze_prepare_seconds = serving_latency_histogram();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_worker_wait_seconds = serving_latency_histogram();
         #[cfg(feature = "grpc-head-cache")]
         let head_cache_rejected_banks = Family::default();
         #[cfg(feature = "grpc-head-cache")]
@@ -1474,6 +1482,16 @@ impl Metrics {
                 head_cache_write_lock_hold_seconds.clone(),
             );
             registry.register(
+                "head_cache_freeze_prepare_seconds",
+                "Time the gRPC head cache converts and checks a frozen bank's transactions before it takes the bank write lock",
+                head_cache_freeze_prepare_seconds.clone(),
+            );
+            registry.register(
+                "head_cache_worker_wait_seconds",
+                "Time a block-machine output waits for a blocking thread before the gRPC head cache applies it",
+                head_cache_worker_wait_seconds.clone(),
+            );
+            registry.register(
                 "head_cache_rejected_banks",
                 "Frozen banks the gRPC head cache could not seal, by the first failed check",
                 head_cache_rejected_banks.clone(),
@@ -1878,6 +1896,10 @@ impl Metrics {
             head_cache_slot_entries,
             #[cfg(feature = "grpc-head-cache")]
             head_cache_write_lock_hold_seconds,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_freeze_prepare_seconds,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_worker_wait_seconds,
             #[cfg(feature = "grpc-head-cache")]
             head_cache_rejected_banks,
             #[cfg(feature = "grpc-head-cache")]
@@ -2867,7 +2889,34 @@ pub(crate) fn head_cache_write_lock_hold(op: &'static str, elapsed_seconds: f64)
 }
 
 #[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_freeze_prepare(elapsed_seconds: f64) {
+    metrics()
+        .head_cache_freeze_prepare_seconds
+        .observe(elapsed_seconds);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_worker_wait(elapsed_seconds: f64) {
+    metrics()
+        .head_cache_worker_wait_seconds
+        .observe(elapsed_seconds);
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+thread_local! {
+    static REJECTED_BANKS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reasons of the bank rejections counted on the calling thread; tests read them per thread.
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_rejected_banks_on_this_thread() -> Vec<&'static str> {
+    REJECTED_BANKS.with(|reasons| reasons.borrow().clone())
+}
+
+#[cfg(feature = "grpc-head-cache")]
 pub(crate) fn head_cache_rejected_bank(reason: &'static str) {
+    #[cfg(test)]
+    REJECTED_BANKS.with(|reasons| reasons.borrow_mut().push(reason));
     let metrics = metrics();
     metrics
         .head_cache_rejected_banks

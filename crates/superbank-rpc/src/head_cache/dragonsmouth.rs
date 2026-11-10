@@ -5,13 +5,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::solana_sdk::{hash::Hash, pubkey::Pubkey};
 use futures_util::StreamExt;
 use solana_commitment_config::CommitmentLevel;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use yellowstone_block_machine::{
     dragonsmouth::{
         RESERVED_FILTER_NAME,
@@ -63,17 +63,9 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
                 );
                 backoff = Duration::from_millis(250);
 
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(output) => handle_output(&cache, session.id, output),
-                        Err(err) => {
-                            warn!("head cache: block-machine error: {err:?}");
-                            break;
-                        }
-                    }
-                }
+                let end = pump(&cache, session.id, &mut stream).await;
 
-                warn!("head cache: stream ended; reconnecting");
+                warn!(?end, "head cache: stream ended; reconnecting");
             }
             Err(err) => {
                 warn!(
@@ -90,6 +82,61 @@ async fn run_block_machine_stream(cache: Arc<HeadCache>, cfg: DragonsmouthHeadCa
     }
 }
 
+/// Why [`pump`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpEnd {
+    StreamEnded,
+    StreamError,
+    WorkerFailed,
+}
+
+/// Applies each output on a blocking thread and waits for it before the next one.
+async fn apply_output(
+    cache: &Arc<HeadCache>,
+    session: u64,
+    output: BlockMachineOutput<BankBuffer>,
+) -> Result<(), tokio::task::JoinError> {
+    let cache = cache.clone();
+    let queued = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        metrics::head_cache_worker_wait(queued.elapsed().as_secs_f64());
+        handle_output(&cache, session, output);
+    })
+    .await
+}
+
+/// Applies outputs in stream order and stops at a stream error or a failed worker.
+/// A worker panic that poisoned a head cache lock is re-raised; any other ends the session.
+async fn pump<St, E>(cache: &Arc<HeadCache>, session: u64, stream: &mut St) -> PumpEnd
+where
+    St: futures_util::Stream<Item = Result<BlockMachineOutput<BankBuffer>, E>> + Unpin,
+    E: std::fmt::Debug,
+{
+    while let Some(result) = stream.next().await {
+        let output = match result {
+            Ok(output) => output,
+            Err(err) => {
+                warn!("head cache: block-machine error: {err:?}");
+                return PumpEnd::StreamError;
+            }
+        };
+        if let Err(err) = apply_output(cache, session, output).await {
+            match err.try_into_panic() {
+                Ok(panic) if cache.locks_poisoned() => std::panic::resume_unwind(panic),
+                Ok(_) => {
+                    error!("head cache: output worker panicked");
+                    return PumpEnd::WorkerFailed;
+                }
+                Err(err) => {
+                    warn!("head cache: output worker cancelled: {err}");
+                    return PumpEnd::WorkerFailed;
+                }
+            }
+        }
+    }
+    PumpEnd::StreamEnded
+}
+
 fn handle_output<S: BlockEventStore<EventT = SubscribeUpdate>>(
     cache: &HeadCache,
     session: u64,
@@ -97,28 +144,20 @@ fn handle_output<S: BlockEventStore<EventT = SubscribeUpdate>>(
 ) {
     match output {
         BlockMachineOutput::FrozenBlock(block) => {
-            let transactions = block
-                .events
-                .iter()
-                .filter_map(|event| match event.update_oneof.as_ref() {
+            let (slot, bank_id, blockhash) = (block.slot, block.bank_id, block.blockhash);
+            let transactions = BlockEventStore::into_iter(block.events)
+                .into_iter()
+                .filter_map(|event| match event.update_oneof {
                     Some(
                         yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Transaction(
                             update,
                         ),
-                    ) if update.slot == block.slot && update.bank_id == block.bank_id => {
-                        update.transaction.clone()
-                    }
+                    ) if update.slot == slot && update.bank_id == bank_id => update.transaction,
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             let count = transactions.len() as u64;
-            cache.freeze_bank(
-                session,
-                block.slot,
-                block.bank_id,
-                block.blockhash,
-                transactions,
-            );
+            cache.freeze_bank(session, slot, bank_id, blockhash, transactions);
             metrics::head_cache_observe_block(
                 cache.latest_slot(),
                 count,
@@ -642,6 +681,295 @@ mod tests {
                     std::time::Instant::now()
                 )
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_applies_each_output_on_a_blocking_thread_in_order() {
+        let waits = worker_waits();
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let events = coverage_events(10, 9)
+            .into_iter()
+            .chain(coverage_events(12, 10));
+        let source = futures_util::stream::iter(events.map(Ok::<_, std::io::Error>))
+            .inspect(|event| observe_bank_metadata(&cache, session.id, event.as_ref().unwrap()));
+        let mut stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        );
+        assert_eq!(
+            pump(&cache, session.id, &mut stream).await,
+            PumpEnd::StreamEnded
+        );
+        let (tip, proof) = cache
+            .coverage
+            .read()
+            .unwrap()
+            .snapshot(
+                10,
+                None,
+                CommitmentLevel::Finalized,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(tip, 12);
+        assert_eq!(proof.slots, vec![10, 12]);
+        // One wait per output, and at least one output per block.
+        assert!(worker_waits() >= waits + 2.0);
+    }
+
+    /// Events of one block with a single transaction whose signature is `[marker; 64]`.
+    fn block_with_transaction(slot: u64, parent: u64, marker: u8) -> Vec<SubscribeUpdate> {
+        use yellowstone_grpc_proto::prelude::{
+            SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
+        };
+        let mut events = coverage_events(slot, parent);
+        for event in &mut events {
+            match event.update_oneof.as_mut().unwrap() {
+                UpdateOneof::Entry(entry) => entry.executed_transaction_count = 1,
+                UpdateOneof::BlockMeta(meta) => meta.executed_transaction_count = 1,
+                _ => {}
+            }
+        }
+        events.insert(
+            6,
+            SubscribeUpdate {
+                filters: vec![TRANSACTIONS_FILTER_NAME.to_string()],
+                update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                    slot,
+                    bank_id: slot,
+                    transaction: Some(super::super::banks::tests::transaction(marker)),
+                })),
+                ..Default::default()
+            },
+        );
+        events
+    }
+
+    type Outputs = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    /// A block stream over `events` that applies the metadata tap and records the kind of
+    /// every output it yields. It owns its handles, so a task can run it.
+    fn recorded_stream(
+        cache: &Arc<HeadCache>,
+        session: u64,
+        events: Vec<Result<SubscribeUpdate, std::io::Error>>,
+    ) -> (
+        impl futures_util::Stream<Item = Result<BlockMachineOutput<BankBuffer>, std::io::Error>>
+        + Unpin
+        + Send
+        + 'static,
+        Outputs,
+    ) {
+        let tap = cache.clone();
+        let source = futures_util::stream::iter(events).inspect(move |event| {
+            if let Ok(event) = event {
+                observe_bank_metadata(&tap, session, event);
+            }
+        });
+        let outputs = Outputs::default();
+        let record = outputs.clone();
+        let stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+            BLOCK_MACHINE_CONFIG,
+        )
+        .inspect(move |output| {
+            let kind = match output {
+                Ok(BlockMachineOutput::FrozenBlock(_)) => "frozen",
+                Ok(BlockMachineOutput::SlotCommitmentUpdate(_)) => "commitment",
+                Ok(_) => "other",
+                Err(_) => "error",
+            };
+            record.lock().unwrap().push(kind);
+        });
+        (stream, outputs)
+    }
+
+    fn worker_waits() -> f64 {
+        super::super::banks::tests::exported_count("superbank_head_cache_worker_wait_seconds")
+    }
+
+    /// Waits for a held worker without blocking the runtime that must keep driving the loop.
+    async fn reached(rx: std::sync::mpsc::Receiver<u64>) {
+        tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker reaches its pause point")
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn frozen_block_is_published_before_its_commitment_update() {
+        let waits = worker_waits();
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let events = block_with_transaction(42, 41, 1)
+            .into_iter()
+            .map(Ok)
+            .collect();
+        let (mut stream, outputs) = recorded_stream(&cache, session.id, events);
+        let (paused, resume) = cache.arm_pause(crate::head_cache::PausePoint::Prepared);
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            let id = session.id;
+            async move { pump(&cache, id, &mut stream).await }
+        });
+        reached(paused).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // The loop is still awaiting the freeze: it has taken no later output.
+        assert_eq!(*outputs.lock().unwrap(), ["frozen"]);
+        assert!(cache.banks.try_read().is_ok());
+        assert!(
+            cache
+                .get_block(
+                    42,
+                    CommitmentLevel::Processed,
+                    solana_transaction_status::TransactionDetails::Full
+                )
+                .is_none()
+        );
+        assert!(!cache.slot_commitment.contains_key(&42));
+        assert!(
+            cache
+                .get_tx(
+                    &crate::solana_sdk::signature::Signature::from([1; 64]),
+                    CommitmentLevel::Processed
+                )
+                .is_none()
+        );
+        resume.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), PumpEnd::StreamEnded);
+        assert_eq!(outputs.lock().unwrap()[0], "frozen");
+        assert!(outputs.lock().unwrap().contains(&"commitment"));
+        let block = cache
+            .get_block(
+                42,
+                CommitmentLevel::Finalized,
+                solana_transaction_status::TransactionDetails::Full,
+            )
+            .expect("served at the committed level");
+        assert_eq!(block.metadata().executed_transaction_count, 1);
+        assert!(
+            cache
+                .get_tx(
+                    &crate::solana_sdk::signature::Signature::from([1; 64]),
+                    CommitmentLevel::Finalized
+                )
+                .is_some()
+        );
+        assert!(worker_waits() >= waits + outputs.lock().unwrap().len() as f64);
+    }
+
+    #[tokio::test]
+    async fn a_worker_panic_outside_a_hold_ends_the_session_and_the_next_one_publishes() {
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let events = block_with_transaction(10, 9, 1)
+            .into_iter()
+            .chain(block_with_transaction(12, 10, 2))
+            .map(Ok)
+            .collect();
+        let (mut stream, outputs) = recorded_stream(&cache, session.id, events);
+        // Dropping the release sender makes the worker panic before it takes the bank lock.
+        let (_paused, resume) = cache.arm_pause(crate::head_cache::PausePoint::Prepared);
+        drop(resume);
+        assert_eq!(
+            pump(&cache, session.id, &mut stream).await,
+            PumpEnd::WorkerFailed
+        );
+        // No later output was applied, and no lock is poisoned.
+        assert_eq!(*outputs.lock().unwrap(), ["frozen"]);
+        assert!(cache.banks.try_read().is_ok());
+        assert!(!cache.locks_poisoned());
+        assert_eq!(cache.latest_slot(), 0);
+        for slot in [10, 12] {
+            assert!(
+                cache
+                    .get_block(
+                        slot,
+                        CommitmentLevel::Processed,
+                        solana_transaction_status::TransactionDetails::None
+                    )
+                    .is_none()
+            );
+        }
+        // The next session starts clean and publishes normally.
+        drop(session);
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let events = block_with_transaction(12, 10, 2)
+            .into_iter()
+            .map(Ok)
+            .collect();
+        let (mut stream, _) = recorded_stream(&cache, session.id, events);
+        assert_eq!(
+            pump(&cache, session.id, &mut stream).await,
+            PumpEnd::StreamEnded
+        );
+        assert!(
+            cache
+                .get_block(
+                    12,
+                    CommitmentLevel::Finalized,
+                    solana_transaction_status::TransactionDetails::Full
+                )
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_panic_inside_a_bank_hold_is_re_raised_on_the_stream_task() {
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let events = block_with_transaction(10, 9, 1)
+            .into_iter()
+            .map(Ok)
+            .collect();
+        let (mut stream, _) = recorded_stream(&cache, session.id, events);
+        // Dropping the release sender makes the worker panic while it holds the bank lock.
+        let (_paused, resume) = cache.arm_pause(crate::head_cache::PausePoint::RowsInserted);
+        drop(resume);
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            let id = session.id;
+            async move { pump(&cache, id, &mut stream).await }
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(cache.banks.is_poisoned());
+        // Dropping the session would take the poisoned lock.
+        std::mem::forget(session);
+    }
+
+    #[tokio::test]
+    async fn pump_returns_on_a_stream_error_after_applying_earlier_outputs() {
+        let cache = Arc::new(HeadCache::new(32, 64));
+        let session = CoverageSession::new(cache.clone(), CommitmentLevel::Processed);
+        let events = block_with_transaction(10, 9, 1)
+            .into_iter()
+            .map(Ok)
+            .chain(std::iter::once(Err(std::io::Error::other("stream failed"))))
+            .collect();
+        let (mut stream, outputs) = recorded_stream(&cache, session.id, events);
+        assert_eq!(
+            pump(&cache, session.id, &mut stream).await,
+            PumpEnd::StreamError
+        );
+        assert_eq!(outputs.lock().unwrap().last(), Some(&"error"));
+        assert!(
+            cache
+                .get_block(
+                    10,
+                    CommitmentLevel::Finalized,
+                    solana_transaction_status::TransactionDetails::Full
+                )
+                .is_some()
         );
     }
 
