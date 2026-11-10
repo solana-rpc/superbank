@@ -757,6 +757,8 @@ pub struct Metrics {
     rpc_blocks_range_seconds: Family<BlockRangeLabels, Histogram>,
     get_block_response_cache_access: Family<OperationOutcomeLabels, Counter>,
     transactions_for_address_cursor_cache_access: Family<OperationOutcomeLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    transactions_for_address_block_time_slot_bounds: Family<OperationOutcomeLabels, Counter>,
     signature_status_history_cache: Family<OperationOutcomeLabels, Counter>,
     get_block_response_cache_entries: Gauge,
     get_block_response_cache_weighted_bytes: Gauge,
@@ -962,6 +964,8 @@ impl Metrics {
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let get_block_response_cache_access = Family::default();
         let transactions_for_address_cursor_cache_access = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let transactions_for_address_block_time_slot_bounds = Family::default();
         let signature_status_history_cache = Family::default();
         let get_block_response_cache_entries = Gauge::default();
         let get_block_response_cache_weighted_bytes = Gauge::default();
@@ -1264,6 +1268,12 @@ impl Metrics {
             "transactions_for_address_cursor_cache_access",
             "getTransactionsForAddress cursor cache outcomes (hit, miss, insert)",
             transactions_for_address_cursor_cache_access.clone(),
+        );
+        #[cfg(feature = "disk-cache")]
+        registry.register(
+            "transactions_for_address_block_time_slot_bounds",
+            "getTransactionsForAddress block-time slot bound outcomes (applied, partial, below_floor, unresolved, disabled, no_index)",
+            transactions_for_address_block_time_slot_bounds.clone(),
         );
         registry.register(
             "get_block_response_cache_entries",
@@ -1814,6 +1824,8 @@ impl Metrics {
             rpc_blocks_range_seconds,
             get_block_response_cache_access,
             transactions_for_address_cursor_cache_access,
+            #[cfg(feature = "disk-cache")]
+            transactions_for_address_block_time_slot_bounds,
             signature_status_history_cache,
             get_block_response_cache_entries,
             get_block_response_cache_weighted_bytes,
@@ -2232,6 +2244,15 @@ impl Metrics {
         let labels =
             Self::current_operation_outcome_labels("get_transactions_for_address", outcome);
         self.transactions_for_address_cursor_cache_access
+            .get_or_create(&labels)
+            .inc();
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub fn transactions_for_address_block_time_slot_bounds(&self, outcome: &'static str) {
+        let labels =
+            Self::current_operation_outcome_labels("get_transactions_for_address", outcome);
+        self.transactions_for_address_block_time_slot_bounds
             .get_or_create(&labels)
             .inc();
     }
@@ -2729,6 +2750,12 @@ pub(crate) fn get_block_response_cache_access(outcome: &'static str) {
 pub(crate) fn transactions_for_address_cursor_cache_access(outcome: &'static str) {
     let metrics = metrics();
     metrics.transactions_for_address_cursor_cache_access(outcome);
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn transactions_for_address_block_time_slot_bounds(outcome: &'static str) {
+    let metrics = metrics();
+    metrics.transactions_for_address_block_time_slot_bounds(outcome);
 }
 
 pub(crate) fn get_block_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {

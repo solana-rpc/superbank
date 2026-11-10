@@ -11,6 +11,8 @@ mod cache_refresh;
 mod get_block_request_shape;
 mod get_transaction_inline_hydration;
 mod latest_slot;
+#[cfg(feature = "disk-cache")]
+mod transactions_for_address_block_time;
 
 use crate::solana_sdk;
 mod http_response_logs;

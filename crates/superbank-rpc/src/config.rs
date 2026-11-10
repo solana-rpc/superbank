@@ -12,6 +12,8 @@ const METRICS_CAPTURE_HEADER_X_ENDPOINT: &str = "X-Endpoint";
 const METRICS_CAPTURE_HEADER_X_RPC_NODE: &str = "X-RPC-Node";
 const METRICS_CAPTURE_HEADER_X_SUBSCRIPTION_ID: &str = "X-Subscription-ID";
 const METRICS_CAPTURE_HEADER_X_ACCOUNT_ID: &str = "X-Account-ID";
+/// Lowest edge slot for getTransactionsForAddress block-time slot bounds.
+pub(crate) const DEFAULT_BLOCK_TIME_SLOT_BOUNDS_MIN_SLOT: u64 = 100_000_000;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum ClickHouseStartupTableCheck {
@@ -473,6 +475,25 @@ pub struct RpcConfig {
         action = ArgAction::Set
     )]
     pub(crate) clickhouse_transactions_for_address_union_pushdown: bool,
+
+    /// Add the slot range of a getTransactionsForAddress block-time filter, read from the
+    /// disk-cache block index, so ClickHouse prunes by primary key. Results are unchanged.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    pub(crate) clickhouse_transactions_for_address_block_time_slot_bounds: bool,
+
+    /// Lowest slot a block-time slot bound may stop at. Some early ledgers store zero or
+    /// displaced block times, so both edges are searched from this slot on.
+    #[arg(
+        long,
+        env = "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS_MIN_SLOT",
+        default_value_t = DEFAULT_BLOCK_TIME_SLOT_BOUNDS_MIN_SLOT
+    )]
+    pub(crate) clickhouse_transactions_for_address_block_time_slot_bounds_min_slot: u64,
 
     /// Resolve a getSignaturesForAddress `before`/`until` cursor that the head and local
     /// tiers missed inside the primary page query (one round trip) instead of a separate
@@ -1425,6 +1446,11 @@ mod config_tests {
         assert!(!cfg.clickhouse_transactions_for_address_position_tokens);
         assert!(!cfg.clickhouse_transactions_for_address_cursor_cache);
         assert!(cfg.clickhouse_transactions_for_address_union_pushdown);
+        assert!(cfg.clickhouse_transactions_for_address_block_time_slot_bounds);
+        assert_eq!(
+            cfg.clickhouse_transactions_for_address_block_time_slot_bounds_min_slot,
+            100_000_000
+        );
         assert!(!cfg.clickhouse_gsfa_inline_cursor);
         assert!(!cfg.emit_http_errors);
         assert_eq!(cfg.get_block_response_cache_max_bytes, 0);
@@ -1670,6 +1696,19 @@ mod config_tests {
             "--clickhouse-transactions-for-address-union-pushdown=false",
         ]);
         assert!(!cfg.clickhouse_transactions_for_address_union_pushdown);
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-transactions-for-address-block-time-slot-bounds=false",
+        ]);
+        assert!(!cfg.clickhouse_transactions_for_address_block_time_slot_bounds);
+        let cfg = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--clickhouse-transactions-for-address-block-time-slot-bounds-min-slot=0",
+        ]);
+        assert_eq!(
+            cfg.clickhouse_transactions_for_address_block_time_slot_bounds_min_slot,
+            0
+        );
         let cfg = RpcConfig::parse_from(["superbank-rpc", "--clickhouse-latest-slot-hint", "true"]);
         assert!(cfg.clickhouse_latest_slot_hint);
         assert!(
@@ -1809,6 +1848,10 @@ mod config_tests {
             "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN",
             "false",
         );
+        let _slot_bounds = EnvVarGuard::set(
+            "CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS",
+            "false",
+        );
         #[cfg(feature = "grpc-head-cache")]
         let _clamp = EnvVarGuard::set("GET_BLOCKS_CLAMP_TO_HEAD_TIP", "false");
         #[cfg(feature = "disk-cache")]
@@ -1824,6 +1867,7 @@ mod config_tests {
         assert!(!cfg.clickhouse_latest_slot_hint);
         assert!(!cfg.get_block_response_cache_unsupported_version);
         assert!(!cfg.clickhouse_transactions_for_address_union_pushdown);
+        assert!(!cfg.clickhouse_transactions_for_address_block_time_slot_bounds);
         #[cfg(feature = "grpc-head-cache")]
         assert!(!cfg.get_blocks_clamp_to_head_tip);
         #[cfg(feature = "disk-cache")]
