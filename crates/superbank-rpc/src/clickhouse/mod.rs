@@ -49,7 +49,7 @@ pub(crate) use gsfa::{GsfaCursor, GsfaMissingCursor, InlineGsfaPage};
 pub(crate) use sharding::{RoutingPolicy, RoutingScope, RoutingTransport, ShardRoutingConfig};
 pub(crate) use util::{QueryCacheConfig, QueryFreshnessClass};
 
-#[cfg(feature = "grpc-streaming")]
+#[cfg(any(test, feature = "grpc-streaming"))]
 pub(crate) use util::transient_shard_local_error_reason;
 
 #[cfg(feature = "grpc-head-cache")]

@@ -35,12 +35,15 @@ mod solana_sdk {
     }
 }
 
+mod admission;
 mod ag_genesis_cert;
 mod block_response_cache;
 mod clickhouse;
 mod get_transaction_primary_cache;
 mod metrics;
 mod processing;
+#[cfg(feature = "grpc-head-cache")]
+mod recent_block_responses;
 mod request_filter;
 mod status_history_cache;
 

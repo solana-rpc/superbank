@@ -6,22 +6,19 @@
 pub(crate) mod ag_genesis_cert;
 mod block_ranges;
 pub(crate) mod blocks;
-mod encoding;
+pub(crate) mod encoding;
 pub(crate) mod signatures;
 pub(crate) mod transactions;
 pub(crate) mod types;
 
 use axum::{
     Json,
-    body::{Body, Bytes, to_bytes},
+    body::{Body, Bytes, HttpBody, to_bytes},
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
-use solana_rpc_client_api::custom_error::{
-    JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE, JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY,
-};
 use std::future::Future;
 use std::io::{self, Write};
 use std::sync::{
@@ -34,11 +31,17 @@ use tracing::{Level, debug, error, info};
 
 use crate::clickhouse::{QueryTimings, RoutingScope, RoutingTransport};
 use crate::metrics;
-use crate::rpc::{JsonRpcInboundRequest, JsonRpcRequest, json_rpc_error_response};
+use crate::rpc::{
+    JSON_RPC_REQUEST_TIMEOUT_CODE, JSON_RPC_REQUEST_TIMEOUT_MESSAGE, JsonRpcHttp503,
+    JsonRpcInboundRequest, JsonRpcRequest, is_http_503_eligible_json_rpc_error,
+    json_rpc_error_response,
+};
 use crate::state::AppState;
 use crate::util::{add_superbank_response_metrics_headers, extract_downstream_timings};
 
 const METRICS_UNKNOWN_METHOD: &str = "unknown";
+const METRICS_BATCH_METHOD: &str = "batch";
+const METRICS_INVALID_METHOD: &str = "invalid";
 const ROUTE_TRANSPORT_TCP: &str = "tcp";
 const ROUTE_TRANSPORT_HTTP: &str = "http";
 const ROUTE_SCOPE_DISTRIBUTED: &str = "distributed";
@@ -59,9 +62,6 @@ pub(crate) const ROUTE_OUTCOME_TIMEOUT: &str = "timeout";
 /// The handler future was dropped before it returned, e.g. the caller disconnected.
 pub(crate) const ROUTE_OUTCOME_ABANDONED: &str = "abandoned";
 const ROUTE_HEADER_LABEL_MISSING: &str = "missing";
-const JSON_RPC_INTERNAL_ERROR_CODE: i64 = -32603;
-const JSON_RPC_REQUEST_TIMEOUT_CODE: i64 = -32000;
-const JSON_RPC_REQUEST_TIMEOUT_MESSAGE: &str = "Request timeout";
 const JSON_RPC_PARAMETER_FILTER_CODE: i32 = -32602;
 const JSON_RPC_PARAMETER_FILTER_MESSAGE: &str =
     "Invalid params: request blocked by parameter filter";
@@ -363,6 +363,7 @@ pub(crate) struct RouteMetric {
     timeout: std::time::Duration,
     /// Created by a handler the JSON-RPC dispatcher is polling.
     dispatched: bool,
+    get_block_shape: Option<metrics::GetBlockRequestShape>,
     x_endpoint: Option<String>,
     x_rpc_node: Option<String>,
     x_subscription_id: Option<String>,
@@ -384,6 +385,7 @@ impl RouteMetric {
             started: Instant::now(),
             timeout: state.rpc_request_timeout,
             dispatched: in_handler_poll(),
+            get_block_shape: None,
             x_endpoint: request_headers.x_endpoint,
             x_rpc_node: request_headers.x_rpc_node,
             x_subscription_id: request_headers.x_subscription_id,
@@ -471,6 +473,27 @@ impl RouteMetric {
     pub(crate) fn method(&self) -> &'static str {
         self.method
     }
+
+    /// Counts this request in the getBlock shape metric when the route is recorded.
+    pub(crate) fn get_block_shape(&mut self, shape: metrics::GetBlockRequestShape) {
+        self.get_block_shape = Some(shape);
+    }
+}
+
+/// The tier that served a successful getBlock request; any other outcome is `other`.
+fn get_block_shape_tier(source: &'static str, outcome: &'static str) -> &'static str {
+    if outcome != ROUTE_OUTCOME_SUCCESS {
+        return "other";
+    }
+    match source {
+        ROUTE_SOURCE_CLICKHOUSE => "clickhouse",
+        ROUTE_SOURCE_RESPONSE_CACHE => "response_cache",
+        #[cfg(feature = "grpc-head-cache")]
+        ROUTE_SOURCE_HEAD_CACHE => "head",
+        #[cfg(feature = "disk-cache")]
+        ROUTE_SOURCE_DISK_CACHE => "disk",
+        _ => "other",
+    }
 }
 
 /// `backend_error` is the unset default, so it also covers handlers that never finished:
@@ -495,6 +518,9 @@ impl Drop for RouteMetric {
             self.started.elapsed() >= self.timeout,
             self.dispatched && !in_handler_poll(),
         );
+        if let Some(shape) = self.get_block_shape {
+            metrics::get_block_request_shape(shape, get_block_shape_tier(self.source, outcome));
+        }
         metrics::route(metrics::RouteMetricLabels {
             method: self.method,
             transport: self.transport,
@@ -762,22 +788,6 @@ fn parameter_filter_response_value(id: Value, method: String, params: Vec<Value>
     )
 }
 
-fn is_http_503_eligible_json_rpc_error(code: i64, message: Option<&str>) -> bool {
-    if code == JSON_RPC_INTERNAL_ERROR_CODE {
-        return true;
-    }
-    if code == JSON_RPC_REQUEST_TIMEOUT_CODE {
-        return message == Some(JSON_RPC_REQUEST_TIMEOUT_MESSAGE);
-    }
-    if code == JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY {
-        return true;
-    }
-    if code == JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE {
-        return true;
-    }
-    false
-}
-
 fn json_rpc_response_value_has_http_503_error(value: &Value) -> bool {
     match value {
         Value::Array(items) => items.iter().any(json_rpc_response_item_has_http_503_error),
@@ -796,11 +806,24 @@ fn json_rpc_response_item_has_http_503_error(value: &Value) -> bool {
     is_http_503_eligible_json_rpc_error(code, message)
 }
 
-async fn promote_http_status_for_json_rpc_errors(response: Response, enabled: bool) -> Response {
+async fn promote_http_status_for_json_rpc_errors(
+    mut response: Response,
+    enabled: bool,
+) -> Response {
     if !enabled {
         return response;
     }
+    if let Some(JsonRpcHttp503(eligible)) = response.extensions().get::<JsonRpcHttp503>().copied() {
+        if eligible {
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        }
+        return response;
+    }
+    promote_http_status_by_scanning_body(response).await
+}
 
+/// Fallback for responses the builders did not mark, such as batch arrays.
+async fn promote_http_status_by_scanning_body(response: Response) -> Response {
     let (mut parts, body) = response.into_parts();
     let bytes = match to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
@@ -967,6 +990,7 @@ async fn dispatch_json_rpc_request(
     let id_for_dispatch = id.clone();
     let params = req.params;
     let method_str = method.as_str();
+    let backend_admission = state.clickhouse.backend_admission.clone();
     let dispatch = Box::pin(async {
         match method_str {
             "getSignaturesForAddress" => {
@@ -1025,7 +1049,8 @@ async fn dispatch_json_rpc_request(
             )),
         }
     });
-    let dispatch = mark_handler_polls(dispatch);
+    let dispatch =
+        crate::admission::backend_request_scope(backend_admission, mark_handler_polls(dispatch));
     let result = if let Some(timeout) = timeout {
         match tokio::time::timeout(timeout, dispatch).await {
             Ok(result) => result,
@@ -1377,21 +1402,25 @@ pub(crate) async fn handle_json_rpc_with_headers(
     let labels = request_header_metric_labels(&headers, &state.metrics_header_capture);
     let request_metric_labels = labels.clone();
     let response_header_metrics_context = Arc::new(ResponseHeaderMetricsContext::default());
-    let result =
+    let (envelope_method, result) =
         with_response_header_metrics_context(response_header_metrics_context.clone(), async move {
             let payload = match serde_json::from_slice::<Value>(&body) {
                 Ok(payload) => payload,
                 Err(_) => {
-                    return Ok(json_rpc_error_response(
-                        Value::Null,
-                        -32700,
-                        "Parse error",
-                        None,
-                    ));
+                    return (
+                        METRICS_INVALID_METHOD,
+                        Ok(json_rpc_error_response(
+                            Value::Null,
+                            -32700,
+                            "Parse error",
+                            None,
+                        )),
+                    );
                 }
             };
 
-            match payload {
+            let envelope_method = envelope_method_label(&payload);
+            let result = match payload {
                 Value::Array(requests) => {
                     handle_batch_request(state, request_metric_labels, requests).await
                 }
@@ -1404,15 +1433,45 @@ pub(crate) async fn handle_json_rpc_with_headers(
                     "Invalid Request",
                     None,
                 )),
-            }
+            };
+            (envelope_method, result)
         })
         .await;
 
     let result =
         finalize_json_rpc_response(result, emit_http_errors, &response_header_metrics_context)
             .await;
+    observe_envelope(envelope_method, &result, start);
     log_http_response(&result, start, &labels);
     result
+}
+
+fn envelope_method_label(payload: &Value) -> &'static str {
+    match payload {
+        Value::Array(_) => METRICS_BATCH_METHOD,
+        Value::Object(request) => request
+            .get("method")
+            .and_then(Value::as_str)
+            .map_or(METRICS_INVALID_METHOD, metrics_method_label),
+        _ => METRICS_INVALID_METHOD,
+    }
+}
+
+/// Body length the server will frame: the Content-Length header, else an exact body size hint.
+fn response_body_len(response: &Response) -> Option<u64> {
+    response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| response.body().size_hint().exact())
+}
+
+fn observe_envelope(method: &'static str, result: &Result<Response, StatusCode>, start: Instant) {
+    metrics::rpc_envelope(method, start.elapsed().as_secs_f64());
+    if let Some(bytes) = result.as_ref().ok().and_then(response_body_len) {
+        metrics::rpc_response_bytes(method, bytes);
+    }
 }
 
 async fn finalize_json_rpc_response(
@@ -1463,17 +1522,19 @@ fn log_http_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        JSON_RPC_INTERNAL_ERROR_CODE, JSON_RPC_REQUEST_TIMEOUT_CODE,
-        JSON_RPC_REQUEST_TIMEOUT_MESSAGE, is_http_503_eligible_json_rpc_error,
-        json_rpc_response_value_has_http_503_error, promote_http_status_for_json_rpc_errors,
-        request_header_metric_labels, response_to_json_value, validate_json_rpc_response_value,
+        JSON_RPC_REQUEST_TIMEOUT_CODE, JSON_RPC_REQUEST_TIMEOUT_MESSAGE, JsonRpcHttp503,
+        envelope_method_label, is_http_503_eligible_json_rpc_error,
+        json_rpc_response_value_has_http_503_error, promote_http_status_by_scanning_body,
+        promote_http_status_for_json_rpc_errors, request_header_metric_labels, response_body_len,
+        response_to_json_value, validate_json_rpc_response_value,
     };
     use axum::{
         Json,
-        http::{HeaderMap, HeaderValue, StatusCode},
-        response::IntoResponse,
+        body::{Body, Bytes, HttpBody, to_bytes},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+        response::{IntoResponse, Response},
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use solana_rpc_client_api::custom_error::{
         JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
         JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE,
@@ -1481,10 +1542,283 @@ mod tests {
         JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED,
         JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE,
         JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED, JSON_RPC_SERVER_ERROR_NODE_UNHEALTHY,
-        JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
+        JSON_RPC_SERVER_ERROR_SLOT_SKIPPED, JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
     };
 
+    use crate::rpc::responses::JSON_RPC_INTERNAL_ERROR_CODE;
+    use crate::rpc::{
+        json_rpc_error_response, json_rpc_filter_transaction_not_found_response,
+        json_rpc_internal_error_response, json_rpc_long_term_storage_unreachable_response,
+        json_rpc_node_unhealthy_response, json_rpc_null_response, json_rpc_success_response,
+        json_rpc_success_response_from_result_bytes,
+    };
     use crate::state::MetricsHeaderCaptureConfig;
+
+    /// A named builder call and the HTTP 503 verdict the body scan gives it.
+    type MarkedResponseCase = (&'static str, fn() -> Response, bool);
+
+    fn marked_response_cases() -> [MarkedResponseCase; 15] {
+        [
+            (
+                "success",
+                || json_rpc_success_response(json!(1), json!({"slot": 7})),
+                false,
+            ),
+            (
+                "success_from_result_bytes",
+                || {
+                    json_rpc_success_response_from_result_bytes(
+                        json!("req-1"),
+                        Bytes::from_static(br#"{"blockhash":"abc","transactions":[]}"#),
+                    )
+                },
+                false,
+            ),
+            ("null", || json_rpc_null_response(json!(2)), false),
+            (
+                "internal_error",
+                || json_rpc_internal_error_response(json!(3)),
+                true,
+            ),
+            (
+                "internal_error_rewritten",
+                || json_rpc_error_response(json!(4), -32603, "boom", Some(json!({"x": 1}))),
+                true,
+            ),
+            (
+                "timeout_exact_message",
+                || {
+                    json_rpc_error_response(
+                        json!(5),
+                        JSON_RPC_REQUEST_TIMEOUT_CODE as i32,
+                        JSON_RPC_REQUEST_TIMEOUT_MESSAGE,
+                        Some(json!({"timeoutMs": 10_000})),
+                    )
+                },
+                true,
+            ),
+            (
+                "timeout_code_other_message",
+                || json_rpc_error_response(json!(6), -32000, "Upstream returned -32000", None),
+                false,
+            ),
+            (
+                "node_unhealthy",
+                || json_rpc_node_unhealthy_response(json!(7)),
+                true,
+            ),
+            (
+                "long_term_storage_unreachable",
+                || json_rpc_long_term_storage_unreachable_response(json!(8)),
+                true,
+            ),
+            (
+                "block_not_available",
+                || {
+                    json_rpc_error_response(
+                        json!(9),
+                        JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE as i32,
+                        "Block not available for slot 9",
+                        None,
+                    )
+                },
+                false,
+            ),
+            (
+                "slot_skipped",
+                || {
+                    json_rpc_error_response(
+                        json!(10),
+                        JSON_RPC_SERVER_ERROR_SLOT_SKIPPED as i32,
+                        "Slot 10 was skipped, or missing due to ledger jump to recent snapshot",
+                        None,
+                    )
+                },
+                false,
+            ),
+            (
+                "long_term_storage_slot_skipped",
+                || {
+                    json_rpc_error_response(
+                        json!(11),
+                        JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_SLOT_SKIPPED as i32,
+                        "Slot 11 was skipped, or missing in long-term storage",
+                        None,
+                    )
+                },
+                false,
+            ),
+            (
+                "invalid_params",
+                || json_rpc_error_response(json!(12), -32602, "Invalid params", None),
+                false,
+            ),
+            (
+                "unsupported_transaction_version",
+                || {
+                    json_rpc_error_response(
+                        json!(13),
+                        JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION as i32,
+                        "Transaction version (0) is not supported by the requesting client",
+                        None,
+                    )
+                },
+                false,
+            ),
+            (
+                "filter_transaction_not_found",
+                || json_rpc_filter_transaction_not_found_response(json!(14), "sig"),
+                false,
+            ),
+        ]
+    }
+
+    async fn into_wire(response: Response) -> (StatusCode, HeaderMap, Option<u64>, Bytes) {
+        let wire_len = response_body_len(&response);
+        let (parts, body) = response.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.expect("response body");
+        (parts.status, parts.headers, wire_len, bytes)
+    }
+
+    fn unmarked(mut response: Response) -> Response {
+        response.extensions_mut().remove::<JsonRpcHttp503>();
+        response
+    }
+
+    #[tokio::test]
+    async fn builder_marker_matches_body_scan() {
+        for (name, build, expected) in marked_response_cases() {
+            let response = build();
+            let marker = response.extensions().get::<JsonRpcHttp503>().copied();
+            assert_eq!(marker, Some(JsonRpcHttp503(expected)), "{name}");
+
+            let (_, _, _, bytes) = into_wire(response).await;
+            let value: Value = serde_json::from_slice(&bytes).expect("JSON-RPC body");
+            assert_eq!(
+                json_rpc_response_value_has_http_503_error(&value),
+                expected,
+                "{name}: {value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_promotion_is_byte_identical_to_body_scan() {
+        for enabled in [true, false] {
+            for (name, build, eligible) in marked_response_cases() {
+                let marked = promote_http_status_for_json_rpc_errors(build(), enabled).await;
+                assert!(marked.extensions().get::<JsonRpcHttp503>().is_some());
+                let scanned = if enabled {
+                    promote_http_status_by_scanning_body(unmarked(build())).await
+                } else {
+                    build()
+                };
+                let marked = into_wire(marked).await;
+                assert_eq!(marked, into_wire(scanned).await, "{name} enabled={enabled}");
+                let expected = if enabled && eligible {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                };
+                assert_eq!(marked.0, expected, "{name} enabled={enabled}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_success_keeps_streamed_body_and_content_length() {
+        let result = Bytes::from(vec![b'1'; 64 * 1024]);
+        let build = || json_rpc_success_response_from_result_bytes(json!(1), result.clone());
+        let content_length = build().headers()[header::CONTENT_LENGTH].clone();
+        assert_eq!(build().body().size_hint().exact(), None);
+
+        let response = promote_http_status_for_json_rpc_errors(build(), true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], content_length);
+        assert_eq!(
+            response.body().size_hint().exact(),
+            None,
+            "body was buffered"
+        );
+
+        // The scan fallback buffers the same body into one exact-size chunk.
+        let scanned = promote_http_status_by_scanning_body(unmarked(build())).await;
+        assert_eq!(
+            scanned.body().size_hint().exact(),
+            Some(content_length.to_str().unwrap().parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn marked_response_promotion_does_not_poll_body() {
+        let mut response = Response::new(Body::from_stream(futures_util::stream::pending::<
+            Result<Bytes, std::convert::Infallible>,
+        >()));
+        response.extensions_mut().insert(JsonRpcHttp503(true));
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            promote_http_status_for_json_rpc_errors(response, true),
+        )
+        .await
+        .expect("marked promotion must not wait for the body");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn unmarked_batch_falls_back_to_body_scan() {
+        let batch = || {
+            Json(json!([
+                {"jsonrpc": "2.0", "id": 1, "result": 7},
+                {"jsonrpc": "2.0", "id": 2, "error": {"code": -32603, "message": "Internal error"}}
+            ]))
+            .into_response()
+        };
+        assert!(batch().extensions().get::<JsonRpcHttp503>().is_none());
+
+        let promoted = promote_http_status_for_json_rpc_errors(batch(), true).await;
+        assert_eq!(promoted.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (_, _, _, promoted_body) = into_wire(promoted).await;
+        let (_, _, _, original_body) = into_wire(batch()).await;
+        assert_eq!(promoted_body, original_body);
+
+        let disabled = promote_http_status_for_json_rpc_errors(batch(), false).await;
+        assert_eq!(disabled.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn envelope_method_label_is_static_and_bounded() {
+        let cases = [
+            (json!({"method": "getBlock"}), "getBlock"),
+            (json!({"method": "getTransaction"}), "getTransaction"),
+            (json!({"method": "notARealMethod"}), "unknown"),
+            (json!({"method": 7}), "invalid"),
+            (json!({"id": 1}), "invalid"),
+            (json!([{"method": "getBlock"}]), "batch"),
+            (json!([]), "batch"),
+            (json!("getBlock"), "invalid"),
+        ];
+        for (payload, expected) in cases {
+            assert_eq!(envelope_method_label(&payload), expected, "{payload}");
+        }
+    }
+
+    #[test]
+    fn response_body_len_prefers_content_length_then_exact_hint() {
+        let streamed =
+            json_rpc_success_response_from_result_bytes(json!(1), Bytes::from_static(b"[1,2]"));
+        let expected = br#"{"jsonrpc":"2.0","id":1,"result":[1,2]}"#.len() as u64;
+        assert_eq!(response_body_len(&streamed), Some(expected));
+
+        let buffered = json_rpc_success_response(json!(1), json!([1, 2]));
+        assert!(buffered.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(response_body_len(&buffered), Some(expected));
+
+        let unknown = Response::new(Body::from_stream(futures_util::stream::empty::<
+            Result<Bytes, std::convert::Infallible>,
+        >()));
+        assert_eq!(response_body_len(&unknown), None);
+    }
 
     #[test]
     fn http_503_classifier_includes_server_side_codes() {
@@ -1793,6 +2127,46 @@ mod route_tests {
         );
         for explicit in [ROUTE_OUTCOME_SUCCESS, ROUTE_OUTCOME_RPC_ERROR] {
             assert_eq!(route_drop_outcome(explicit, true, true), explicit);
+        }
+    }
+
+    #[test]
+    fn get_block_shape_tier_names_the_serving_tier_only_on_success() {
+        let success = ROUTE_OUTCOME_SUCCESS;
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_CLICKHOUSE, success),
+            "clickhouse"
+        );
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_RESPONSE_CACHE, success),
+            "response_cache"
+        );
+        #[cfg(feature = "grpc-head-cache")]
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_HEAD_CACHE, success),
+            "head"
+        );
+        #[cfg(feature = "disk-cache")]
+        assert_eq!(
+            get_block_shape_tier(ROUTE_SOURCE_DISK_CACHE, success),
+            "disk"
+        );
+        assert_eq!(get_block_shape_tier(ROUTE_SOURCE_NONE, success), "other");
+        for failed in [
+            ROUTE_OUTCOME_NOT_FOUND,
+            ROUTE_OUTCOME_RPC_ERROR,
+            ROUTE_OUTCOME_BACKEND_ERROR,
+            ROUTE_OUTCOME_TIMEOUT,
+            ROUTE_OUTCOME_ABANDONED,
+        ] {
+            assert_eq!(
+                get_block_shape_tier(ROUTE_SOURCE_CLICKHOUSE, failed),
+                "other"
+            );
+            assert_eq!(
+                get_block_shape_tier(ROUTE_SOURCE_RESPONSE_CACHE, failed),
+                "other"
+            );
         }
     }
 

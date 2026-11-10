@@ -10,7 +10,7 @@ use std::time::Duration;
 use solana_commitment_config::CommitmentLevel;
 use solana_epoch_schedule::EpochSchedule;
 use tokio::sync::futures::OwnedNotified;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{AcquireError, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::ClickHouseClient;
@@ -25,6 +25,8 @@ use crate::util::{current_time_millis, ttl_millis};
 use crate::disk_cache::DiskCache;
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::HeadCache;
+#[cfg(feature = "grpc-head-cache")]
+use crate::recent_block_responses::RecentBlockResponses;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MetricsHeaderCaptureConfig {
@@ -50,6 +52,8 @@ pub(crate) struct AppState {
     pub(crate) metrics_header_capture: MetricsHeaderCaptureConfig,
     pub(crate) hydration_sem: Arc<Semaphore>,
     pub(crate) get_block_hydration_parallelism: usize,
+    /// getTransaction records up to this many bytes hydrate on the async worker; 0 disables.
+    pub(crate) get_transaction_inline_hydration_max_bytes: usize,
     pub(crate) block_response_cache: BlockResponseCache,
     pub(crate) get_transaction_primary_cache: PrimaryTransactionCache,
     pub(crate) get_block_response_cache_share_confirmed: bool,
@@ -62,6 +66,9 @@ pub(crate) struct AppState {
     pub(crate) epoch_schedule: EpochSchedule,
     #[cfg(feature = "grpc-head-cache")]
     pub(crate) head_cache: Option<Arc<HeadCache>>,
+    /// Serialized head-cache getBlock results keyed by blockhash (disabled unless sized).
+    #[cfg(feature = "grpc-head-cache")]
+    pub(crate) recent_block_responses: RecentBlockResponses,
     /// Finalized recent-slot cache in local ClickHouse; consulted between the
     /// head cache and source ClickHouse. It is not part of latest-slot resolution:
     /// its tip never leads the head cache, so it adds nothing there.
@@ -80,6 +87,15 @@ impl AppState {
     #[cfg(feature = "disk-cache")]
     pub(crate) fn disk_cache(&self) -> Option<&Arc<DiskCache>> {
         self.disk_cache.as_ref()?.get()
+    }
+
+    /// Waits for a `hydration_sem` permit and records the wait under `method`.
+    pub(crate) async fn acquire_hydration_permit(
+        &self,
+        method: &'static str,
+    ) -> Result<OwnedSemaphorePermit, AcquireError> {
+        let _wait = metrics::HydrationPermitWait::start(method);
+        self.hydration_sem.clone().acquire_owned().await
     }
 
     pub(crate) async fn resolve_latest_slot_with_source(
