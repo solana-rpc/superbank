@@ -198,6 +198,8 @@ pub struct TransactionsForAddressQuery {
     pub resolved_pagination: Option<SignatureSlot>,
     pub slot_filter: Option<NumericFilter<u64>>,
     pub block_time_filter: Option<NumericFilter<i64>>,
+    /// Slots that hold every block `block_time_filter` admits; added as bare `slot` predicates.
+    pub block_time_slot_bounds: Option<NumericFilter<u64>>,
     pub signature_filter: Option<SignatureFilter>,
     pub resolved_signature_filter: Option<ResolvedSignatureFilter>,
     pub status: TransactionStatusFilter,

@@ -352,6 +352,82 @@ fn apply_resolved_address_bounds(
     });
 }
 
+/// Slots added on each side of a block-time slot range to absorb timestamp jitter.
+#[cfg(feature = "disk-cache")]
+const BLOCK_TIME_SLOT_MARGIN: u64 = 1_500;
+
+/// The inclusive block-time window a filter admits; `None` leaves that side open.
+#[cfg(feature = "disk-cache")]
+fn block_time_window(filter: &NumericFilter<i64>) -> (Option<i64>, Option<i64>) {
+    let min = [
+        filter.gte,
+        filter.gt.map(|t| t.saturating_add(1)),
+        filter.eq,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let max = [
+        filter.lte,
+        filter.lt.map(|t| t.saturating_sub(1)),
+        filter.eq,
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    (min, max)
+}
+
+/// The slot range of a block-time filter from the disk-cache block index, widened by
+/// `BLOCK_TIME_SLOT_MARGIN`. `None` leaves the query as the request states it.
+#[cfg(feature = "disk-cache")]
+fn block_time_slot_bounds(
+    state: &AppState,
+    filter: &NumericFilter<i64>,
+) -> Option<NumericFilter<u64>> {
+    if !state
+        .clickhouse
+        .transactions_for_address_block_time_slot_bounds()
+    {
+        metrics::transactions_for_address_block_time_slot_bounds("disabled");
+        return None;
+    }
+    let Some(index) = state.disk_cache().and_then(|disk| disk.block_index()) else {
+        metrics::transactions_for_address_block_time_slot_bounds("no_index");
+        return None;
+    };
+    let (min_time, max_time) = block_time_window(filter);
+    let found = index.slot_bounds_for_block_time(
+        min_time,
+        max_time,
+        state
+            .clickhouse
+            .transactions_for_address_block_time_slot_bounds_min_slot(),
+    );
+    let gte = found
+        .gte
+        .map(|slot| slot.saturating_sub(BLOCK_TIME_SLOT_MARGIN));
+    let lte = found
+        .lte
+        .map(|slot| slot.saturating_add(BLOCK_TIME_SLOT_MARGIN));
+    let complete = (min_time.is_none() || gte.is_some()) && (max_time.is_none() || lte.is_some());
+    metrics::transactions_for_address_block_time_slot_bounds(
+        match (gte.or(lte), complete, found.below_floor) {
+            (_, _, true) => "below_floor",
+            (Some(_), true, false) => "applied",
+            (Some(_), false, false) => "partial",
+            (None, _, false) => "unresolved",
+        },
+    );
+    gte.or(lte).map(|_| NumericFilter {
+        gte,
+        gt: None,
+        lte,
+        lt: None,
+        eq: None,
+    })
+}
+
 fn unsupported_transaction_version_message(version: u8) -> String {
     format!(
         "Transaction version ({version}) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": {version}"
@@ -1234,6 +1310,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         resolved_pagination: None,
         slot_filter,
         block_time_filter,
+        block_time_slot_bounds: None,
         signature_filter,
         resolved_signature_filter: None,
         status,
@@ -1267,6 +1344,10 @@ pub(crate) async fn handle_get_transactions_for_address(
         prequery_timings.add(timings);
     }
     apply_resolved_address_bounds(&mut query, &bound_positions);
+    #[cfg(feature = "disk-cache")]
+    if let Some(filter) = query.block_time_filter.as_ref() {
+        query.block_time_slot_bounds = block_time_slot_bounds(state.as_ref(), filter);
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum RecordSource {
@@ -2253,6 +2334,7 @@ mod tests {
             resolved_pagination: None,
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: Some(SignatureFilter {
                 gte: Some("shared".into()),
                 gt: Some("other".into()),

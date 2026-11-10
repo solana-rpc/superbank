@@ -489,6 +489,20 @@ export default {
           default: 'true',
           text: 'Push the token-accounts filter, `ORDER BY` and `LIMIT` of `getTransactionsForAddress` into each `UNION` branch. `false` filters outside the union.',
         }),
+        opt('CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS', {
+          type: 'bool',
+          default: 'true',
+          text: 'Add the slot range of a `getTransactionsForAddress` `blockTime` window, read from the disk-cache block index and widened by 1,500 slots, as `slot` predicates so ClickHouse prunes by primary key. Results are unchanged.',
+          requires: ['feature:disk-cache'],
+          relations: [{ type: 'see', to: 'DISK_CACHE_BLOCK_INDEX_ENABLED' }],
+        }),
+        opt('CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS_MIN_SLOT', {
+          type: 'u64 (slot)',
+          default: '100000000',
+          text: 'Lowest slot a `getTransactionsForAddress` block-time slot bound may stop at. Some early ledger blocks store zero or displaced block times, so both edges are searched from this slot on. `0` trusts every indexed time.',
+          requires: ['feature:disk-cache'],
+          relations: [{ type: 'see', to: 'CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS' }],
+        }),
         opt('CLICKHOUSE_GSFA_INLINE_CURSOR', {
           type: 'bool',
           default: 'false',

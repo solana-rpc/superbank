@@ -106,6 +106,19 @@ impl CoverageMap {
             .is_some_and(|(_, range_end)| *range_end >= start)
     }
 
+    /// The first covered range that ends at or after `slot`, clipped to start at `slot`.
+    pub(crate) fn next_covered(&self, slot: u64) -> Option<(u64, u64)> {
+        if let Some((_, &end)) = self.ranges.range(..=slot).next_back()
+            && end >= slot
+        {
+            return Some((slot, end));
+        }
+        self.ranges
+            .range(slot..)
+            .next()
+            .map(|(&start, &end)| (start, end))
+    }
+
     /// `(min covered, max covered)` across all ranges.
     pub(crate) fn covered_span(&self) -> Option<(u64, u64)> {
         let (&first_start, _) = self.ranges.first_key_value()?;
@@ -184,6 +197,18 @@ impl CoverageMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_covered_clips_the_containing_range_or_jumps_the_hole() {
+        let mut map = CoverageMap::new();
+        map.insert_range(10, 20);
+        map.insert_range(30, 40);
+        assert_eq!(map.next_covered(0), Some((10, 20)));
+        assert_eq!(map.next_covered(15), Some((15, 20)));
+        assert_eq!(map.next_covered(20), Some((20, 20)));
+        assert_eq!(map.next_covered(21), Some((30, 40)));
+        assert_eq!(map.next_covered(41), None);
+    }
 
     #[test]
     fn insert_merges_overlapping_and_adjacent_ranges() {

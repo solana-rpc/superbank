@@ -710,6 +710,10 @@ pub(crate) fn build_transactions_for_address_query(
         append_numeric_filter_conditions("block_time", block_time_filter, &mut conditions);
     }
 
+    if let Some(bounds) = &query.block_time_slot_bounds {
+        append_transactions_for_address_slot_filter_conditions(bounds, &mut conditions);
+    }
+
     if let Some(signature_filter) = query.resolved_signature_filter.as_ref() {
         // Compare pre-resolved bounds directly, without scalar lookups or
         // per-query transformations of primary-index columns.
@@ -901,6 +905,10 @@ pub(crate) fn build_transactions_for_address_hot_query(
         append_numeric_filter_conditions("block_time", block_time_filter, &mut conditions);
     }
 
+    if let Some(bounds) = &query.block_time_slot_bounds {
+        append_numeric_filter_conditions("slot", bounds, &mut conditions);
+    }
+
     if let Some(signature_filter) = query.resolved_signature_filter.as_ref() {
         apply_hot_resolved_signature_filter(signature_filter, &mut conditions);
     }
@@ -1060,6 +1068,7 @@ mod tests {
             resolved_pagination: None,
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: Some(SignatureFilter {
                 gte: Some(signature),
                 ..SignatureFilter::default()
@@ -1129,6 +1138,7 @@ mod tests {
                 ..NumericFilter::default()
             }),
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter,
             resolved_signature_filter,
             status: TransactionStatusFilter::Failed,
@@ -1306,6 +1316,7 @@ mod tests {
                 lte: Some(1_778_907_499),
                 ..NumericFilter::default()
             }),
+            block_time_slot_bounds: None,
             signature_filter: None,
             resolved_signature_filter: None,
             status: TransactionStatusFilter::Any,
@@ -1348,6 +1359,7 @@ mod tests {
             }),
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: None,
             resolved_signature_filter: None,
             status: TransactionStatusFilter::Any,
@@ -1391,6 +1403,7 @@ mod tests {
             }),
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             // Invalid text deliberately verifies no signature decoding or scalar SQL remains.
             signature_filter: Some(SignatureFilter {
                 gte: Some("already resolved".into()),
@@ -1443,6 +1456,7 @@ mod tests {
             resolved_pagination: None,
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: None,
             resolved_signature_filter: Some(ResolvedSignatureFilter {
                 gte: Some(SignatureSlot {
@@ -1491,6 +1505,7 @@ mod tests {
             }),
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: None,
             resolved_signature_filter: None,
             status: TransactionStatusFilter::Any,
@@ -1530,6 +1545,7 @@ mod tests {
             }),
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: Some(SignatureFilter {
                 gte: Some("ignored".to_string()),
                 ..SignatureFilter::default()
@@ -1596,6 +1612,7 @@ mod tests {
                 ..NumericFilter::default()
             }),
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: None,
             resolved_signature_filter: None,
             status: TransactionStatusFilter::Any,
@@ -1609,5 +1626,265 @@ mod tests {
 
         assert!(sql.contains("WHERE slot <= 420051754"));
         assert!(!sql.contains("slot + toUInt64(0) <= 420051754"));
+    }
+
+    fn block_time_bounded_query(
+        token_accounts: TokenAccountsFilter,
+    ) -> TransactionsForAddressQuery {
+        TransactionsForAddressQuery {
+            address: bs58::encode([9_u8; 32]).into_string(),
+            limit: 200,
+            sort_order: SortOrder::Asc,
+            pagination: None,
+            resolved_pagination: None,
+            slot_filter: None,
+            block_time_filter: Some(NumericFilter {
+                gte: Some(1_786_000_000),
+                lt: Some(1_786_003_600),
+                ..NumericFilter::default()
+            }),
+            block_time_slot_bounds: Some(NumericFilter {
+                gte: Some(437_000_000),
+                lte: Some(437_018_000),
+                ..NumericFilter::default()
+            }),
+            signature_filter: None,
+            resolved_signature_filter: None,
+            status: TransactionStatusFilter::Succeeded,
+            token_accounts,
+        }
+    }
+
+    #[test]
+    fn block_time_slot_bounds_reach_every_union_branch_beside_the_block_time_filter() {
+        let query = block_time_bounded_query(TokenAccountsFilter::BalanceChanged);
+        let window = "block_time >= 1786000000 AND block_time < 1786003600 \
+                      AND slot >= 437000000 AND slot <= 437018000";
+        for union_pushdown in [true, false] {
+            let tables = TransactionsForAddressTables {
+                cache_partition: None,
+                gsfa_table: "default.gsfa",
+                gsfa_bucket_modulus: 32,
+                token_owner_table: "default.token_owner_activity",
+                token_owner_bucket_modulus: 32,
+                signatures_table: "default.signatures",
+                signature_bucket_modulus: 32,
+                union_pushdown,
+            };
+            let sql = build_transactions_for_address_query(&tables, &query, "").expect("query");
+            let sql = normalize_sql(&sql);
+            let expected = if union_pushdown { 2 } else { 1 };
+            assert_eq!(sql.matches(window).count(), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn hot_query_adds_block_time_slot_bounds_beside_the_block_time_filter() {
+        let query = block_time_bounded_query(TokenAccountsFilter::None);
+        let sql =
+            build_transactions_for_address_hot_query("default.gsfa_hot_local", 32, &query, "")
+                .expect("query");
+        let sql = normalize_sql(&sql);
+        assert!(sql.contains(
+            "WHERE err IS NULL AND block_time >= 1786000000 AND block_time < 1786003600 \
+             AND slot >= 437000000 AND slot <= 437018000"
+        ));
+    }
+
+    #[cfg(feature = "disk-cache")]
+    #[derive(Debug, PartialEq, clickhouse::Row, serde::Deserialize)]
+    struct AddressRow {
+        signature: String,
+        slot: u64,
+        slot_idx: u32,
+        err: Option<String>,
+        memo: Option<String>,
+        block_time: Option<i64>,
+    }
+
+    /// Reverse-key tables with skipped slots, untimed blocks and failed rows, and a block
+    /// index over the same blocks; pages must not change when the slot bounds are added.
+    #[cfg(feature = "disk-cache")]
+    #[tokio::test]
+    #[ignore = "requires disposable ClickHouse: DISK_CACHE_TEST_URL=http://127.0.0.1:18123"]
+    async fn block_time_slot_bounds_keep_pages_unchanged_clickhouse_integration() {
+        let url = std::env::var("DISK_CACHE_TEST_URL").expect("explicit disposable ClickHouse URL");
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let client = clickhouse::Client::default()
+            .with_url(&url)
+            .with_user("default");
+        let database = format!(
+            "test_block_time_slot_bounds_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let address = "So11111111111111111111111111111111111111112";
+        let key = format!("CAST(base58Decode('{address}') AS FixedString(32))");
+        // Slot 10_000 + n, skipped when n % 7 = 0, untimed when n % 97 = 0, 3 slots a second.
+        // Below the floor (n < 400) some blocks store 0 and n 200..=230 run 120 s behind.
+        let blocks = "SELECT 10000 + number AS slot, multiIf(number % 97 = 0, NULL, \
+             number < 400 AND number % 11 = 0, 0, number BETWEEN 200 AND 230, \
+             1000000 + intDiv(number, 3) - 120, 1000000 + intDiv(number, 3)) AS block_time \
+             FROM numbers(2001) WHERE number % 7 != 0";
+        let signature =
+            "toFixedString(unhex(concat(hex(cityHash64(slot, idx)), repeat('0', 112))), 64)";
+        for sql in [
+            format!("CREATE DATABASE {database}"),
+            format!(
+                "CREATE TABLE {database}.gsfa (addr_bucket UInt8 MATERIALIZED cityHash64(address) % 32, \
+                 address FixedString(32), signature FixedString(64), slot UInt64, slot_idx UInt32, \
+                 err Nullable(String), memo Nullable(String), block_time Nullable(Int64)) \
+                 ENGINE = ReplacingMergeTree(slot) PARTITION BY addr_bucket \
+                 PRIMARY KEY (addr_bucket, address, slot, slot_idx, signature) \
+                 ORDER BY (addr_bucket, address, slot DESC, slot_idx DESC, signature) \
+                 SETTINGS allow_experimental_reverse_key = 1, index_granularity = 16"
+            ),
+            format!(
+                "CREATE TABLE {database}.token_owner_activity (owner_bucket UInt8 MATERIALIZED \
+                 cityHash64(owner) % 32, owner FixedString(32), token_account FixedString(32), \
+                 signature FixedString(64), slot UInt64, slot_idx UInt32, memo Nullable(String), \
+                 err Nullable(String), block_time Nullable(Int64), balance_changed UInt8) \
+                 ENGINE = ReplacingMergeTree(slot) PARTITION BY owner_bucket \
+                 PRIMARY KEY (owner_bucket, owner, slot, slot_idx, signature, token_account) \
+                 ORDER BY (owner_bucket, owner, slot DESC, slot_idx DESC, signature, token_account) \
+                 SETTINGS allow_experimental_reverse_key = 1, index_granularity = 16"
+            ),
+            format!(
+                "INSERT INTO {database}.gsfa (address, signature, slot, slot_idx, err, memo, block_time) \
+                 SELECT {key}, {signature}, slot, idx, if((slot + idx) % 5 = 0, 'failed', NULL), \
+                 NULL, block_time FROM ({blocks}) ARRAY JOIN [0, 1] AS idx"
+            ),
+            format!(
+                "INSERT INTO {database}.token_owner_activity (owner, token_account, signature, slot, \
+                 slot_idx, memo, err, block_time, balance_changed) \
+                 SELECT {key}, {key}, {signature}, slot, idx, NULL, \
+                 if(slot % 11 = 0, 'failed', NULL), block_time, toUInt8(slot % 3 != 0) \
+                 FROM ({blocks}) ARRAY JOIN [2] AS idx"
+            ),
+        ] {
+            client
+                .query(&sql)
+                .execute()
+                .await
+                .unwrap_or_else(|err| panic!("{err}: {sql}"));
+        }
+
+        let timed = (0..=2_000_u64)
+            .filter(|n| n % 7 != 0 && n % 97 != 0)
+            .map(|n| {
+                let time = match n {
+                    0..400 if n % 11 == 0 => 0,
+                    200..=230 => 1_000_000 + (n / 3) as i64 - 120,
+                    _ => 1_000_000 + (n / 3) as i64,
+                };
+                (10_000 + n, time)
+            })
+            .collect::<Vec<_>>();
+        let floor = 10_400;
+        let index = crate::disk_cache::block_index::BlockIndex::for_block_time_tests(
+            10_000, 12_000, &timed,
+        );
+        let gsfa_table = format!("{database}.gsfa");
+        let token_owner_table = format!("{database}.token_owner_activity");
+        let signatures_table = format!("{database}.signatures");
+        let mut compared = 0;
+        let mut bounded = 0;
+        for (gte, lt) in [
+            (1_000_000, 1_000_050),
+            (1_000_032, 1_000_033),
+            (1_000_100, 1_000_400),
+            (1_000_500, 1_000_700),
+            (1_000_660, 1_000_667),
+            (999_000, 1_000_010),
+            (999_940, 999_960),
+            (1_000_120, 1_000_150),
+        ] {
+            let bounds = index.slot_bounds_for_block_time(Some(gte), Some(lt - 1), floor);
+            bounded += usize::from(bounds.gte.is_some() || bounds.lte.is_some());
+            for (token_accounts, union_pushdown, sort_order, status) in [
+                (
+                    TokenAccountsFilter::None,
+                    true,
+                    SortOrder::Asc,
+                    TransactionStatusFilter::Any,
+                ),
+                (
+                    TokenAccountsFilter::BalanceChanged,
+                    true,
+                    SortOrder::Asc,
+                    TransactionStatusFilter::Succeeded,
+                ),
+                (
+                    TokenAccountsFilter::BalanceChanged,
+                    false,
+                    SortOrder::Desc,
+                    TransactionStatusFilter::Succeeded,
+                ),
+                (
+                    TokenAccountsFilter::All,
+                    true,
+                    SortOrder::Desc,
+                    TransactionStatusFilter::Failed,
+                ),
+            ] {
+                let tables = TransactionsForAddressTables {
+                    cache_partition: None,
+                    gsfa_table: &gsfa_table,
+                    gsfa_bucket_modulus: 32,
+                    token_owner_table: &token_owner_table,
+                    token_owner_bucket_modulus: 32,
+                    signatures_table: &signatures_table,
+                    signature_bucket_modulus: 32,
+                    union_pushdown,
+                };
+                let mut query = TransactionsForAddressQuery {
+                    address: address.to_string(),
+                    limit: 40,
+                    sort_order,
+                    pagination: None,
+                    resolved_pagination: None,
+                    slot_filter: None,
+                    block_time_filter: Some(NumericFilter {
+                        gte: Some(gte),
+                        lt: Some(lt),
+                        ..NumericFilter::default()
+                    }),
+                    block_time_slot_bounds: None,
+                    signature_filter: None,
+                    resolved_signature_filter: None,
+                    status,
+                    token_accounts,
+                };
+                let fetch = |query: &TransactionsForAddressQuery| {
+                    let sql =
+                        build_transactions_for_address_query(&tables, query, "").expect("query");
+                    let client = client.clone();
+                    async move {
+                        client
+                            .query(&sql)
+                            .fetch_all::<AddressRow>()
+                            .await
+                            .expect(&sql)
+                    }
+                };
+                let plain = fetch(&query).await;
+                query.block_time_slot_bounds = Some(NumericFilter {
+                    gte: bounds.gte,
+                    lte: bounds.lte,
+                    ..NumericFilter::default()
+                });
+                assert_eq!(fetch(&query).await, plain, "{gte}..{lt} {bounds:?}");
+                compared += usize::from(!plain.is_empty());
+            }
+        }
+        assert!(compared >= 16, "only {compared} non-empty pages");
+        assert!(bounded >= 4, "only {bounded} windows gained a slot bound");
+        client
+            .query(&format!("DROP DATABASE {database}"))
+            .execute()
+            .await
+            .unwrap();
     }
 }

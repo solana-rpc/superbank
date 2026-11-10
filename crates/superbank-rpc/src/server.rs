@@ -403,6 +403,12 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     clickhouse.set_transactions_for_address_union_pushdown(
         args.clickhouse_transactions_for_address_union_pushdown,
     );
+    clickhouse.set_transactions_for_address_block_time_slot_bounds(
+        args.clickhouse_transactions_for_address_block_time_slot_bounds,
+    );
+    clickhouse.set_transactions_for_address_block_time_slot_bounds_min_slot(
+        args.clickhouse_transactions_for_address_block_time_slot_bounds_min_slot,
+    );
     clickhouse.set_gsfa_inline_cursor(args.clickhouse_gsfa_inline_cursor);
     clickhouse.set_backend_admission(backend_admission(&args));
     clickhouse.set_signatures_owner_shard_routing(

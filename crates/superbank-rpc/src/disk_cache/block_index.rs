@@ -29,6 +29,8 @@ const UNPROVEN_COVERAGE_TABLE: &str = "coverage";
 /// A forward scan waits this long behind the finalized tip for a missing block before it
 /// leaves the block's slots uncovered and moves on.
 const UNPROVEN_SETTLE_SLOTS: u64 = 1_500;
+/// Covered slots one search step may walk to find a timed block before the bound gives up.
+const TIMED_WALK_LIMIT: u64 = SEGMENT_SLOTS;
 
 fn segment_memory_bytes() -> u64 {
     SEGMENT_SLOTS * std::mem::size_of::<AtomicI64>() as u64
@@ -53,6 +55,15 @@ pub(crate) enum BlockTimeLookup {
     NotCovered,
     Skipped,
     Found(Option<i64>),
+}
+
+/// Slots that hold every block of a block-time window; `None` leaves that side open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BlockTimeSlotBounds {
+    pub(crate) gte: Option<u64>,
+    pub(crate) lte: Option<u64>,
+    /// The window starts before the floor, so the lower side stays open.
+    pub(crate) below_floor: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
@@ -131,6 +142,94 @@ fn segment_slots(segment: &Segment, id: u64, start: u64, end: u64) -> Vec<u64> {
     slots
 }
 
+/// Covered blocks that carry a block time, read under the index locks.
+struct TimedView<'a> {
+    segments: &'a HashMap<u64, Segment>,
+    coverage: &'a CoverageMap,
+}
+
+impl TimedView<'_> {
+    /// The first covered block in `[from, to]` with a block time. `Err` means the walk
+    /// passed `TIMED_WALK_LIMIT` covered slots without one.
+    fn next_timed(&self, from: u64, to: u64) -> Result<Option<(u64, i64)>, ()> {
+        let mut budget = TIMED_WALK_LIMIT;
+        let mut cursor = from;
+        while cursor <= to {
+            let Some((start, end)) = self.coverage.next_covered(cursor) else {
+                return Ok(None);
+            };
+            if start > to {
+                return Ok(None);
+            }
+            let end = end.min(to);
+            let mut slot = start;
+            while slot <= end {
+                let segment_id = slot / SEGMENT_SLOTS;
+                let segment_end = end.min(segment_id * SEGMENT_SLOTS + SEGMENT_SLOTS - 1);
+                // Eviction drops a segment before its coverage, so a missing one is skipped.
+                if let Some(segment) = self.segments.get(&segment_id) {
+                    let last = segment_end % SEGMENT_SLOTS;
+                    let mut offset = slot % SEGMENT_SLOTS;
+                    while offset <= last {
+                        let word_index = offset / 64;
+                        let word_last = last.min(word_index * 64 + 63);
+                        let mut word = segment.produced[word_index as usize]
+                            .load(Ordering::Relaxed)
+                            & (u64::MAX << (offset % 64));
+                        if word_last % 64 != 63 {
+                            word &= (1u64 << (word_last % 64 + 1)) - 1;
+                        }
+                        while word != 0 {
+                            let hit = word_index * 64 + u64::from(word.trailing_zeros());
+                            let time = segment.times[hit as usize].load(Ordering::Relaxed);
+                            // Sentinels are negative, and some early ledgers store an unknown time as 0.
+                            if time > 0 {
+                                return Ok(Some((segment_id * SEGMENT_SLOTS + hit, time)));
+                            }
+                            word &= word - 1;
+                        }
+                        budget = budget.checked_sub(word_last - offset + 1).ok_or(())?;
+                        offset = word_last + 1;
+                    }
+                }
+                slot = segment_end + 1;
+            }
+            cursor = end + 1;
+        }
+        Ok(None)
+    }
+
+    /// From `from` on: a timed block at or below `time` and a timed block above it, as close
+    /// to the edge as a binary search finds them when block times never decrease.
+    fn partition(&self, time: i64, from: u64) -> (Option<u64>, Option<u64>) {
+        let Some((covered, tip)) = self.coverage.covered_span() else {
+            return (None, None);
+        };
+        let start = covered.max(from);
+        if start > tip {
+            return (None, None);
+        }
+        let mut at_or_below = None;
+        let (mut low, mut high) = (start, tip + 1);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            // A walk past the limit narrows the search downward like a later block would.
+            match self.next_timed(mid, tip) {
+                Ok(Some((slot, value))) if value <= time => {
+                    at_or_below = Some(slot);
+                    low = slot + 1;
+                }
+                _ => high = mid,
+            }
+        }
+        let above = match self.next_timed(at_or_below.map_or(start, |slot| slot + 1), tip) {
+            Ok(Some((slot, value))) if value > time => Some(slot),
+            _ => None,
+        };
+        (at_or_below, above)
+    }
+}
+
 impl BlockIndex {
     #[cfg(test)]
     pub(crate) fn for_range_tests(start: u64, end: u64, slots: &[u64]) -> Self {
@@ -141,6 +240,21 @@ impl BlockIndex {
                 slot,
                 parent_slot: slot.saturating_sub(1),
                 block_time: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(index.publish_memory(start, end, &rows));
+        index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_block_time_tests(start: u64, end: u64, blocks: &[(u64, i64)]) -> Self {
+        let index = tests::test_index();
+        let rows = blocks
+            .iter()
+            .map(|&(slot, block_time)| BlockTimeRangeRow {
+                slot,
+                parent_slot: slot.saturating_sub(1),
+                block_time: Some(block_time),
             })
             .collect::<Vec<_>>();
         assert!(index.publish_memory(start, end, &rows));
@@ -268,6 +382,38 @@ impl BlockIndex {
         }
         crate::metrics::block_index_lookup("get_blocks", started.elapsed().as_secs_f64());
         proof
+    }
+
+    /// Slot bounds for blocks timed in `[min_time, max_time]`, assuming block times never
+    /// decrease from `floor` on. A side whose edge block lies below `floor` stays open.
+    pub(crate) fn slot_bounds_for_block_time(
+        &self,
+        min_time: Option<i64>,
+        max_time: Option<i64>,
+        floor: u64,
+    ) -> BlockTimeSlotBounds {
+        let started = Instant::now();
+        // Lock order matches reserve_segments and range_coverage.
+        let segments = self.segments.read().expect("block-index segments lock");
+        let coverage = self.coverage.read().expect("block-index coverage lock");
+        let view = TimedView {
+            segments: &segments,
+            coverage: &coverage,
+        };
+        // The edge blocks from `floor` on: the last before the window and the first after it.
+        // With a floor, a missing edge before the window lies below the floor.
+        let before = min_time.and_then(|time| view.partition(time.saturating_sub(1), floor).0);
+        let after = max_time.and_then(|time| view.partition(time, floor).1);
+        let bounds = BlockTimeSlotBounds {
+            gte: before.map(|slot| slot + 1),
+            lte: after.map(|slot| slot.saturating_sub(1)),
+            below_floor: floor > 0 && min_time.is_some() && before.is_none(),
+        };
+        crate::metrics::block_index_lookup(
+            "block_time_slot_bounds",
+            started.elapsed().as_secs_f64(),
+        );
+        bounds
     }
 
     fn value(&self, slot: u64) -> Option<i64> {
@@ -884,6 +1030,199 @@ mod tests {
 
         assert!(!index.publish_memory(0, 0, &[]));
         assert_eq!(index.tip_span(), Some((SEGMENT_SLOTS, SEGMENT_SLOTS)));
+    }
+
+    /// One-segment index whose `ranges` hold a block at every slot not in `skipped`.
+    fn timed_index(
+        ranges: &[(u64, u64)],
+        skipped: &[u64],
+        untimed: &[u64],
+        time: impl Fn(u64) -> i64,
+    ) -> BlockIndex {
+        let index = test_index();
+        for &(start, end) in ranges {
+            let rows = (start..=end)
+                .filter(|slot| !skipped.contains(slot))
+                .map(|slot| BlockTimeRangeRow {
+                    slot,
+                    parent_slot: slot.saturating_sub(1),
+                    block_time: (!untimed.contains(&slot)).then(|| time(slot)),
+                })
+                .collect::<Vec<_>>();
+            assert!(index.publish_memory(start, end, &rows));
+        }
+        index
+    }
+
+    fn bounds(gte: Option<u64>, lte: Option<u64>) -> BlockTimeSlotBounds {
+        BlockTimeSlotBounds {
+            gte,
+            lte,
+            below_floor: false,
+        }
+    }
+
+    #[test]
+    fn slot_bounds_stop_at_the_nearest_timed_block_outside_the_window() {
+        // Two slots share each second; 105, 106 and 116 are skipped, 110 has no time.
+        let index = timed_index(&[(100, 130)], &[105, 106, 116], &[110], |slot| {
+            1_000 + (slot as i64 - 100) / 2
+        });
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(1_005), Some(1_010), 0),
+            bounds(Some(110), Some(121))
+        );
+        // Skipped slots next to an edge stay inside the range.
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(1_003), Some(1_007), 0),
+            bounds(Some(105), Some(116))
+        );
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(1_005), None, 0),
+            bounds(Some(110), None)
+        );
+        assert_eq!(
+            index.slot_bounds_for_block_time(None, Some(1_005), 0),
+            bounds(None, Some(111))
+        );
+    }
+
+    #[test]
+    fn slot_bounds_stay_open_where_the_index_has_no_block_outside_the_window() {
+        let index = timed_index(&[(100, 130)], &[], &[], |slot| slot as i64);
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(90), Some(200), 0),
+            bounds(None, None)
+        );
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(100), Some(130), 0),
+            bounds(None, None)
+        );
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(101), Some(129), 0),
+            bounds(Some(101), Some(129))
+        );
+        assert_eq!(
+            test_index().slot_bounds_for_block_time(Some(1), Some(2), 0),
+            bounds(None, None)
+        );
+    }
+
+    #[test]
+    fn slot_bounds_widen_across_coverage_holes() {
+        let index = timed_index(&[(100, 120), (200, 220)], &[], &[], |slot| slot as i64);
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(150), Some(210), 0),
+            bounds(Some(121), Some(210))
+        );
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(105), Some(150), 0),
+            bounds(Some(105), Some(199))
+        );
+    }
+
+    #[test]
+    fn slot_bounds_skip_zero_times_and_keep_edges_below_the_floor_open() {
+        // Slots 100..=119 store 0, as some early ledgers do for an unknown time.
+        let index = timed_index(&[(100, 160)], &[], &[], |slot| {
+            if slot < 120 { 0 } else { slot as i64 }
+        });
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(130), Some(140), 0),
+            bounds(Some(130), Some(140))
+        );
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(120), Some(140), 0),
+            bounds(None, Some(140))
+        );
+        // The lower edge block (129) sits below the floor; the upper one (141) does not.
+        assert_eq!(
+            index.slot_bounds_for_block_time(Some(130), Some(140), 135),
+            BlockTimeSlotBounds {
+                gte: None,
+                lte: Some(140),
+                below_floor: true,
+            }
+        );
+    }
+
+    /// Below `FLOOR` the blocks carry early-ledger damage that only ever lowers a time:
+    /// zero times, a displaced low run and rows whose time is below the indexed one.
+    #[test]
+    fn slot_bounds_contain_every_block_in_random_windows() {
+        const FLOOR: u64 = 600;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |modulus: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % modulus
+        };
+        for _ in 0..50 {
+            let mut time = 1_000_i64;
+            // (slot, indexed time, row time)
+            let mut blocks = Vec::new();
+            for slot in 0..2_000 {
+                time += next(3) as i64;
+                if next(10) == 0 {
+                    continue;
+                }
+                let timed = (next(50) != 0).then_some(time);
+                let block = match (slot < FLOOR, next(12)) {
+                    (true, 0) => (slot, Some(0), Some(0)),
+                    (true, 1) if (200..240).contains(&slot) => {
+                        (slot, timed.map(|t| t - 400), timed.map(|t| t - 400))
+                    }
+                    (true, 2) => (slot, timed, timed.map(|t| t - next(500) as i64)),
+                    _ => (slot, timed, timed),
+                };
+                blocks.push(block);
+            }
+            let index = test_index();
+            let mut start = 0;
+            while start < 2_000 {
+                let end = (start + 50 + next(400)).min(1_999);
+                if next(4) != 0 {
+                    let rows = blocks
+                        .iter()
+                        .filter(|(slot, _, _)| (start..=end).contains(slot))
+                        .map(|&(slot, block_time, _)| BlockTimeRangeRow {
+                            slot,
+                            parent_slot: slot.saturating_sub(1),
+                            block_time,
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(index.publish_memory(start, end, &rows));
+                }
+                start = end + 1;
+            }
+            for _ in 0..40 {
+                let low = 1_000 + next(2_200) as i64;
+                let min_time = (next(5) != 0).then_some(low);
+                let max_time = (next(5) != 0).then_some(low + next(300) as i64);
+                let found = index.slot_bounds_for_block_time(min_time, max_time, FLOOR);
+                for &(slot, _, row_time) in &blocks {
+                    let Some(value) = row_time else { continue };
+                    if min_time.is_some_and(|t| value < t) || max_time.is_some_and(|t| value > t) {
+                        continue;
+                    }
+                    assert!(found.gte.is_none_or(|gte| slot >= gte), "{slot} {found:?}");
+                    assert!(found.lte.is_none_or(|lte| slot <= lte), "{slot} {found:?}");
+                }
+                if let (Some(gte), Some(min)) = (found.gte, min_time) {
+                    assert!(gte > FLOOR);
+                    assert!(
+                        matches!(index.block_time(gte - 1), BlockTimeLookup::Found(Some(v)) if v < min)
+                    );
+                }
+                if let (Some(lte), Some(max)) = (found.lte, max_time) {
+                    assert!(lte + 1 >= FLOOR);
+                    assert!(
+                        matches!(index.block_time(lte + 1), BlockTimeLookup::Found(Some(v)) if v > max)
+                    );
+                }
+            }
+        }
     }
 
     fn row(slot: u64, parent_slot: u64) -> BlockTimeRangeRow {

@@ -340,6 +340,12 @@ pub struct ClickHouseClient {
     /// getTransactionsForAddress token-accounts UNION pushdown
     /// (`CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_UNION_PUSHDOWN`).
     pub(crate) transactions_for_address_union_pushdown: bool,
+    /// getTransactionsForAddress block-time slot bounds
+    /// (`CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS`).
+    pub(crate) transactions_for_address_block_time_slot_bounds: bool,
+    /// Lowest edge slot for those bounds
+    /// (`CLICKHOUSE_TRANSACTIONS_FOR_ADDRESS_BLOCK_TIME_SLOT_BOUNDS_MIN_SLOT`).
+    pub(crate) transactions_for_address_block_time_slot_bounds_min_slot: u64,
     /// getTransactionsForAddress: last-row positions of served ClickHouse pages, by signature.
     pub(crate) transactions_for_address_cursors: Option<moka::future::Cache<String, SignatureSlot>>,
     /// Primary distributed getSignaturesForAddress: resolve a `before`/`until` cursor that
@@ -822,6 +828,9 @@ impl ClickHouseClient {
             latest_slot_hint: true,
             transactions_for_address_position_tokens: false,
             transactions_for_address_union_pushdown: true,
+            transactions_for_address_block_time_slot_bounds: true,
+            transactions_for_address_block_time_slot_bounds_min_slot:
+                crate::config::DEFAULT_BLOCK_TIME_SLOT_BOUNDS_MIN_SLOT,
             transactions_for_address_cursors: None,
             gsfa_inline_cursor: false,
             transaction_table,
