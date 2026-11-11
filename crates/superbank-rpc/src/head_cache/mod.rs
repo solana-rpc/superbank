@@ -109,6 +109,23 @@ pub(super) enum PausePoint {
     Released,
 }
 
+/// Test-only view of the address index: the reference switch and the hits of each arm.
+#[cfg(test)]
+#[derive(Default)]
+struct AddressIndexProbe {
+    /// Makes every insert search its position and every removal scan the list.
+    reference: std::sync::atomic::AtomicBool,
+    /// Insert arms (first, searched), then removal arms (popped, skipped, scanned, empty).
+    hits: [std::sync::atomic::AtomicU64; 6],
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ArmCount {
+    Insert,
+    Removal,
+}
+
 #[cfg(test)]
 struct PauseHook {
     point: PausePoint,
@@ -247,6 +264,8 @@ pub(crate) struct HeadCache {
 
     #[cfg(test)]
     pauses: Pauses,
+    #[cfg(test)]
+    address_index: AddressIndexProbe,
 }
 
 impl HeadCache {
@@ -277,6 +296,34 @@ impl HeadCache {
             commitment_waiters: Semaphore::new(COMMITMENT_WAIT_MAX_WAITERS),
             #[cfg(test)]
             pauses: Pauses::default(),
+            #[cfg(test)]
+            address_index: AddressIndexProbe::default(),
+        }
+    }
+
+    /// Counts the arm that `oldest_or_newest` selects. In reference mode it returns the value
+    /// that selects the search (insert) or the scan (removal) instead.
+    #[cfg(test)]
+    fn address_index_arm(
+        &self,
+        oldest_or_newest: Option<std::cmp::Ordering>,
+        count: ArmCount,
+    ) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let probe = &self.address_index;
+        let (arm, reference) = match (count, oldest_or_newest) {
+            (ArmCount::Insert, Some(Greater)) => (1, Some(Greater)),
+            (ArmCount::Insert, _) => (0, Some(Greater)),
+            (ArmCount::Removal, Some(Equal)) => (2, Some(Less)),
+            (ArmCount::Removal, Some(Greater)) => (3, Some(Less)),
+            (ArmCount::Removal, Some(Less)) => (4, Some(Less)),
+            (ArmCount::Removal, None) => (5, Some(Less)),
+        };
+        probe.hits[arm].fetch_add(1, Ordering::Relaxed);
+        if probe.reference.load(Ordering::Relaxed) {
+            reference
+        } else {
+            oldest_or_newest
         }
     }
 
@@ -960,7 +1007,20 @@ impl HeadCache {
         for addr in &addrs {
             if let Entry::Occupied(mut occ) = self.sigs_by_address.entry(*addr) {
                 let deque = occ.get_mut();
-                deque.retain(|k| k.pos.slot != slot);
+                // Lists are newest first, so the last key is the oldest one.
+                let oldest = deque.back().map(|key| key.pos.slot.cmp(&slot));
+                #[cfg(test)]
+                let oldest = self.address_index_arm(oldest, ArmCount::Removal);
+                match oldest {
+                    Some(std::cmp::Ordering::Equal) => {
+                        while deque.back().is_some_and(|key| key.pos.slot == slot) {
+                            deque.pop_back();
+                        }
+                    }
+                    // Every key is newer than the slot, so the list holds none of its keys.
+                    Some(std::cmp::Ordering::Greater) => {}
+                    _ => deque.retain(|k| k.pos.slot != slot),
+                }
 
                 if deque.is_empty() {
                     deques.push(occ.remove());
@@ -1156,8 +1216,19 @@ impl HeadCache {
         let mut entry = self.sigs_by_address.entry(address).or_default();
         // Keep newest-first by (slot, idx) even when an older slot is reclaimed late.
         let order = |k: &HeadSigKey| (k.pos.slot, k.pos.idx);
-        let at = entry.partition_point(|k| order(k) > order(&key));
-        entry.insert(at, key);
+        // A key that is not older than the first one goes first; a tie goes before its equal.
+        let newest = entry.front().map(|front| order(front).cmp(&order(&key)));
+        #[cfg(test)]
+        let newest = self.address_index_arm(newest, ArmCount::Insert);
+        match newest {
+            None | Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
+                entry.push_front(key);
+            }
+            Some(std::cmp::Ordering::Greater) => {
+                let at = entry.partition_point(|k| order(k) > order(&key));
+                entry.insert(at, key);
+            }
+        }
         while let Some(back) = entry.back()
             && back.pos.slot < min_slot
         {

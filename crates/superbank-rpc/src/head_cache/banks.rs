@@ -645,6 +645,8 @@ fn check_entries(bank: &Bank, metadata: &BlockMetadataRecord) -> Result<(), &'st
 }
 
 #[cfg(test)]
+mod address_index_model;
+#[cfg(test)]
 mod bench;
 #[cfg(test)]
 pub(crate) mod tests;
