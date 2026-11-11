@@ -297,13 +297,18 @@ function clearSelection() {
 }
 
 // --- Steps ------------------------------------------------------------------
+// Every manual move ends autoplay. Only the play timer calls showStep directly.
 function goToStep(index, { announce = true } = {}) {
+  stopPlay();
+  showStep(index, announce);
+}
+
+function showStep(index, announce) {
   stepIndex = Math.min(Math.max(index, 0), life.steps.length - 1);
   render({ announce });
 }
 
 function step(delta) {
-  stopPlay();
   goToStep(stepIndex + delta);
 }
 
@@ -333,17 +338,14 @@ function startPlay() {
   $('play').textContent = 'Pause';
   playTimer = setInterval(() => {
     if (stepIndex >= life.steps.length - 1) return stopPlay();
-    goToStep(stepIndex + 1, { announce: false });
+    showStep(stepIndex + 1, false);
   }, PLAY_INTERVAL_MS);
 }
 
 function setupSteps() {
   $('walk-prev').addEventListener('click', () => step(-1));
   $('walk-next').addEventListener('click', () => step(1));
-  $('restart').addEventListener('click', () => {
-    stopPlay();
-    goToStep(0);
-  });
+  $('restart').addEventListener('click', () => goToStep(0));
   $('play').addEventListener('click', () => (playTimer ? stopPlay() : startPlay()));
   $('walkthrough').addEventListener('click', () => select(selection?.kind === 'step' ? null : { kind: 'step' }));
   // Arrow keys step, unless a control that uses them (the selector radios) has focus.
