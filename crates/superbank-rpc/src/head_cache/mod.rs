@@ -47,6 +47,99 @@ pub(crate) struct HeadTxMeta {
     pub(crate) block_time: Option<i64>,
 }
 
+/// Rows of one transaction that depend only on the transaction and its slot.
+struct PreparedTransaction {
+    signature: Signature,
+    signature_str: Arc<str>,
+    idx: u32,
+    err: Option<serde_json::Value>,
+    memo: Option<String>,
+    // Static keys plus loaded addresses, sorted and deduplicated.
+    addresses: Vec<Pubkey>,
+    // `block_time` stays unset until the row is inserted under the bank write lock.
+    record: Arc<StoredTransactionRecord>,
+}
+
+/// Converts one transaction; every field is a function of `(slot, tx_info)`.
+fn prepare_transaction(
+    slot: u64,
+    tx_info: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo,
+) -> Result<PreparedTransaction, convert::ConvertError> {
+    let record = convert::stored_record_from_transaction_info(slot, tx_info)?;
+    let signature = Signature::from(record.signature);
+    let memo = extract_memo(&record);
+    let err = record
+        .meta_err
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok());
+    let idx = tx_info.index.min(u64::from(u32::MAX)) as u32;
+    let signature_str: Arc<str> = bs58::encode(record.signature).into_string().into();
+    let mut addresses = Vec::with_capacity(
+        record.tx_account_keys.len()
+            + record.meta_loaded_addresses_writable.len()
+            + record.meta_loaded_addresses_readonly.len(),
+    );
+    addresses.extend(record.tx_account_keys.iter().copied());
+    addresses.extend(record.meta_loaded_addresses_writable.iter().copied());
+    addresses.extend(record.meta_loaded_addresses_readonly.iter().copied());
+    addresses.sort_unstable();
+    addresses.dedup();
+    Ok(PreparedTransaction {
+        signature,
+        signature_str,
+        idx,
+        err,
+        memo,
+        addresses: addresses.into_iter().map(Pubkey::from).collect(),
+        record: Arc::new(record),
+    })
+}
+
+/// Test-only points where a worker thread blocks until the test releases it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PausePoint {
+    /// `freeze_bank` after the prepare step and before the bank write lock.
+    Prepared,
+    /// First publish after the rows are inserted and before the coverage proof is published.
+    RowsInserted,
+    /// A bank write about to release the lock, before it frees anything or records its hold.
+    Releasing,
+    /// A bank write after it released the lock and before it frees the retired values.
+    Released,
+}
+
+/// Test-only view of the address index: the reference switch and the hits of each arm.
+#[cfg(test)]
+#[derive(Default)]
+struct AddressIndexProbe {
+    /// Makes every insert search its position and every removal scan the list.
+    reference: std::sync::atomic::AtomicBool,
+    /// Insert arms (first, searched), then removal arms (popped, skipped, scanned, empty).
+    hits: [std::sync::atomic::AtomicU64; 6],
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ArmCount {
+    Insert,
+    Removal,
+}
+
+#[cfg(test)]
+struct PauseHook {
+    point: PausePoint,
+    reached: std::sync::mpsc::Sender<u64>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Pauses(std::sync::Mutex<Option<PauseHook>>);
+
+/// Retired batches that staging holds leave queued for the next freeze, commit or discard.
+const RETIRED_BACKLOG: usize = 256;
+
 /// Bank events buffered by a lagging receiver before it reports `Lagged`.
 const BANK_EVENT_CAPACITY: usize = 4096;
 
@@ -159,12 +252,20 @@ pub(crate) struct HeadCache {
     bank_events: broadcast::Sender<HeadBankEvent>,
     // Events queued under the bank write lock and sent once it is released.
     pending_bank_events: std::sync::Mutex<Vec<HeadBankEvent>>,
+    // Values removed under the bank write lock; a non-staging release drops them.
+    // A staging release drops them only past `RETIRED_BACKLOG`.
+    retired: std::sync::Mutex<Vec<Box<dyn Send>>>,
     commit_notify: Notify,
 
     /// `HEAD_CACHE_COMMITMENT_WAIT_MS`; zero disables the wait in [`Self::get_tx_waiting`].
     commitment_wait: Duration,
     /// `HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS` permits, one held per waiting request.
     commitment_waiters: Semaphore,
+
+    #[cfg(test)]
+    pauses: Pauses,
+    #[cfg(test)]
+    address_index: AddressIndexProbe,
 }
 
 impl HeadCache {
@@ -189,9 +290,81 @@ impl HeadCache {
             clamp_explicit_end: true,
             bank_events: broadcast::channel(BANK_EVENT_CAPACITY).0,
             pending_bank_events: std::sync::Mutex::default(),
+            retired: std::sync::Mutex::default(),
             commit_notify: Notify::new(),
             commitment_wait: Duration::ZERO,
             commitment_waiters: Semaphore::new(COMMITMENT_WAIT_MAX_WAITERS),
+            #[cfg(test)]
+            pauses: Pauses::default(),
+            #[cfg(test)]
+            address_index: AddressIndexProbe::default(),
+        }
+    }
+
+    /// Counts the arm that `oldest_or_newest` selects. In reference mode it returns the value
+    /// that selects the search (insert) or the scan (removal) instead.
+    #[cfg(test)]
+    fn address_index_arm(
+        &self,
+        oldest_or_newest: Option<std::cmp::Ordering>,
+        count: ArmCount,
+    ) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let probe = &self.address_index;
+        let (arm, reference) = match (count, oldest_or_newest) {
+            (ArmCount::Insert, Some(Greater)) => (1, Some(Greater)),
+            (ArmCount::Insert, _) => (0, Some(Greater)),
+            (ArmCount::Removal, Some(Equal)) => (2, Some(Less)),
+            (ArmCount::Removal, Some(Greater)) => (3, Some(Less)),
+            (ArmCount::Removal, Some(Less)) => (4, Some(Less)),
+            (ArmCount::Removal, None) => (5, Some(Less)),
+        };
+        probe.hits[arm].fetch_add(1, Ordering::Relaxed);
+        if probe.reference.load(Ordering::Relaxed) {
+            reference
+        } else {
+            oldest_or_newest
+        }
+    }
+
+    /// Arms one pause. The receiver yields the paused thread's conversion count when it reaches
+    /// `point`; the sender releases it, and dropping the sender makes the thread panic.
+    #[cfg(test)]
+    pub(super) fn arm_pause(
+        &self,
+        point: PausePoint,
+    ) -> (std::sync::mpsc::Receiver<u64>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume) = std::sync::mpsc::channel();
+        *self
+            .pauses
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PauseHook {
+            point,
+            reached,
+            resume,
+        });
+        (reached_rx, resume_tx)
+    }
+
+    #[cfg(test)]
+    fn pause_at(&self, point: PausePoint) {
+        let hook = {
+            let mut armed = self
+                .pauses
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if armed.as_ref().is_some_and(|hook| hook.point == point) {
+                armed.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            let _ = hook.reached.send(convert::conversions_on_this_thread());
+            hook.resume.recv().expect("pause released");
         }
     }
 
@@ -215,6 +388,40 @@ impl HeadCache {
                 blockhash,
                 kind,
             });
+    }
+
+    /// True once a panic under the bank or coverage write lock has poisoned it.
+    fn locks_poisoned(&self) -> bool {
+        self.banks.is_poisoned() || self.coverage.is_poisoned()
+    }
+
+    /// Queues `value` to drop after the bank write lock is released.
+    fn retire<T: Send + 'static>(&self, value: T) {
+        self.retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Box::new(value));
+    }
+
+    #[cfg(test)]
+    fn retired_len(&self) -> usize {
+        self.retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Takes the queue; with `all` unset, only once it exceeds [`RETIRED_BACKLOG`].
+    fn take_retired(&self, all: bool) -> Vec<Box<dyn Send>> {
+        let mut retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if all || retired.len() > RETIRED_BACKLOG {
+            std::mem::take(&mut *retired)
+        } else {
+            Vec::new()
+        }
     }
 
     // Holding the queue lock while sending keeps events in order across callers.
@@ -768,40 +975,59 @@ impl HeadCache {
             self.queue_bank_event(slot, blockhash, kind);
         }
         self.slot_block_time.remove(&slot);
-        self.slot_block_metadata.remove(&slot);
+        let metadata = self.slot_block_metadata.remove(&slot);
 
-        if let Some((_, sigs)) = self.sigs_by_slot.remove(&slot) {
-            for sig in sigs {
-                if self
-                    .meta_by_signature
-                    .get(&sig)
-                    .is_some_and(|meta| meta.pos.slot == slot)
-                {
-                    self.tx_by_signature.remove(&sig);
-                    self.meta_by_signature.remove(&sig);
-                }
+        let sigs = self
+            .sigs_by_slot
+            .remove(&slot)
+            .map(|(_, sigs)| sigs)
+            .unwrap_or_default();
+        let mut records = Vec::new();
+        let mut metas = Vec::new();
+        for sig in &sigs {
+            if self
+                .meta_by_signature
+                .get(sig)
+                .is_some_and(|meta| meta.pos.slot == slot)
+            {
+                records.extend(self.tx_by_signature.remove(sig));
+                metas.extend(self.meta_by_signature.remove(sig));
             }
         }
 
-        let Some((_, mut addrs)) = self.addrs_by_slot.remove(&slot) else {
-            return;
-        };
+        let mut addrs = self
+            .addrs_by_slot
+            .remove(&slot)
+            .map(|(_, addrs)| addrs)
+            .unwrap_or_default();
         addrs.sort_unstable();
         addrs.dedup();
 
-        for addr in addrs {
-            match self.sigs_by_address.entry(addr) {
-                Entry::Occupied(mut occ) => {
-                    let deque = occ.get_mut();
-                    deque.retain(|k| k.pos.slot != slot);
-
-                    if deque.is_empty() {
-                        occ.remove();
+        let mut deques = Vec::new();
+        for addr in &addrs {
+            if let Entry::Occupied(mut occ) = self.sigs_by_address.entry(*addr) {
+                let deque = occ.get_mut();
+                // Lists are newest first, so the last key is the oldest one.
+                let oldest = deque.back().map(|key| key.pos.slot.cmp(&slot));
+                #[cfg(test)]
+                let oldest = self.address_index_arm(oldest, ArmCount::Removal);
+                match oldest {
+                    Some(std::cmp::Ordering::Equal) => {
+                        while deque.back().is_some_and(|key| key.pos.slot == slot) {
+                            deque.pop_back();
+                        }
                     }
+                    // Every key is newer than the slot, so the list holds none of its keys.
+                    Some(std::cmp::Ordering::Greater) => {}
+                    _ => deque.retain(|k| k.pos.slot != slot),
                 }
-                Entry::Vacant(_) => {}
+
+                if deque.is_empty() {
+                    deques.push(occ.remove());
+                }
             }
         }
+        self.retire((records, metas, sigs, addrs, deques, metadata));
     }
 
     fn projection_wins(
@@ -817,7 +1043,7 @@ impl HeadCache {
             || rank_of(old.bank_commitment.as_ref()) != 0
     }
 
-    // Cheap probe that runs before the costly record conversion.
+    // Cheap probe that runs before any row is built or stamped.
     fn keeps_existing_projection(
         &self,
         signature: &Signature,
@@ -829,14 +1055,15 @@ impl HeadCache {
             .is_some_and(|old| Self::projection_wins(&old, slot, bank_commitment))
     }
 
-    fn ingest_bank_transaction(
+    /// Inserts a prepared row under the bank write lock.
+    fn insert_bank_transaction(
         &self,
         slot: u64,
-        tx_info: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo,
-        bank_commitment: Option<Arc<std::sync::atomic::AtomicU8>>,
+        tx: &mut PreparedTransaction,
+        bank_commitment: &Arc<std::sync::atomic::AtomicU8>,
     ) {
-        // Skip transactions that are already outside the retained window. This avoids doing
-        // conversion work and prevents address indexes from accumulating stale keys.
+        // Skip transactions that are already outside the retained window. This prevents
+        // address indexes from accumulating stale keys.
         let current_latest = self.latest_slot.load(Ordering::Relaxed);
         let prospective_latest = current_latest.max(slot);
         let min_slot = prospective_latest.saturating_sub(self.retain_slots.saturating_sub(1));
@@ -844,51 +1071,23 @@ impl HeadCache {
             return;
         }
 
-        let signature_bytes: [u8; 64] = match convert::bytes_to_array(&tx_info.signature) {
-            Ok(sig) => sig,
-            Err(err) => {
-                tracing::warn!(slot, "head cache: invalid signature bytes: {err}");
-                return;
-            }
-        };
-        let signature = Signature::from(signature_bytes);
-
-        if self.keeps_existing_projection(&signature, slot, bank_commitment.as_ref()) {
+        let signature = tx.signature;
+        if self.keeps_existing_projection(&signature, slot, Some(bank_commitment)) {
             return;
         }
 
-        let mut record = match convert::stored_record_from_transaction_info(slot, tx_info) {
-            Ok(record) => record,
-            Err(err) => {
-                tracing::warn!(
-                    slot,
-                    signature = %bs58::encode(signature_bytes).into_string(),
-                    "head cache: failed to convert transaction: {err}"
-                );
-                return;
-            }
-        };
         let block_time = self.slot_block_time.get(&slot).map(|value| *value.value());
-        record.block_time = block_time;
+        if tx.record.block_time != block_time {
+            Arc::make_mut(&mut tx.record).block_time = block_time;
+        }
 
-        let memo = extract_memo(&record);
-        let err_value = record
-            .meta_err
-            .as_ref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.trim()).ok());
-
-        let pos = SlotIndex {
-            slot,
-            idx: tx_info.index.min(u64::from(u32::MAX)) as u32,
-        };
-
-        let signature_str: Arc<str> = bs58::encode(signature_bytes).into_string().into();
+        let pos = SlotIndex { slot, idx: tx.idx };
         let meta = Arc::new(HeadTxMeta {
-            bank_commitment,
-            signature_str,
+            bank_commitment: Some(bank_commitment.clone()),
+            signature_str: tx.signature_str.clone(),
             pos,
-            err: err_value,
-            memo,
+            err: tx.err.clone(),
+            memo: tx.memo.clone(),
             block_time,
         });
 
@@ -920,9 +1119,7 @@ impl HeadCache {
             }
         }
         self.meta_by_signature.insert(signature, meta.clone());
-
-        let record = Arc::new(record);
-        self.tx_by_signature.insert(signature, record.clone());
+        self.tx_by_signature.insert(signature, tx.record.clone());
 
         self.sigs_by_slot.entry(slot).or_default().push(signature);
 
@@ -931,33 +1128,17 @@ impl HeadCache {
             pos: meta.pos,
         };
 
-        let mut unique_addrs = Vec::with_capacity(
-            record.tx_account_keys.len()
-                + record.meta_loaded_addresses_writable.len()
-                + record.meta_loaded_addresses_readonly.len(),
-        );
-        unique_addrs.extend(record.tx_account_keys.iter().copied());
-        unique_addrs.extend(record.meta_loaded_addresses_writable.iter().copied());
-        unique_addrs.extend(record.meta_loaded_addresses_readonly.iter().copied());
-        unique_addrs.sort_unstable();
-        unique_addrs.dedup();
-
-        let unique_pubkeys = unique_addrs
-            .into_iter()
-            .map(Pubkey::from)
-            .collect::<Vec<_>>();
-
         {
             let mut slot_addrs = self.addrs_by_slot.entry(slot).or_default();
-            slot_addrs.extend(unique_pubkeys.iter().copied());
+            slot_addrs.extend(tx.addresses.iter().copied());
         }
 
-        for addr in unique_pubkeys {
+        for addr in tx.addresses.iter().copied() {
             self.index_address(addr, key, min_slot);
         }
 
         // In the common path, `note_slot_commitment` has already advanced `latest_slot` for this
-        // slot, so avoid the atomic in the hot ingest loop.
+        // slot, so avoid the atomic in the hot insert loop.
         if slot > current_latest {
             let prev_latest = self.latest_slot.fetch_max(slot, Ordering::Relaxed);
             if slot > prev_latest {
@@ -1035,8 +1216,19 @@ impl HeadCache {
         let mut entry = self.sigs_by_address.entry(address).or_default();
         // Keep newest-first by (slot, idx) even when an older slot is reclaimed late.
         let order = |k: &HeadSigKey| (k.pos.slot, k.pos.idx);
-        let at = entry.partition_point(|k| order(k) > order(&key));
-        entry.insert(at, key);
+        // A key that is not older than the first one goes first; a tie goes before its equal.
+        let newest = entry.front().map(|front| order(front).cmp(&order(&key)));
+        #[cfg(test)]
+        let newest = self.address_index_arm(newest, ArmCount::Insert);
+        match newest {
+            None | Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
+                entry.push_front(key);
+            }
+            Some(std::cmp::Ordering::Greater) => {
+                let at = entry.partition_point(|k| order(k) > order(&key));
+                entry.insert(at, key);
+            }
+        }
         while let Some(back) = entry.back()
             && back.pos.slot < min_slot
         {
@@ -1060,7 +1252,7 @@ impl HeadCache {
     /// up to that commitment's tip is either skipped (a proven parent edge jumps it) or
     /// was frozen and ingested whole before its commitment was published (the block
     /// machine emits a commitment update only for frozen blocks, after the block, and
-    /// both are applied in order by one task). `None` when the stream is disconnected,
+    /// the stream loop applies both in order). `None` when the stream is disconnected,
     /// the tip has not advanced within [`coverage::TIP_MAX_AGE`], or no verified parent
     /// edge reaches the tip. A reconnect starts a new proof, so slots the head never
     /// received are never inside it. Take it before reading head rows, and pass it to

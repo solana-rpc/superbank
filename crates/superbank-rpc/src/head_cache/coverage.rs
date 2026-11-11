@@ -159,7 +159,14 @@ impl HeadCoverage {
     pub(crate) fn retain(&mut self, slot: u64, retain: u64) {
         self.highest = self.highest.max(slot);
         let floor = self.highest.saturating_sub(retain.saturating_sub(1));
-        self.nodes = self.nodes.split_off(&floor);
+        // Most calls trim nothing; they skip the rebuild and its allocation.
+        if self
+            .nodes
+            .first_key_value()
+            .is_some_and(|(slot, _)| *slot < floor)
+        {
+            self.nodes = self.nodes.split_off(&floor);
+        }
     }
 
     fn link(&self, slot: u64, commitment: CommitmentLevel) -> Option<Link> {
@@ -492,6 +499,24 @@ mod tests {
                 .gaps(10, 11),
             vec![(10, 10)]
         );
+    }
+    #[test]
+    fn retain_drops_only_slots_below_the_floor() {
+        let now = Instant::now();
+        let mut state = HeadCoverage::default();
+        state.connect();
+        for slot in 10..=13 {
+            add(&mut state, slot, slot - 1, now);
+        }
+        let slots = |state: &HeadCoverage| state.nodes.keys().copied().collect::<Vec<_>>();
+        state.retain(13, 4);
+        assert_eq!(slots(&state), [10, 11, 12, 13]);
+        state.retain(14, 4);
+        assert_eq!(slots(&state), [11, 12, 13]);
+        state.retain(12, 4);
+        assert_eq!(slots(&state), [11, 12, 13]);
+        state.retain(20, 4);
+        assert!(slots(&state).is_empty());
     }
     #[test]
     fn forks_and_commitment_mismatch_cannot_prove_continuity() {

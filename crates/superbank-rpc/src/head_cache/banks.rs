@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Speculative banks are scoped to one subscription; only a selected bank is published.
-use super::{HeadBankEventKind, HeadCache, coverage::Link};
+use super::{HeadBankEventKind, HeadCache, PreparedTransaction, coverage::Link};
 use crate::clickhouse::{BlockFooterRecord, BlockMetadataRecord};
 use solana_commitment_config::CommitmentLevel;
 use std::{
@@ -19,6 +19,9 @@ const PENDING_COMMITMENT_SLOTS: u64 = 64;
 
 type BankKey = (u64, u64); // (slot, node-local bank ID), within BankState::session
 
+/// Per-transaction rows, or the metric label of the first failed per-transaction check.
+type PreparedBank = Result<Vec<PreparedTransaction>, &'static str>;
+
 #[derive(Default)]
 pub(super) struct BankState {
     session: u64,
@@ -34,7 +37,7 @@ pub(super) struct BankState {
 struct Bank {
     metadata: Option<BlockMetadataRecord>,
     footer: Option<BlockFooterRecord>,
-    transactions: Option<Vec<SubscribeUpdateTransactionInfo>>,
+    transactions: Option<Vec<PreparedTransaction>>,
     sealed_hash: Option<[u8; 32]>,
     entries: Vec<yellowstone_grpc_proto::prelude::SubscribeUpdateEntry>,
     commitment: Arc<AtomicU8>,
@@ -69,16 +72,25 @@ impl BankOp {
         }
     }
 
-    fn notifies(self) -> bool {
-        !matches!(
+    fn is_staging(self) -> bool {
+        matches!(
             self,
             Self::StageMetadata | Self::StageFooter | Self::StageEntry
         )
     }
+
+    fn notifies(self) -> bool {
+        !self.is_staging()
+    }
+
+    /// Staging holds run per stream event on the stream task and free only a backlog.
+    fn drains_retired(self) -> bool {
+        !self.is_staging()
+    }
 }
 
-/// Bank write lock that records its hold time, then sends queued events and notifies
-/// commit waiters once released.
+/// Bank write lock that records its hold time, then sends queued events, notifies
+/// commit waiters and drops retired values once released.
 struct BankWrite<'a> {
     cache: &'a HeadCache,
     state: Option<RwLockWriteGuard<'a, BankState>>,
@@ -102,13 +114,21 @@ impl DerefMut for BankWrite<'_> {
 
 impl Drop for BankWrite<'_> {
     fn drop(&mut self) {
+        #[cfg(test)]
+        self.cache.pause_at(super::PausePoint::Releasing);
         let held = self.acquired.elapsed();
         drop(self.state.take());
+        let retired = self.cache.take_retired(self.op.drains_retired());
         crate::metrics::head_cache_write_lock_hold(self.op.label(), held.as_secs_f64());
         self.cache.send_bank_events();
         if self.op.notifies() {
             self.cache.commit_notify.notify_waiters();
         }
+        #[cfg(test)]
+        if self.op.drains_retired() {
+            self.cache.pause_at(super::PausePoint::Released);
+        }
+        drop(retired);
     }
 }
 
@@ -153,11 +173,15 @@ impl HeadCache {
         }
         self.latest_slot.store(0, Ordering::Relaxed);
         self.address_truncated_slot.clear();
-        *state = BankState {
-            session,
-            minimum_commitment: rank(minimum),
-            ..Default::default()
-        };
+        let previous = std::mem::replace(
+            &mut *state,
+            BankState {
+                session,
+                minimum_commitment: rank(minimum),
+                ..Default::default()
+            },
+        );
+        self.retire(previous);
         self.coverage.write().expect("head coverage lock").connect();
         session
     }
@@ -176,7 +200,7 @@ impl HeadCache {
             self.remove_slot_inner(slot, HeadBankEventKind::Evicted);
         }
         state.session = state.session.checked_add(1).expect("head session overflow");
-        state.banks.clear();
+        self.retire(std::mem::take(&mut state.banks));
         state.selected.clear();
         state.canonical.clear();
         state.discarded.clear();
@@ -264,8 +288,21 @@ impl HeadCache {
         hash: [u8; 32],
         transactions: Vec<SubscribeUpdateTransactionInfo>,
     ) {
-        let mut state = self.write_banks(BankOp::Freeze);
         let key = (slot, bank_id);
+        // The peek is a hint: the write hold below repeats every check.
+        let peek = {
+            let state = self.banks.read().expect("head bank lock");
+            self.reaches_transaction_checks(&state, session, key, hash, transactions.len())
+        };
+        let mut prepared = peek.then(|| {
+            let started = Instant::now();
+            let prepared = prepare_bank(slot, &transactions);
+            crate::metrics::head_cache_freeze_prepare(started.elapsed().as_secs_f64());
+            prepared
+        });
+        #[cfg(test)]
+        self.pause_at(super::PausePoint::Prepared);
+        let mut state = self.write_banks(BankOp::Freeze);
         if !self.accept_bank(&state, session, key) {
             return;
         }
@@ -276,23 +313,28 @@ impl HeadCache {
         let checked = match bank.metadata.as_ref() {
             None => Err("metadata_missing"),
             Some(meta) if meta.blockhash != hash => Err("blockhash_mismatch"),
-            Some(meta) => complete_bank(bank, slot, &transactions).inspect_err(|reason| {
-                tracing::warn!(
-                    slot,
-                    bank_id,
-                    reason,
-                    expected_transactions = meta.executed_transaction_count,
-                    received_transactions = transactions.len(),
-                    "head cache: incomplete or malformed bank"
-                );
-            }),
+            Some(meta) => {
+                complete_bank(bank, slot, &transactions, &mut prepared).inspect_err(|reason| {
+                    tracing::warn!(
+                        slot,
+                        bank_id,
+                        reason,
+                        expected_transactions = meta.executed_transaction_count,
+                        received_transactions = transactions.len(),
+                        "head cache: incomplete or malformed bank"
+                    );
+                })
+            }
         };
-        if let Err(reason) = checked {
-            crate::metrics::head_cache_rejected_bank(reason);
-            return;
-        }
+        let rows = match checked {
+            Ok(rows) => rows,
+            Err(reason) => {
+                crate::metrics::head_cache_rejected_bank(reason);
+                return;
+            }
+        };
         bank.sealed_hash = Some(hash);
-        bank.transactions = Some(transactions);
+        bank.transactions = Some(rows);
         self.publish_bank(&mut state, key);
         self.retain_banks(&mut state);
     }
@@ -326,10 +368,12 @@ impl HeadCache {
                 .copied()
                 .filter(|other| other.0 == slot && *other != key)
                 .collect();
+            let mut removed = Vec::new();
             for loser in losers {
-                state.banks.remove(&loser);
+                removed.extend(state.banks.remove(&loser));
                 state.discarded.insert(loser);
             }
+            self.retire_banks(removed);
         }
         state.highest = state.highest.max(slot);
         let bank = state.banks.entry(key).or_default();
@@ -363,8 +407,9 @@ impl HeadCache {
             return;
         }
         let key = (slot, bank_id);
-        state.banks.remove(&key);
+        let removed = state.banks.remove(&key);
         state.discarded.insert(key);
+        self.retire_banks(removed);
         if state.selected.get(&slot) == Some(&bank_id) {
             state.selected.remove(&slot);
             self.remove_slot(slot);
@@ -378,6 +423,14 @@ impl HeadCache {
         self.retain_banks(&mut state);
     }
 
+    /// Queues banks removed under the bank write lock to drop after its release.
+    fn retire_banks(&self, banks: impl IntoIterator<Item = Bank>) {
+        let banks: Vec<_> = banks.into_iter().collect();
+        if !banks.is_empty() {
+            self.retire(banks);
+        }
+    }
+
     fn accept_bank(&self, state: &BankState, session: u64, key: BankKey) -> bool {
         state.session == session
             && key.0 >= self.bank_floor(state)
@@ -388,11 +441,31 @@ impl HeadCache {
                 .is_none_or(|winner| *winner == key.1)
     }
 
+    /// Whether the checks that precede the per-transaction ones pass. A hint only.
+    fn reaches_transaction_checks(
+        &self,
+        state: &BankState,
+        session: u64,
+        key: BankKey,
+        hash: [u8; 32],
+        count: usize,
+    ) -> bool {
+        self.accept_bank(state, session, key)
+            && state.banks.get(&key).is_some_and(|bank| {
+                bank.sealed_hash.is_none()
+                    && bank.metadata.as_ref().is_some_and(|meta| {
+                        meta.blockhash == hash
+                            && meta.executed_transaction_count == count as u64
+                            && meta.entry_count == bank.entries.len() as u64
+                    })
+            })
+    }
+
     fn publish_bank(&self, state: &mut BankState, key: BankKey) {
-        let Some(bank) = state.banks.get(&key) else {
+        let Some(bank) = state.banks.get_mut(&key) else {
             return;
         };
-        let (Some(metadata), Some(transactions)) = (&bank.metadata, &bank.transactions) else {
+        let (Some(metadata), Some(rows)) = (&bank.metadata, &mut bank.transactions) else {
             return;
         };
         let commitment = decode_commitment(bank.commitment.load(Ordering::Acquire));
@@ -410,8 +483,8 @@ impl HeadCache {
             // A signature may have first appeared on an abandoned slot. Repair
             // the winner's projection after discard, or transfer a processed
             // projection when this bank gains canonical commitment.
-            for tx in transactions {
-                self.ingest_bank_transaction(key.0, tx, Some(bank.commitment.clone()));
+            for tx in rows.iter_mut() {
+                self.insert_bank_transaction(key.0, tx, &bank.commitment);
             }
             self.note_slot_commitment(key.0, commitment);
             self.announce_bank(state, key, commitment);
@@ -421,11 +494,13 @@ impl HeadCache {
             self.remove_slot_inner(key.0, HeadBankEventKind::Discarded);
         }
         self.note_block_metadata(metadata.clone());
-        for tx in transactions {
-            self.ingest_bank_transaction(key.0, tx, Some(bank.commitment.clone()));
+        for tx in rows.iter_mut() {
+            self.insert_bank_transaction(key.0, tx, &bank.commitment);
         }
         self.note_slot_commitment(key.0, commitment);
         state.selected.insert(key.0, key.1);
+        #[cfg(test)]
+        self.pause_at(super::PausePoint::RowsInserted);
         let mut proof = self.coverage.write().expect("head coverage lock");
         proof.select_bank(Link {
             slot: metadata.slot,
@@ -482,19 +557,45 @@ impl HeadCache {
 
     fn retain_banks(&self, state: &mut BankState) {
         let floor = self.bank_floor(state);
-        state.banks.retain(|key, _| key.0 >= floor);
+        let removed = state
+            .banks
+            .extract_if(|key, _| key.0 < floor)
+            .map(|(_, bank)| bank);
+        self.retire_banks(removed);
         state.selected.retain(|slot, _| *slot >= floor);
         state.canonical.retain(|slot, _| *slot >= floor);
         state.discarded.retain(|key| key.0 >= floor);
     }
 }
 
-/// `Err` names the first check that rejects the bank; it is a metric label.
+/// Per-transaction checks in input order; `Err` is the metric label of the first failure.
+fn prepare_bank(slot: u64, transactions: &[SubscribeUpdateTransactionInfo]) -> PreparedBank {
+    let mut indices = HashSet::with_capacity(transactions.len());
+    let mut signatures = HashSet::with_capacity(transactions.len());
+    let mut rows = Vec::with_capacity(transactions.len());
+    for tx in transactions {
+        if tx.index >= transactions.len() as u64 || !indices.insert(tx.index) {
+            return Err("transaction_index");
+        }
+        if !signatures.insert(&tx.signature) {
+            return Err("duplicate_signature");
+        }
+        match super::prepare_transaction(slot, tx) {
+            Ok(row) => rows.push(row),
+            Err(_) => return Err("malformed_transaction"),
+        }
+    }
+    Ok(rows)
+}
+
+/// `Err` names the first check that rejects the bank; it is a metric label. `prepared` is the
+/// [`prepare_bank`] result from outside the lock; a rejected bank leaves its rows in it.
 fn complete_bank(
     bank: &Bank,
     slot: u64,
     transactions: &[SubscribeUpdateTransactionInfo],
-) -> Result<(), &'static str> {
+    prepared: &mut Option<PreparedBank>,
+) -> PreparedBank {
     let Some(metadata) = &bank.metadata else {
         return Err("metadata_missing");
     };
@@ -504,19 +605,20 @@ fn complete_bank(
     if metadata.entry_count != bank.entries.len() as u64 {
         return Err("entry_count");
     }
-    let mut indices = HashSet::new();
-    let mut signatures = HashSet::new();
-    for tx in transactions {
-        if tx.index >= transactions.len() as u64 || !indices.insert(tx.index) {
-            return Err("transaction_index");
-        }
-        if !signatures.insert(&tx.signature) {
-            return Err("duplicate_signature");
-        }
-        if super::convert::stored_record_from_transaction_info(slot, tx).is_err() {
-            return Err("malformed_transaction");
+    let rows = prepared
+        .take()
+        .unwrap_or_else(|| prepare_bank(slot, transactions))?;
+    match check_entries(bank, metadata) {
+        Ok(()) => Ok(rows),
+        Err(reason) => {
+            *prepared = Some(Ok(rows));
+            Err(reason)
         }
     }
+}
+
+/// `Err` names the first entry check that fails; it is a metric label.
+fn check_entries(bank: &Bank, metadata: &BlockMetadataRecord) -> Result<(), &'static str> {
     let mut entries = bank.entries.iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|entry| entry.index);
     let mut next = 0u64;
@@ -542,5 +644,9 @@ fn complete_bank(
     }
 }
 
+#[cfg(test)]
+mod address_index_model;
+#[cfg(test)]
+mod bench;
 #[cfg(test)]
 pub(crate) mod tests;

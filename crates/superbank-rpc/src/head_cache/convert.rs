@@ -369,10 +369,23 @@ fn convert_return_data(meta: &TransactionStatusMeta) -> Result<ReturnDataConvers
     Ok((true, Some(program_id), Some(return_data.data.clone())))
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONVERSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Conversions started on the calling thread; tests compare deltas.
+#[cfg(test)]
+pub(crate) fn conversions_on_this_thread() -> u64 {
+    CONVERSIONS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn stored_record_from_transaction_info(
     slot: u64,
     tx_info: &SubscribeUpdateTransactionInfo,
 ) -> Result<StoredTransactionRecord, ConvertError> {
+    #[cfg(test)]
+    CONVERSIONS.with(|count| count.set(count.get() + 1));
     let signature =
         bytes_to_array::<64>(&tx_info.signature).map_err(|_| ConvertError::InvalidLen {
             what: "signature",
