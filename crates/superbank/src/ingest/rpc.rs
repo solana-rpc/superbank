@@ -2744,6 +2744,84 @@ mod tests {
     }
 
     #[test]
+    fn agave44_maximum_v1_and_deep_cpi_survive_rpc_and_bigtable_mapping() {
+        use prost::Message as _;
+        use solana_storage_proto::convert::generated;
+        use solana_transaction_status::VersionedTransactionWithStatusMeta;
+
+        let mut tx = build_test_v1_transaction(TransactionConfig::empty());
+        let overhead = wincode::serialize(&tx).unwrap().len() - 3;
+        let data = vec![42; solana_message::v1::MAX_TRANSACTION_SIZE - overhead];
+        let VersionedMessage::V1(message) = &mut tx.message else {
+            unreachable!()
+        };
+        message.instructions[0].data = data.clone();
+        tx.sanitize().unwrap();
+        let signed_bytes = wincode::serialize(&tx).unwrap();
+        assert_eq!(signed_bytes.len(), solana_message::v1::MAX_TRANSACTION_SIZE);
+        let heights = vec![
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+            None,
+        ];
+        let meta = TransactionStatusMeta {
+            pre_balances: vec![10_000, 1],
+            post_balances: vec![5_000, 1],
+            fee: 5_000,
+            inner_instructions: Some(vec![InnerInstructions {
+                index: 0,
+                instructions: heights
+                    .iter()
+                    .map(|&stack_height| InnerInstruction {
+                        instruction: CompiledInstruction {
+                            program_id_index: 1,
+                            accounts: vec![0],
+                            data: vec![7],
+                        },
+                        stack_height,
+                    })
+                    .collect(),
+            }]),
+            ..Default::default()
+        };
+        let encoded = TransactionWithStatusMeta::Complete(VersionedTransactionWithStatusMeta {
+            transaction: tx.clone(),
+            meta: meta.clone(),
+        })
+        .encode(UiTransactionEncoding::Base64, Some(1), true)
+        .unwrap();
+        let rpc = map_rpc_transaction(42, None, 0, &encoded).unwrap();
+        assert_eq!(rpc.tx_instructions_data[0].as_ref(), data.as_slice());
+        assert_eq!(
+            rpc.meta_inner_instructions_stack_height,
+            vec![heights.clone()]
+        );
+
+        let bytes = generated::Transaction::from(tx).encode_to_vec();
+        let decoded: VersionedTransaction = generated::Transaction::decode(bytes.as_slice())
+            .unwrap()
+            .into();
+        assert_eq!(wincode::serialize(&decoded).unwrap(), signed_bytes);
+        let meta_bytes = generated::TransactionStatusMeta::from(meta).encode_to_vec();
+        let decoded_meta: TransactionStatusMeta =
+            generated::TransactionStatusMeta::decode(meta_bytes.as_slice())
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let bigtable =
+            map_versioned_transaction_with_meta(42, None, 0, &decoded, Some(&decoded_meta), 1)
+                .unwrap();
+        assert_eq!(bigtable.tx_instructions_data, rpc.tx_instructions_data);
+        assert_eq!(bigtable.message_hash, rpc.message_hash);
+        assert_eq!(bigtable.meta_inner_instructions_stack_height, vec![heights]);
+    }
+
+    #[test]
     fn bigtable_v1_mapping_preserves_empty_config_and_enforces_max_version() {
         let tx = build_test_v1_transaction(TransactionConfig::empty());
         let row = map_versioned_transaction_with_meta(42, None, 0, &tx, None, 1)

@@ -25,7 +25,7 @@ use crate::clickhouse::{
     SignatureSlot, SortOrder, StoredTransactionRecord, TokenAccountsFilter,
     TransactionStatusFilter, TransactionsForAddressQuery,
 };
-use crate::get_transaction_primary_cache::PrimaryTransactionCacheKey;
+use crate::get_transaction_primary_cache::{PrimaryTransactionCacheKey, record_heap_bytes};
 use crate::handlers::{
     RouteMetric,
     types::{
@@ -48,16 +48,93 @@ use crate::clickhouse::SlotBoundary;
 #[cfg(any(feature = "grpc-head-cache", feature = "disk-cache"))]
 use std::collections::HashSet;
 
-const GET_TRANSACTION_ALLOWED_FIELDS: [&str; 4] = [
+const GET_TRANSACTION_ALLOWED_FIELDS: [&str; 5] = [
     "encoding",
     "commitment",
     "maxSupportedTransactionVersion",
+    "minContextSlot",
     "slot",
 ];
 const GET_TRANSACTION_INVALID_SIGNATURE_MESSAGE: &str =
     "Invalid params: signature is not a valid transaction signature";
 const GET_TRANSACTION_DENYLISTED_SIGNATURES: [&str; 1] =
     ["1111111111111111111111111111111111111111111111111111111111111111"];
+
+/// `reason` labels of `superbank_get_transaction_not_found_total`.
+pub(crate) mod not_found {
+    /// The head holds the signature in another slot than the pinned one.
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    pub(crate) const HEAD_SLOT_MISMATCH: &str = "head_slot_mismatch";
+    /// The head holds the signature only below the requested commitment.
+    pub(crate) const HEAD_PROCESSED_ONLY: &str = "head_processed_only";
+    /// The pinned slot is not below the head window, but the head does not know the signature.
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    pub(crate) const HEAD_ABSENT: &str = "head_absent";
+    /// The pinned slot is older than the head window.
+    #[cfg_attr(not(feature = "grpc-head-cache"), allow(dead_code))]
+    pub(crate) const BELOW_HEAD: &str = "below_head";
+    /// The disk cache holds the signature in another slot than the pinned one.
+    #[cfg_attr(not(feature = "disk-cache"), allow(dead_code))]
+    pub(crate) const DISK_SLOT_MISMATCH: &str = "disk_slot_mismatch";
+    /// The disk cache proved that the pinned slot does not hold the signature.
+    #[cfg_attr(not(feature = "disk-cache"), allow(dead_code))]
+    pub(crate) const DISK_MISS: &str = "disk_miss";
+    /// The primary returned no row and no other reason applies.
+    pub(crate) const CLICKHOUSE_NULL: &str = "clickhouse_null";
+
+    /// `head_processed_only` outranks the tier that answered; the window reasons refine only
+    /// the primary's null.
+    pub(crate) fn reason(head_miss: Option<&'static str>, tier: &'static str) -> &'static str {
+        match head_miss {
+            Some(HEAD_PROCESSED_ONLY) => HEAD_PROCESSED_ONLY,
+            Some(head) if tier == CLICKHOUSE_NULL => head,
+            _ => tier,
+        }
+    }
+}
+
+/// Counts a null answered by `tier`, refined by the head's view of the signature at that time.
+#[cfg_attr(not(feature = "grpc-head-cache"), allow(unused_variables))]
+fn record_not_found(
+    state: &AppState,
+    signature: &Signature,
+    requested_slot: Option<u64>,
+    tier: &'static str,
+) {
+    #[cfg(feature = "grpc-head-cache")]
+    let head_miss = state
+        .head_cache
+        .as_deref()
+        .and_then(|cache| head_miss_reason(cache, signature, requested_slot));
+    #[cfg(not(feature = "grpc-head-cache"))]
+    let head_miss = None;
+    metrics::get_transaction_not_found(not_found::reason(head_miss, tier));
+}
+
+/// Why the head could not serve `signature`, when it can tell: it holds it below the requested
+/// commitment, or a pinned slot falls inside or below its window.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_miss_reason(
+    cache: &crate::head_cache::HeadCache,
+    signature: &Signature,
+    requested_slot: Option<u64>,
+) -> Option<&'static str> {
+    if cache
+        .get_meta(signature, CommitmentLevel::Processed)
+        .is_some()
+    {
+        return Some(not_found::HEAD_PROCESSED_ONLY);
+    }
+    let slot = requested_slot?;
+    if cache.latest_slot() == 0 {
+        return None;
+    }
+    Some(if slot >= cache.min_retained_slot() {
+        not_found::HEAD_ABSENT
+    } else {
+        not_found::BELOW_HEAD
+    })
+}
 
 #[derive(Debug)]
 struct ParsedGetTransactionConfig {
@@ -275,10 +352,93 @@ fn apply_resolved_address_bounds(
     });
 }
 
+/// Slots added on each side of a block-time slot range to absorb timestamp jitter.
+#[cfg(feature = "disk-cache")]
+const BLOCK_TIME_SLOT_MARGIN: u64 = 1_500;
+
+/// The inclusive block-time window a filter admits; `None` leaves that side open.
+#[cfg(feature = "disk-cache")]
+fn block_time_window(filter: &NumericFilter<i64>) -> (Option<i64>, Option<i64>) {
+    let min = [
+        filter.gte,
+        filter.gt.map(|t| t.saturating_add(1)),
+        filter.eq,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let max = [
+        filter.lte,
+        filter.lt.map(|t| t.saturating_sub(1)),
+        filter.eq,
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    (min, max)
+}
+
+/// The slot range of a block-time filter from the disk-cache block index, widened by
+/// `BLOCK_TIME_SLOT_MARGIN`. `None` leaves the query as the request states it.
+#[cfg(feature = "disk-cache")]
+fn block_time_slot_bounds(
+    state: &AppState,
+    filter: &NumericFilter<i64>,
+) -> Option<NumericFilter<u64>> {
+    if !state
+        .clickhouse
+        .transactions_for_address_block_time_slot_bounds()
+    {
+        metrics::transactions_for_address_block_time_slot_bounds("disabled");
+        return None;
+    }
+    let Some(index) = state.disk_cache().and_then(|disk| disk.block_index()) else {
+        metrics::transactions_for_address_block_time_slot_bounds("no_index");
+        return None;
+    };
+    let (min_time, max_time) = block_time_window(filter);
+    let found = index.slot_bounds_for_block_time(
+        min_time,
+        max_time,
+        state
+            .clickhouse
+            .transactions_for_address_block_time_slot_bounds_min_slot(),
+    );
+    let gte = found
+        .gte
+        .map(|slot| slot.saturating_sub(BLOCK_TIME_SLOT_MARGIN));
+    let lte = found
+        .lte
+        .map(|slot| slot.saturating_add(BLOCK_TIME_SLOT_MARGIN));
+    let complete = (min_time.is_none() || gte.is_some()) && (max_time.is_none() || lte.is_some());
+    metrics::transactions_for_address_block_time_slot_bounds(
+        match (gte.or(lte), complete, found.below_floor) {
+            (_, _, true) => "below_floor",
+            (Some(_), true, false) => "applied",
+            (Some(_), false, false) => "partial",
+            (None, _, false) => "unresolved",
+        },
+    );
+    gte.or(lte).map(|_| NumericFilter {
+        gte,
+        gt: None,
+        lte,
+        lt: None,
+        eq: None,
+    })
+}
+
 fn unsupported_transaction_version_message(version: u8) -> String {
     format!(
         "Transaction version ({version}) is not supported by the requesting client. Please try the request again with the following configuration parameter: \"maxSupportedTransactionVersion\": {version}"
     )
+}
+
+/// A record within `GET_TRANSACTION_INLINE_HYDRATION_MAX_BYTES`, sized as the primary record
+/// cache weighs it, hydrates on the async worker without a permit.
+fn hydrates_inline(state: &AppState, record: &StoredTransactionRecord) -> bool {
+    let max_bytes = state.get_transaction_inline_hydration_max_bytes;
+    max_bytes > 0 && record_heap_bytes(record) <= max_bytes
 }
 
 /// Hydrate a stored record and build the JSON-RPC response; shared by the
@@ -300,23 +460,31 @@ pub(crate) async fn respond_with_hydrated_transaction(
         }
     };
 
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            error!(signature = signature_str, "Hydration semaphore closed");
-            let mut resp = json_rpc_internal_error_response(id);
-            attach_timings(&mut resp);
-            return Ok(resp);
-        }
+    let record_slot = record.slot;
+    let hydrated = if hydrates_inline(state, &record) {
+        Ok(hydrate_transaction_record(
+            record.as_ref(),
+            encoding,
+            max_version,
+        ))
+    } else {
+        let permit = match state.acquire_hydration_permit(route.method()).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!(signature = signature_str, "Hydration semaphore closed");
+                let mut resp = json_rpc_internal_error_response(id);
+                attach_timings(&mut resp);
+                return Ok(resp);
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            hydrate_transaction_record(record.as_ref(), encoding, max_version)
+        })
+        .await
     };
 
-    let record_slot = record.slot;
-    match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        hydrate_transaction_record(record.as_ref(), encoding, max_version)
-    })
-    .await
-    {
+    match hydrated {
         Ok(Ok(encoded_tx)) => {
             route.success();
             let mut resp = json_rpc_success_response(id, encoded_tx);
@@ -356,6 +524,67 @@ pub(crate) async fn respond_with_hydrated_transaction(
             Ok(resp)
         }
     }
+}
+
+async fn validate_get_transaction_context(
+    state: &AppState,
+    route: &mut RouteMetric,
+    id: &Value,
+    commitment: CommitmentConfig,
+    min_context_slot: Option<u64>,
+) -> Option<Response> {
+    if commitment.is_processed() {
+        #[cfg(feature = "grpc-head-cache")]
+        {
+            if state.head_cache.is_none() {
+                route.invalid_params();
+                return Some(json_rpc_error_response(
+                    id.clone(),
+                    -32602,
+                    "Only confirmed or finalized commitments are supported",
+                    Some(json!({ "requestedCommitment": commitment.commitment })),
+                ));
+            }
+        }
+        #[cfg(not(feature = "grpc-head-cache"))]
+        {
+            route.invalid_params();
+            return Some(json_rpc_error_response(
+                id.clone(),
+                -32602,
+                "Only confirmed or finalized commitments are supported",
+                Some(json!({ "requestedCommitment": commitment.commitment })),
+            ));
+        }
+    }
+
+    let min_context_slot = min_context_slot?;
+    let (context_slot, context_source) = match state
+        .resolve_latest_slot_with_source("get_transaction_min_context", commitment.commitment)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            metrics::backend_error("get_latest_finalized_slot");
+            error!("Failed to fetch latest slot for minContextSlot check: {error}");
+            return Some(json_rpc_internal_error_response(id.clone()));
+        }
+    };
+    match context_source {
+        LatestSlotSource::ClickHouse => route.source_clickhouse(),
+        #[cfg(feature = "grpc-head-cache")]
+        LatestSlotSource::HeadCache => route.source_head_cache(),
+    }
+    if context_slot < min_context_slot {
+        route.rpc_error();
+        return Some(json_rpc_error_response(
+            id.clone(),
+            JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED as i32,
+            "Minimum context slot has not been reached",
+            Some(json!({ "contextSlot": context_slot })),
+        ));
+    }
+    None
 }
 
 pub(crate) async fn handle_get_transaction(
@@ -440,56 +669,44 @@ pub(crate) async fn handle_get_transaction(
     let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Json);
     let commitment = config.commitment.unwrap_or(CommitmentConfig::default());
 
-    if commitment.is_processed() {
-        #[cfg(feature = "grpc-head-cache")]
-        {
-            if state.head_cache.is_none() {
-                route.invalid_params();
-                return Ok(json_rpc_error_response(
-                    id,
-                    -32602,
-                    "Only confirmed or finalized commitments are supported",
-                    Some(json!({ "requestedCommitment": commitment.commitment })),
-                ));
-            }
-        }
-        #[cfg(not(feature = "grpc-head-cache"))]
-        {
-            route.invalid_params();
-            return Ok(json_rpc_error_response(
-                id,
-                -32602,
-                "Only confirmed or finalized commitments are supported",
-                Some(json!({ "requestedCommitment": commitment.commitment })),
-            ));
-        }
-    }
-
-    #[cfg(feature = "grpc-head-cache")]
-    if let Some(cache) = state.head_cache.as_ref()
-        && let Some(record) = cache.get_tx(&signature, commitment.commitment)
+    if let Some(response) = validate_get_transaction_context(
+        state.as_ref(),
+        &mut route,
+        &id,
+        commitment,
+        config.min_context_slot,
+    )
+    .await
     {
-        if requested_slot.is_some_and(|slot| record.slot != slot) {
-            route.source_head_cache();
-            route.not_found();
-            return Ok(json_rpc_null_response(id));
-        }
-
-        route.source_head_cache();
-        return respond_with_hydrated_transaction(
-            state.as_ref(),
-            id,
-            &mut route,
-            signature_str,
-            record,
-            encoding,
-            config.max_supported_transaction_version,
-            None,
-        )
-        .await;
+        return Ok(response);
     }
+
     #[cfg(feature = "grpc-head-cache")]
-    if state.head_cache.is_some() {
+    if let Some(cache) = state.head_cache.as_ref() {
+        if let Some(record) = cache
+            .get_tx_waiting(&signature, commitment.commitment, requested_slot)
+            .await
+        {
+            if requested_slot.is_some_and(|slot| record.slot != slot) {
+                route.source_head_cache();
+                route.not_found();
+                metrics::get_transaction_not_found(not_found::HEAD_SLOT_MISMATCH);
+                return Ok(json_rpc_null_response(id));
+            }
+
+            route.source_head_cache();
+            return respond_with_hydrated_transaction(
+                state.as_ref(),
+                id,
+                &mut route,
+                signature_str,
+                record,
+                encoding,
+                config.max_supported_transaction_version,
+                None,
+            )
+            .await;
+        }
         route.head_cache_read();
     }
 
@@ -503,6 +720,7 @@ pub(crate) async fn handle_get_transaction(
             if requested_slot.is_some_and(|slot| record.slot != slot) {
                 route.source_disk_cache();
                 route.not_found();
+                metrics::get_transaction_not_found(not_found::DISK_SLOT_MISMATCH);
                 return Ok(json_rpc_null_response(id));
             }
             observe_disk_cache_slot_age(state.as_ref(), record.slot);
@@ -525,6 +743,12 @@ pub(crate) async fn handle_get_transaction(
         ) {
             route.source_disk_cache();
             route.not_found();
+            record_not_found(
+                state.as_ref(),
+                &signature,
+                requested_slot,
+                not_found::DISK_MISS,
+            );
             return Ok(json_rpc_null_response(id));
         }
     }
@@ -586,6 +810,12 @@ pub(crate) async fn handle_get_transaction(
 
     let Some(record) = transaction_row else {
         route.not_found();
+        record_not_found(
+            state.as_ref(),
+            &signature,
+            requested_slot,
+            not_found::CLICKHOUSE_NULL,
+        );
         let mut resp = json_rpc_null_response(id);
         add_downstream_header(&mut resp, &timings);
         return Ok(resp);
@@ -1080,6 +1310,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         resolved_pagination: None,
         slot_filter,
         block_time_filter,
+        block_time_slot_bounds: None,
         signature_filter,
         resolved_signature_filter: None,
         status,
@@ -1113,6 +1344,10 @@ pub(crate) async fn handle_get_transactions_for_address(
         prequery_timings.add(timings);
     }
     apply_resolved_address_bounds(&mut query, &bound_positions);
+    #[cfg(feature = "disk-cache")]
+    if let Some(filter) = query.block_time_filter.as_ref() {
+        query.block_time_slot_bounds = block_time_slot_bounds(state.as_ref(), filter);
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum RecordSource {
@@ -1283,7 +1518,7 @@ pub(crate) async fn handle_get_transactions_for_address(
                     error: TransactionHydrationError,
                 }
 
-                let permit = match state.hydration_sem.clone().acquire_owned().await {
+                let permit = match state.acquire_hydration_permit(route.method()).await {
                     Ok(permit) => permit,
                     Err(_) => {
                         error!(address, "Hydration semaphore closed");
@@ -1941,7 +2176,7 @@ pub(crate) async fn handle_get_transactions_for_address(
         error: TransactionHydrationError,
     }
 
-    let permit = match state.hydration_sem.clone().acquire_owned().await {
+    let permit = match state.acquire_hydration_permit(route.method()).await {
         Ok(permit) => permit,
         Err(_) => {
             error!(address, "Hydration semaphore closed");
@@ -2099,6 +2334,7 @@ mod tests {
             resolved_pagination: None,
             slot_filter: None,
             block_time_filter: None,
+            block_time_slot_bounds: None,
             signature_filter: Some(SignatureFilter {
                 gte: Some("shared".into()),
                 gt: Some("other".into()),

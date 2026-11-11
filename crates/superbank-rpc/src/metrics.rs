@@ -42,9 +42,26 @@ const SERVING_LATENCY_BUCKETS: [f64; 18] = [
     5.0, 10.0,
 ];
 
-/// Request, primary ClickHouse and local-cache key latency, which judge p90/p99.
+/// Request, envelope, primary ClickHouse and local-cache key latency, which judge p90/p99.
 fn serving_latency_histogram() -> Histogram {
     Histogram::new(SERVING_LATENCY_BUCKETS)
+}
+
+/// 1 KiB to 64 MiB in powers of 4.
+const RESPONSE_BYTES_BUCKETS: [f64; 9] = [
+    1024.0,
+    4096.0,
+    16384.0,
+    65536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+];
+
+fn response_bytes_histogram() -> Histogram {
+    Histogram::new(RESPONSE_BYTES_BUCKETS)
 }
 
 const BATCH_SIZE_BUCKETS: [f64; 8] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
@@ -63,7 +80,23 @@ struct SignatureStatusStageLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct EnvelopeMethodLabels {
+    method: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct DisconnectOutcomeLabels {
+    outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct GetBlockNotFoundLabels {
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BackendAdmissionLabels {
+    operation: &'static str,
     outcome: &'static str,
 }
 
@@ -636,6 +669,43 @@ struct HeadCacheActiveLabels {
     x_rpc_node: String,
 }
 
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheLockOpLabels {
+    op: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheRejectedBankLabels {
+    reason: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheBankEventLabels {
+    kind: &'static str,
+    outcome: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RecentStoreOutcomeLabels {
+    outcome: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RecentStoreEvictionLabels {
+    reason: &'static str,
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HeadCacheCommitmentWaitLabels {
+    outcome: &'static str,
+}
+
 #[cfg(feature = "grpc-streaming")]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct SuperbankGrpcMethodLabels {
@@ -664,6 +734,10 @@ pub struct Metrics {
     rpc_latency_seconds: Family<MethodStatusLabels, Histogram>,
 
     rpc_inflight: Family<MethodLabels, Gauge>,
+    rpc_admission_wait_seconds: Histogram,
+    rpc_admission_inflight: Gauge,
+    rpc_backend_admission: Family<BackendAdmissionLabels, Counter>,
+    rpc_backend_admission_wait_seconds: Histogram,
     rpc_timeouts: Family<MethodLabels, Counter>,
     rpc_batch_requests: Family<BatchLabels, Counter>,
     rpc_batch_items: Family<BatchLabels, Counter>,
@@ -677,10 +751,14 @@ pub struct Metrics {
     signature_status_disconnect_verification: Family<DisconnectOutcomeLabels, Counter>,
     rpc_batch_rejected: Family<BatchRejectLabels, Counter>,
     rpc_response_overhead_seconds: Family<MethodLabels, Histogram>,
+    rpc_envelope_seconds: Family<EnvelopeMethodLabels, Histogram>,
+    rpc_response_bytes: Family<EnvelopeMethodLabels, Histogram>,
     rpc_blocks_slots_returned: Family<MethodLabels, Histogram>,
     rpc_blocks_range_seconds: Family<BlockRangeLabels, Histogram>,
     get_block_response_cache_access: Family<OperationOutcomeLabels, Counter>,
     transactions_for_address_cursor_cache_access: Family<OperationOutcomeLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
+    transactions_for_address_block_time_slot_bounds: Family<OperationOutcomeLabels, Counter>,
     signature_status_history_cache: Family<OperationOutcomeLabels, Counter>,
     get_block_response_cache_entries: Gauge,
     get_block_response_cache_weighted_bytes: Gauge,
@@ -690,6 +768,7 @@ pub struct Metrics {
     get_transaction_primary_cache_weighted_bytes: Gauge,
     get_transaction_primary_cache_max_bytes: Gauge,
     get_block_phase_seconds: Family<OperationLabels, Histogram>,
+    get_block_not_found: Family<GetBlockNotFoundLabels, Counter>,
 
     backend_errors: Family<OperationLabels, Counter>,
     inflation_reward_rejections: Family<BatchRejectLabels, Counter>,
@@ -734,6 +813,34 @@ pub struct Metrics {
     head_cache_address_entries: Gauge,
     #[cfg(feature = "grpc-head-cache")]
     head_cache_slot_entries: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_write_lock_hold_seconds: Family<HeadCacheLockOpLabels, Histogram>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_freeze_prepare_seconds: Histogram,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_worker_wait_seconds: Histogram,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_rejected_banks: Family<HeadCacheRejectedBankLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_bank_events: Family<HeadCacheBankEventLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_bank_events_lagged: Counter,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_requests: Family<RecentStoreOutcomeLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_prebuilds: Family<RecentStoreOutcomeLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_evictions: Family<RecentStoreEvictionLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_entries: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_resident_bytes: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    get_block_recent_store_max_bytes: Gauge,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_commitment_waits: Family<HeadCacheCommitmentWaitLabels, Counter>,
+    #[cfg(feature = "grpc-head-cache")]
+    head_cache_commitment_wait_seconds: Family<HeadCacheCommitmentWaitLabels, Histogram>,
 
     #[cfg(feature = "grpc-streaming")]
     superbank_grpc_stream_requests_total: Family<SuperbankGrpcMethodLabels, Counter>,
@@ -818,6 +925,9 @@ pub struct Metrics {
     get_transaction_disk_cache_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
     get_transaction_primary_slot_age: Histogram,
     get_transaction_primary_slot_age_skipped_total: Family<SlotAgeSkipLabels, Counter>,
+    get_transaction_not_found: Family<GetTransactionNotFoundLabels, Counter>,
+    get_block_request_shape_total: Family<GetBlockRequestShapeLabels, Counter>,
+    hydration_permit_wait_seconds: Family<HydrationPermitLabels, Histogram>,
 }
 
 impl Metrics {
@@ -827,6 +937,10 @@ impl Metrics {
             Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
 
         let rpc_inflight = Family::default();
+        let rpc_admission_wait_seconds = serving_latency_histogram();
+        let rpc_admission_inflight = Gauge::default();
+        let rpc_backend_admission = Family::default();
+        let rpc_backend_admission_wait_seconds = serving_latency_histogram();
         let rpc_timeouts = Family::default();
         let rpc_batch_requests = Family::default();
         let rpc_batch_items = Family::default();
@@ -844,12 +958,18 @@ impl Metrics {
         let rpc_batch_rejected = Family::default();
         let rpc_response_overhead_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+        let rpc_envelope_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
+        let rpc_response_bytes =
+            Family::new_with_constructor(response_bytes_histogram as fn() -> Histogram);
         let rpc_blocks_slots_returned =
             Family::new_with_constructor(block_slot_count_histogram as fn() -> Histogram);
         let rpc_blocks_range_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
         let get_block_response_cache_access = Family::default();
         let transactions_for_address_cursor_cache_access = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let transactions_for_address_block_time_slot_bounds = Family::default();
         let signature_status_history_cache = Family::default();
         let get_block_response_cache_entries = Gauge::default();
         let get_block_response_cache_weighted_bytes = Gauge::default();
@@ -860,6 +980,7 @@ impl Metrics {
         let get_transaction_primary_cache_max_bytes = Gauge::default();
         let get_block_phase_seconds =
             Family::new_with_constructor(latency_histogram as fn() -> Histogram);
+        let get_block_not_found = Family::default();
 
         let backend_errors = Family::default();
         let inflation_reward_rejections = Family::default();
@@ -905,6 +1026,36 @@ impl Metrics {
         let head_cache_address_entries = Gauge::default();
         #[cfg(feature = "grpc-head-cache")]
         let head_cache_slot_entries = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_write_lock_hold_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_freeze_prepare_seconds = serving_latency_histogram();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_worker_wait_seconds = serving_latency_histogram();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_rejected_banks = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_bank_events = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_bank_events_lagged = Counter::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_requests = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_prebuilds = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_evictions = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_entries = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_resident_bytes = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let get_block_recent_store_max_bytes = Gauge::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_commitment_waits = Family::default();
+        #[cfg(feature = "grpc-head-cache")]
+        let head_cache_commitment_wait_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
 
         #[cfg(feature = "grpc-streaming")]
         let superbank_grpc_stream_requests_total = Family::default();
@@ -1007,6 +1158,26 @@ impl Metrics {
             rpc_inflight.clone(),
         );
         registry.register(
+            "rpc_admission_wait_seconds",
+            "Time an HTTP request waited for an RPC_CONCURRENCY_LIMIT permit",
+            rpc_admission_wait_seconds.clone(),
+        );
+        registry.register(
+            "rpc_inflight",
+            "HTTP requests holding an RPC_CONCURRENCY_LIMIT permit",
+            rpc_admission_inflight.clone(),
+        );
+        registry.register(
+            "rpc_backend_admission",
+            "JSON-RPC calls admitted to or shed from source ClickHouse by RPC_BACKEND_CONCURRENCY_LIMIT, by the operation that asked first",
+            rpc_backend_admission.clone(),
+        );
+        registry.register(
+            "rpc_backend_admission_wait_seconds",
+            "Time a JSON-RPC call waited for an RPC_BACKEND_CONCURRENCY_LIMIT permit, including shed waits",
+            rpc_backend_admission_wait_seconds.clone(),
+        );
+        registry.register(
             "rpc_timeouts",
             "Total JSON-RPC requests that exceeded the server timeout",
             rpc_timeouts.clone(),
@@ -1072,6 +1243,16 @@ impl Metrics {
             rpc_response_overhead_seconds.clone(),
         );
         registry.register(
+            "rpc_envelope_seconds",
+            "JSON-RPC HTTP envelope time by method, batch or invalid, from handler entry until the response is handed to the server, before the body is written",
+            rpc_envelope_seconds.clone(),
+        );
+        registry.register(
+            "rpc_response_bytes",
+            "Uncompressed JSON-RPC HTTP response body size in bytes by method, batch or invalid",
+            rpc_response_bytes.clone(),
+        );
+        registry.register(
             "rpc_blocks_range_seconds",
             "Block range latency by local/primary coverage and bounded fallback reason",
             rpc_blocks_range_seconds.clone(),
@@ -1095,6 +1276,12 @@ impl Metrics {
             "transactions_for_address_cursor_cache_access",
             "getTransactionsForAddress cursor cache outcomes (hit, miss, insert)",
             transactions_for_address_cursor_cache_access.clone(),
+        );
+        #[cfg(feature = "disk-cache")]
+        registry.register(
+            "transactions_for_address_block_time_slot_bounds",
+            "getTransactionsForAddress block-time slot bound outcomes (applied, partial, below_floor, unresolved, disabled, no_index)",
+            transactions_for_address_block_time_slot_bounds.clone(),
         );
         registry.register(
             "get_block_response_cache_entries",
@@ -1135,6 +1322,11 @@ impl Metrics {
             "get_block_phase_seconds",
             "getBlock phase latency in seconds",
             get_block_phase_seconds.clone(),
+        );
+        registry.register(
+            "get_block_not_found",
+            "getBlock not-found answers by the tier and proof that decided them",
+            get_block_not_found.clone(),
         );
         registry.register(
             "rpc_backend_errors",
@@ -1283,6 +1475,76 @@ impl Metrics {
                 "head_cache_slot_entries",
                 "Current number of slot entries tracked by the gRPC head cache",
                 head_cache_slot_entries.clone(),
+            );
+            registry.register(
+                "head_cache_write_lock_hold_seconds",
+                "Time the gRPC head cache bank write lock is held, by operation",
+                head_cache_write_lock_hold_seconds.clone(),
+            );
+            registry.register(
+                "head_cache_freeze_prepare_seconds",
+                "Time the gRPC head cache converts and checks a frozen bank's transactions before it takes the bank write lock",
+                head_cache_freeze_prepare_seconds.clone(),
+            );
+            registry.register(
+                "head_cache_worker_wait_seconds",
+                "Time a block-machine output waits for a blocking thread before the gRPC head cache applies it",
+                head_cache_worker_wait_seconds.clone(),
+            );
+            registry.register(
+                "head_cache_rejected_banks",
+                "Frozen banks the gRPC head cache could not seal, by the first failed check",
+                head_cache_rejected_banks.clone(),
+            );
+            registry.register(
+                "head_cache_bank_events",
+                "gRPC head cache bank lifecycle events by kind and send outcome",
+                head_cache_bank_events.clone(),
+            );
+            registry.register(
+                "head_cache_bank_events_lagged",
+                "gRPC head cache bank events skipped by a lagging receiver",
+                head_cache_bank_events_lagged.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_requests",
+                "Recent getBlock store lookups by outcome",
+                get_block_recent_store_requests.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_prebuilds",
+                "Recent getBlock prebuild attempts by outcome",
+                get_block_recent_store_prebuilds.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_evictions",
+                "Recent getBlock store entries removed, by reason",
+                get_block_recent_store_evictions.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_entries",
+                "Serialized results held by the recent getBlock store",
+                get_block_recent_store_entries.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_resident_bytes",
+                "Serialized result bytes held by the recent getBlock store",
+                get_block_recent_store_resident_bytes.clone(),
+            );
+            registry.register(
+                "get_block_recent_store_max_bytes",
+                "Byte budget of the recent getBlock store",
+                get_block_recent_store_max_bytes.clone(),
+            );
+            registry.register(
+                "head_cache_commitment_waits",
+                "getTransaction waits for a head signature to reach the requested commitment, by outcome",
+                head_cache_commitment_waits.clone(),
+            );
+            registry.register(
+                "head_cache_commitment_wait_seconds",
+                "Time getTransaction waited for a head signature to reach the requested commitment",
+                head_cache_commitment_wait_seconds.clone(),
             );
         }
 
@@ -1523,6 +1785,27 @@ impl Metrics {
             "Primary getTransaction results not recorded in the slot-age histogram, by reason",
             get_transaction_primary_slot_age_skipped_total.clone(),
         );
+        let get_transaction_not_found = Family::<GetTransactionNotFoundLabels, Counter>::default();
+        registry.register(
+            "get_transaction_not_found",
+            "getTransaction null results, by why no tier returned the transaction",
+            get_transaction_not_found.clone(),
+        );
+
+        let get_block_request_shape_total =
+            Family::<GetBlockRequestShapeLabels, Counter>::default();
+        registry.register(
+            "get_block_request_shape",
+            "Parsed getBlock requests by response-shaping options and the tier that served them",
+            get_block_request_shape_total.clone(),
+        );
+        let hydration_permit_wait_seconds =
+            Family::new_with_constructor(serving_latency_histogram as fn() -> Histogram);
+        registry.register(
+            "hydration_permit_wait_seconds",
+            "Wait for a HYDRATION_CPU_CONCURRENCY permit by method, including cancelled waits",
+            hydration_permit_wait_seconds.clone(),
+        );
 
         // Register process metrics to expose basic runtime health info (CPU, memory).
         if let Err(err) =
@@ -1536,6 +1819,10 @@ impl Metrics {
             rpc_requests,
             rpc_latency_seconds,
             rpc_inflight,
+            rpc_admission_wait_seconds,
+            rpc_admission_inflight,
+            rpc_backend_admission,
+            rpc_backend_admission_wait_seconds,
             rpc_timeouts,
             rpc_batch_requests,
             rpc_batch_items,
@@ -1549,10 +1836,14 @@ impl Metrics {
             signature_status_disconnect_verification,
             rpc_batch_rejected,
             rpc_response_overhead_seconds,
+            rpc_envelope_seconds,
+            rpc_response_bytes,
             rpc_blocks_slots_returned,
             rpc_blocks_range_seconds,
             get_block_response_cache_access,
             transactions_for_address_cursor_cache_access,
+            #[cfg(feature = "disk-cache")]
+            transactions_for_address_block_time_slot_bounds,
             signature_status_history_cache,
             get_block_response_cache_entries,
             get_block_response_cache_weighted_bytes,
@@ -1562,6 +1853,7 @@ impl Metrics {
             get_transaction_primary_cache_weighted_bytes,
             get_transaction_primary_cache_max_bytes,
             get_block_phase_seconds,
+            get_block_not_found,
             backend_errors,
             inflation_reward_rejections,
             inflation_reward_lookups,
@@ -1602,6 +1894,34 @@ impl Metrics {
             head_cache_address_entries,
             #[cfg(feature = "grpc-head-cache")]
             head_cache_slot_entries,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_write_lock_hold_seconds,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_freeze_prepare_seconds,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_worker_wait_seconds,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_rejected_banks,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_bank_events,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_bank_events_lagged,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_requests,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_prebuilds,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_evictions,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_entries,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_resident_bytes,
+            #[cfg(feature = "grpc-head-cache")]
+            get_block_recent_store_max_bytes,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_commitment_waits,
+            #[cfg(feature = "grpc-head-cache")]
+            head_cache_commitment_wait_seconds,
             #[cfg(feature = "grpc-streaming")]
             superbank_grpc_stream_requests_total,
             #[cfg(feature = "grpc-streaming")]
@@ -1684,6 +2004,9 @@ impl Metrics {
             get_transaction_disk_cache_slot_age_skipped_total,
             get_transaction_primary_slot_age,
             get_transaction_primary_slot_age_skipped_total,
+            get_transaction_not_found,
+            get_block_request_shape_total,
+            hydration_permit_wait_seconds,
         }
     }
 
@@ -1947,6 +2270,15 @@ impl Metrics {
             .inc();
     }
 
+    #[cfg(feature = "disk-cache")]
+    pub fn transactions_for_address_block_time_slot_bounds(&self, outcome: &'static str) {
+        let labels =
+            Self::current_operation_outcome_labels("get_transactions_for_address", outcome);
+        self.transactions_for_address_block_time_slot_bounds
+            .get_or_create(&labels)
+            .inc();
+    }
+
     pub fn get_block_response_cache_state(&self, entries: u64, bytes: u64, max_bytes: u64) {
         self.get_block_response_cache_entries
             .set(clamp_i64(entries));
@@ -1982,6 +2314,24 @@ impl Metrics {
     pub fn backend_error(&self, operation: &str) {
         let labels = Self::current_operation_labels(operation);
         self.backend_errors.get_or_create(&labels).inc();
+    }
+
+    fn rpc_admission_wait(&self, waited: std::time::Duration) {
+        self.rpc_admission_wait_seconds
+            .observe(waited.as_secs_f64());
+    }
+
+    fn backend_admission(
+        &self,
+        operation: &'static str,
+        outcome: &'static str,
+        waited: std::time::Duration,
+    ) {
+        self.rpc_backend_admission
+            .get_or_create(&BackendAdmissionLabels { operation, outcome })
+            .inc();
+        self.rpc_backend_admission_wait_seconds
+            .observe(waited.as_secs_f64());
     }
 
     pub fn inflation_reward_rejection(&self, reason: &str) {
@@ -2238,6 +2588,23 @@ pub(crate) fn backend_error(operation: &str) {
     metrics.backend_error(operation);
 }
 
+pub(crate) fn rpc_admission_wait(waited: std::time::Duration) {
+    metrics().rpc_admission_wait(waited);
+}
+
+pub(crate) fn rpc_inflight(delta: i64) {
+    metrics().rpc_admission_inflight.inc_by(delta);
+}
+
+/// `outcome` is `admitted` or `shed`.
+pub(crate) fn backend_admission(
+    operation: &'static str,
+    outcome: &'static str,
+    waited: std::time::Duration,
+) {
+    metrics().backend_admission(operation, outcome, waited);
+}
+
 pub(crate) fn inflation_reward_rejection(reason: &str) {
     let metrics = metrics();
     metrics.inflation_reward_rejection(reason);
@@ -2368,6 +2735,20 @@ pub(crate) fn response_overhead(method: &str, elapsed_ms: u64) {
     metrics.response_overhead(method, elapsed_ms);
 }
 
+pub(crate) fn rpc_envelope(method: &'static str, elapsed_seconds: f64) {
+    metrics()
+        .rpc_envelope_seconds
+        .get_or_create(&EnvelopeMethodLabels { method })
+        .observe(elapsed_seconds);
+}
+
+pub(crate) fn rpc_response_bytes(method: &'static str, bytes: u64) {
+    metrics()
+        .rpc_response_bytes
+        .get_or_create(&EnvelopeMethodLabels { method })
+        .observe(bytes as f64);
+}
+
 pub(crate) fn blocks_slots_returned(method: &str, slots: usize) {
     let metrics = metrics();
     metrics.blocks_slots_returned(method, slots);
@@ -2391,6 +2772,12 @@ pub(crate) fn get_block_response_cache_access(outcome: &'static str) {
 pub(crate) fn transactions_for_address_cursor_cache_access(outcome: &'static str) {
     let metrics = metrics();
     metrics.transactions_for_address_cursor_cache_access(outcome);
+}
+
+#[cfg(feature = "disk-cache")]
+pub(crate) fn transactions_for_address_block_time_slot_bounds(outcome: &'static str) {
+    let metrics = metrics();
+    metrics.transactions_for_address_block_time_slot_bounds(outcome);
 }
 
 pub(crate) fn get_block_response_cache_state(entries: u64, bytes: u64, max_bytes: u64) {
@@ -2420,6 +2807,22 @@ pub(crate) fn get_transaction_primary_cache_state(entries: u64, bytes: u64, max_
 pub(crate) fn get_block_phase(phase: &str, elapsed_seconds: f64) {
     let metrics = metrics();
     metrics.get_block_phase(phase, elapsed_seconds);
+}
+
+/// Only a `reason` label, so captured request headers never multiply the series.
+pub(crate) fn get_block_not_found(reason: &'static str) {
+    metrics()
+        .get_block_not_found
+        .get_or_create(&GetBlockNotFoundLabels { reason })
+        .inc();
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn get_block_not_found_count(reason: &'static str) -> u64 {
+    metrics()
+        .get_block_not_found
+        .get_or_create(&GetBlockNotFoundLabels { reason })
+        .get()
 }
 
 pub(crate) fn export_metrics() -> Result<Vec<u8>, String> {
@@ -2474,6 +2877,150 @@ pub(crate) fn head_cache_observe_block(
     metrics
         .head_cache_slot_entries
         .set(clamp_i64_usize(slot_entries));
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_write_lock_hold(op: &'static str, elapsed_seconds: f64) {
+    let metrics = metrics();
+    metrics
+        .head_cache_write_lock_hold_seconds
+        .get_or_create(&HeadCacheLockOpLabels { op })
+        .observe(elapsed_seconds);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_freeze_prepare(elapsed_seconds: f64) {
+    metrics()
+        .head_cache_freeze_prepare_seconds
+        .observe(elapsed_seconds);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_worker_wait(elapsed_seconds: f64) {
+    metrics()
+        .head_cache_worker_wait_seconds
+        .observe(elapsed_seconds);
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+thread_local! {
+    static REJECTED_BANKS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reasons of the bank rejections counted on the calling thread; tests read them per thread.
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_rejected_banks_on_this_thread() -> Vec<&'static str> {
+    REJECTED_BANKS.with(|reasons| reasons.borrow().clone())
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_rejected_bank(reason: &'static str) {
+    #[cfg(test)]
+    REJECTED_BANKS.with(|reasons| reasons.borrow_mut().push(reason));
+    let metrics = metrics();
+    metrics
+        .head_cache_rejected_banks
+        .get_or_create(&HeadCacheRejectedBankLabels { reason })
+        .inc();
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_rejected_banks_count(reason: &'static str) -> u64 {
+    metrics()
+        .head_cache_rejected_banks
+        .get_or_create(&HeadCacheRejectedBankLabels { reason })
+        .get()
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_bank_event(kind: &'static str, outcome: &'static str) {
+    let metrics = metrics();
+    metrics
+        .head_cache_bank_events
+        .get_or_create(&HeadCacheBankEventLabels { kind, outcome })
+        .inc();
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_bank_events_lagged(skipped: u64) {
+    let metrics = metrics();
+    metrics.head_cache_bank_events_lagged.inc_by(skipped);
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_bank_events_lagged_count() -> u64 {
+    metrics().head_cache_bank_events_lagged.get()
+}
+
+/// Counts a getTransaction commitment wait; `waited_seconds` is `None` when it never started.
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn head_cache_commitment_wait(outcome: &'static str, waited_seconds: Option<f64>) {
+    let metrics = metrics();
+    let labels = HeadCacheCommitmentWaitLabels { outcome };
+    metrics
+        .head_cache_commitment_waits
+        .get_or_create(&labels)
+        .inc();
+    if let Some(seconds) = waited_seconds {
+        metrics
+            .head_cache_commitment_wait_seconds
+            .get_or_create(&labels)
+            .observe(seconds);
+    }
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn head_cache_commitment_waits_count(outcome: &'static str) -> u64 {
+    metrics()
+        .head_cache_commitment_waits
+        .get_or_create(&HeadCacheCommitmentWaitLabels { outcome })
+        .get()
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_request(outcome: &'static str) {
+    metrics()
+        .get_block_recent_store_requests
+        .get_or_create(&RecentStoreOutcomeLabels { outcome })
+        .inc();
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_prebuild(outcome: &'static str) {
+    metrics()
+        .get_block_recent_store_prebuilds
+        .get_or_create(&RecentStoreOutcomeLabels { outcome })
+        .inc();
+}
+
+#[cfg(all(feature = "grpc-head-cache", test))]
+pub(crate) fn get_block_recent_store_prebuild_count(outcome: &'static str) -> u64 {
+    metrics()
+        .get_block_recent_store_prebuilds
+        .get_or_create(&RecentStoreOutcomeLabels { outcome })
+        .get()
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_evictions(reason: &'static str, count: u64) {
+    metrics()
+        .get_block_recent_store_evictions
+        .get_or_create(&RecentStoreEvictionLabels { reason })
+        .inc_by(count);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+pub(crate) fn get_block_recent_store_state(entries: u64, bytes: u64, max_bytes: u64) {
+    let metrics = metrics();
+    metrics
+        .get_block_recent_store_entries
+        .set(clamp_i64(entries));
+    metrics
+        .get_block_recent_store_resident_bytes
+        .set(clamp_i64(bytes));
+    metrics
+        .get_block_recent_store_max_bytes
+        .set(clamp_i64(max_bytes));
 }
 
 #[cfg(feature = "grpc-head-cache")]
@@ -2927,6 +3474,27 @@ struct SlotAgeSkipLabels {
     reason: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct GetTransactionNotFoundLabels {
+    reason: &'static str,
+}
+
+/// Counts a getTransaction null result by why no tier returned the transaction.
+pub(crate) fn get_transaction_not_found(reason: &'static str) {
+    metrics()
+        .get_transaction_not_found
+        .get_or_create(&GetTransactionNotFoundLabels { reason })
+        .inc();
+}
+
+#[cfg(test)]
+pub(crate) fn get_transaction_not_found_count(reason: &'static str) -> u64 {
+    metrics()
+        .get_transaction_not_found
+        .get_or_create(&GetTransactionNotFoundLabels { reason })
+        .get()
+}
+
 /// Counts a primary getTransaction result left out of the slot-age histogram because no usable
 /// finalized tip was cached (`no_tip`, `stale_tip`).
 pub(crate) fn get_transaction_primary_slot_age_skipped(reason: &'static str) {
@@ -2953,6 +3521,100 @@ pub(crate) fn get_transaction_disk_cache_slot_age_skipped(reason: &'static str) 
         .get_transaction_disk_cache_slot_age_skipped_total
         .get_or_create(&SlotAgeSkipLabels { reason })
         .inc();
+}
+
+/// Response-shaping options of one parsed getBlock request; every field is a fixed enumeration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GetBlockRequestShape {
+    pub(crate) encoding: &'static str,
+    pub(crate) details: &'static str,
+    pub(crate) rewards: &'static str,
+    pub(crate) msv: &'static str,
+    pub(crate) commitment: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct GetBlockRequestShapeLabels {
+    encoding: &'static str,
+    details: &'static str,
+    rewards: &'static str,
+    msv: &'static str,
+    commitment: &'static str,
+    tier: &'static str,
+}
+
+impl GetBlockRequestShapeLabels {
+    fn new(shape: GetBlockRequestShape, tier: &'static str) -> Self {
+        Self {
+            encoding: shape.encoding,
+            details: shape.details,
+            rewards: shape.rewards,
+            msv: shape.msv,
+            commitment: shape.commitment,
+            tier,
+        }
+    }
+}
+
+/// Counts one getBlock request; `tier` is `head`, `response_cache`, `disk`, `clickhouse` or `other`.
+pub(crate) fn get_block_request_shape(shape: GetBlockRequestShape, tier: &'static str) {
+    metrics()
+        .get_block_request_shape_total
+        .get_or_create(&GetBlockRequestShapeLabels::new(shape, tier))
+        .inc();
+}
+
+#[cfg(all(test, feature = "grpc-head-cache"))]
+pub(crate) fn get_block_request_shape_count_for_tests(
+    shape: GetBlockRequestShape,
+    tier: &'static str,
+) -> u64 {
+    metrics()
+        .get_block_request_shape_total
+        .get_or_create(&GetBlockRequestShapeLabels::new(shape, tier))
+        .get()
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct HydrationPermitLabels {
+    method: &'static str,
+}
+
+/// Records one hydration permit wait for `method` when dropped, so cancelled waits count too.
+pub(crate) struct HydrationPermitWait {
+    method: &'static str,
+    started: Instant,
+}
+
+impl HydrationPermitWait {
+    pub(crate) fn start(method: &'static str) -> Self {
+        Self {
+            method,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for HydrationPermitWait {
+    fn drop(&mut self) {
+        metrics()
+            .hydration_permit_wait_seconds
+            .get_or_create(&HydrationPermitLabels {
+                method: self.method,
+            })
+            .observe(self.started.elapsed().as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hydration_permit_wait_count_for_tests(method: &'static str) -> u64 {
+    let exported =
+        String::from_utf8(metrics().export().expect("metrics export")).expect("metrics are UTF-8");
+    let prefix = format!("superbank_hydration_permit_wait_seconds_count{{method=\"{method}\"}} ");
+    exported
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map_or(0, |count| count.parse().expect("numeric count"))
 }
 
 #[cfg(test)]
@@ -2996,6 +3658,16 @@ mod tests {
         metrics.track_request("getSlot").observe(StatusCode::OK);
         metrics.observe_clickhouse("getSlot", 5, 0, 0);
         metrics.get_block_phase("fetch", 0.01);
+        metrics
+            .rpc_envelope_seconds
+            .get_or_create(&EnvelopeMethodLabels { method: "getSlot" })
+            .observe(0.01);
+        metrics.rpc_admission_wait(std::time::Duration::from_millis(1));
+        metrics.backend_admission("fetch", "admitted", std::time::Duration::ZERO);
+        metrics
+            .hydration_permit_wait_seconds
+            .get_or_create(&HydrationPermitLabels { method: "getBlock" })
+            .observe(0.0001);
         #[cfg(feature = "disk-cache")]
         metrics
             .disk_cache_key_seconds
@@ -3010,6 +3682,10 @@ mod tests {
         let mut serving = vec![
             "superbank_rpc_response_time_seconds",
             "superbank_rpc_clickhouse_duration_seconds",
+            "superbank_rpc_envelope_seconds",
+            "superbank_rpc_admission_wait_seconds",
+            "superbank_rpc_backend_admission_wait_seconds",
+            "superbank_hydration_permit_wait_seconds",
         ];
         if cfg!(feature = "disk-cache") {
             serving.push("superbank_disk_cache_key_seconds");
@@ -3029,6 +3705,51 @@ mod tests {
             exported_buckets(&exported, "superbank_get_block_phase_seconds"),
             LATENCY_BUCKETS
         );
+    }
+
+    #[test]
+    fn response_bytes_use_power_of_four_buckets_with_static_method_label() {
+        let metrics = Metrics::new();
+        metrics
+            .rpc_response_bytes
+            .get_or_create(&EnvelopeMethodLabels { method: "getBlock" })
+            .observe(4_600_000.0);
+
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        let name = "superbank_rpc_response_bytes";
+        assert_eq!(exported_buckets(&exported, name), RESPONSE_BYTES_BUCKETS);
+        let bucket = |le: &str, count: u64| {
+            format!("{name}_bucket{{le=\"{le}\",method=\"getBlock\"}} {count}")
+        };
+        assert!(exported.contains(&bucket("4194304.0", 0)), "{exported}");
+        assert!(exported.contains(&bucket("16777216.0", 1)), "{exported}");
+        assert!(
+            exported.contains(&format!("{name}_count{{method=\"getBlock\"}} 1")),
+            "{exported}"
+        );
+    }
+
+    #[test]
+    fn admission_metrics_export_bounded_labels() {
+        let metrics = Metrics::new();
+        metrics.rpc_admission_wait(std::time::Duration::from_millis(2));
+        metrics.rpc_admission_inflight.inc_by(1);
+        metrics.backend_admission(
+            "get_transaction_by_signature",
+            "shed",
+            std::time::Duration::from_millis(5),
+        );
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        for line in [
+            "superbank_rpc_admission_wait_seconds_count 1",
+            "superbank_rpc_inflight 1",
+            "superbank_rpc_backend_admission_total{operation=\"get_transaction_by_signature\",outcome=\"shed\"} 1",
+            "superbank_rpc_backend_admission_wait_seconds_count 1",
+        ] {
+            assert!(exported.lines().any(|l| l == line), "{line}\n{exported}");
+        }
     }
 
     #[test]
@@ -3072,6 +3793,33 @@ mod tests {
         assert!(exported.contains(
             "superbank_rpc_response_time_seconds_count{method=\"getSlot\",status=\"abandoned\"} 1"
         ));
+    }
+
+    #[test]
+    fn get_block_request_shape_exports_enumerated_labels_only() {
+        let metrics = Metrics::new();
+        let shape = GetBlockRequestShape {
+            encoding: "json",
+            details: "full",
+            rewards: "false",
+            msv: "set",
+            commitment: "confirmed",
+        };
+        for tier in ["head", "head", "other"] {
+            metrics
+                .get_block_request_shape_total
+                .get_or_create(&GetBlockRequestShapeLabels::new(shape, tier))
+                .inc();
+        }
+        let exported = String::from_utf8(metrics.export().expect("metrics export"))
+            .expect("metrics are UTF-8");
+        let line = |tier: &str, count: u64| {
+            format!(
+                "superbank_get_block_request_shape_total{{encoding=\"json\",details=\"full\",rewards=\"false\",msv=\"set\",commitment=\"confirmed\",tier=\"{tier}\"}} {count}"
+            )
+        };
+        assert!(exported.contains(&line("head", 2)), "{exported}");
+        assert!(exported.contains(&line("other", 1)), "{exported}");
     }
 
     #[test]

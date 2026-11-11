@@ -185,6 +185,8 @@ curl -sS http://localhost:8899 \
 
 ## Configuration
 
+See the [Agave 4.4 compatibility guide](docs/agave-4.4-compatibility.md) for request-context semantics and producer qualification requirements.
+
 Before activation, a trusted same-cluster `getAgGenesisCert` can successfully return `null`. For a bounded historical Fumarole or Jetstreamer run, first record the same endpoint's `getSlot` with finalized commitment, then obtain its authoritative null certificate response. Keep both responses as operational evidence and set `FUMAROLE_PREACTIVATION_THROUGH_SLOT` or `JETSTREAMER_PREACTIVATION_THROUGH_SLOT` to that recorded finalized slot (or an earlier slot). These settings are explicit offline attestations by the operator; neither binary discovers or validates that external evidence. A missing, unsupported, failed or malformed certificate response cannot qualify this mode. The bound never advances automatically; qualify a new snapshot for further historical work, or use the trusted certificate slot once one exists. Do not configure both genesis and preactivation bounds. Slot zero is valid only when actually evidenced, never a placeholder for an unknown boundary.
 
 

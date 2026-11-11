@@ -3,9 +3,16 @@
  * Copyright 2025-2026 Triton One Limited. All rights reserved.
  */
 
+mod agave44_transaction;
+mod backend_admission;
 mod block_ranges;
 mod cache_refresh;
+#[cfg(feature = "grpc-head-cache")]
+mod get_block_request_shape;
+mod get_transaction_inline_hydration;
 mod latest_slot;
+#[cfg(feature = "disk-cache")]
+mod transactions_for_address_block_time;
 
 use crate::solana_sdk;
 mod http_response_logs;
@@ -55,7 +62,7 @@ use crate::handlers::handle_json_rpc_with_headers;
 use crate::handlers::signatures::{
     handle_get_signature_statuses, handle_get_signatures_for_address,
 };
-use crate::handlers::transactions::handle_get_transactions_for_address;
+use crate::handlers::transactions::{handle_get_transactions_for_address, not_found};
 use crate::handlers::types::{InflationRewardInfo, MAX_GET_BLOCKS_RANGE};
 use crate::hydration::BlockHydrationError;
 use crate::hydration::build_transaction_status_meta;
@@ -184,12 +191,15 @@ fn test_state_with_token_owner_activity_available(available: bool) -> Arc<AppSta
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -295,12 +305,15 @@ pub(crate) fn test_state_with_clickhouse_url(clickhouse_url: &str) -> Arc<AppSta
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -360,12 +373,15 @@ async fn test_state_with_clickhouse_cached_signature_slot(
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         #[cfg(feature = "grpc-head-cache")]
         head_cache: None,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -417,11 +433,13 @@ fn test_state_with_head_cache(head_cache: Arc<HeadCache>) -> Arc<AppState> {
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -476,11 +494,13 @@ fn test_state_with_head_cache_and_clickhouse_url(
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -542,11 +562,13 @@ async fn test_state_with_head_cache_and_cached_signature_slot(
         metrics_header_capture: Default::default(),
         hydration_sem: Arc::new(Semaphore::new(8)),
         get_block_hydration_parallelism: 4,
+        get_transaction_inline_hydration_max_bytes: 0,
         get_block_response_cache_share_confirmed: true,
         block_response_cache: BlockResponseCache::new(0),
         get_transaction_primary_cache: PrimaryTransactionCache::disabled(),
         status_history_cache: crate::status_history_cache::StatusHistoryCache::disabled(),
         head_cache: Some(head_cache),
+        recent_block_responses: crate::recent_block_responses::RecentBlockResponses::new(0),
         #[cfg(feature = "disk-cache")]
         disk_cache: None,
     })
@@ -953,7 +975,38 @@ fn assert_chunked_block_hydration_matches(block: StoredBlockRecord) {
                     "{details:?}/{encoding:?}/rewards={show_rewards}/chunks={chunk_count} differ"
                 );
             }
+            if let StoredBlockPayload::Full(block) = payload {
+                assert_shared_block_bytes_match(block, encoding, details, show_rewards, &expected);
+            }
         }
+    }
+}
+
+/// The head cache's shared payload must build the bytes of the owned payload.
+fn assert_shared_block_bytes_match(
+    block: &StoredBlockRecord,
+    encoding: UiTransactionEncoding,
+    details: TransactionDetails,
+    show_rewards: bool,
+    expected: &[u8],
+) {
+    let shared = shared_block_payload(block);
+    let sequential =
+        sequential_block_bytes(shared.clone(), encoding, details, show_rewards, Some(1))
+            .expect("shared sequential build succeeds");
+    assert!(sequential == expected, "{details:?}/{encoding:?} shared");
+    let chunked = chunked_block_bytes(shared, encoding, details, show_rewards, Some(1), 3)
+        .expect("shared chunked build succeeds");
+    assert!(
+        chunked == expected,
+        "{details:?}/{encoding:?} shared chunks"
+    );
+}
+
+fn shared_block_payload(block: &StoredBlockRecord) -> StoredBlockPayload {
+    StoredBlockPayload::SharedFull {
+        metadata: block.metadata.clone(),
+        transactions: block.transactions.iter().cloned().map(Arc::new).collect(),
     }
 }
 
@@ -1034,6 +1087,31 @@ fn chunked_block_hydration_reports_the_sequential_error() {
                 )
                 .expect_err("chunked build fails");
                 assert_eq!(actual, expected, "{name}/{details:?}/chunks={chunk_count}");
+            }
+            let shared = shared_block_payload(&block);
+            let shared_sequential = sequential_block_bytes(
+                shared.clone(),
+                UiTransactionEncoding::Json,
+                details,
+                true,
+                None,
+            )
+            .expect_err("shared sequential build fails");
+            assert_eq!(shared_sequential, expected, "{name}/{details:?} shared");
+            for chunk_count in [2, 3, 4] {
+                let actual = chunked_block_bytes(
+                    shared.clone(),
+                    UiTransactionEncoding::Json,
+                    details,
+                    true,
+                    None,
+                    chunk_count,
+                )
+                .expect_err("shared chunked build fails");
+                assert_eq!(
+                    actual, expected,
+                    "{name}/{details:?}/chunks={chunk_count} shared"
+                );
             }
         }
     }
@@ -5519,7 +5597,7 @@ async fn get_signature_statuses_rejects_invalid_config() {
 
 #[tokio::test]
 async fn get_signature_statuses_ignores_unknown_config_fields() {
-    for commitment in [
+    for unknown in [
         json!("processed"),
         json!("confirmed"),
         json!("finalized"),
@@ -5536,7 +5614,7 @@ async fn get_signature_statuses_ignores_unknown_config_fields() {
                 json!(["not_base58"]),
                 json!({
                     "searchTransactionHistory": false,
-                    "commitment": commitment
+                    "futureConfig": unknown
                 }),
             ]),
         )
@@ -6122,6 +6200,7 @@ async fn get_transaction_with_slot_returns_null_on_head_cache_slot_mismatch() {
     cache.insert_for_tests(signature, record, 0, &[address], CommitmentLevel::Processed);
 
     let state = test_state_with_head_cache(cache);
+    let before = metrics::get_transaction_not_found_count(not_found::HEAD_SLOT_MISMATCH);
     let response = crate::handlers::transactions::handle_get_transaction(
         state,
         json!(1),
@@ -6136,6 +6215,178 @@ async fn get_transaction_with_slot_returns_null_on_head_cache_slot_mismatch() {
     let parsed = parse_json_rpc_response(response).await;
     assert!(parsed.error.is_none(), "expected null result, not error");
     assert_eq!(parsed.result, Some(Value::Null));
+    assert!(metrics::get_transaction_not_found_count(not_found::HEAD_SLOT_MISMATCH) > before);
+}
+
+/// Inserts a transaction for `[marker; 64]` that the head holds at `processed`.
+#[cfg(feature = "grpc-head-cache")]
+fn insert_processed_head_transaction(cache: &HeadCache, marker: u8, slot: u64) -> String {
+    let address = Pubkey::new_from_array([marker; 32]);
+    let signature_bytes = [marker; 64];
+    let mut record = base_transaction_record();
+    record.slot = slot;
+    record.signature = signature_bytes;
+    record.tx_signatures = vec![signature_bytes];
+    record.tx_account_keys = vec![address.to_bytes()];
+    cache.insert_for_tests(
+        Signature::from(signature_bytes),
+        record,
+        0,
+        &[address],
+        CommitmentLevel::Processed,
+    );
+    bs58::encode(signature_bytes).into_string()
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_transaction_commitment_wait_returns_the_transaction_once_confirmed() {
+    let cache = Arc::new(
+        HeadCache::new(32, TEST_MAX_LIMIT as usize)
+            .with_commitment_wait(Duration::from_secs(10), 4),
+    );
+    let signature = insert_processed_head_transaction(&cache, 81, 123);
+    let state = test_state_with_head_cache_and_cached_signature_slot(
+        cache.clone(),
+        "http://127.0.0.1:1",
+        [81; 64],
+        None,
+    )
+    .await;
+    let request = |state| {
+        crate::handlers::transactions::handle_get_transaction(
+            state,
+            json!(1),
+            Some(vec![
+                json!(signature),
+                json!({
+                    "commitment": "confirmed",
+                    "encoding": "json",
+                    "maxSupportedTransactionVersion": 0
+                }),
+            ]),
+        )
+    };
+
+    let started = std::time::Instant::now();
+    let waiter = tokio::spawn(request(state.clone()));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiter.is_finished(),
+        "waits while the head holds processed"
+    );
+    cache.note_slot_commitment(123, CommitmentLevel::Confirmed);
+    cache.commit_notify().notify_waiters();
+    let waited = to_bytes(waiter.await.unwrap().unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let direct = to_bytes(request(state).await.unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(waited, direct, "a wait answers exactly like a head hit");
+    let value: Value = serde_json::from_slice(&waited).unwrap();
+    assert_eq!(value.pointer("/result/slot"), Some(&json!(123)));
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[tokio::test]
+async fn get_transaction_counts_a_processed_only_null_without_waiting_by_default() {
+    let cache = Arc::new(HeadCache::new(32, TEST_MAX_LIMIT as usize));
+    let signature = insert_processed_head_transaction(&cache, 82, 123);
+    let state = test_state_with_head_cache_and_cached_signature_slot(
+        cache,
+        "http://127.0.0.1:1",
+        [82; 64],
+        None,
+    )
+    .await;
+    let before = metrics::get_transaction_not_found_count(not_found::HEAD_PROCESSED_ONLY);
+    let response = crate::handlers::transactions::handle_get_transaction(
+        state,
+        json!(1),
+        Some(vec![json!(signature), json!({ "commitment": "confirmed" })]),
+    )
+    .await
+    .expect("response");
+    assert_eq!(
+        parse_json_rpc_response(response).await.result,
+        Some(Value::Null)
+    );
+    assert!(metrics::get_transaction_not_found_count(not_found::HEAD_PROCESSED_ONLY) > before);
+}
+
+#[cfg(feature = "grpc-head-cache")]
+#[test]
+fn get_transaction_null_reasons_follow_the_head_view() {
+    use crate::handlers::transactions::head_miss_reason;
+    let cache = HeadCache::new(32, TEST_MAX_LIMIT as usize);
+    let unknown = Signature::from([90; 64]);
+    assert_eq!(head_miss_reason(&cache, &unknown, Some(10)), None);
+
+    insert_processed_head_transaction(&cache, 84, 100);
+    let held = Signature::from([84; 64]);
+    assert_eq!(
+        head_miss_reason(&cache, &held, None),
+        Some(not_found::HEAD_PROCESSED_ONLY)
+    );
+    assert_eq!(head_miss_reason(&cache, &unknown, None), None);
+    for (slot, reason) in [
+        (69, not_found::HEAD_ABSENT),
+        (200, not_found::HEAD_ABSENT),
+        (68, not_found::BELOW_HEAD),
+    ] {
+        assert_eq!(head_miss_reason(&cache, &unknown, Some(slot)), Some(reason));
+    }
+
+    for (head, tier, expected) in [
+        (
+            Some(not_found::HEAD_PROCESSED_ONLY),
+            not_found::DISK_MISS,
+            not_found::HEAD_PROCESSED_ONLY,
+        ),
+        (
+            Some(not_found::HEAD_ABSENT),
+            not_found::DISK_MISS,
+            not_found::DISK_MISS,
+        ),
+        (
+            Some(not_found::BELOW_HEAD),
+            not_found::CLICKHOUSE_NULL,
+            not_found::BELOW_HEAD,
+        ),
+        (None, not_found::CLICKHOUSE_NULL, not_found::CLICKHOUSE_NULL),
+    ] {
+        assert_eq!(not_found::reason(head, tier), expected);
+    }
+}
+
+#[tokio::test]
+async fn get_transaction_counts_a_primary_null() {
+    let signature_bytes = [83u8; 64];
+    let state = test_state_with_clickhouse_cached_signature_slot(
+        "http://127.0.0.1:1",
+        signature_bytes,
+        None,
+    )
+    .await;
+    let before = metrics::get_transaction_not_found_count(not_found::CLICKHOUSE_NULL);
+    let response = crate::handlers::transactions::handle_get_transaction(
+        state,
+        json!(1),
+        Some(vec![
+            json!(bs58::encode(signature_bytes).into_string()),
+            json!({ "commitment": "confirmed" }),
+        ]),
+    )
+    .await
+    .expect("response");
+    assert_eq!(
+        parse_json_rpc_response(response).await.result,
+        Some(Value::Null)
+    );
+    assert!(metrics::get_transaction_not_found_count(not_found::CLICKHOUSE_NULL) > before);
 }
 
 #[cfg(feature = "grpc-head-cache")]
@@ -8049,12 +8300,17 @@ async fn get_block_clickhouse_partial_payload_repair() {
     execute(&http, &url, format!("DROP DATABASE {database}")).await;
 }
 
+mod agave44_statuses;
 mod agave_43;
 
 #[cfg(feature = "grpc-head-cache")]
 mod agave43_cached_encoding;
 #[cfg(feature = "grpc-head-cache")]
 mod get_block_footer;
+#[cfg(feature = "grpc-head-cache")]
+mod get_block_head_proof;
+#[cfg(feature = "grpc-head-cache")]
+mod get_block_recent_store;
 #[cfg(feature = "disk-cache")]
 mod gsfa_race {
     //! getSignaturesForAddress races the local page against the primary's full page.

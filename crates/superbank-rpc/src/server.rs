@@ -24,6 +24,7 @@ use tower_http::{
 };
 use tracing::{info, warn};
 
+use crate::admission::{BackendAdmission, GlobalAdmissionLayer};
 use crate::block_response_cache::BlockResponseCache;
 use crate::clickhouse::{
     ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, QueryCacheConfig,
@@ -51,6 +52,8 @@ use crate::disk_cache::{
 use crate::head_cache::dragonsmouth::DragonsmouthHeadCacheConfig;
 #[cfg(feature = "grpc-head-cache")]
 use crate::head_cache::{HeadCache, dragonsmouth};
+#[cfg(feature = "grpc-head-cache")]
+use crate::recent_block_responses::{self, RecentBlockResponses};
 #[cfg(feature = "grpc-head-cache")]
 use solana_commitment_config::CommitmentLevel;
 
@@ -219,6 +222,31 @@ fn validate_query_resource_limits(args: &RpcConfig) -> RpcResult<()> {
     Ok(())
 }
 
+fn backend_admission(args: &RpcConfig) -> Option<Arc<BackendAdmission>> {
+    let queue_timeout = Duration::from_millis(args.rpc_backend_queue_timeout_ms);
+    let admission = BackendAdmission::new(args.rpc_backend_concurrency_limit, queue_timeout)?;
+    info!(
+        limit = args.rpc_backend_concurrency_limit,
+        queue_timeout_ms = args.rpc_backend_queue_timeout_ms,
+        "JSON-RPC backend admission enabled"
+    );
+    if args.rpc_backend_concurrency_limit >= args.rpc_concurrency_limit {
+        warn!(
+            rpc_backend_concurrency_limit = args.rpc_backend_concurrency_limit,
+            rpc_concurrency_limit = args.rpc_concurrency_limit,
+            "RPC_BACKEND_CONCURRENCY_LIMIT should stay below RPC_CONCURRENCY_LIMIT so cache-served requests keep global permits"
+        );
+    }
+    if args.rpc_backend_queue_timeout_ms >= args.clickhouse_query_timeout_ms {
+        warn!(
+            rpc_backend_queue_timeout_ms = args.rpc_backend_queue_timeout_ms,
+            clickhouse_query_timeout_ms = args.clickhouse_query_timeout_ms,
+            "RPC_BACKEND_QUEUE_TIMEOUT_MS should remain below CLICKHOUSE_QUERY_TIMEOUT_MS; the backend wait runs inside the ClickHouse operation timeout"
+        );
+    }
+    Some(admission)
+}
+
 pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     info!("Starting Solana RPC server on {}:{}", args.host, args.port);
     let rpc_parameter_filters =
@@ -266,6 +294,14 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         return Err(RpcError::Config(
             "GET_INFLATION_REWARD_QUERY_TIMEOUT_MS must be below RPC_REQUEST_TIMEOUT_MS"
                 .to_string(),
+        ));
+    }
+    #[cfg(feature = "grpc-head-cache")]
+    if args.head_cache_commitment_wait_ms > 0
+        && args.head_cache_commitment_wait_ms >= args.rpc_request_timeout_ms
+    {
+        return Err(RpcError::Config(
+            "HEAD_CACHE_COMMITMENT_WAIT_MS must be below RPC_REQUEST_TIMEOUT_MS".to_string(),
         ));
     }
 
@@ -367,7 +403,14 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     clickhouse.set_transactions_for_address_union_pushdown(
         args.clickhouse_transactions_for_address_union_pushdown,
     );
+    clickhouse.set_transactions_for_address_block_time_slot_bounds(
+        args.clickhouse_transactions_for_address_block_time_slot_bounds,
+    );
+    clickhouse.set_transactions_for_address_block_time_slot_bounds_min_slot(
+        args.clickhouse_transactions_for_address_block_time_slot_bounds_min_slot,
+    );
     clickhouse.set_gsfa_inline_cursor(args.clickhouse_gsfa_inline_cursor);
+    clickhouse.set_backend_admission(backend_admission(&args));
     clickhouse.set_signatures_owner_shard_routing(
         args.clickhouse_signatures_owner_shard_routing,
         &args.clickhouse_cluster,
@@ -418,7 +461,11 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
 
             let cache = Arc::new(
                 HeadCache::new(retain_slots, max_per_address)
-                    .with_explicit_end_clamp(args.get_blocks_clamp_to_head_tip),
+                    .with_explicit_end_clamp(args.get_blocks_clamp_to_head_tip)
+                    .with_commitment_wait(
+                        Duration::from_millis(args.head_cache_commitment_wait_ms),
+                        args.head_cache_commitment_wait_max_waiters,
+                    ),
             );
 
             let cfg = DragonsmouthHeadCacheConfig {
@@ -442,6 +489,9 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     };
     #[cfg(not(feature = "grpc-head-cache"))]
     let head_cache_task: Option<JoinHandle<()>> = None;
+
+    #[cfg(feature = "grpc-head-cache")]
+    let recent_block_responses = recent_block_store(&args, head_cache.is_some());
 
     #[cfg(all(feature = "disk-cache", feature = "grpc-head-cache"))]
     let status_history_tiers = Some((
@@ -487,6 +537,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
             args.hydration_cpu_concurrency.max(1),
         )),
         get_block_hydration_parallelism: args.get_block_hydration_parallelism.max(1),
+        get_transaction_inline_hydration_max_bytes: args.get_transaction_inline_hydration_max_bytes,
         block_response_cache: BlockResponseCache::new(args.get_block_response_cache_max_bytes)
             .with_unsupported_version_cache(args.get_block_response_cache_unsupported_version),
         get_transaction_primary_cache: PrimaryTransactionCache::new(
@@ -501,18 +552,39 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         ),
         #[cfg(feature = "grpc-head-cache")]
         head_cache,
+        #[cfg(feature = "grpc-head-cache")]
+        recent_block_responses,
         #[cfg(feature = "disk-cache")]
         disk_cache: disk_runtime.as_ref().map(|runtime| runtime.cache.clone()),
     });
+
+    #[cfg(feature = "grpc-head-cache")]
+    let recent_store_task = state
+        .head_cache
+        .clone()
+        .filter(|_| state.recent_block_responses.enabled())
+        .map(|head| {
+            let events = head.subscribe_bank_events();
+            let prebuild = recent_block_responses::Prebuild::new(
+                args.get_block_prebuild_shapes.0.clone(),
+                args.get_block_prebuild_concurrency,
+            );
+            tokio::spawn(recent_block_responses::run(
+                state.clone(),
+                head,
+                events,
+                prebuild,
+            ))
+        });
+    #[cfg(not(feature = "grpc-head-cache"))]
+    let recent_store_task: Option<JoinHandle<()>> = None;
 
     // Build the router
     let rpc_layers = tower::ServiceBuilder::new()
         .layer(axum::extract::DefaultBodyLimit::max(
             args.rpc_max_body_bytes,
         ))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(
-            args.rpc_concurrency_limit.max(1),
-        ))
+        .layer(GlobalAdmissionLayer::new(args.rpc_concurrency_limit))
         .layer(CorsLayer::permissive());
 
     let app = Router::new()
@@ -567,6 +639,9 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         if let Some(task) = head_cache_task {
+            task.abort();
+        }
+        if let Some(task) = recent_store_task {
             task.abort();
         }
         #[cfg(feature = "pyroscope")]
@@ -634,6 +709,33 @@ struct DiskCacheRuntime {
 /// Head retention below this cannot bridge a disk cache trailing the finalized tip, so
 /// the status history cache would only ever bypass.
 const STATUS_HISTORY_MIN_HEAD_RETAIN_SLOTS: u64 = 256;
+
+/// The recent getBlock store needs the head cache; prebuild needs the store.
+#[cfg(feature = "grpc-head-cache")]
+fn recent_block_store(args: &RpcConfig, head_cache_running: bool) -> RecentBlockResponses {
+    let max_bytes = args.get_block_recent_store_max_bytes;
+    let shapes = args.get_block_prebuild_shapes.0.len();
+    if max_bytes > 0 && !head_cache_running {
+        warn!(
+            "GET_BLOCK_RECENT_STORE_MAX_BYTES > 0 but the head cache is not running; store disabled"
+        );
+        return RecentBlockResponses::new(0);
+    }
+    if shapes > 0 && max_bytes == 0 {
+        warn!(
+            "GET_BLOCK_PREBUILD_SHAPES is set but GET_BLOCK_RECENT_STORE_MAX_BYTES is 0; prebuild disabled"
+        );
+    }
+    if max_bytes > 0 {
+        info!(
+            max_bytes,
+            prebuild_shapes = shapes,
+            prebuild_concurrency = args.get_block_prebuild_concurrency.max(1),
+            "recent getBlock store enabled"
+        );
+    }
+    RecentBlockResponses::new(max_bytes)
+}
 
 /// Why an enabled status history cache can never skip the primary, if it cannot.
 /// `tiers` is (head cache running, disk cache enabled, head retained slots), or `None`
@@ -1058,6 +1160,22 @@ mod tests {
     use solana_epoch_schedule::EpochSchedule;
     use std::convert::Infallible;
     use tower::{ServiceBuilder, ServiceExt, service_fn};
+
+    #[cfg(feature = "grpc-head-cache")]
+    #[test]
+    fn recent_block_store_needs_a_budget_and_the_head_cache() {
+        use super::recent_block_store;
+        use clap::Parser;
+        let defaults = RpcConfig::parse_from(["superbank-rpc"]);
+        assert!(!recent_block_store(&defaults, true).enabled());
+        let sized = RpcConfig::parse_from([
+            "superbank-rpc",
+            "--get-block-recent-store-max-bytes",
+            "1048576",
+        ]);
+        assert!(recent_block_store(&sized, true).enabled());
+        assert!(!recent_block_store(&sized, false).enabled());
+    }
 
     #[test]
     fn inert_status_history_cache_is_reported() {

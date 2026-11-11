@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::body::Bytes;
 use moka::future::Cache;
+use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct BlockResponseCacheKey {
@@ -19,6 +20,42 @@ pub(crate) struct BlockResponseCacheKey {
     pub(crate) show_rewards: bool,
     pub(crate) max_supported_transaction_version: Option<u8>,
     pub(crate) footer: bool,
+}
+
+impl BlockResponseCacheKey {
+    /// One key per response-shaping option set; the request ID is not part of it.
+    pub(crate) fn new(
+        slot: u64,
+        commitment: solana_commitment_config::CommitmentLevel,
+        encoding: UiTransactionEncoding,
+        transaction_details: TransactionDetails,
+        show_rewards: bool,
+        max_supported_transaction_version: Option<u8>,
+        footer: bool,
+    ) -> Self {
+        let encoding = match encoding {
+            UiTransactionEncoding::Binary => 0,
+            UiTransactionEncoding::Base58 => 1,
+            UiTransactionEncoding::Base64 => 2,
+            UiTransactionEncoding::Json => 3,
+            UiTransactionEncoding::JsonParsed => 4,
+        };
+        let transaction_details = match transaction_details {
+            TransactionDetails::Full => 0,
+            TransactionDetails::Signatures => 1,
+            TransactionDetails::None => 2,
+            TransactionDetails::Accounts => 3,
+        };
+        Self {
+            slot,
+            commitment,
+            encoding,
+            transaction_details,
+            show_rewards,
+            max_supported_transaction_version,
+            footer,
+        }
+    }
 }
 
 /// Bound on remembered `UnsupportedTransactionVersion` results. Entries hold only

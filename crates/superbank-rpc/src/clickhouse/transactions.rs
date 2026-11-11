@@ -276,6 +276,27 @@ impl ClickHouseClient {
         self.transactions_for_address_union_pushdown = enabled;
     }
 
+    pub(crate) fn set_transactions_for_address_block_time_slot_bounds(&mut self, enabled: bool) {
+        self.transactions_for_address_block_time_slot_bounds = enabled;
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn transactions_for_address_block_time_slot_bounds(&self) -> bool {
+        self.transactions_for_address_block_time_slot_bounds
+    }
+
+    pub(crate) fn set_transactions_for_address_block_time_slot_bounds_min_slot(
+        &mut self,
+        slot: u64,
+    ) {
+        self.transactions_for_address_block_time_slot_bounds_min_slot = slot;
+    }
+
+    #[cfg(feature = "disk-cache")]
+    pub(crate) fn transactions_for_address_block_time_slot_bounds_min_slot(&self) -> u64 {
+        self.transactions_for_address_block_time_slot_bounds_min_slot
+    }
+
     pub(crate) fn set_transactions_for_address_position_tokens(&mut self, enabled: bool) {
         self.transactions_for_address_position_tokens = enabled;
     }
