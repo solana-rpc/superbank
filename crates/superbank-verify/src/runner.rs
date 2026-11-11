@@ -25,7 +25,8 @@ use crate::epoch::EpochSlots;
 use crate::metrics;
 use crate::range::RangeSpec;
 use crate::report::{
-    Finding, FindingClass, FindingCode, ReportWriter, RunCounters, SlotStatus, log_finding,
+    Finding, FindingClass, FindingCode, ProblemSlots, ReportWriter, RunCounters, SlotStatus,
+    log_finding,
 };
 use crate::verify::{BlockInfo, EntryInfo, VerifyMode, VerifyOutcome, verify_block_in_era};
 
@@ -100,6 +101,10 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
         if cursor > 0 {
             metrics::set_last_processed_slot(cursor - 1);
         }
+    }
+
+    if args.collect_problem_slots {
+        counters.problem_slots = Some(ProblemSlots::default());
     }
 
     if cursor > range_end {
@@ -198,6 +203,7 @@ pub(crate) async fn run(args: &Args) -> Result<RunCounters> {
 
             let status = slot_status(&findings);
             counters.record_slot(status);
+            counters.note_problem_slot(block.slot, status);
             metrics::observe_slot_status(status, 1);
             counters.entries_verified += outcome.entries_verified;
             counters.hashes_computed += outcome.hashes_computed;
@@ -456,6 +462,9 @@ fn account_spans(result: &ObserveResult, counters: &mut RunCounters) {
     let missing = span_len(result.missing_span);
     if missing > 0 {
         counters.slots_missing += missing;
+        if let Some(span) = result.missing_span {
+            counters.note_missing_span(span);
+        }
         metrics::observe_slot_status(SlotStatus::Missing, missing);
     }
 }

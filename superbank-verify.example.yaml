@@ -11,23 +11,25 @@ full: true
 # structural = invariants only (fast); full = recompute every SHA-256 hash.
 mode: structural
 
-# Optional forensic integrity audit. Off by default because it adds raw-table
-# ClickHouse aggregation scans for every window (transactions in full mode).
-audit-duplicate-conflicts: false
+# Fails slots whose raw ClickHouse rows hold conflicting duplicates. Adds
+# aggregation scans for every window (transactions in full mode).
+audit-duplicate-conflicts: true
 
-# Cluster shape (defaults are mainnet-beta).
+# mainnet | devnet | testnet. Sets the defaults for epoch-warmup,
+# expected-genesis-hash, hashes-per-tick-schedule and alpenglow-genesis-block.
+solana-cluster: mainnet
 slots-per-epoch: 432000
-epoch-warmup: true
 ticks-per-slot: 64
-expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
-# hashes_per_tick eras "<from_slot>:<value>,..." (0 disables the check for an
-# era). Default: built-in mainnet history — only override for other clusters.
+# Overrides for the cluster defaults:
+# epoch-warmup: false
+# expected-genesis-hash: "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+# hashes_per_tick eras "<from_slot>:<value>,..." (0 disables the check for an era).
 # hashes-per-tick-schedule: "0:12500"
 
 # Trusted same-cluster Agave RPC resolves getAgGenesisCert. Null is pre-migration;
 # unsupported/unavailable/malformed responses fail. No independent BLS validation.
 # alpenglow-rpc-url: "https://your-trusted-agave-rpc"
-# Offline alternative: the genesis certificate block slot and consensus block ID pair.
+# Offline override of the cluster's built-in pair, or "none" for historical rules everywhere.
 # alpenglow-genesis-block: "<slot>:<base58-block-id>"
 # This slot still uses historical PoH; new rules apply strictly after it. The pair
 # must match on checkpoint resume. Without either setting, all slots use historical PoH.
@@ -57,9 +59,9 @@ clickhouse-url: "http://localhost:8123"
 clickhouse-database: "default"
 clickhouse-user: "default"
 clickhouse-password: ""
-blocks-table: "default.blocks_metadata"
-entries-table: "default.entries"
-transactions-table: "default.transactions"
+blocks-table: "blocks_metadata"
+entries-table: "entries"
+transactions-table: "transactions"
 
 # Metrics / health.
 metrics-host: "0.0.0.0"
