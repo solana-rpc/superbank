@@ -4,6 +4,7 @@ pub mod clickhouse;
 pub mod config;
 pub mod manifest;
 pub mod metrics;
+pub mod poh;
 pub mod read;
 pub mod server;
 pub mod storage;

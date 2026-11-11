@@ -39,10 +39,13 @@ hourly_988_427236024-427245023/
 
 `transactions` and `blocks_metadata` are required. Other Superbank tables are
 included when they exist on the ClickHouse server and are recorded as skipped in
-`manifest.json` when absent. This lets RPC/Bigtable deployments archive cleanly
-without PoH `entries`, while Fumarole/gRPC/Jetstreamer deployments preserve
-entries for later PoH-specific tooling.
-`blocks_metadata.parquet` carries the Alpenglow footer columns `bank_id`, `bank_hash`, `block_producer_time_nanos` and `block_user_agent`. They are `NULL` for blocks stored without a footer, and for archives made before the columns existed. The archive manifest format is version 3; older bundles remain readable and restore with those columns `NULL`. Block data and its footer are written in one `blocks_metadata` row. Replay may not provide historical footers, so audit and record gaps before archiving. See the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
+`manifest.json` when absent. Fumarole/gRPC/Jetstreamer deployments preserve
+`entries` for PoH checks. RPC/Bigtable deployments have no `entries` and no
+footers, so they must turn the default Alpenglow checks down; see
+[Alpenglow defaults](#alpenglow-defaults).
+`blocks_metadata.parquet` carries the Alpenglow footer columns `bank_id`, `bank_hash`, `block_producer_time_nanos` and `block_user_agent`. They are `NULL` for blocks stored without a footer, and for archives made before the columns existed. The archive manifest format is version 3; older bundles remain readable and restore with those columns `NULL`. Block data and its footer are written in one `blocks_metadata` row. Replay may not provide historical footers. By default, validation blocks the archive when an Alpenglow block has no complete footer; see [Alpenglow footer coverage](#alpenglow-footer-coverage) and the [rollout and replay limits](../../docs/agave-4.3-compatibility.md#alpenglow-operational-rollout).
+
+`transactions.parquet` carries `tx_version` and the v1 transaction config columns `tx_config_priority_fee`, `tx_config_compute_unit_limit`, `tx_config_loaded_accounts_data_size_limit` and `tx_config_heap_size`. They are `NULL` for legacy and v0 transactions, for v1 fields the transaction did not set, and for archives made before the columns existed. Restore names each archived column, so a destination without the v1 columns fails instead of dropping them.
 
 `SHA256SUMS.txt` contains one SHA-256 checksum for each `.parquet` file in the
 bundle. `report.json` is a machine-readable run report: it carries a
@@ -86,7 +89,7 @@ outcome. Its top level is flattened, so run fields sit alongside the header:
 
 ```json
 {
-  "report_version": 1,
+  "report_version": 2,
   "producer": {
     "name": "superbank-solparq",
     "version": "0.5.1-rc1-sp1",
@@ -131,6 +134,13 @@ The companion archive reader is built separately:
 
 ```bash
 cargo build -p superbank-solparq --bin superbank-solparq-read --release
+```
+
+`tests/poh_boundary.rs` runs the PoH check against ClickHouse over ranges that span each cluster's Alpenglow genesis slot. It is ignored by default. Each test creates and drops its own database, so point it at a disposable loopback server:
+
+```bash
+SOLPARQ_TEST_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  cargo test -p superbank-solparq --test poh_boundary -- --ignored
 ```
 
 ## Release
@@ -381,6 +391,7 @@ Currency (how up to date the data is):
 | `solparq_disk_free_bytes` | gauge | `disk`, `path` | Free space on a ClickHouse-managed disk, from `system.disks` |
 | `solparq_disk_used_bytes` | gauge | `disk`, `path` | Used space on a ClickHouse-managed disk, from `system.disks` |
 | `solparq_disk_total_bytes` | gauge | `disk`, `path` | Total space on a ClickHouse-managed disk, from `system.disks` |
+| `solparq_disk_data_bytes` | gauge | `disk`, `path` | Bytes of active parts of every ClickHouse table on a disk, system tables included, from `system.parts`. The `free`, `used` and `total` gauges are filesystem-wide and count other workloads that share the filesystem |
 | `solparq_db_table_bytes` | gauge | `table_kind`, `table` | Disk bytes used by a ClickHouse source table, from `system.tables` |
 | `solparq_db_table_rows` | gauge | `table_kind`, `table` | Row count of a ClickHouse source table, from `system.tables` |
 
@@ -412,6 +423,8 @@ separate actionable gaps from expected leader gaps and other problems:
   informational).
 - `transaction_mismatch` — block transaction count does not match the archived
   transaction rows (**other data issue**).
+- `footer_missing` — an Alpenglow block is stored without a complete footer.
+  Not reported with `--alpenglow-genesis-slot none`.
 
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
@@ -554,11 +567,15 @@ Before creating an archive, validation logs a gap summary even when
   are expected leader/production gaps.
 - `transaction_mismatch_ranges`: slots where block transaction counts do not
   match transaction rows.
+- `footer_missing_ranges`: Alpenglow blocks stored without a complete footer.
 
 By default, each archive type continues from the highest existing archive of
-that same type. If no archive exists for that type, `superbank-solparq` starts from the
-oldest transaction slot available in ClickHouse. To ignore existing archives and
-plan from the oldest ClickHouse slot at startup, use:
+that same type. If no archive exists for that type, or the last one ends before
+the data in ClickHouse, `superbank-solparq` starts one slot after the oldest
+transaction slot in ClickHouse. That oldest block stays unarchived, because its
+parent was never ingested and the [Proof-of-History check](#proof-of-history-check)
+cannot link it. To ignore existing archives and plan from the oldest ClickHouse
+slot at startup, use:
 
 ```bash
 --no-continue-from-last-archive
@@ -587,7 +604,7 @@ archive tasks.
 
 ## Archive Ranges
 
-- `hourly`: one nominal hour of slots at the configured cluster cadence (9000 slots with the historical 400 ms default; 18000 slots at 200 ms)
+- `hourly`: one nominal hour of slots at the configured cluster cadence (18000 slots at the 200 ms default; 9000 slots at the historical 400 ms)
 - `epoch`: 432000 slots, aligned to epoch boundaries
 - `custom`: defaults to 1000 slots
 - `custom:<slots>`: explicit custom size, for example `custom:2500`
@@ -604,24 +621,24 @@ archives use the shared `custom_*` archive namespace.
 
 ### Hourly slot cadence
 
-Set `--hourly-slot-duration-ms` (env `SOLPARQ_HOURLY_SLOT_DURATION_MS`) to the nominal slot duration of the cluster/history being archived. The default is `400`, preserving existing 9000-slot planning. For a 200 ms cluster, use:
+Set `--hourly-slot-duration-ms` (env `SOLPARQ_HOURLY_SLOT_DURATION_MS`) to the nominal slot duration of the cluster/history being archived. The default is `200` (18000-slot windows). To archive 400 ms history with the earlier 9000-slot windows, use:
 
 ```bash
 cargo run -p superbank-solparq -- \
   --db-server 127.0.0.1 --db-user default --db-password '' \
-  --archive-range-type hourly --hourly-slot-duration-ms 200 \
+  --archive-range-type hourly --hourly-slot-duration-ms 400 \
   --archive-file-output-location ./archives
 ```
 
-The duration must be positive and divide `3600000` ms exactly. An hourly window covers `[start, start + 3600000 / duration - 1]`, inclusive, and waits until ClickHouse reaches that end slot. Skipped slots do not shrink the window. This is a nominal hour by slot cadence, starting from the earliest available slot or the preceding archive's end plus one; it is not aligned to UTC hours or measured from block timestamps. The setting leaves epoch slot counts, custom windows, explicit `--archive-slot-range` boundaries, and the archive check interval unchanged.
+The duration must be positive and divide `3600000` ms exactly. An hourly window covers `[start, start + 3600000 / duration - 1]`, inclusive, and waits until ClickHouse reaches that end slot. Skipped slots do not shrink the window. This is a nominal hour by slot cadence, starting one slot after the earliest available slot or at the preceding archive's end plus one; it is not aligned to UTC hours or measured from block timestamps. The setting leaves epoch slot counts, custom windows, explicit `--archive-slot-range` boundaries, and the archive check interval unchanged.
 
-[Solana's Alpenglow guide](https://solana.com/upgrades/alpenglow) describes reduced slot times as a separate staged change. Do not infer cadence from consensus activation or a client version. Keep `400` for historical 400 ms data; stop and restart the archiver with the new duration when reaching the cluster's cadence transition. A window spanning that transition can represent a different elapsed duration; use a one-shot explicit slot range to close the old history at the transition boundary before continuing with the new cadence.
+[Solana's Alpenglow guide](https://solana.com/upgrades/alpenglow) describes reduced slot times as a separate staged change. Do not infer cadence from consensus activation or a client version. Set `400` for historical 400 ms data; stop and restart the archiver with the new duration when reaching the cluster's cadence transition. A window spanning that transition can represent a different elapsed duration; use a one-shot explicit slot range to close the old history at the transition boundary before continuing with the new cadence.
 
 Archive IDs remain `hourly_<epoch>_<start>-<end>` and manifests keep their existing format and explicit inclusive bounds. Legacy files and newer bundles can coexist: continuation uses the stored end slot plus one. Readers accept either size, and the `source: solparq` restore path uses recorded ranges without requiring the cadence setting. Retention still keeps the configured number of archives per kind, ordered by end slot, including mixed-cadence history; it does not promise a fixed wall-clock duration. ClickHouse cleanup remains gated by the archived high-watermark of every configured kind.
 
 ### Aligned custom archives
 
-By default a `custom` archive starts at the earliest slot available in ClickHouse
+By default a `custom` archive starts one slot after the earliest slot available in ClickHouse
 and steps forward in fixed-size windows from there. Pass `--custom-aligned`
 (env `SOLPARQ_CUSTOM_ALIGNED`, off by default) to instead snap custom windows onto
 fixed slot-count boundaries — `custom:1000` produces `1000, 2000, 3000, …` so each
@@ -634,7 +651,8 @@ boundaries. Notes:
 - Only the `custom` kind is affected (`hourly` never aligns; `epoch` always aligns
   to its own boundary).
 - Aligning skips any leading partial window: if the earliest slot is `10_500`, the
-  first `custom:1000` archive is `11000-11999` and slots `10_500–10_999` are not
+  first `custom:1000` archive is `11000-11999`. An earliest slot on a boundary,
+  such as `11_000`, also moves the first archive to the next boundary, `12000-12999` and slots `10_500–10_999` are not
   archived by this kind — the same trade-off `epoch` already makes for a partial
   leading epoch. `--delete-archived-data-range` preserves this never-archived
   leading window by flooring the delete at the lowest archived start slot; pass
@@ -651,6 +669,10 @@ Before writing an archive, `superbank-solparq` checks:
   `blocks_metadata`.
 - Each block's `executed_transaction_count` matches transaction rows in the
   `transactions` table.
+- Each stored block after `--alpenglow-genesis-slot` has a complete footer.
+  See [Alpenglow footer coverage](#alpenglow-footer-coverage).
+- Proof-of-History structure over the range. See
+  [Proof-of-History check](#proof-of-history-check).
 
 If warnings are found in regular mode, `superbank-solparq` asks for confirmation before
 creating the archive. Use `--force-archive` to archive despite warnings.
@@ -664,6 +686,8 @@ The produced-slots check calls Solana `getBlocks`. Some RPC providers disable
 `--server-mode` archiving is skipped (it requires `--force-archive`), even when
 the block and transaction-count checks are clean.
 
+Rate limits and short outages do not fail the check at once. solparq tries each `getBlocks` call up to 4 times. It retries on HTTP 429, HTTP 5xx, JSON-RPC error code 429, timeouts and connection failures. It waits 1 s, 2 s, then 4 s between tries, or the `Retry-After` value when the server sends one, capped at 10 s. Each retry logs a `Solana RPC getBlocks failed; retrying` warning. Other RPC errors, such as `Bad method`, fail at once. When all tries fail, `rpc_check_error` ends with `(after N attempts)`.
+
 Set `--allow-rpc-validation-failure` (`SOLPARQ_ALLOW_RPC_VALIDATION_FAILURE`) to
 let archiving proceed when *only* the RPC cross-check failed. Unlike
 `--force-archive`, this still blocks on verified data problems (missing blocks,
@@ -675,17 +699,73 @@ logged and exposed via the `missing_block` / `rpc_errors` validation metrics.
 Prefer pointing `--solana-rpc-url` at an endpoint that supports `getBlocks` when
 you want full verification.
 
-The default Solana RPC endpoint is:
+The default Solana RPC endpoint is the public Solana Foundation endpoint of `--solana-cluster`:
 
-```text
-https://api.mainnet-beta.solana.com
-```
+| `--solana-cluster` | Default `--solana-rpc-url` |
+| --- | --- |
+| `mainnet` (default) | `https://api.mainnet-beta.solana.com` |
+| `devnet` | `https://api.devnet.solana.com` |
+| `testnet` | `https://api.testnet.solana.com` |
 
 Override it with:
 
 ```bash
 --solana-rpc-url https://your.rpc.endpoint
 ```
+
+### Alpenglow defaults
+
+The defaults target an archiver fed by gRPC, Fumarole or Jetstreamer, which store `entries` and footers:
+
+- `--solana-cluster mainnet` (`SOLPARQ_SOLANA_CLUSTER`): the cluster being archived. Set `devnet` or `testnet` for those clusters.
+- `--alpenglow-genesis-slot`: the boundary of `--solana-cluster`, from the table below.
+- `--footer-coverage-policy require`: footer gaps block the archive.
+- `--poh-verify-mode full`: PoH structure and every entry hash are checked before each archive.
+
+| `--solana-cluster` | Alpenglow genesis slot |
+| --- | --- |
+| `mainnet` | `459652999` |
+| `devnet` | `504148999` |
+| `testnet` | `444625255` |
+
+These are the `block.slot` values that each cluster's public Solana Foundation RPC returned for `getAgGenesisCert` on 2026-11-03.
+
+`--solana-cluster` also selects the PoH check's cluster parameters: the genesis hash and the `update_hashes_per_tick*` history. On devnet and testnet, slots before the `update_hashes_per_tick` feature are not checked for hash counts, because their genesis value is not recorded here.
+
+Other deployments change these settings:
+
+- RPC/Bigtable sources: set `--footer-coverage-policy report` and `--poh-verify-mode off`. Those sources write no footers and no `entries`, so the defaults would block every archive after the boundary.
+- Other clusters, such as a local test validator: set `--alpenglow-genesis-slot` to the cluster's slot, or to `none` together with `--footer-coverage-policy report` and `--poh-verify-mode off`.
+
+solparq rejects `none` at startup while `require` or a PoH mode other than `off` is set. The footer check reads the `bank_hash`, `block_producer_time_nanos` and `block_user_agent` columns. Apply the current `blocks_metadata` DDL before running the defaults.
+
+### Alpenglow footer coverage
+
+`--alpenglow-genesis-slot` (`SOLPARQ_ALPENGLOW_GENESIS_SLOT`) is the `block.slot` of a trusted same-cluster `getAgGenesisCert` response. The default comes from `--solana-cluster`; see [Alpenglow defaults](#alpenglow-defaults). Validation lists every stored block after that slot whose `bank_hash`, `block_producer_time_nanos` or `block_user_agent` is `NULL`. It reads `blocks_metadata` with `FINAL`. Blocks up to the genesis slot are not checked, because they never carry a footer, so a range that spans the slot is checked only after it. solparq never infers the slot from an epoch, a date or a validator version.
+
+The gaps appear as `footer_missing_ranges` in `report.json`, the text report and the gap summary log, and as the `footer_missing` validation metric category. `--footer-coverage-policy` (`SOLPARQ_FOOTER_COVERAGE_POLICY`) decides what they do:
+
+- `report`: the archive proceeds.
+- `require` (default): footer gaps block the archive like other data problems. `--force-archive` still overrides them, and `--allow-rpc-validation-failure` does not. `require` needs `--alpenglow-genesis-slot`.
+
+Gap backfill uses the RPC source, which carries no footer. Backfilled blocks after the genesis slot stay footer gaps, and solparq logs a warning for them.
+
+### Proof-of-History check
+
+`--poh-verify-mode` (`SOLPARQ_POH_VERIFY_MODE`) runs [superbank-verify](../superbank-verify/README.md) over the archive's slot range in ClickHouse before anything is written, including to S3. The archive is a `SELECT ... WHERE slot BETWEEN start AND end` over the same tables, so a clean run covers the data that goes into the Parquet files. The default is `full`.
+
+- `structural`: tick counts, entry and transaction-index structure, last entry hash equals the blockhash, and blockhash linkage, including to the block before the range.
+- `full`: everything above plus recomputing every entry hash. The cost depends on the era:
+  - After `--alpenglow-genesis-slot`, every entry has `num_hashes = 1`, so `full` costs one SHA-256 hash per entry. On staging, 2,000 mainnet slots (702,053 entries) took 22 s with a debug build reading ClickHouse over the network.
+  - Before the genesis slot, a slot costs about 4M SHA-256 hashes at 62,500 hashes per tick. Set `structural` when archiving historical ranges, or measure one window on your hardware first.
+
+  `--poh-verify-threads` (`SOLPARQ_POH_VERIFY_THREADS`, default `0` = all cores) bounds the hashing.
+
+The check runs last, after repair, backfill and re-validation, and only when nothing else already blocks the range. It also fails a slot when ClickHouse holds duplicate rows for it whose contents differ (`duplicate_conflict`), because the archive could export either copy. Slots after `--alpenglow-genesis-slot` use Alpenglow rules (one Alpentick, `num_hashes = 1`), and any mode other than `off` needs that flag: without a boundary every slot would be checked with historical PoH rules, so every post-Alpenglow window would fail. solparq rejects the combination at startup. Ranges entirely before the boundary are unaffected by its value. Cluster parameters come from `--solana-cluster`.
+
+A failed slot (`entry_hash_mismatch`, `chain_break`, `tick_count_mismatch`, ...) blocks the archive like a missing block; `--force-archive` still overrides it and `--allow-rpc-validation-failure` does not. Slots the check cannot verify also block: blocks without `entries` rows (ranges ingested over JSON-RPC or Bigtable, and gap backfill) and slots missing from the chain. `--poh-verify-allow-unverifiable` (`SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE`) lets those through while failures still block.
+
+Results appear under `validation.poh` in `report.json` (slot counts, `failed_ranges`, `unverifiable_ranges`, `missing_ranges` and finding counts), as `validation_poh_*` lines in the text report, as the `poh_failed` and `poh_unverifiable` validation metric categories, and as the `poh-verification` skip reason. Each finding is also logged with its slot.
 
 ### Backfilling gaps before archiving
 
@@ -812,6 +892,15 @@ That deletes matching slots from:
 
 Optional tables are deleted only when they were available for the archive run.
 
+### Cleanup keeps the next window's parent
+
+The [Proof-of-History check](#proof-of-history-check) links the first block of a window to its parent block, the last block of the window before. Cleanup keeps that parent in ClickHouse so the next window stays verifiable:
+
+- The delete range ends one slot before the highest block at or before its end. That block and its rows in every table stay.
+- On the next cleanup, the range widens down to the block an earlier cleanup kept. That block is the parent of the first block at or after the range start. The range widens only when a stored archive of any configured type covers the block, so a slot that no archive holds is never deleted.
+
+Each deployment keeps one block per archive type at most. A cleanup made before this rule may already have deleted a parent. The next window of that type then reports `missing_parent` and is unverifiable. Restore the parent block, or let that one window through with `--poh-verify-allow-unverifiable`.
+
 ## Options
 
 Required:
@@ -838,7 +927,7 @@ Common defaults:
 - `--ops-port 30303`
 - `--metrics-port 31313`
 - `--archive-slot-range` unset
-- `--hourly-slot-duration-ms 400` (env `SOLPARQ_HOURLY_SLOT_DURATION_MS`)
+- `--hourly-slot-duration-ms 200` (env `SOLPARQ_HOURLY_SLOT_DURATION_MS`)
 - `--custom-aligned` unset (off; only affects `custom` — see [Aligned custom archives](#aligned-custom-archives))
 - `--no-continue-from-last-archive` unset
 - `--log-file` unset
@@ -846,6 +935,13 @@ Common defaults:
 - `--delete-archived-data-from-slot-zero` unset (off; server mode only)
 - `--repair-mismatches` unset (off)
 - `--allow-rpc-validation-failure` unset (off)
+- `--solana-cluster mainnet`
+- `--alpenglow-genesis-slot` from `--solana-cluster` (mainnet `459652999`, devnet `504148999`, testnet `444625255`; `none` disables the boundary)
+- `--solana-rpc-url` from `--solana-cluster`
+- `--footer-coverage-policy require`
+- `--poh-verify-mode full`
+- `--poh-verify-allow-unverifiable` unset (off)
+- `--poh-verify-threads 0` (all cores)
 - `--backfill-gaps` unset (off)
 - `--backfill-superbank-bin superbank`
 - `--backfill-include-undercounts` on (only applies when `--backfill-gaps` is set)

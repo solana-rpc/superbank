@@ -16,7 +16,7 @@ pub const DONE_FILE_PREFIX: &str = ".done";
 pub const MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// Bump when the `report.json` schema changes.
-pub const REPORT_FORMAT_VERSION: u32 = 1;
+pub const REPORT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveManifest {

@@ -414,11 +414,11 @@
               },
               {
                 "color": "yellow",
-                "value": 1000
+                "value": 2000
               },
               {
                 "color": "red",
-                "value": 50000
+                "value": 100000
               }
             ]
           },
@@ -1538,7 +1538,7 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 6,
+        "w": 5,
         "x": 0,
         "y": 47
       },
@@ -1595,8 +1595,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 6,
+        "w": 5,
+        "x": 5,
         "y": 47
       },
       "id": 45,
@@ -1656,8 +1656,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 12,
+        "w": 5,
+        "x": 10,
         "y": 47
       },
       "id": 46,
@@ -1717,8 +1717,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 6,
-        "x": 18,
+        "w": 5,
+        "x": 15,
         "y": 47
       },
       "id": 47,
@@ -1751,6 +1751,68 @@
       ],
       "title": "Validation RPC errors (1h)",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 47
+      },
+      "id": 64,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (nodename) (solparq_validation_slots{nodename=~\"$nodename\",category=\"footer_missing\",archive_kind=~\"$archive_kind\"})",
+          "legendFormat": "{{nodename}} \u00b7 footer gaps",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Footer gaps (Alpenglow)",
+      "type": "stat",
+      "description": "Alpenglow blocks stored without a complete footer in the last validated range. Needs --alpenglow-genesis-slot."
     },
     {
       "collapsed": false,
