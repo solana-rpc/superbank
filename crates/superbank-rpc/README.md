@@ -611,6 +611,7 @@ Configuration:
 | `--dragonsmouth-endpoint` | `DRAGONSMOUTH_ENDPOINT` | — | Required when enabled. |
 | `--dragonsmouth-x-token` | `DRAGONSMOUTH_X_TOKEN` | — | Optional auth header. |
 | `--head-cache-retain-slots` | `HEAD_CACHE_RETAIN_SLOTS` | `32` | How many slots to retain in memory. |
+| `--head-cache-max-per-address` | `HEAD_CACHE_MAX_PER_ADDRESS` | `10000` | Newest signatures kept for each address. A `getSignaturesForAddress` page fills from the head only when this is above the page limit plus the rows below the requested commitment. |
 | `--head-cache-min-commitment` | `HEAD_CACHE_MIN_COMMITMENT` | `processed` | `processed|confirmed|finalized` exposure gate for head reads. |
 | `--head-cache-commitment-wait-ms` | `HEAD_CACHE_COMMITMENT_WAIT_MS` | `0` | Milliseconds a `getTransaction` waits for a signature the head holds below the requested commitment to reach it. `0` disables the wait. Must be below `RPC_REQUEST_TIMEOUT_MS`. |
 | `--head-cache-commitment-wait-max-waiters` | `HEAD_CACHE_COMMITMENT_WAIT_MAX_WAITERS` | `1024` | Requests that may wait at once; a request past the cap does not wait. `0` turns the wait off. |

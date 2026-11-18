@@ -91,8 +91,8 @@ export default {
         opt('MAX_SIGNATURES_LIMIT', {
           type: 'u64',
           default: '1000',
-          text: 'Maximum signatures per address page. Also the head cache per-address index cap.',
-          relations: [{ type: 'see', to: 'HEAD_CACHE_ENABLED' }],
+          text: 'Maximum signatures per address page.',
+          relations: [{ type: 'see', to: 'HEAD_CACHE_MAX_PER_ADDRESS' }],
         }),
         opt('HYDRATION_CPU_CONCURRENCY', { type: 'usize', default: '8', text: 'Concurrent CPU-heavy response hydration jobs (bounds `spawn_blocking` use).' }),
       ],
@@ -628,6 +628,15 @@ export default {
           relations: [
             { type: 'see', to: 'SIGNATURE_STATUS_HISTORY_CACHE_ENTRIES' },
             { type: 'see', to: 'DISK_CACHE_GSFA_EMPTY_WATERMARK_TTL_SECS' },
+          ],
+        }),
+        opt('HEAD_CACHE_MAX_PER_ADDRESS', {
+          type: 'usize',
+          default: '10000',
+          text: "Newest signatures kept for each address. The cap drops the oldest keys of a busy address. A `getSignaturesForAddress` page fills from the head only when the cap is above the page limit plus the address's rows below the requested commitment. Each key takes about 80 bytes.",
+          relations: [
+            { type: 'see', to: 'MAX_SIGNATURES_LIMIT' },
+            { type: 'see', to: 'HEAD_CACHE_RETAIN_SLOTS' },
           ],
         }),
         opt('HEAD_CACHE_MIN_COMMITMENT', {

@@ -1497,6 +1497,33 @@ mod tests {
 
     #[cfg(feature = "disk-cache")]
     #[test]
+    fn confirmed_address_page_fills_only_when_the_cap_exceeds_the_limit() {
+        let limit = 4;
+        let confirmed_rows = |cap: usize| {
+            let cache = HeadCache::new(64, cap);
+            let busy = Pubkey::new_unique();
+            for (slot, rows, commitment) in [
+                (1_000, 3, CommitmentLevel::Confirmed),
+                (1_001, 3, CommitmentLevel::Confirmed),
+                (1_002, 2, CommitmentLevel::Processed),
+            ] {
+                for idx in 0..rows {
+                    let sig = Signature::new_unique();
+                    let mut tx = base_transaction(slot, [1; 32]);
+                    tx.signature = *sig.as_array();
+                    cache.insert_for_tests(sig, tx, idx, &[busy], commitment);
+                }
+            }
+            cache
+                .signatures_for_address(&busy, None, None, limit, CommitmentLevel::Confirmed)
+                .len()
+        };
+        // At a cap equal to the limit, the processed tip rows push confirmed rows out.
+        assert_eq!(confirmed_rows(limit), 2);
+        assert_eq!(confirmed_rows(2 * limit), limit);
+    }
+
+    #[test]
     fn address_floor_needs_a_session_chain_and_respects_the_per_address_cap() {
         use coverage::Link;
         use std::time::{Duration, Instant};
