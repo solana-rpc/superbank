@@ -1495,7 +1495,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "disk-cache")]
     #[test]
     fn confirmed_address_page_fills_only_when_the_cap_exceeds_the_limit() {
         let limit = 4;
@@ -1523,6 +1522,7 @@ mod tests {
         assert_eq!(confirmed_rows(2 * limit), limit);
     }
 
+    #[cfg(feature = "disk-cache")]
     #[test]
     fn address_floor_needs_a_session_chain_and_respects_the_per_address_cap() {
         use coverage::Link;
