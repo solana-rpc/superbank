@@ -457,7 +457,7 @@ pub async fn run_server(args: RpcConfig) -> RpcResult<()> {
         {
             let min_commitment = parse_commitment_level(&args.head_cache_min_commitment);
             let retain_slots = args.head_cache_retain_slots.max(1);
-            let max_per_address = args.max_signatures_limit as usize;
+            let max_per_address = args.head_cache_max_per_address;
 
             let cache = Arc::new(
                 HeadCache::new(retain_slots, max_per_address)

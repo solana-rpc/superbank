@@ -730,6 +730,12 @@ pub struct RpcConfig {
     pub(crate) head_cache_retain_slots: u64,
 
     #[cfg(feature = "grpc-head-cache")]
+    /// Newest signatures the head cache keeps for each address. A getSignaturesForAddress page
+    /// fills from the head only when this exceeds its limit plus the rows below its commitment.
+    #[arg(long, env = "HEAD_CACHE_MAX_PER_ADDRESS", default_value_t = 10_000)]
+    pub(crate) head_cache_max_per_address: usize,
+
+    #[cfg(feature = "grpc-head-cache")]
     /// Minimum commitment exposed by the head cache: processed|confirmed|finalized.
     #[arg(long, env = "HEAD_CACHE_MIN_COMMITMENT", default_value = "processed")]
     pub(crate) head_cache_min_commitment: String,
@@ -1720,13 +1726,16 @@ mod config_tests {
             let cfg = RpcConfig::parse_from(["superbank-rpc"]);
             assert_eq!(cfg.head_cache_commitment_wait_ms, 0);
             assert_eq!(cfg.head_cache_commitment_wait_max_waiters, 1024);
+            assert_eq!(cfg.head_cache_max_per_address, 10_000);
             let cfg = RpcConfig::parse_from([
                 "superbank-rpc",
                 "--head-cache-commitment-wait-ms=400",
                 "--head-cache-commitment-wait-max-waiters=8",
+                "--head-cache-max-per-address=2500",
             ]);
             assert_eq!(cfg.head_cache_commitment_wait_ms, 400);
             assert_eq!(cfg.head_cache_commitment_wait_max_waiters, 8);
+            assert_eq!(cfg.head_cache_max_per_address, 2_500);
             assert!(RpcConfig::parse_from(["superbank-rpc"]).get_blocks_clamp_to_head_tip);
             let cfg =
                 RpcConfig::parse_from(["superbank-rpc", "--get-blocks-clamp-to-head-tip=false"]);
