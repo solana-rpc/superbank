@@ -215,7 +215,7 @@ impl Inner {
     }
 }
 
-/// Removes a `Building` entry if its task ends without a result, for example on a panic.
+/// Removes a `Building` entry if its owner ends without a result, for example on cancellation.
 struct BuildGuard {
     inner: Arc<Inner>,
     key: RecentBlockKey,
@@ -261,7 +261,7 @@ impl RecentBlockResponses {
             .is_some_and(|inner| inner.lock().entry(key).is_some())
     }
 
-    /// Returns the stored bytes, joins a running build, or starts one in its own task.
+    /// Returns the stored bytes, joins a running build, or runs one in the calling task.
     /// Errors reach the requests waiting on that build and are never stored.
     pub(crate) async fn get_or_build<F>(
         &self,
@@ -277,7 +277,7 @@ impl RecentBlockResponses {
                 .map(|bytes| (bytes, RecentAccess::Built))
                 .map_err(Arc::new);
         };
-        let (mut done, access) = {
+        let (mut done, access, owned) = {
             let mut blocks = inner.lock();
             match blocks.entry(&key) {
                 Some(Entry::Ready(bytes)) => return Ok((bytes.clone(), RecentAccess::Hit)),
@@ -286,7 +286,7 @@ impl RecentBlockResponses {
                     drop(blocks);
                     // Free what the unused build holds, such as a prebuild permit, before waiting.
                     drop(build);
-                    (done, RecentAccess::Merged)
+                    (done, RecentAccess::Merged, None)
                 }
                 None => {
                     let id = blocks.next_id;
@@ -305,21 +305,22 @@ impl RecentBlockResponses {
                         id,
                         armed: true,
                     };
-                    tokio::spawn(run_build(guard, sender, build));
-                    (done, RecentAccess::Built)
+                    (done, RecentAccess::Built, Some((guard, sender, build)))
                 }
             }
         };
+        if let Some((guard, sender, build)) = owned {
+            return run_build(guard, sender, build)
+                .await
+                .map(|bytes| (bytes, RecentAccess::Built));
+        }
         let outcome = match done.wait_for(Option::is_some).await {
             Ok(outcome) => outcome.clone(),
             Err(_) => None,
         };
         outcome
-            .unwrap_or_else(|| {
-                Err(Arc::new(RecentBuildError::Failed(
-                    "recent getBlock build stopped".to_string(),
-                )))
-            })
+            // The owner was cancelled. Request callers fall through to the ordinary head path.
+            .unwrap_or_else(|| Err(Arc::new(RecentBuildError::Unavailable)))
             .map(|bytes| (bytes, access))
     }
 
@@ -382,14 +383,19 @@ impl RecentBlockResponses {
     }
 }
 
-async fn run_build<F>(mut guard: BuildGuard, done: watch::Sender<BuildOutcome>, build: F)
+async fn run_build<F>(
+    mut guard: BuildGuard,
+    done: watch::Sender<BuildOutcome>,
+    build: F,
+) -> Result<Bytes, Arc<RecentBuildError>>
 where
     F: Future<Output = Result<Bytes, RecentBuildError>>,
 {
     let result = build.await.map_err(Arc::new);
     guard.inner.finish(&guard.key, guard.id, &result);
     guard.armed = false;
-    done.send_replace(Some(result));
+    done.send_replace(Some(result.clone()));
+    result
 }
 
 /// One `getBlock` result shape to build when a block is confirmed.
@@ -816,6 +822,62 @@ mod tests {
             (&b"block"[..], RecentAccess::Merged)
         );
         assert_eq!(first.await.unwrap().unwrap().1, RecentAccess::Built);
+    }
+
+    #[tokio::test]
+    async fn dropping_builder_cancels_work_and_releases_waiters() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    signal.send(()).ok();
+                }
+            }
+        }
+
+        let store = RecentBlockResponses::new(1024);
+        let (dropped, was_dropped) = tokio::sync::oneshot::channel();
+        let owner = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .get_or_build(key(7, 1), async move {
+                        let _signal = DropSignal(Some(dropped));
+                        std::future::pending::<()>().await;
+                        Ok(Bytes::new())
+                    })
+                    .await
+            })
+        };
+        while !store.contains(&key(7, 1)) {
+            tokio::task::yield_now().await;
+        }
+
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let waiter = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .get_or_build(key(7, 1), async move {
+                        let _permit = permit;
+                        Err(RecentBuildError::Unavailable)
+                    })
+                    .await
+            })
+        };
+        while permits.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        owner.abort();
+        was_dropped.await.expect("the owned build was cancelled");
+        assert!(matches!(
+            waiter.await.unwrap().unwrap_err().as_ref(),
+            RecentBuildError::Unavailable
+        ));
+        assert!(!store.contains(&key(7, 1)));
     }
 
     #[tokio::test]
