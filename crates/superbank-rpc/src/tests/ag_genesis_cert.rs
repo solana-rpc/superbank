@@ -328,10 +328,8 @@ async fn get_ag_genesis_cert_http_failure_and_redirect_are_not_null() {
         assert_source_error(&call(&rpc).await.1, "upstream_unavailable");
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let (rpc, _) = rpc_server(source(&url), false).await;
+    // Port 0 never accepts a connection, so no parallel test can answer it.
+    let (rpc, _) = rpc_server(source("http://127.0.0.1:0"), false).await;
     assert_source_error(&call(&rpc).await.1, "upstream_unavailable");
 }
 
