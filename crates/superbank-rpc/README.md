@@ -663,6 +663,14 @@ source page answers alone and a pending local read is cancelled. If the source f
 still waits for a complete local page before it returns the error. A request whose `before`/`until`
 cursor is left to the source page query (`CLICKHOUSE_GSFA_INLINE_CURSOR`, below) is not raced: the
 local page cannot be bounded by a cursor it does not know.
+`superbank_disk_cache_gsfa_race_total` counts each race once by `result`: `local_served` (a
+complete local page answered), `primary_first` (the source page answered before the local page
+settled), or, when the local page settled first and the source page answered, `local_empty` and
+`local_short` (the page reached the coverage floor with no rows, or with fewer than `limit` rows)
+and `local_unavailable` (no page: not ready, busy, timeout, probe budget, query error, or an
+unproven tip gap). `primary_error` counts a source error that no complete local page replaced, and
+`cancelled` a request dropped before its race ended. With request label capture on (see Metrics),
+it also carries `x_endpoint` and the other request labels.
 
 The local tip trails the source's finalized tip by the forwarder lag (at least
 `DISK_CACHE_REPAIR_MIN_LAG_SLOTS`), so a newest-first address page whose request window extends above
@@ -1425,7 +1433,7 @@ Route normalization metric:
 
 Request-scoped metric families:
 
-- `rpc_requests`, `rpc_response_time_seconds`, `rpc_inflight_requests`, `rpc_timeouts`, `rpc_response_overhead_seconds`, `rpc_blocks_slots_returned`, `rpc_batch_requests`, `rpc_batch_items`, `rpc_batch_size`, `rpc_batch_rejected_total`, `rpc_backend_errors`, `rpc_clickhouse_duration_seconds`, `rpc_clickhouse_received_bytes`, `rpc_clickhouse_decoded_bytes`, `rpc_clickhouse_timeouts`, `rpc_clickhouse_query_cache_total`, `rpc_clickhouse_query_cache_settings_total` can include `x_endpoint`, `x_rpc_node`, `x_subscription_id`, and `x_account_id` when each capture option is enabled.
+- `rpc_requests`, `rpc_response_time_seconds`, `rpc_inflight_requests`, `rpc_timeouts`, `rpc_response_overhead_seconds`, `rpc_blocks_slots_returned`, `rpc_batch_requests`, `rpc_batch_items`, `rpc_batch_size`, `rpc_batch_rejected_total`, `rpc_backend_errors`, `rpc_clickhouse_duration_seconds`, `rpc_clickhouse_received_bytes`, `rpc_clickhouse_decoded_bytes`, `rpc_clickhouse_timeouts`, `rpc_clickhouse_query_cache_total`, `rpc_clickhouse_query_cache_settings_total`, `disk_cache_gsfa_race` can include `x_endpoint`, `x_rpc_node`, `x_subscription_id`, and `x_account_id` when each capture option is enabled.
 - For those labels, values are `missing|<raw-value>` for enabled capture; disabled capture omits the label.
 - `rpc_requests` and `rpc_response_time_seconds` use `status="abandoned"` for requests dropped before a response existed, so cancelled requests keep their latency.
 - `rpc_clickhouse_timeouts` carries `target`: `primary`, or `cache`/`background` for the local disk cache, which reuses primary operation names.
