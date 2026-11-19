@@ -49,6 +49,7 @@ const SHARD_TCP_TIMEOUT_RESERVE_MAX_MS: u128 = 5_000;
 const SHARD_TCP_TIMEOUT_RESERVE_DIVISOR: u128 = 4;
 const SHARD_TCP_TIMEOUT_MIN_MS: u128 = 1;
 
+#[cfg(any(test, feature = "disk-cache"))]
 /// Inclusive slot bounds from partition `oldest` to partition `newest` at `width` slots each.
 pub(crate) fn partition_slot_span(width: u64, newest: u64, oldest: u64) -> (u64, u64) {
     (
@@ -1176,6 +1177,7 @@ impl ClickHouseClient {
         }
     }
 
+    #[cfg(any(test, feature = "disk-cache"))]
     /// Scopes a local-cache client to `partitions`: one slot range over them, plus a
     /// partition filter unless they fill that range.
     pub(crate) fn set_cache_partitions(&mut self, partitions: &[u64]) {
