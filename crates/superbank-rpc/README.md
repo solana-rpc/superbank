@@ -651,12 +651,12 @@ Signature and address reads use an in-process Bloom membership index to exclude 
 partitions before querying ClickHouse. This preserves whole-partition eviction without making
 key lookups search every retained partition. Signature status batches, pagination-bound signature
 lookups, regular/hot address history, and token-owner history use the same routing mechanism.
-`getSignaturesForAddress` reads every candidate partition in one local query over a single slot
-range from the oldest to the newest candidate, so a full page and a partial page that falls
-through to the source each cost one admission and one round trip. Skipped partitions inside the
-range are definite index negatives; a range, unlike an `intDiv(slot, width) IN (...)` set, keeps
-primary-key analysis on binary search. The local page runs concurrently with the source query for
-the request's own bounds and limit. A complete local page (full, or bounded by an `until` inside the
+`getSignaturesForAddress` reads every candidate partition in one local query, so a full page and
+a partial page that falls through to the source each cost one admission and one round trip. The
+query filters on one slot range from the oldest to the newest candidate and on
+`_partition_id IN (...)` with the candidate partitions. ClickHouse then opens only the candidates'
+parts, and the range, unlike an `intDiv(slot, width) IN (...)` set, keeps primary-key analysis on
+binary search. The local page runs concurrently with the source query for the request's own bounds and limit. A complete local page (full, or bounded by an `until` inside the
 covered span) answers if it arrives first, and the source read is left to finish and is discarded,
 because cancelling a source read holds its admission until termination is verified. Otherwise the
 source page answers alone and a pending local read is cancelled. If the source fails, the request
@@ -708,7 +708,7 @@ are counted in `superbank_disk_cache_reads_total{operation="gsfa_empty_watermark
 uses it, because nothing proves the slots above the local tip.
 
 `getSignatureStatuses` batches read their candidate
-partitions the same way, in one query over the candidates' slot range, while that range costs at
+partitions the same way, in one query over the candidate partitions, while their slot range costs at
 most 1,024 signature-partition lookups or four times the lookups of per-partition queries (after a
 restart, unknown partitions make every signature a candidate); larger sparse batches query
 candidate partitions newest first. Local tables merge each partition to one part once it has
@@ -824,9 +824,9 @@ errors, invalidation, and slots first covered during the lookup fall back to the
 An index entry whose payload is unavailable also falls back. Cache format and retention
 are unchanged.
 
-A Bloom-positive `getTransaction` first runs one local query over the slot span of its
-candidate partitions: it resolves the newest indexed position and returns that payload
-under a single admission. A row is used only when its slot is covered and lies in a
+A Bloom-positive `getTransaction` first runs one local query over its candidate partitions,
+with the same slot range and partition filter: it resolves the newest indexed position and
+returns that payload under a single admission. A row is used only when its slot is covered and lies in a
 candidate partition. No row, or any other row, is not a miss: the attempt then runs the
 separate position and payload reads above with the same candidates, and only they can
 prove absence. When the fused query returns no row and there are several candidate

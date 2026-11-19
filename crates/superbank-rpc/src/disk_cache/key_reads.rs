@@ -515,9 +515,8 @@ impl DiskCache {
         }
         Ok((partitions, None))
     }
-    /// Inclusive slot bounds from the oldest to the newest candidate partition. One
-    /// range keeps primary-key analysis on binary search; partitions skipped inside it
-    /// are definite index negatives, so callers must not treat their rows as candidates.
+    /// Inclusive slot bounds from the oldest to the newest candidate partition. Reads set
+    /// it with `cache_slot_partitions`, so they open only the candidates' parts inside it.
     fn partition_slot_span(&self, newest: u64, oldest: u64) -> (u64, u64) {
         partition_slot_span(self.inner.cfg.partition_slots, newest, oldest)
     }
@@ -791,9 +790,10 @@ impl DiskCache {
         );
         let mut client = self.scoped_client(&self.query_client(), newest, read);
         client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+        client.cache_slot_partitions = candidates.partitions.clone();
         let (record, _) = client.get_transaction_fused(signature).await?;
-        // The newest position may sit in a skipped partition inside the range, or
-        // outside coverage, where the loop would instead stop or look elsewhere.
+        // The newest position may sit outside coverage or outside the candidates,
+        // where the loop would instead stop or look elsewhere.
         let width = self.inner.cfg.partition_slots;
         Ok(match record {
             None => FusedRead::Empty,
@@ -863,6 +863,7 @@ impl DiskCache {
         read.check()?;
         let mut client = self.scoped_client(&self.query_client(), newest, read);
         client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+        client.cache_slot_partitions = candidates.partitions.clone();
         let (position, _) = client.get_signature_slot(&signature.to_string()).await?;
         Ok(position.is_some())
     }
@@ -1011,10 +1012,9 @@ impl DiskCache {
             return Ok(());
         };
         let by_partition = self.status_candidates(floor, tip, signatures, encoded);
-        // One query over the candidates' slot span: one admission and one round trip
+        // One query over the candidate partitions: one admission and one round trip
         // instead of one per partition (an unknown partition is a candidate for every
-        // signature). Partitions skipped inside the span are definite index negatives,
-        // and argMax over the span selects the newest row, as the newest-first loop did.
+        // signature). argMax over them selects the newest row, as the newest-first loop did.
         if single_query && let Some((oldest, newest, pending)) = status_span(&by_partition) {
             read.check()?;
             crate::metrics::disk_cache_read_count(
@@ -1024,6 +1024,7 @@ impl DiskCache {
             );
             let mut client = self.scoped_client(&self.query_client(), newest, read);
             client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+            client.cache_slot_partitions = by_partition.keys().copied().collect();
             let (records, _) = client.get_signature_statuses(&pending).await?;
             self.record_statuses(records, found);
             return Ok(());
@@ -1114,15 +1115,15 @@ impl DiskCache {
             );
             // One query over every candidate: one admission and one round trip, so a
             // short (partial) page is denied as quickly as a full page is served. It
-            // spans one slot range from the oldest to the newest candidate: partitions
-            // inside it that were skipped are definite index negatives with no rows for
-            // this address, and a range keeps primary-key analysis on binary search.
-            // The query orders by slot, so this equals the former newest-first loop.
+            // reads only the candidate partitions, inside one slot range from the oldest
+            // to the newest candidate. The query orders by slot, so this equals the
+            // former newest-first loop.
             let records = match (partitions.first(), partitions.last()) {
                 (None, _) | (_, None) => Vec::new(),
                 (Some(&newest), Some(&oldest)) => {
                     let mut client = self.scoped_client(&base, newest, &read);
                     client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+                    client.cache_slot_partitions = partitions.clone();
                     client
                         .get_signatures_for_address_with_positions(
                             &address.to_string(),

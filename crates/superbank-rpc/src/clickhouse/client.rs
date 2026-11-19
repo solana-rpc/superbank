@@ -49,6 +49,20 @@ const SHARD_TCP_TIMEOUT_RESERVE_MAX_MS: u128 = 5_000;
 const SHARD_TCP_TIMEOUT_RESERVE_DIVISOR: u128 = 4;
 const SHARD_TCP_TIMEOUT_MIN_MS: u128 = 1;
 
+/// ` AND _partition_id IN (...)` for local-cache partitions, or nothing when empty. A
+/// local table's `PARTITION BY intDiv(slot, width)` names each partition by its number.
+pub(crate) fn partition_id_filter(partitions: &[u64]) -> String {
+    if partitions.is_empty() {
+        return String::new();
+    }
+    let ids = partitions
+        .iter()
+        .map(|partition| format!("'{partition}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND _partition_id IN ({ids})")
+}
+
 pub(crate) fn shard_tcp_query_timeout_for(query_timeout: Duration) -> Duration {
     let timeout_ms = query_timeout.as_millis();
     if timeout_ms <= SHARD_TCP_TIMEOUT_MIN_MS {
@@ -326,6 +340,9 @@ pub struct ClickHouseClient {
     /// `cache_slot_predicate` filters on this range instead of one partition;
     /// `cache_partition` still marks the client as a local-cache client.
     pub(crate) cache_slot_range: Option<(u64, u64)>,
+    /// Local-cache reads only: the candidate partitions inside `cache_slot_range`. When
+    /// not empty, a multi-partition read opens only these partitions' parts.
+    pub(crate) cache_slot_partitions: Vec<u64>,
     /// Local-cache reads only: the longest wait for HTTP admission before failing with
     /// [`CacheAdmissionBusy`], so a saturated cache denies quickly instead of spending
     /// the caller's budget in the queue.
@@ -823,6 +840,7 @@ impl ClickHouseClient {
             signature_slot_cache: Arc::new(SignatureSlotCache::from_env()),
             cache_partition: None,
             cache_slot_range: None,
+            cache_slot_partitions: Vec::new(),
             cache_admission_wait: None,
             get_transaction_single_round_trip: false,
             latest_slot_hint: true,
@@ -1151,10 +1169,13 @@ impl ClickHouseClient {
         let Some((width, partition)) = self.cache_partition else {
             return String::new();
         };
-        // A plain slot range keeps primary-key analysis on binary search; an
-        // `intDiv(slot, w) IN (...)` set forces a scan of every candidate part's index.
+        // `_partition_id` drops the other parts before index analysis. The slot range keeps
+        // primary-key analysis on binary search; an `intDiv(slot, w) IN (...)` set does not.
         match self.cache_slot_range {
-            Some((low, high)) => format!(" AND slot BETWEEN {low} AND {high}"),
+            Some((low, high)) => format!(
+                " AND slot BETWEEN {low} AND {high}{}",
+                partition_id_filter(&self.cache_slot_partitions)
+            ),
             None => format!(" AND intDiv(slot, {width}) = {partition}"),
         }
     }
@@ -2855,6 +2876,11 @@ mod tests {
         assert_eq!(client.cache_slot_predicate(), " AND intDiv(slot, 10) = 7");
         client.cache_slot_range = Some((20, 79));
         assert_eq!(client.cache_slot_predicate(), " AND slot BETWEEN 20 AND 79");
+        client.cache_slot_partitions = vec![7, 2];
+        assert_eq!(
+            client.cache_slot_predicate(),
+            " AND slot BETWEEN 20 AND 79 AND _partition_id IN ('7', '2')"
+        );
     }
 
     #[tokio::test]
