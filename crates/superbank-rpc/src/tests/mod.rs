@@ -8524,43 +8524,88 @@ mod gsfa_race {
 
     #[tokio::test]
     async fn each_race_counts_one_result_with_the_request_labels() {
-        const RESULTS: [&str; 5] = [
+        type Local = std::pin::Pin<Box<dyn Future<Output = Option<DiskGsfaPage>> + Send>>;
+        const RESULTS: [&str; 7] = [
             "local_served",
             "local_empty",
             "local_short",
             "local_unavailable",
             "primary_first",
+            "primary_error",
+            "cancelled",
         ];
-        for result in RESULTS {
-            let local: std::pin::Pin<Box<dyn Future<Output = Option<DiskGsfaPage>> + Send>> =
-                match result {
-                    "local_served" => Box::pin(std::future::ready(Some(page(&[99], false)))),
-                    "local_empty" => Box::pin(std::future::ready(Some(page(&[], true)))),
-                    "local_short" => Box::pin(std::future::ready(Some(page(&[99], true)))),
-                    "local_unavailable" => Box::pin(std::future::ready(None)),
-                    _ => Box::pin(std::future::pending()),
-                };
-            // The primary is polled first; only `primary_first` lets it answer at once.
-            let primary_first = result == "primary_first";
-            let primary = boxed(async move {
-                if !primary_first {
-                    tokio::task::yield_now().await;
-                }
-                primary_rows(&[7])
-            });
-            let endpoint = format!("race-test-{result}");
+        let ready = |page: Option<DiskGsfaPage>| -> Local { Box::pin(std::future::ready(page)) };
+        let pending = || -> Local { Box::pin(std::future::pending()) };
+        // The primary is polled first: `now` answers before the local page, `late` after it.
+        let now = |result: PrimaryResult| boxed(std::future::ready(result));
+        let late = |result: PrimaryResult| {
+            boxed(async move {
+                tokio::task::yield_now().await;
+                result
+            })
+        };
+        let down = || Err(ProcessingError::database_msg("primary down"));
+        let cases: Vec<(&str, &str, Local, PrimaryGsfaPage)> = vec![
+            (
+                "served",
+                "local_served",
+                ready(Some(page(&[99], false))),
+                late(primary_rows(&[7])),
+            ),
+            (
+                "empty",
+                "local_empty",
+                ready(Some(page(&[], true))),
+                late(primary_rows(&[7])),
+            ),
+            (
+                "short",
+                "local_short",
+                ready(Some(page(&[99], true))),
+                late(primary_rows(&[7])),
+            ),
+            (
+                "none",
+                "local_unavailable",
+                ready(None),
+                late(primary_rows(&[7])),
+            ),
+            ("first", "primary_first", pending(), now(primary_rows(&[7]))),
+            (
+                "down-served",
+                "local_served",
+                ready(Some(page(&[99], false))),
+                now(down()),
+            ),
+            (
+                "down-short",
+                "primary_error",
+                ready(Some(page(&[99], true))),
+                now(down()),
+            ),
+            ("down-late", "primary_error", ready(None), late(down())),
+            (
+                "dropped",
+                "cancelled",
+                pending(),
+                boxed(std::future::pending()),
+            ),
+        ];
+        for (case, result, local, primary) in cases {
+            let endpoint = format!("race-test-{case}");
             let labels = crate::metrics::RequestHeaderMetricLabels {
                 x_endpoint: Some(endpoint.clone()),
                 ..crate::metrics::RequestHeaderMetricLabels::disabled()
             };
-            crate::metrics::with_request_metric_labels(labels, race_gsfa_page(local, primary))
-                .await
-                .unwrap();
+            let race =
+                crate::metrics::with_request_metric_labels(labels, race_gsfa_page(local, primary));
+            let answered = tokio::time::timeout(Duration::from_millis(50), race).await;
+            assert_eq!(answered.is_err(), result == "cancelled", "{case}");
             for counted in RESULTS {
                 assert_eq!(
                     crate::metrics::disk_cache_gsfa_race_count_for_tests(counted, &endpoint),
                     u64::from(counted == result),
-                    "{result} race counted as {counted}"
+                    "{case} race counted as {counted}"
                 );
             }
         }

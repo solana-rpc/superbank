@@ -3161,33 +3161,57 @@ pub(crate) fn disk_cache_tip_gap(operation: &'static str, outcome: &'static str)
         .inc();
 }
 
-/// One getSignaturesForAddress local/primary race, by `result`, with the request's labels.
+/// Counts one getSignaturesForAddress local/primary race by its result when dropped, with
+/// the request labels read at the start. A race dropped before its result is `cancelled`.
 #[cfg(feature = "disk-cache")]
-pub(crate) fn disk_cache_gsfa_race(result: &'static str) {
-    let request = current_request_metric_labels();
+pub(crate) struct GsfaRace {
+    result: &'static str,
+    request: RequestHeaderMetricLabels,
+}
+
+#[cfg(feature = "disk-cache")]
+impl GsfaRace {
+    pub(crate) fn start() -> Self {
+        Self {
+            result: "cancelled",
+            request: current_request_metric_labels(),
+        }
+    }
+
+    pub(crate) fn finish(&mut self, result: &'static str) {
+        self.result = result;
+    }
+}
+
+#[cfg(feature = "disk-cache")]
+impl Drop for GsfaRace {
+    fn drop(&mut self) {
+        let request = std::mem::replace(&mut self.request, RequestHeaderMetricLabels::disabled());
+        metrics()
+            .disk_cache_gsfa_race_total
+            .get_or_create(&GsfaRaceLabels {
+                result: self.result,
+                x_endpoint: request.x_endpoint,
+                x_rpc_node: request.x_rpc_node,
+                x_subscription_id: request.x_subscription_id,
+                x_account_id: request.x_account_id,
+            })
+            .inc();
+    }
+}
+
+#[cfg(all(test, feature = "disk-cache"))]
+pub(crate) fn disk_cache_gsfa_race_count_for_tests(result: &'static str, x_endpoint: &str) -> u64 {
     metrics()
         .disk_cache_gsfa_race_total
         .get_or_create(&GsfaRaceLabels {
             result,
-            x_endpoint: request.x_endpoint,
-            x_rpc_node: request.x_rpc_node,
-            x_subscription_id: request.x_subscription_id,
-            x_account_id: request.x_account_id,
+            x_endpoint: Some(x_endpoint.to_string()),
+            x_rpc_node: None,
+            x_subscription_id: None,
+            x_account_id: None,
         })
-        .inc();
-}
-
-#[cfg(all(test, feature = "disk-cache"))]
-pub(crate) fn disk_cache_gsfa_race_count_for_tests(result: &str, x_endpoint: &str) -> u64 {
-    let exported =
-        String::from_utf8(metrics().export().expect("metrics export")).expect("metrics are UTF-8");
-    let prefix = format!(
-        "superbank_disk_cache_gsfa_race_total{{result=\"{result}\",x_endpoint=\"{x_endpoint}\"}} "
-    );
-    exported
-        .lines()
-        .find_map(|line| line.strip_prefix(prefix.as_str()))
-        .map_or(0, |count| count.parse().expect("numeric count"))
+        .get()
 }
 
 #[cfg(feature = "disk-cache")]

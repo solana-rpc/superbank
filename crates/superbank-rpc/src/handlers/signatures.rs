@@ -677,25 +677,28 @@ pub(crate) async fn race_gsfa_page(
     let local = std::pin::pin!(local);
     // Poll the primary first so its request is sent before the local page's
     // synchronous candidate filtering runs.
+    let mut race = metrics::GsfaRace::start();
     match select(primary, local).await {
         Either::Left((Ok((records, timings)), _)) => {
-            metrics::disk_cache_gsfa_race("primary_first");
+            race.finish("primary_first");
             Ok((records, timings, None))
         }
-        Either::Left((Err(err), local)) => {
-            let page = local.await;
-            metrics::disk_cache_gsfa_race(local_race_result(page.as_ref()));
-            match page {
-                Some(page) if !page.reached_floor => Ok((
+        Either::Left((Err(err), local)) => match local.await {
+            Some(page) if !page.reached_floor => {
+                race.finish("local_served");
+                Ok((
                     Vec::new(),
                     crate::clickhouse::QueryTimings::zero(),
                     Some(page),
-                )),
-                _ => Err(err),
+                ))
             }
-        }
+            _ => {
+                race.finish("primary_error");
+                Err(err)
+            }
+        },
         Either::Right((Some(page), primary)) if !page.reached_floor => {
-            metrics::disk_cache_gsfa_race("local_served");
+            race.finish("local_served");
             let inherited_admission = crate::clickhouse::read_query::admission::current();
             tokio::spawn(crate::clickhouse::read_query::admission::scope_with(
                 inherited_admission,
@@ -710,21 +713,24 @@ pub(crate) async fn race_gsfa_page(
             ))
         }
         Either::Right((page, primary)) => {
-            metrics::disk_cache_gsfa_race(local_race_result(page.as_ref()));
-            primary
-                .await
-                .map(|(records, timings)| (records, timings, None))
+            let result = local_race_result(page.as_ref());
+            let primary = primary.await;
+            race.finish(if primary.is_ok() {
+                result
+            } else {
+                "primary_error"
+            });
+            primary.map(|(records, timings)| (records, timings, None))
         }
     }
 }
 
-/// The race result for a settled local page: complete, short at the coverage floor (with or
-/// without rows), or none (not ready, busy, timeout, probe budget, query error, tip gap).
+/// The race result for a local page that cannot answer alone: short at the coverage floor
+/// (with or without rows), or none (not ready, busy, timeout, probe budget, error, tip gap).
 #[cfg(feature = "disk-cache")]
 fn local_race_result(page: Option<&crate::disk_cache::DiskGsfaPage>) -> &'static str {
     match page {
         None => "local_unavailable",
-        Some(page) if !page.reached_floor => "local_served",
         Some(page) if page.records.is_empty() => "local_empty",
         Some(_) => "local_short",
     }

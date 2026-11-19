@@ -665,11 +665,12 @@ cursor is left to the source page query (`CLICKHOUSE_GSFA_INLINE_CURSOR`, below)
 local page cannot be bounded by a cursor it does not know.
 `superbank_disk_cache_gsfa_race_total` counts each race once by `result`: `local_served` (a
 complete local page answered), `primary_first` (the source page answered before the local page
-settled), or, when the local page settled first or after a source error, `local_empty` and
+settled), or, when the local page settled first and the source page answered, `local_empty` and
 `local_short` (the page reached the coverage floor with no rows, or with fewer than `limit` rows)
 and `local_unavailable` (no page: not ready, busy, timeout, probe budget, query error, or an
-unproven tip gap). With request label capture on (see Metrics), it also carries `x_endpoint` and
-the other request labels.
+unproven tip gap). `primary_error` counts a source error that no complete local page replaced, and
+`cancelled` a request dropped before its race ended. With request label capture on (see Metrics),
+it also carries `x_endpoint` and the other request labels.
 
 The local tip trails the source's finalized tip by the forwarder lag (at least
 `DISK_CACHE_REPAIR_MIN_LAG_SLOTS`), so a newest-first address page whose request window extends above
