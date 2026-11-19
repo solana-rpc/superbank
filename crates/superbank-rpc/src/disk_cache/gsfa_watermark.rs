@@ -18,9 +18,8 @@ use std::time::{Duration, Instant};
 
 use crate::solana_sdk::pubkey::Pubkey;
 
-/// Slots kept below the local contiguous tip when filling: a replica serving the primary page
-/// may lag the replica the filler copied from, and recent slots are the ones repairs touch.
-/// The local page reads `(W, tip]` anyway, so a lower `W` costs nothing but floor margin.
+/// Slots kept below the local contiguous tip when filling. It must exceed the primary replicas' lag
+/// and the repair window: the local page reads only `(W, tip]`, so a row at or below `W` is hidden.
 pub(crate) const GSFA_WATERMARK_TIP_MARGIN_SLOTS: u64 = 4_500;
 
 /// The watermark for an empty primary page read while the local contiguous tip was `local_tip`.
