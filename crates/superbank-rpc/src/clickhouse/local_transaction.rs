@@ -49,10 +49,8 @@ pub(crate) fn build_fused_transaction_query(
 }
 
 impl ClickHouseClient {
-    /// Resolve the newest indexed position in the candidate partitions of
-    /// `cache_slot_range` and read its payload under one admission. No row is not
-    /// absence: the caller must fall back to the separate position and payload reads,
-    /// which alone decide a miss.
+    /// Resolve the newest indexed position in the scoped partitions and read its payload
+    /// under one admission. No row is not absence: only the two-step read decides a miss.
     pub(crate) async fn get_transaction_fused(
         &self,
         signature: &Signature,
