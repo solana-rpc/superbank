@@ -168,6 +168,8 @@ async fn status_span_latency_benchmark() {
     // 88 partitions of 10 slots: a scaled-down retention window with many partitions.
     let mut cfg = config(url, format!("{database}_cache"));
     cfg.retain_slots = 880;
+    // A cold per-partition read of 256 signatures takes about 2 s; a timeout keeps only partial results.
+    cfg.query_timeout = Duration::from_secs(30);
     let cache = DiskCache::open(cfg, &source).await.unwrap();
     let cache_db = &cache.inner.cfg.database;
     execute(&client, &format!("INSERT INTO {cache_db}.transactions (signature,slot,slot_idx,tx_signatures,tx_account_keys,tx_num_required_signatures,meta_status_ok) SELECT toFixedString(concat('b-',toString(10 + intDiv(number,{rows_per_slot})),'-',toString(number % {rows_per_slot})),64),10 + intDiv(number,{rows_per_slot}),number % {rows_per_slot},[toFixedString(concat('b-',toString(10 + intDiv(number,{rows_per_slot})),'-',toString(number % {rows_per_slot})),64)],[toFixedString('address',32)],1,1 FROM numbers({}) SETTINGS max_partitions_per_insert_block=200", 880 * rows_per_slot)).await;
