@@ -250,6 +250,16 @@ async fn gsfa_empty_watermark_skips_the_primary_only_when_proven() {
     )
     .await
     .expect("rows above the watermark come from the local page");
+    // The local read stops at W: rows at or below it are not read, as the primary had none.
+    const MID: u64 = 59;
+    watermarks.insert(address("address"), MID, std::time::Instant::now());
+    let above = answers_without_primary(
+        with_head(proven_head(tip + 1, tip + 5)),
+        "address",
+        json!({"limit": 1000}),
+    )
+    .await
+    .expect("a page bounded at the watermark is proven by the head");
 
     // Not proven: every case below must reach the (blocked) primary.
     let cases: Vec<(&str, Arc<AppState>, Value)> = vec![
@@ -300,6 +310,11 @@ async fn gsfa_empty_watermark_skips_the_primary_only_when_proven() {
     .expect("primary reads drain");
     let expected = body_for(primary_only.clone(), "address", json!({"limit": 1000})).await;
     assert_eq!(local, expected);
+    let mut expected_above = expected.clone();
+    let rows = expected_above["result"].as_array_mut().unwrap();
+    rows.retain(|row| row["slot"].as_u64().unwrap() > MID);
+    assert!(!rows.is_empty() && rows.len() < expected["result"].as_array().unwrap().len());
+    assert_eq!(above, expected_above);
 
     // TTL: an expired entry is gone.
     let short = crate::disk_cache::gsfa_watermark::GsfaWatermarks::new(Duration::from_millis(1), 4);

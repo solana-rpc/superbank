@@ -854,10 +854,10 @@ fn watermark_provable(
     false
 }
 
-/// A no-cursor page for an address with an empty-address watermark: the local page serves
-/// when it is complete, or when it covers `(watermark, local tip]` and the head cache proves
-/// everything above the local tip. Otherwise the primary serves alone, since the local page is
-/// already known to be short.
+/// A no-cursor page for an address with an empty-address watermark. The local read stops at
+/// the watermark, as the primary held no row at or below it. The local page serves when it is
+/// full, or when it covers `(watermark, local tip]` and the head cache proves everything above
+/// the local tip. Otherwise the primary serves alone, since the local page is known to be short.
 #[cfg(all(feature = "grpc-head-cache", feature = "disk-cache"))]
 #[allow(clippy::too_many_arguments)]
 async fn watermark_gsfa_page(
@@ -878,17 +878,19 @@ async fn watermark_gsfa_page(
 )> {
     use crate::disk_cache::gsfa_watermark::local_page_reaches_watermark;
     let local = disk
-        .signatures_for_address_until(address_pubkey, None, None, limit as usize, deadline)
+        .signatures_for_address_until(
+            address_pubkey,
+            None,
+            Some(SlotBoundary::Slot(watermark)),
+            limit as usize,
+            deadline,
+        )
         .await;
+    // A page bounded by `until` never sets `reached_floor`, so its length decides.
     let outcome = match &local {
-        Some(page) if !page.reached_floor => "complete",
-        Some(page)
-            if local_page_reaches_watermark(page.floor, watermark)
-                && head_proves_above(cache, page.tip, commitment) =>
-        {
-            "hit"
-        }
+        Some(page) if page.records.len() >= limit as usize => "complete",
         Some(page) if !local_page_reaches_watermark(page.floor, watermark) => "floor_gap",
+        Some(page) if head_proves_above(cache, page.tip, commitment) => "hit",
         Some(_) => "head_unproven",
         None => "local_unavailable",
     };

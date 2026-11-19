@@ -691,7 +691,9 @@ cursor (`before`, `until`, `beforeSlot`, `untilSlot`) gets an empty source page 
 the address is recorded as having no source row at or below `W` = the local contiguous tip read
 before the source query, minus 4,500 slots (replica lag and recent repairs; the filler copied every
 slot up to that tip from the source). A later request of the same kind for that address, within the
-TTL, reads only the local page. It answers without the source when the local page is complete, or
+TTL, reads only the local page, and only its slots above `W`: the 4,500-slot margin plus the slots
+since the entry was written, not the whole retention window. It answers without the source when
+the local page is full (`limit` rows), or
 when it starts at or below `W + 1` and the head cache's chain proof (the one `getBlocks` uses)
 covers every slot from the local tip + 1 up to its tip for the request's commitment, and the head
 cache has not filled its per-address list for the address (a full list may have evicted older rows). These conditions are checked against
