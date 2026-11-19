@@ -8521,6 +8521,50 @@ mod gsfa_race {
             assert!(error.to_string().contains("primary down"), "{error}");
         }
     }
+
+    #[tokio::test]
+    async fn each_race_counts_one_result_with_the_request_labels() {
+        const RESULTS: [&str; 5] = [
+            "local_served",
+            "local_empty",
+            "local_short",
+            "local_unavailable",
+            "primary_first",
+        ];
+        for result in RESULTS {
+            let local: std::pin::Pin<Box<dyn Future<Output = Option<DiskGsfaPage>> + Send>> =
+                match result {
+                    "local_served" => Box::pin(std::future::ready(Some(page(&[99], false)))),
+                    "local_empty" => Box::pin(std::future::ready(Some(page(&[], true)))),
+                    "local_short" => Box::pin(std::future::ready(Some(page(&[99], true)))),
+                    "local_unavailable" => Box::pin(std::future::ready(None)),
+                    _ => Box::pin(std::future::pending()),
+                };
+            // The primary is polled first; only `primary_first` lets it answer at once.
+            let primary_first = result == "primary_first";
+            let primary = boxed(async move {
+                if !primary_first {
+                    tokio::task::yield_now().await;
+                }
+                primary_rows(&[7])
+            });
+            let endpoint = format!("race-test-{result}");
+            let labels = crate::metrics::RequestHeaderMetricLabels {
+                x_endpoint: Some(endpoint.clone()),
+                ..crate::metrics::RequestHeaderMetricLabels::disabled()
+            };
+            crate::metrics::with_request_metric_labels(labels, race_gsfa_page(local, primary))
+                .await
+                .unwrap();
+            for counted in RESULTS {
+                assert_eq!(
+                    crate::metrics::disk_cache_gsfa_race_count_for_tests(counted, &endpoint),
+                    u64::from(counted == result),
+                    "{result} race counted as {counted}"
+                );
+            }
+        }
+    }
 }
 
 fn test_state_with_primary_cache(clickhouse_url: &str, max_bytes: u64) -> Arc<AppState> {

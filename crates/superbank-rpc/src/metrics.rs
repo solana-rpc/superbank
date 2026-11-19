@@ -610,6 +610,30 @@ struct DiskCacheReadLabels {
 }
 
 #[cfg(feature = "disk-cache")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct GsfaRaceLabels {
+    result: &'static str,
+    x_endpoint: Option<String>,
+    x_rpc_node: Option<String>,
+    x_subscription_id: Option<String>,
+    x_account_id: Option<String>,
+}
+
+#[cfg(feature = "disk-cache")]
+impl EncodeLabelSetTrait for GsfaRaceLabels {
+    fn encode(&self, mut encoder: LabelSetEncoder<'_>) -> Result<(), fmt::Error> {
+        encode_required_label(&mut encoder, "result", self.result)?;
+        encode_request_header_labels(
+            &mut encoder,
+            self.x_endpoint.as_deref(),
+            self.x_rpc_node.as_deref(),
+            self.x_subscription_id.as_deref(),
+            self.x_account_id.as_deref(),
+        )
+    }
+}
+
+#[cfg(feature = "disk-cache")]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct DiskCacheReasonLabels {
     reason: String,
@@ -874,6 +898,8 @@ pub struct Metrics {
     #[cfg(feature = "disk-cache")]
     disk_cache_tip_gap_total: Family<DiskCacheReadLabels, Counter>,
     #[cfg(feature = "disk-cache")]
+    disk_cache_gsfa_race_total: Family<GsfaRaceLabels, Counter>,
+    #[cfg(feature = "disk-cache")]
     disk_cache_covered_min_slot: Gauge,
     #[cfg(feature = "disk-cache")]
     disk_cache_covered_max_slot: Gauge,
@@ -1091,6 +1117,8 @@ impl Metrics {
         let disk_cache_reads_total = Family::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_tip_gap_total = Family::default();
+        #[cfg(feature = "disk-cache")]
+        let disk_cache_gsfa_race_total = Family::default();
         #[cfg(feature = "disk-cache")]
         let disk_cache_covered_min_slot = Gauge::default();
         #[cfg(feature = "disk-cache")]
@@ -1664,6 +1692,11 @@ impl Metrics {
                 disk_cache_tip_gap_total.clone(),
             );
             registry.register(
+                "disk_cache_gsfa_race",
+                "getSignaturesForAddress races between the local page and the primary page, by result",
+                disk_cache_gsfa_race_total.clone(),
+            );
+            registry.register(
                 "disk_cache_covered_min_slot",
                 "Oldest slot covered by the disk cache",
                 disk_cache_covered_min_slot.clone(),
@@ -1952,6 +1985,8 @@ impl Metrics {
             disk_cache_reads_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_tip_gap_total,
+            #[cfg(feature = "disk-cache")]
+            disk_cache_gsfa_race_total,
             #[cfg(feature = "disk-cache")]
             disk_cache_covered_min_slot,
             #[cfg(feature = "disk-cache")]
@@ -3124,6 +3159,35 @@ pub(crate) fn disk_cache_tip_gap(operation: &'static str, outcome: &'static str)
             outcome: outcome.to_string(),
         })
         .inc();
+}
+
+/// One getSignaturesForAddress local/primary race, by `result`, with the request's labels.
+#[cfg(feature = "disk-cache")]
+pub(crate) fn disk_cache_gsfa_race(result: &'static str) {
+    let request = current_request_metric_labels();
+    metrics()
+        .disk_cache_gsfa_race_total
+        .get_or_create(&GsfaRaceLabels {
+            result,
+            x_endpoint: request.x_endpoint,
+            x_rpc_node: request.x_rpc_node,
+            x_subscription_id: request.x_subscription_id,
+            x_account_id: request.x_account_id,
+        })
+        .inc();
+}
+
+#[cfg(all(test, feature = "disk-cache"))]
+pub(crate) fn disk_cache_gsfa_race_count_for_tests(result: &str, x_endpoint: &str) -> u64 {
+    let exported =
+        String::from_utf8(metrics().export().expect("metrics export")).expect("metrics are UTF-8");
+    let prefix = format!(
+        "superbank_disk_cache_gsfa_race_total{{result=\"{result}\",x_endpoint=\"{x_endpoint}\"}} "
+    );
+    exported
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map_or(0, |count| count.parse().expect("numeric count"))
 }
 
 #[cfg(feature = "disk-cache")]
