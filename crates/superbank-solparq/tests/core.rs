@@ -26,9 +26,9 @@ fn hourly_plan_uses_prompt_filename_convention() {
     let plan = plan_next_archive(
         ArchiveKind::Hourly,
         ClickHouseBounds {
-            earliest_slot: 427_236_024,
-            latest_slot: 427_245_023,
-            distinct_slots: 9_000,
+            earliest_slot: 427_236_023,
+            latest_slot: 427_254_023,
+            distinct_slots: 18_000,
         },
         None,
         true,
@@ -40,8 +40,8 @@ fn hourly_plan_uses_prompt_filename_convention() {
     assert_eq!(plan.kind, ArchiveKind::Hourly);
     assert_eq!(plan.epoch, 988);
     assert_eq!(plan.start_slot, 427_236_024);
-    assert_eq!(plan.end_slot, 427_245_023);
-    assert_eq!(plan.file_name(), "hourly_988_427236024-427245023.parquet");
+    assert_eq!(plan.end_slot, 427_254_023);
+    assert_eq!(plan.file_name(), "hourly_988_427236024-427254023.parquet");
 }
 
 #[test]
@@ -95,9 +95,9 @@ fn plan_can_start_from_oldest_slot_when_continuation_is_disabled() {
     let plan = plan_next_archive(
         kind,
         ClickHouseBounds {
-            earliest_slot: 10_000,
+            earliest_slot: 9_999,
             latest_slot: 12_999,
-            distinct_slots: 3_000,
+            distinct_slots: 3_001,
         },
         Some("custom_0_10000-10999.parquet"),
         false,
@@ -144,7 +144,7 @@ fn custom_aligned_waits_until_full_window_available() {
     let plan = plan_next_archive(
         kind,
         ClickHouseBounds {
-            earliest_slot: 1_000,
+            earliest_slot: 999,
             latest_slot: 1_499,
             distinct_slots: 500,
         },
@@ -159,9 +159,9 @@ fn custom_aligned_waits_until_full_window_available() {
     let plan = plan_next_archive(
         kind,
         ClickHouseBounds {
-            earliest_slot: 1_000,
+            earliest_slot: 999,
             latest_slot: 2_050,
-            distinct_slots: 1_051,
+            distinct_slots: 1_052,
         },
         None,
         true,
@@ -1414,6 +1414,7 @@ fn dashboard_and_metrics_expose_clickhouse_disk_usage() {
                 path: "/var/lib/clickhouse/".to_string(),
                 free_bytes: 25 * 1024 * 1024 * 1024,
                 total_bytes: 100 * 1024 * 1024 * 1024,
+                data_bytes: 8 * 1024 * 1024 * 1024,
             }],
             ..Default::default()
         },
@@ -1421,7 +1422,11 @@ fn dashboard_and_metrics_expose_clickhouse_disk_usage() {
 
     let status = state.public_status();
     let html = render_dashboard(&config, &status);
-    assert!(html.contains("ClickHouse disk usage"));
+    assert!(html.contains("ClickHouse data on disk"));
+    assert!(
+        html.contains("8.0 GB (filesystem 75.0 GB / 100.0 GB used, 75%)"),
+        "{html}"
+    );
     assert!(html.contains("<code>default</code>"));
     assert!(html.contains("<code>/var/lib/clickhouse/</code>"));
     assert!(html.contains("75.0 GB"));
@@ -1438,6 +1443,9 @@ fn dashboard_and_metrics_expose_clickhouse_disk_usage() {
     ));
     assert!(text.contains(
         "solparq_disk_total_bytes{disk=\"default\",path=\"/var/lib/clickhouse/\"} 107374182400"
+    ));
+    assert!(text.contains(
+        "solparq_disk_data_bytes{disk=\"default\",path=\"/var/lib/clickhouse/\"} 8589934592"
     ));
 }
 
@@ -1637,7 +1645,7 @@ fn archive_report_document_is_json_with_producer_and_run_facts() {
     let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
 
     // Manifest-style build identity.
-    assert_eq!(value["report_version"], 1);
+    assert_eq!(value["report_version"], 2);
     assert_eq!(value["producer"]["name"], "superbank-solparq");
     assert!(value["producer"]["version"].is_string());
     assert!(value["producer"]["git_sha"].is_string());
@@ -2224,4 +2232,31 @@ fn metrics_expose_gap_backfill_outcome() {
     assert!(
         text.contains("solparq_gap_backfills_total{archive_kind=\"epoch\",outcome=\"partial\"} 1")
     );
+}
+
+#[test]
+fn first_window_starts_after_the_earliest_block() {
+    // The earliest block's parent was never ingested, so the PoH check could not link it.
+    let bounds = ClickHouseBounds {
+        earliest_slot: 1_000,
+        latest_slot: 5_000,
+        distinct_slots: 4_001,
+    };
+    let kind = ArchiveKind::Custom { slots: 1_000 };
+    let plan = plan_next_archive(kind, bounds, None, true, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.start_slot, plan.end_slot), (1_001, 2_000));
+
+    // Aligned: an earliest slot on a boundary moves the first window to the next boundary.
+    let plan = plan_next_archive(kind, bounds, None, true, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.start_slot, plan.end_slot), (2_000, 2_999));
+
+    // A previous archive that ends before the data restarts the same way.
+    let plan = plan_next_archive(kind, bounds, Some("custom_0_100-199.parquet"), true, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.start_slot, 1_001);
 }

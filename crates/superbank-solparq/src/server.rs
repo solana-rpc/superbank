@@ -604,7 +604,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
       <div class="metric"><div class="label">Archives created</div><div class="value">{archives_created}</div></div>
       <div class="metric"><div class="label">Last run</div><div class="value">{last_run}</div></div>
       <div class="metric"><div class="label">Last success</div><div class="value">{last_success}</div></div>
-      <div class="metric"><div class="label">ClickHouse disk usage</div><div class="value">{disk_summary}</div></div>
+      <div class="metric"><div class="label">ClickHouse data on disk</div><div class="value">{disk_summary}</div></div>
       <div class="metric"><div class="label">DB table sizes (total)</div><div class="value">{table_size_summary}</div></div>
     </div>
 
@@ -633,7 +633,7 @@ pub fn render_dashboard(config: &Config, status: &PublicStatus) -> String {
       </section>
     </div>
     <section class="disks">
-      <h2>ClickHouse disk usage</h2>
+      <h2>ClickHouse disks</h2>
       {disk_rows}
     </section>
     <section class="disks">
@@ -693,11 +693,13 @@ fn render_disk_summary(disks: &[DiskUsage]) -> String {
     if disks.is_empty() {
         return "unknown".to_string();
     }
+    let data: u64 = disks.iter().map(|disk| disk.data_bytes).sum();
     let total: u64 = disks.iter().map(|disk| disk.total_bytes).sum();
     let used: u64 = disks.iter().map(DiskUsage::used_bytes).sum();
     let percent = usage_percent(used, total);
     format!(
-        "{} / {} ({percent:.0}%)",
+        "{} (filesystem {} / {} used, {percent:.0}%)",
+        format_bytes(data),
         format_bytes(used),
         format_bytes(total)
     )
@@ -720,10 +722,11 @@ fn render_disk_usage(disks: &[DiskUsage]) -> String {
                 ""
             };
             format!(
-                "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td>\
+                "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
                  <td><span class=\"bar\"><span class=\"bar-fill {bar_class}\" style=\"width:{:.0}%\"></span></span> {percent:.1}%</td></tr>",
                 html_escape(&disk.name),
                 html_escape(&disk.path),
+                format_bytes(disk.data_bytes),
                 format_bytes(used),
                 format_bytes(disk.free_bytes),
                 format_bytes(disk.total_bytes),
@@ -732,7 +735,8 @@ fn render_disk_usage(disks: &[DiskUsage]) -> String {
         })
         .collect::<String>();
     format!(
-        "<table><thead><tr><th>Disk</th><th>Path</th><th>Used</th><th>Free</th><th>Total</th><th>Usage</th></tr></thead><tbody>{rows}</tbody></table>"
+        "<p>ClickHouse data counts every table, system tables included. The filesystem columns count every workload that shares the filesystem.</p>\
+         <table><thead><tr><th>Disk</th><th>Path</th><th>ClickHouse data</th><th>Filesystem used</th><th>Free</th><th>Total</th><th>Filesystem usage</th></tr></thead><tbody>{rows}</tbody></table>"
     )
 }
 

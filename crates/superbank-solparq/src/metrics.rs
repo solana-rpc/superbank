@@ -153,6 +153,12 @@ enum ValidationCategory {
     NotProduced,
     /// Block transaction count does not match the archived transaction rows.
     TransactionMismatch,
+    /// Alpenglow block stored without a complete footer.
+    FooterMissing,
+    /// superbank-verify found a PoH, tick or chain-linkage failure.
+    PohFailed,
+    /// superbank-verify could not check the slot (no entries rows, chain gap).
+    PohUnverifiable,
 }
 
 impl ValidationCategory {
@@ -161,6 +167,9 @@ impl ValidationCategory {
             ValidationCategory::MissingBlock => "missing_block",
             ValidationCategory::NotProduced => "not_produced",
             ValidationCategory::TransactionMismatch => "transaction_mismatch",
+            ValidationCategory::FooterMissing => "footer_missing",
+            ValidationCategory::PohFailed => "poh_failed",
+            ValidationCategory::PohUnverifiable => "poh_unverifiable",
         }
     }
 }
@@ -278,6 +287,7 @@ struct Metrics {
     disk_free_bytes: Family<DiskLabels, Gauge>,
     disk_used_bytes: Family<DiskLabels, Gauge>,
     disk_total_bytes: Family<DiskLabels, Gauge>,
+    disk_data_bytes: Family<DiskLabels, Gauge>,
     db_table_bytes: Family<DbTableLabels, Gauge>,
     db_table_rows: Family<DbTableLabels, Gauge>,
     // Counters.
@@ -339,6 +349,7 @@ impl Metrics {
         let disk_free_bytes = Family::<DiskLabels, Gauge>::default();
         let disk_used_bytes = Family::<DiskLabels, Gauge>::default();
         let disk_total_bytes = Family::<DiskLabels, Gauge>::default();
+        let disk_data_bytes = Family::<DiskLabels, Gauge>::default();
         let db_table_bytes = Family::<DbTableLabels, Gauge>::default();
         let db_table_rows = Family::<DbTableLabels, Gauge>::default();
         let archives_created_total = Family::<KindLabels, Counter>::default();
@@ -502,6 +513,11 @@ impl Metrics {
             disk_total_bytes.clone(),
         );
         registry.register(
+            "disk_data_bytes",
+            "Bytes of active parts of every ClickHouse table on a disk, from system.parts",
+            disk_data_bytes.clone(),
+        );
+        registry.register(
             "db_table_bytes",
             "Disk bytes used by a ClickHouse source table, from system.tables, by table_kind and table",
             db_table_bytes.clone(),
@@ -603,6 +619,7 @@ impl Metrics {
             disk_free_bytes,
             disk_used_bytes,
             disk_total_bytes,
+            disk_data_bytes,
             db_table_bytes,
             db_table_rows,
             archives_created_total,
@@ -647,6 +664,9 @@ impl Metrics {
             self.disk_total_bytes
                 .get_or_create(&labels)
                 .set(clamp_i64(disk.total_bytes));
+            self.disk_data_bytes
+                .get_or_create(&labels)
+                .set(clamp_i64(disk.data_bytes));
         }
     }
 
@@ -1026,6 +1046,26 @@ impl AppState {
                 validation.transaction_mismatches.len() as u64,
                 validation.transaction_mismatch_ranges.len() as u64,
             );
+            self.observe_validation_category(
+                kind_label,
+                ValidationCategory::FooterMissing,
+                validation.footer_missing_slots(),
+                validation.footer_missing_ranges.len() as u64,
+            );
+            if let Some(poh) = &validation.poh {
+                self.observe_validation_category(
+                    kind_label,
+                    ValidationCategory::PohFailed,
+                    poh.slots_failed,
+                    poh.failed_ranges.len() as u64,
+                );
+                self.observe_validation_category(
+                    kind_label,
+                    ValidationCategory::PohUnverifiable,
+                    poh.slots_unverifiable + poh.slots_missing,
+                    (poh.unverifiable_ranges.len() + poh.missing_ranges.len()) as u64,
+                );
+            }
             // Split mismatches by direction: undercount needs re-ingestion,
             // overcount is dedup-fixable.
             let undercount_slots: u64 = validation
@@ -1279,6 +1319,14 @@ fn classify_skip_reason(report: &ArchiveRunReport) -> Option<String> {
         return Some("user-declined".to_string());
     }
     if reason.contains("validation warnings") {
+        if report
+            .validation
+            .as_ref()
+            .and_then(|validation| validation.poh.as_ref())
+            .is_some_and(|poh| poh.blocks_archive())
+        {
+            return Some("poh-verification".to_string());
+        }
         if report
             .validation
             .as_ref()

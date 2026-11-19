@@ -8,8 +8,9 @@ pub struct ParsedArchiveName {
     pub end_slot: u64,
 }
 
+/// Parses a legacy `<id>.parquet` file name or a bundle directory name `<id>`.
 pub fn parse_archive_name(file_name: &str) -> Option<ParsedArchiveName> {
-    let stem = file_name.strip_suffix(".parquet")?;
+    let stem = file_name.strip_suffix(".parquet").unwrap_or(file_name);
     let mut parts = stem.split('_');
     let kind_label = parts.next()?.to_string();
     let epoch = parts.next()?.parse().ok()?;
