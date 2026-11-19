@@ -222,18 +222,15 @@ fn error_outcome(err: &ProcessingError) -> &'static str {
 const STATUS_SPAN_MAX_LOOKUPS: usize = 1024;
 const STATUS_SPAN_MAX_OVERREAD: usize = 4;
 
-/// Oldest and newest candidate partitions and the distinct signatures for one status
-/// query over their span, or `None` when that query would read far more than
-/// per-partition queries.
-fn status_span(by_partition: &BTreeMap<u64, Vec<String>>) -> Option<(u64, u64, Vec<String>)> {
-    let (&oldest, _) = by_partition.first_key_value()?;
+/// The newest candidate partition and the distinct signatures for one status query over
+/// every candidate partition, or `None` when it would read far more than per-partition queries.
+fn status_span(by_partition: &BTreeMap<u64, Vec<String>>) -> Option<(u64, Vec<String>)> {
     let (&newest, _) = by_partition.last_key_value()?;
     let pairs: usize = by_partition.values().map(Vec::len).sum();
     let pending: BTreeSet<&String> = by_partition.values().flatten().collect();
-    let span = usize::try_from(newest - oldest).map_or(usize::MAX, |d| d.saturating_add(1));
-    let lookups = pending.len().saturating_mul(span);
+    let lookups = pending.len().saturating_mul(by_partition.len());
     (lookups <= STATUS_SPAN_MAX_LOOKUPS.max(pairs.saturating_mul(STATUS_SPAN_MAX_OVERREAD)))
-        .then(|| (oldest, newest, pending.into_iter().cloned().collect()))
+        .then(|| (newest, pending.into_iter().cloned().collect()))
 }
 
 /// A signature the read never matched (a Bloom negative or a query miss) is absent
@@ -337,15 +334,6 @@ enum FusedRead {
 /// known. With one candidate the span lookup is that probe, so it is not repeated.
 fn span_check_first(fused: &FusedRead, candidate_partitions: usize) -> bool {
     matches!(fused, FusedRead::Empty) && candidate_partitions > 1
-}
-fn partition_slot_span(width: u64, newest: u64, oldest: u64) -> (u64, u64) {
-    (
-        oldest.saturating_mul(width),
-        newest
-            .saturating_add(1)
-            .saturating_mul(width)
-            .saturating_sub(1),
-    )
 }
 /// Returns the served value, the `get_tx` outcome label and the `get_tx_reason` label.
 fn transaction_outcome(
@@ -514,12 +502,6 @@ impl DiskCache {
             }
         }
         Ok((partitions, None))
-    }
-    /// Inclusive slot bounds from the oldest to the newest candidate partition. One
-    /// range keeps primary-key analysis on binary search; partitions skipped inside it
-    /// are definite index negatives, so callers must not treat their rows as candidates.
-    fn partition_slot_span(&self, newest: u64, oldest: u64) -> (u64, u64) {
-        partition_slot_span(self.inner.cfg.partition_slots, newest, oldest)
     }
     pub(super) fn key_span(&self) -> Option<(u64, u64)> {
         self.inner
@@ -766,9 +748,7 @@ impl DiskCache {
         signature: &Signature,
         read: &Read,
     ) -> ProcessingResult<FusedRead> {
-        let (Some(&newest), Some(&oldest)) =
-            (candidates.partitions.first(), candidates.partitions.last())
-        else {
+        let Some(&newest) = candidates.partitions.first() else {
             return Ok(FusedRead::NotRun);
         };
         // Same admission checks as the per-partition loop; a probe budget it would
@@ -790,19 +770,12 @@ impl DiskCache {
             candidates.partitions.len() as u64,
         );
         let mut client = self.scoped_client(&self.query_client(), newest, read);
-        client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+        client.set_cache_partitions(&candidates.partitions);
         let (record, _) = client.get_transaction_fused(signature).await?;
-        // The newest position may sit in a skipped partition inside the range, or
-        // outside coverage, where the loop would instead stop or look elsewhere.
-        let width = self.inner.cfg.partition_slots;
+        // The newest position may sit outside coverage, where the loop would stop.
         Ok(match record {
             None => FusedRead::Empty,
-            Some(record)
-                if self.covers_slot(record.slot)
-                    && candidates.partitions.contains(&(record.slot / width)) =>
-            {
-                FusedRead::Row(Box::new(record))
-            }
+            Some(record) if self.covers_slot(record.slot) => FusedRead::Row(Box::new(record)),
             Some(_) => FusedRead::Rejected,
         })
     }
@@ -854,15 +827,13 @@ impl DiskCache {
         signature: &Signature,
         read: &Read,
     ) -> ProcessingResult<bool> {
-        let (Some(&newest), Some(&oldest)) =
-            (candidates.partitions.first(), candidates.partitions.last())
-        else {
+        let Some(&newest) = candidates.partitions.first() else {
             // No span to ask: leave the verdict to the probes.
             return Ok(true);
         };
         read.check()?;
         let mut client = self.scoped_client(&self.query_client(), newest, read);
-        client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+        client.set_cache_partitions(&candidates.partitions);
         let (position, _) = client.get_signature_slot(&signature.to_string()).await?;
         Ok(position.is_some())
     }
@@ -1011,11 +982,9 @@ impl DiskCache {
             return Ok(());
         };
         let by_partition = self.status_candidates(floor, tip, signatures, encoded);
-        // One query over the candidates' slot span: one admission and one round trip
-        // instead of one per partition (an unknown partition is a candidate for every
-        // signature). Partitions skipped inside the span are definite index negatives,
-        // and argMax over the span selects the newest row, as the newest-first loop did.
-        if single_query && let Some((oldest, newest, pending)) = status_span(&by_partition) {
+        // One query and one admission over the candidate partitions, not one per partition.
+        // argMax selects the newest row; an unknown partition is a candidate for every signature.
+        if single_query && let Some((newest, pending)) = status_span(&by_partition) {
             read.check()?;
             crate::metrics::disk_cache_read_count(
                 "key_partition",
@@ -1023,7 +992,7 @@ impl DiskCache {
                 by_partition.values().map(|p| p.len() as u64).sum(),
             );
             let mut client = self.scoped_client(&self.query_client(), newest, read);
-            client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+            client.set_cache_partitions(&by_partition.keys().copied().collect::<Vec<_>>());
             let (records, _) = client.get_signature_statuses(&pending).await?;
             self.record_statuses(records, found);
             return Ok(());
@@ -1112,17 +1081,13 @@ impl DiskCache {
                 "signatures_for_address",
                 partitions.len(),
             );
-            // One query over every candidate: one admission and one round trip, so a
-            // short (partial) page is denied as quickly as a full page is served. It
-            // spans one slot range from the oldest to the newest candidate: partitions
-            // inside it that were skipped are definite index negatives with no rows for
-            // this address, and a range keeps primary-key analysis on binary search.
-            // The query orders by slot, so this equals the former newest-first loop.
-            let records = match (partitions.first(), partitions.last()) {
-                (None, _) | (_, None) => Vec::new(),
-                (Some(&newest), Some(&oldest)) => {
+            // One query and one admission over every candidate partition, so a short page
+            // is denied as quickly as a full page is served.
+            let records = match partitions.first() {
+                None => Vec::new(),
+                Some(&newest) => {
                     let mut client = self.scoped_client(&base, newest, &read);
-                    client.cache_slot_range = Some(self.partition_slot_span(newest, oldest));
+                    client.set_cache_partitions(&partitions);
                     client
                         .get_signatures_for_address_with_positions(
                             &address.to_string(),
@@ -1482,25 +1447,6 @@ mod window_tests {
     }
 
     #[test]
-    fn span_contains_every_candidate_partition_probe() {
-        // A per-partition probe reads `intDiv(slot, width) = p`; the span check is
-        // only equivalent if each candidate's whole slot range lies inside the span.
-        for width in [1u64, 10, 43_200] {
-            for (newest, oldest) in [(0u64, 0u64), (4, 1), (87, 0), (1_000_000, 3)] {
-                let (low, high) = partition_slot_span(width, newest, oldest);
-                for p in [oldest, oldest + (newest - oldest) / 2, newest] {
-                    let first = p * width;
-                    let last = first + (width - 1);
-                    assert!(
-                        low <= first && last <= high,
-                        "{width} {p} in {low}..={high}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn get_tx_budget_is_capped_by_the_shared_read_timeout() {
         use std::time::Duration;
         let mut cfg = super::super::key_tests::config(String::new(), String::new());
@@ -1748,14 +1694,14 @@ mod window_tests {
         // One signature over every partition, and a duplicate signature queried once.
         let mut map: BTreeMap<u64, Vec<String>> = (0..90).map(|p| (p, sigs(1))).collect();
         map.get_mut(&89).unwrap().push("s0".into());
-        assert_eq!(status_span(&map), Some((0, 89, sigs(1))));
-        // Sparse, known partitions: within the absolute lookup cap, then beyond it.
+        assert_eq!(status_span(&map), Some((89, sigs(1))));
+        // Known partitions: the cost counts candidate partitions, not the slot span.
         let small = known(&[(10, 4), (41, 4)]);
-        assert_eq!(status_span(&small).unwrap().2.len(), 8);
-        assert!(status_span(&known(&[(10, 128), (14, 128)])).is_none());
-        assert!(status_span(&known(&[(10, 128), (11, 128)])).is_some());
-        // Unknown partitions list every signature: 256 signatures over 23 unknown of
-        // 88 partitions stay one query, 11 unknown fall back.
+        assert_eq!(status_span(&small).unwrap().1.len(), 8);
+        assert!(status_span(&known(&[(10, 128), (40, 128)])).is_some());
+        assert!(status_span(&known(&[(10, 256), (11, 256), (12, 256), (13, 256)])).is_some());
+        assert!(status_span(&known(&[(10, 64), (20, 64), (30, 64), (40, 64), (50, 64)])).is_none());
+        // Unknown partitions list every signature, so one query reads no more than the loop.
         let unknown = |count: u64| -> BTreeMap<u64, Vec<String>> {
             (0..88)
                 .filter(|p| p % (88 / count).max(1) == 0)
@@ -1766,6 +1712,6 @@ mod window_tests {
         };
         assert!(status_span(&unknown(58)).is_some());
         assert!(status_span(&unknown(23)).is_some());
-        assert!(status_span(&unknown(11)).is_none());
+        assert!(status_span(&unknown(11)).is_some());
     }
 }

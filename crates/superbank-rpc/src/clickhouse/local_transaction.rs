@@ -11,7 +11,7 @@ use crate::processing::{ProcessingError, ProcessingResult};
 use crate::solana_sdk::signature::Signature;
 
 use super::QueryFreshnessClass;
-use super::client::ClickHouseClient;
+use super::client::{ClickHouseClient, partition_id_filter};
 use super::queries::TRANSACTION_SELECT_COLUMNS;
 use super::rows::{fetch_single_transaction_row, map_transaction_row};
 use super::types::{QueryTimings, StoredTransactionRecord};
@@ -26,18 +26,20 @@ pub(crate) fn build_fused_transaction_query(
     sig_bucket: u64,
     signature_literal: &str,
     (low, high): (u64, u64),
+    partitions: &[u64],
     settings_clause: &str,
 ) -> String {
+    let partitions = partition_id_filter(partitions);
     format!(
         "SELECT
             {columns}
          FROM {transaction_table}
-         PREWHERE slot BETWEEN {low} AND {high} AND signature = {signature_literal}
+         PREWHERE slot BETWEEN {low} AND {high}{partitions} AND signature = {signature_literal}
              AND (slot, slot_idx) IN (
                  SELECT slot, slot_idx
                  FROM {signature_statuses_table}
                  PREWHERE sig_bucket = {sig_bucket} AND signature = {signature_literal}
-                     AND slot BETWEEN {low} AND {high}
+                     AND slot BETWEEN {low} AND {high}{partitions}
                  ORDER BY slot DESC, slot_idx DESC, signature
                  LIMIT 1)
          LIMIT 1
@@ -47,9 +49,8 @@ pub(crate) fn build_fused_transaction_query(
 }
 
 impl ClickHouseClient {
-    /// Resolve the newest indexed position within `cache_slot_range` and read its
-    /// payload under one admission. No row is not absence: the caller must fall back
-    /// to the separate position and payload reads, which alone decide a miss.
+    /// Resolve the newest indexed position in the scoped partitions and read its payload
+    /// under one admission. No row is not absence: only the two-step read decides a miss.
     pub(crate) async fn get_transaction_fused(
         &self,
         signature: &Signature,
@@ -76,6 +77,7 @@ impl ClickHouseClient {
                 sig_bucket,
                 &literal,
                 range,
+                &self.cache_slot_partitions,
                 &settings_clause,
             );
             let (row, timings) =
@@ -102,15 +104,18 @@ mod tests {
             7,
             "toFixedString(unhex('AB'), 64)",
             (20, 79),
+            &[7, 2],
             "SETTINGS max_execution_time=1",
         ));
         assert!(query.contains(
             "FROM cache.transactions PREWHERE slot BETWEEN 20 AND 79 \
+             AND _partition_id IN ('7', '2') \
              AND signature = toFixedString(unhex('AB'), 64) AND (slot, slot_idx) IN ("
         ));
         assert!(query.contains(
             "SELECT slot, slot_idx FROM cache.signatures PREWHERE sig_bucket = 7 \
              AND signature = toFixedString(unhex('AB'), 64) AND slot BETWEEN 20 AND 79 \
+             AND _partition_id IN ('7', '2') \
              ORDER BY slot DESC, slot_idx DESC, signature LIMIT 1)"
         ));
         assert!(query.ends_with("LIMIT 1) LIMIT 1 SETTINGS max_execution_time=1"));

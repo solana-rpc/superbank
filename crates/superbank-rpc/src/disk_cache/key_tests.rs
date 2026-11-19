@@ -995,6 +995,7 @@ async fn assert_fused_transaction(client: &clickhouse::Client, cache: &DiskCache
         bucket,
         &literal,
         (10, 49),
+        &[4, 1],
         "",
     );
     // The IN set drives payload primary-key analysis; the position lookup is keyed.
@@ -1004,7 +1005,7 @@ async fn assert_fused_transaction(client: &clickhouse::Client, cache: &DiskCache
         "{outer}"
     );
     assert!(outer.contains("Search Algorithm: binary search"), "{outer}");
-    let (_, inner) = query.split_once("IN (").unwrap();
+    let (_, inner) = query.split_once("(slot, slot_idx) IN (").unwrap();
     let (inner, _) = inner.rsplit_once(')').unwrap();
     let inner = explain(client, inner).await;
     assert!(
@@ -1012,6 +1013,13 @@ async fn assert_fused_transaction(client: &clickhouse::Client, cache: &DiskCache
         "{inner}"
     );
     assert!(inner.contains("Search Algorithm: binary search"), "{inner}");
+    // Partitions 1 to 4 hold one part each; only the candidates' parts reach the
+    // first index step (min-max).
+    for (plan, parts) in [(&outer, "1/2 "), (&inner, "2/2 ")] {
+        let (_, indexes) = plan.split_once("Indexes:").unwrap();
+        let (_, selected) = indexes.split_once("Parts: ").unwrap();
+        assert!(selected.starts_with(parts), "{plan}");
+    }
 
     // A hit is one local query.
     let (found, selects) = local_selects(client, cache.get_tx(signature(25), None)).await;
@@ -1027,13 +1035,13 @@ async fn assert_fused_transaction(client: &clickhouse::Client, cache: &DiskCache
     execute(client, &format!("ALTER TABLE {database}.signatures DELETE WHERE slot_idx = 99 SETTINGS mutations_sync = 2")).await;
 
     // The newest row sits in a skipped partition inside the span: the per-partition
-    // search never reads it, so neither may the fused read.
+    // search never reads it, and the partition filter keeps the fused read out too.
     execute(client, &format!("INSERT INTO {database}.transactions (signature,slot,slot_idx,tx_signatures) VALUES (toFixedString('sig-15',64),35,5,[toFixedString('sig-15',64)])")).await;
     assert!(!signature_candidate(cache, 3, signature(15)));
     let repair = cache.begin_fill(45, 45);
     let (found, selects) = local_selects(client, cache.get_tx(signature(15), None)).await;
     assert_eq!(found_transaction(found).slot, 15);
-    assert!(selects > 1, "rejected fused row must fall back");
+    assert_eq!(selects, 1, "the fused read answers from the candidates");
     drop(repair);
     for table in ["transactions", "signatures"] {
         execute(client, &format!("ALTER TABLE {database}.{table} DELETE WHERE slot = 35 AND slot_idx = 5 SETTINGS mutations_sync = 2")).await;

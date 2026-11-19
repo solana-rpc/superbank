@@ -49,6 +49,32 @@ const SHARD_TCP_TIMEOUT_RESERVE_MAX_MS: u128 = 5_000;
 const SHARD_TCP_TIMEOUT_RESERVE_DIVISOR: u128 = 4;
 const SHARD_TCP_TIMEOUT_MIN_MS: u128 = 1;
 
+#[cfg(any(test, feature = "disk-cache"))]
+/// Inclusive slot bounds from partition `oldest` to partition `newest` at `width` slots each.
+pub(crate) fn partition_slot_span(width: u64, newest: u64, oldest: u64) -> (u64, u64) {
+    (
+        oldest.saturating_mul(width),
+        newest
+            .saturating_add(1)
+            .saturating_mul(width)
+            .saturating_sub(1),
+    )
+}
+
+/// ` AND _partition_id IN (...)` for local-cache partitions, or nothing when empty. A
+/// local table's `PARTITION BY intDiv(slot, width)` names each partition by its number.
+pub(crate) fn partition_id_filter(partitions: &[u64]) -> String {
+    if partitions.is_empty() {
+        return String::new();
+    }
+    let ids = partitions
+        .iter()
+        .map(|partition| format!("'{partition}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND _partition_id IN ({ids})")
+}
+
 pub(crate) fn shard_tcp_query_timeout_for(query_timeout: Duration) -> Duration {
     let timeout_ms = query_timeout.as_millis();
     if timeout_ms <= SHARD_TCP_TIMEOUT_MIN_MS {
@@ -326,6 +352,9 @@ pub struct ClickHouseClient {
     /// `cache_slot_predicate` filters on this range instead of one partition;
     /// `cache_partition` still marks the client as a local-cache client.
     pub(crate) cache_slot_range: Option<(u64, u64)>,
+    /// Local-cache reads only: the partitions inside `cache_slot_range` to open, or empty
+    /// to open the whole range. [`Self::set_cache_partitions`] sets both.
+    pub(crate) cache_slot_partitions: Vec<u64>,
     /// Local-cache reads only: the longest wait for HTTP admission before failing with
     /// [`CacheAdmissionBusy`], so a saturated cache denies quickly instead of spending
     /// the caller's budget in the queue.
@@ -823,6 +852,7 @@ impl ClickHouseClient {
             signature_slot_cache: Arc::new(SignatureSlotCache::from_env()),
             cache_partition: None,
             cache_slot_range: None,
+            cache_slot_partitions: Vec::new(),
             cache_admission_wait: None,
             get_transaction_single_round_trip: false,
             latest_slot_hint: true,
@@ -1147,14 +1177,39 @@ impl ClickHouseClient {
         }
     }
 
+    #[cfg(any(test, feature = "disk-cache"))]
+    /// Scopes a local-cache client to `partitions`: one slot range over them, plus a
+    /// partition filter unless they fill that range.
+    pub(crate) fn set_cache_partitions(&mut self, partitions: &[u64]) {
+        self.cache_slot_range = None;
+        self.cache_slot_partitions = Vec::new();
+        let (Some((width, _)), Some(&oldest), Some(&newest)) = (
+            self.cache_partition,
+            partitions.iter().min(),
+            partitions.iter().max(),
+        ) else {
+            return;
+        };
+        self.cache_slot_range = Some(partition_slot_span(width, newest, oldest));
+        let mut distinct = partitions.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if (distinct.len() as u64) <= newest - oldest {
+            self.cache_slot_partitions = distinct;
+        }
+    }
+
     pub(crate) fn cache_slot_predicate(&self) -> String {
         let Some((width, partition)) = self.cache_partition else {
             return String::new();
         };
-        // A plain slot range keeps primary-key analysis on binary search; an
-        // `intDiv(slot, w) IN (...)` set forces a scan of every candidate part's index.
+        // `_partition_id` drops the other parts before index analysis. The slot range keeps
+        // primary-key analysis on binary search; an `intDiv(slot, w) IN (...)` set does not.
         match self.cache_slot_range {
-            Some((low, high)) => format!(" AND slot BETWEEN {low} AND {high}"),
+            Some((low, high)) => format!(
+                " AND slot BETWEEN {low} AND {high}{}",
+                partition_id_filter(&self.cache_slot_partitions)
+            ),
             None => format!(" AND intDiv(slot, {width}) = {partition}"),
         }
     }
@@ -2612,8 +2667,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
-        ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, probe_replica,
-        shard_tcp_query_timeout_for, split_table_reference, validate_gsfa_shard_layout_query,
+        ClickHouseClient, ClickHouseClientOptions, InflationRewardQueryLimits, partition_slot_span,
+        probe_replica, shard_tcp_query_timeout_for, split_table_reference,
+        validate_gsfa_shard_layout_query,
     };
     use crate::clickhouse::{
         QueryCacheConfig, QueryFreshnessClass, RoutingPolicy, RoutingScope, RoutingTransport,
@@ -2848,6 +2904,25 @@ mod tests {
     }
 
     #[test]
+    fn span_contains_every_candidate_partition_probe() {
+        // A per-partition probe reads `intDiv(slot, width) = p`; the span check is
+        // only equivalent if each candidate's whole slot range lies inside the span.
+        for width in [1u64, 10, 43_200] {
+            for (newest, oldest) in [(0u64, 0u64), (4, 1), (87, 0), (1_000_000, 3)] {
+                let (low, high) = partition_slot_span(width, newest, oldest);
+                for p in [oldest, oldest + (newest - oldest) / 2, newest] {
+                    let first = p * width;
+                    let last = first + (width - 1);
+                    assert!(
+                        low <= first && last <= high,
+                        "{width} {p} in {low}..={high}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cache_slot_predicate_uses_range_when_set() {
         let mut client = test_client_with_hot_addresses(Vec::new());
         assert_eq!(client.cache_slot_predicate(), "");
@@ -2855,6 +2930,16 @@ mod tests {
         assert_eq!(client.cache_slot_predicate(), " AND intDiv(slot, 10) = 7");
         client.cache_slot_range = Some((20, 79));
         assert_eq!(client.cache_slot_predicate(), " AND slot BETWEEN 20 AND 79");
+        client.set_cache_partitions(&[7, 2, 7]);
+        assert_eq!(
+            client.cache_slot_predicate(),
+            " AND slot BETWEEN 20 AND 79 AND _partition_id IN ('2', '7')"
+        );
+        // Partitions that fill the range need no partition filter.
+        client.set_cache_partitions(&[4, 2, 3]);
+        assert_eq!(client.cache_slot_predicate(), " AND slot BETWEEN 20 AND 49");
+        client.set_cache_partitions(&[]);
+        assert_eq!(client.cache_slot_predicate(), " AND intDiv(slot, 10) = 7");
     }
 
     #[tokio::test]
