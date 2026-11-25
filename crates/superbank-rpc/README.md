@@ -662,12 +662,12 @@ Signature and address reads use an in-process Bloom membership index to exclude 
 partitions before querying ClickHouse. This preserves whole-partition eviction without making
 key lookups search every retained partition. Signature status batches, pagination-bound signature
 lookups, regular/hot address history, and token-owner history use the same routing mechanism.
-`getSignaturesForAddress` reads every candidate partition in one local query over a single slot
-range from the oldest to the newest candidate, so a full page and a partial page that falls
-through to the source each cost one admission and one round trip. Skipped partitions inside the
-range are definite index negatives; a range, unlike an `intDiv(slot, width) IN (...)` set, keeps
-primary-key analysis on binary search. The local page runs concurrently with the source query for
-the request's own bounds and limit. A complete local page (full, or bounded by an `until` inside the
+`getSignaturesForAddress` reads every candidate partition in one local query, so a full page and
+a partial page that falls through to the source each cost one admission and one round trip. The
+query filters on one slot range from the oldest to the newest candidate and, unless the candidates
+fill that range, on `_partition_id IN (...)` with them. ClickHouse then opens only the candidates'
+parts, and the range, unlike an `intDiv(slot, width) IN (...)` set, keeps primary-key analysis on
+binary search. The local page runs concurrently with the source query for the request's own bounds and limit. A complete local page (full, or bounded by an `until` inside the
 covered span) answers if it arrives first, and the source read is left to finish and is discarded,
 because cancelling a source read holds its admission until termination is verified. Otherwise the
 source page answers alone and a pending local read is cancelled. If the source fails, the request
@@ -719,7 +719,7 @@ are counted in `superbank_disk_cache_reads_total{operation="gsfa_empty_watermark
 uses it, because nothing proves the slots above the local tip.
 
 `getSignatureStatuses` batches read their candidate
-partitions the same way, in one query over the candidates' slot range, while that range costs at
+partitions the same way, in one query over the candidate partitions, while it costs at
 most 1,024 signature-partition lookups or four times the lookups of per-partition queries (after a
 restart, unknown partitions make every signature a candidate); larger sparse batches query
 candidate partitions newest first. Local tables merge each partition to one part once it has
@@ -835,10 +835,10 @@ errors, invalidation, and slots first covered during the lookup fall back to the
 An index entry whose payload is unavailable also falls back. Cache format and retention
 are unchanged.
 
-A Bloom-positive `getTransaction` first runs one local query over the slot span of its
-candidate partitions: it resolves the newest indexed position and returns that payload
-under a single admission. A row is used only when its slot is covered and lies in a
-candidate partition. No row, or any other row, is not a miss: the attempt then runs the
+A Bloom-positive `getTransaction` first runs one local query over its candidate partitions,
+with the same slot range and partition filter: it resolves the newest indexed position and
+returns that payload under a single admission. A row is used only when its slot is covered.
+No row, or any other row, is not a miss: the attempt then runs the
 separate position and payload reads above with the same candidates, and only they can
 prove absence. When the fused query returns no row and there are several candidate
 partitions, the fallback first runs the fused query's position lookup alone over the same
@@ -933,7 +933,7 @@ Configuration:
 | `--disk-cache-fused-get-tx=<bool>` | `DISK_CACHE_FUSED_GET_TX` | `true` | Reads a local `getTransaction` position and payload in one query before the two-step lookup. `false` uses only the two-step lookup (position, then payload). |
 | `--disk-cache-get-tx-span-check=<bool>` | `DISK_CACHE_GET_TX_SPAN_CHECK` | `true` | After an empty fused `getTransaction` read over more than one candidate partition, asks the whole span for a position once and skips the per-partition probes when it holds none (reason `span_empty`). `false` always runs the per-partition probes. |
 | `--disk-cache-eviction-safe-hits=<bool>` | `DISK_CACHE_EVICTION_SAFE_HITS` | `true` | Serves a local `getTransaction` row found across an eviction while its slot is still covered. `false` makes eviction discard every in-flight read. |
-| `--disk-cache-status-span-query=<bool>` | `DISK_CACHE_STATUS_SPAN_QUERY` | `true` | Looks up local signature statuses with one query over the candidates' slot span (within the lookup cap). `false` queries candidate partitions one at a time, newest first. |
+| `--disk-cache-status-span-query=<bool>` | `DISK_CACHE_STATUS_SPAN_QUERY` | `true` | Looks up local signature statuses with one query over the candidate partitions (within the lookup cap). `false` queries candidate partitions one at a time, newest first. |
 | `--disk-cache-compact-transactions-parts` | `DISK_CACHE_COMPACT_TRANSACTIONS_PARTS` | `false` | Writes new local `transactions` parts as Compact; raise `DISK_CACHE_MAX_BYTES` (~13.5% more bytes) with it. `false` resets the layout settings at startup so new parts use the server default. Never rebuilds the cache. |
 | `--gsfa-race-primary=<bool>` | `GSFA_RACE_PRIMARY` | `true` | Races the local `getSignaturesForAddress` page against the primary's full page. `false` awaits the local page first and asks the primary only for the remainder below the coverage floor. |
 | `--disk-cache-get-tx-unknown-timeout-ms` | `DISK_CACHE_GET_TX_UNKNOWN_TIMEOUT_MS` | `150` | Budget for one local `getTransaction` attempt while more than 4 signature-index partitions have unknown membership (index build after a restart); capped at the getTransaction budget. Positive integer. |
