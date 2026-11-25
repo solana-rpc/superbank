@@ -134,11 +134,20 @@ fn list_local_archives(dir: &PathBuf) -> Result<Vec<ArchiveObject>> {
         }
         let metadata = entry.metadata()?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        let size_bytes = if is_bundle {
+            fs::read_dir(&path)?
+                .filter_map(|file| file.ok()?.metadata().ok())
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+                .sum()
+        } else {
+            metadata.len()
+        };
         archives.push(ArchiveObject {
             path: path.display().to_string(),
             parsed_name: parse_archive_name(&name),
             name,
-            size_bytes: metadata.len(),
+            size_bytes,
             modified_utc: metadata.modified().ok().map(DateTime::<Utc>::from),
         });
     }
@@ -150,34 +159,46 @@ async fn list_s3_archives(
     prefix: Option<ObjectPath>,
 ) -> Result<Vec<ArchiveObject>> {
     let mut stream = store.list(prefix.as_ref());
-    let mut archives = Vec::new();
+    let mut objects = Vec::new();
     while let Some(meta) = stream.try_next().await? {
-        let location = meta.location.as_ref();
-        let is_bundle_manifest = location.ends_with("/manifest.json");
-        if !location.ends_with(".parquet") && !is_bundle_manifest {
-            continue;
-        }
-        let name = if is_bundle_manifest {
-            location
-                .rsplit_once('/')
-                .and_then(|(parent, _)| parent.rsplit_once('/').map(|(_, name)| name))
-                .unwrap_or(location)
-                .to_string()
-        } else {
-            meta.location
-                .filename()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| meta.location.to_string())
+        objects.push((meta.location.to_string(), meta.size, meta.last_modified));
+    }
+    Ok(group_listed_objects(objects))
+}
+
+/// One entry per bundle (a prefix holding `manifest.json`, sized as the sum of its
+/// objects) and per legacy single-file `.parquet` archive. Other objects are ignored.
+pub fn group_listed_objects(objects: Vec<(String, u64, DateTime<Utc>)>) -> Vec<ArchiveObject> {
+    let bundles: std::collections::BTreeSet<String> = objects
+        .iter()
+        .filter_map(|(location, _, _)| location.strip_suffix("/manifest.json"))
+        .map(ToOwned::to_owned)
+        .collect();
+    let mut grouped: std::collections::BTreeMap<String, ArchiveObject> = Default::default();
+    for (location, size, modified) in objects {
+        let parent = location.rsplit_once('/').map(|(parent, _)| parent);
+        let (key, name) = match parent {
+            Some(parent) if bundles.contains(parent) => (
+                parent.to_string(),
+                parent.rsplit('/').next().unwrap_or(parent).to_string(),
+            ),
+            _ if location.ends_with(".parquet") => (
+                location.clone(),
+                location.rsplit('/').next().unwrap_or(&location).to_string(),
+            ),
+            _ => continue,
         };
-        archives.push(ArchiveObject {
-            path: meta.location.to_string(),
+        let entry = grouped.entry(key.clone()).or_insert_with(|| ArchiveObject {
+            path: key,
             parsed_name: parse_archive_name(&name),
             name,
-            size_bytes: meta.size,
-            modified_utc: Some(meta.last_modified),
+            size_bytes: 0,
+            modified_utc: None,
         });
+        entry.size_bytes += size;
+        entry.modified_utc = entry.modified_utc.max(Some(modified));
     }
-    Ok(archives)
+    grouped.into_values().collect()
 }
 
 fn s3_config_from_source(source: &SourceArgs) -> Result<S3ArchiveConfig> {

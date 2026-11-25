@@ -298,7 +298,7 @@ struct CliArgs {
     #[arg(long, env = "RPC_MAX_INFLIGHT", default_value_t = 64)]
     rpc_max_inflight: usize,
 
-    /// Max supported transaction version for getBlock (default: 0)
+    /// Max supported transaction version for getBlock (default: 1)
     #[arg(long, env = "RPC_MAX_SUPPORTED_TX_VERSION", default_value_t = 1)]
     rpc_max_supported_tx_version: u8,
 
@@ -765,7 +765,11 @@ struct FileConfig {
     solparq_from_slot: Option<u64>,
     #[serde(alias = "solparq_to_slot")]
     solparq_to_slot: Option<u64>,
-    #[serde(alias = "solparq_tables")]
+    #[serde(
+        alias = "solparq_tables",
+        default,
+        deserialize_with = "deserialize_table_list"
+    )]
     solparq_tables: Option<Vec<String>>,
     #[serde(alias = "solparq_clickhouse_settings")]
     solparq_clickhouse_settings: Option<String>,
@@ -1711,10 +1715,56 @@ pub(crate) fn test_args() -> Args {
     args
 }
 
+/// A YAML list or, as on the command line, one comma-separated string.
+fn deserialize_table_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TableList {
+        List(Vec<String>),
+        Comma(String),
+    }
+    let tables = match Option::<TableList>::deserialize(deserializer)? {
+        None => return Ok(None),
+        Some(TableList::List(tables)) => tables,
+        Some(TableList::Comma(text)) => text.split(',').map(str::to_string).collect(),
+    };
+    Ok(Some(
+        tables
+            .into_iter()
+            .map(|table| table.trim().to_string())
+            .filter(|table| !table.is_empty())
+            .collect(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn file_config_solparq_tables_accepts_a_list_or_a_comma_separated_string() {
+        for yaml in [
+            "solparq-tables: [transactions, blocks_metadata]\n",
+            "solparq-tables: \"transactions, blocks_metadata\"\n",
+            "solparq-tables:\n  - transactions\n  - blocks_metadata\n",
+        ] {
+            let config: FileConfig = serde_yaml::from_str(yaml).expect(yaml);
+            assert_eq!(
+                config.solparq_tables,
+                Some(vec![
+                    "transactions".to_string(),
+                    "blocks_metadata".to_string()
+                ]),
+                "{yaml}"
+            );
+        }
+        let config: FileConfig = serde_yaml::from_str("source: solparq\n").expect("no tables");
+        assert_eq!(config.solparq_tables, None);
+    }
 
     #[test]
     fn clickhouse_async_insert_defaults_to_false() {

@@ -402,7 +402,7 @@ export default {
         opt('--solparq-to-slot', 'SOLPARQ_TO_SLOT', { type: 'u64', text: 'Restore only bundles and rows at or before this slot, inclusive.' }),
         opt('--solparq-tables', 'SOLPARQ_TABLES', {
           type: 'list',
-          text: 'Restrict the restore to these archived table kinds, for example `transactions` and `blocks_metadata`. Comma-separated string on the CLI and in the env var, but a YAML list in the config file. Default is every table in the bundle.',
+          text: 'Restrict the restore to these archived table kinds, for example `transactions` and `blocks_metadata`. Comma-separated string on the CLI and in the env var; the config file takes a YAML list or the same comma-separated string. Default is every table in the bundle.',
         }),
         opt('--solparq-clickhouse-settings', 'SOLPARQ_CLICKHOUSE_SETTINGS', {
           type: 'string',

@@ -128,8 +128,8 @@ export default {
         }),
         opt('SOLPARQ_HOURLY_SLOT_DURATION_MS', '--hourly-slot-duration-ms', {
           type: 'u64 (ms)',
-          default: '400',
-          text: 'Nominal slot duration used to size `hourly` archives: 400 gives 9000 slots, 200 gives 18000. Must be positive and divide 3600000 exactly. Alpenglow does not change it.',
+          default: '200',
+          text: 'Nominal slot duration used to size `hourly` archives: 200 gives 18000 slots, 400 gives 9000. Must be positive and divide 3600000 exactly. Alpenglow does not change it.',
           relations: [{ type: 'see', to: 'SOLPARQ_ARCHIVE_RANGE_TYPE' }],
         }),
         opt('SOLPARQ_CUSTOM_SLOT_RANGE', '--custom-slot-range', {
@@ -264,16 +264,53 @@ export default {
       id: 'validation',
       title: 'Validation, repair and backfill',
       items: [
+        opt('SOLPARQ_SOLANA_CLUSTER', '--solana-cluster', {
+          type: 'mainnet | devnet | testnet',
+          default: 'mainnet',
+          text: 'Solana cluster being archived. It sets the default `--alpenglow-genesis-slot` (mainnet `459652999`, devnet `504148999`, testnet `444625255`) and `--solana-rpc-url`, and the PoH check\'s genesis hash and hashes-per-tick history.',
+          relations: [{ type: 'see', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+        }),
         opt('SOLPARQ_SOLANA_RPC_URL', '--solana-rpc-url', {
           type: 'url',
           default: 'https://api.mainnet-beta.solana.com',
-          text: 'Solana RPC used for the produced-slots cross-check, and by gap backfill.',
+          text: 'Solana RPC used for the produced-slots cross-check, and by gap backfill. The default is the public Solana Foundation endpoint of `--solana-cluster`; the value shown is mainnet\'s.',
+          relations: [{ type: 'see', to: 'SOLPARQ_SOLANA_CLUSTER' }],
         }),
         opt('SOLPARQ_ALLOW_RPC_VALIDATION_FAILURE', '--allow-rpc-validation-failure', {
           type: 'bool',
           default: 'false',
           text: 'Keep archiving when the produced-slots cross-check cannot run (for example a provider without `getBlocks`). Verified problems such as missing blocks or transaction mismatches still block, and missing-block detection is unavailable for that run.',
           relations: [{ type: 'see', to: 'SOLPARQ_FORCE_ARCHIVE' }],
+        }),
+        opt('SOLPARQ_ALPENGLOW_GENESIS_SLOT', '--alpenglow-genesis-slot', {
+          type: 'u64 | none',
+          default: '459652999',
+          text: 'Trusted `getAgGenesisCert` `block.slot` for the cluster. The default comes from `--solana-cluster`; the value shown is mainnet\'s. Validation reports stored blocks after it that lack a complete Alpenglow footer, and the PoH check applies Alpenglow rules after it. `none` skips the footer check, and needs `--footer-coverage-policy report` and `--poh-verify-mode off`.',
+          relations: [{ type: 'see', to: 'SOLPARQ_FOOTER_COVERAGE_POLICY' }],
+        }),
+        opt('SOLPARQ_FOOTER_COVERAGE_POLICY', '--footer-coverage-policy', {
+          type: 'report | require',
+          default: 'require',
+          text: '`report` lists footer gaps and archives anyway. `require` blocks the archive on footer gaps, like other data problems; `--force-archive` still overrides it. `require` needs `--alpenglow-genesis-slot`. RPC/Bigtable sources write no footers, so set `report` for them.',
+          relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+        }),
+        opt('SOLPARQ_POH_VERIFY_MODE', '--poh-verify-mode', {
+          type: 'off | structural | full',
+          default: 'full',
+          text: 'Run superbank-verify over the archive slot range in ClickHouse before writing it, once the other validation checks pass. `structural` checks ticks, entries and blockhash linkage; `full` also recomputes every entry hash. After the Alpenglow genesis slot every entry has one hash, so `full` is cheap; before it a slot costs about 4M hashes, so set `structural` for historical ranges. A PoH failure blocks the archive like other data problems; `--force-archive` still overrides it. Conflicting duplicate rows for a slot also fail it. Slots after `--alpenglow-genesis-slot` use Alpenglow rules, so any mode other than `off` needs it. Cluster parameters come from `--solana-cluster`. RPC/Bigtable sources store no `entries`, so set `off` for them.',
+          relations: [{ type: 'requires', to: 'SOLPARQ_ALPENGLOW_GENESIS_SLOT' }],
+        }),
+        opt('SOLPARQ_POH_VERIFY_ALLOW_UNVERIFIABLE', '--poh-verify-allow-unverifiable', {
+          type: 'bool',
+          default: 'false',
+          text: 'Archive even when the PoH check leaves slots unverifiable (blocks without `entries` rows, such as RPC-backfilled ones) or missing from the chain. PoH failures still block.',
+          relations: [{ type: 'see', to: 'SOLPARQ_POH_VERIFY_MODE' }],
+        }),
+        opt('SOLPARQ_POH_VERIFY_THREADS', '--poh-verify-threads', {
+          type: 'usize',
+          default: '0',
+          text: 'Threads for PoH hash recomputation. `0` uses every available core.',
+          relations: [{ type: 'see', to: 'SOLPARQ_POH_VERIFY_MODE' }],
         }),
         opt('SOLPARQ_REPAIR_MISMATCHES', '--repair-mismatches', {
           type: 'bool',
