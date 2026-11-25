@@ -76,9 +76,11 @@ struct TxSignaturesRow {
 
 impl ChDb {
     pub(crate) fn new(args: &Args) -> Self {
+        // The client decodes only LZ4 blocks; newer servers default to ZSTD.
         let mut client = ClickHouseClient::default()
             .with_url(&args.clickhouse_url)
-            .with_database(&args.clickhouse_database);
+            .with_database(&args.clickhouse_database)
+            .with_option("network_compression_method", "lz4");
         if !args.clickhouse_user.is_empty() {
             client = client.with_user(&args.clickhouse_user);
         }
