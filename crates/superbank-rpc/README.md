@@ -159,6 +159,17 @@ a topology change requires restart and successful preflight.
 Successful reads consume the complete response, including EOF after a single-row result,
 before releasing admission. A valid first row does not hide a later stream or decoding
 error. Successful EOF generates no verification probes and permits connection reuse.
+
+The read guard makes admission ownership explicit:
+
+| State | Event | Result |
+| --- | --- | --- |
+| `Prepared` | Submit the read | `Submitted`; keep admission. |
+| `Prepared` | Drop or fail before submission | Release admission without verification. |
+| `Submitted` | Consume successful EOF | `Released`; release all associated permits without verification. |
+| `Submitted` | Drop, timeout, or stream error | Close the response, then apply the endpoint's abandonment policy. |
+| `Released` | Drop or repeat completion | No verification or further admission work. |
+
 Dropping a query before submission releases its admission immediately. Once submitted,
 abandonment closes the data response before scheduling verification and retains its read
 and associated workflow permits until termination is confirmed, or for primary and shard
